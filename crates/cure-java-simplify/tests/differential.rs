@@ -481,3 +481,200 @@ public class DiffStr {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// 保守性专项：不可证明语义的场景【必须不动】——正确性的一半是"知道何时不该动"
+// ---------------------------------------------------------------------------
+
+#[test]
+fn conservative_float_nan() {
+    // NaN 比较取反在浮点下不成立（!(a<b)=true 但 a>=b=false）
+    differential(
+        "ConsNaN",
+        r#"
+public class ConsNaN {
+    public static void main(String[] args) {
+        double nan = 0.0 / 0.0;
+        System.out.println(nan < 1.0);
+        System.out.println(!(nan < 1.0));
+        System.out.println(nan >= 1.0);
+        System.out.println(nan == nan);
+        System.out.println(nan != nan);
+        double z = 0.0;
+        System.out.println(0 * nan);
+        System.out.println(z == -z);
+        System.out.println(1 / z == Double.POSITIVE_INFINITY);
+        float f = 0.0f;
+        System.out.println(0 * f);
+        System.out.println(-z);
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn conservative_overflow_and_div() {
+    // 整数回绕与除零异常语义
+    differential(
+        "ConsOvf",
+        r#"
+public class ConsOvf {
+    public static void main(String[] args) {
+        System.out.println(Integer.MAX_VALUE + 1);
+        System.out.println(Integer.MIN_VALUE - 1);
+        System.out.println(Integer.MIN_VALUE / -1);
+        System.out.println(-Integer.MIN_VALUE);
+        System.out.println(Long.MAX_VALUE + 1L);
+        try {
+            System.out.println(1 / 0);
+        } catch (ArithmeticException e) {
+            System.out.println("div0: " + e.getMessage());
+        }
+        try {
+            System.out.println(5 % 0);
+        } catch (ArithmeticException e) {
+            System.out.println("mod0: " + e.getMessage());
+        }
+        System.out.println(1 << 32);
+        System.out.println(1L << 64);
+        int i = 200;
+        byte b = (byte) i;
+        System.out.println(b);
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn conservative_string_semantics() {
+    // 字符串池化/引用比较/locale 敏感方法
+    differential(
+        "ConsStr",
+        r#"
+public class ConsStr {
+    public static void main(String[] args) {
+        // == 是引用比较（字面量池化后恰好 true，但不可证明等价于 equals）
+        String a = "he" + "llo";
+        String b = "hello";
+        System.out.println(a == b);
+        String c = new String("hello");
+        System.out.println(c == b);
+        System.out.println(c.equals(b));
+        // intern 改变引用语义
+        System.out.println(c.intern() == b);
+        // locale 敏感方法不折
+        String s = "abc";
+        System.out.println(s.toUpperCase());
+        System.out.println("i".toUpperCase());
+        String turkish = "I";
+        System.out.println(turkish.toLowerCase());
+        // hashCode 确定性可折 ✓（JLS 规定）
+        System.out.println("hello".hashCode());
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn conservative_local_array_identity() {
+    // 有 string == 时守卫拦截数组字面量下标折叠；传播+打印必须仍产出合法 Java
+    differential(
+        "ConsArr",
+        r#"
+public class ConsArr {
+    public static void main(String[] args) {
+        int i = 1;
+        String[] table = {"zero", "one", "two"};
+        String f = table[i];
+        System.out.println(f);
+        String g = "one";
+        System.out.println(f == g);
+        String h = new String("one");
+        System.out.println(h == g);
+    }
+    static String pick() {
+        // 无 == 上下文：数组下标照常折叠
+        String[] t2 = {"a", "b"};
+        return t2[1];
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn conservative_string_creation_identity() {
+    // 折叠产出「池化常量」 vs 原语义「运行期新建 String」——== 必须保持 false
+    differential(
+        "ConsStr2",
+        r#"
+public class ConsStr2 {
+    static final String[] T = {"a", "b"};
+    public static void main(String[] args) {
+        String b = "hello";
+        // sb.toString() 常量链：运行期新建 → == false
+        String a = new StringBuilder().append("he").append("llo").toString();
+        System.out.println(a == b);
+        System.out.println(a.equals(b));
+        // new String(Base64 解码)：运行期新建 → == false
+        String c = new String(java.util.Base64.getDecoder().decode("aGVsbG8="));
+        System.out.println(c == b);
+        System.out.println(c.equals(b));
+        // valueOf 剥壳后常量化：valueOf 调用阻断常量折叠 → == false
+        System.out.println(String.valueOf("he") + "llo" == b);
+        System.out.println((String.valueOf("he") + "llo").equals(b));
+        // toString/valueOf 非常量化折叠：运行期新建 → == false
+        System.out.println(Integer.toString(5) == "5");
+        System.out.println(String.valueOf('x') == "x");
+        // new String(lit)：经典引用身份
+        String d = new String("hello");
+        System.out.println(d == b);
+        // new String()：与 "" 也是不同对象
+        System.out.println(new String() == "");
+        // 字面量数组的元素本来就是池化引用 → == true（折下标不改变语义）
+        System.out.println(T[0] == "a");
+        System.out.println(T[1] == "b");
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn conservative_types_and_boxes() {
+    // 装箱身份/窄化/char 溢出
+    differential(
+        "ConsBox",
+        r#"
+public class ConsBox {
+    public static void main(String[] args) {
+        Integer a = 127;
+        Integer b = 127;
+        System.out.println(a == b);
+        Integer c = 128;
+        Integer d = 128;
+        System.out.println(c == d);
+        System.out.println(c.equals(d));
+        // Integer.valueOf("99") 是解析——不能与 99 视为同一字面量处理
+        System.out.println(Integer.valueOf("99").intValue());
+        Object o = "str";
+        System.out.println(o instanceof String);
+        Object n = Integer.valueOf(3);
+        System.out.println(n instanceof String);
+        char ch = 'a';
+        int i = ch + 1;
+        System.out.println((char) i);
+        // 混合类型比较
+        long l = 5;
+        System.out.println(l == 5);
+        double dv = 5.0;
+        System.out.println(dv == 5);
+        System.out.println(0.1 + 0.2 == 0.3);
+    }
+}
+"#,
+    );
+}

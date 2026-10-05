@@ -105,6 +105,7 @@ impl Rule<JavaAst> for StringBuilderFold {
         "string_builder_fold"
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let root = ctx.root();
         let lang = ctx.lang;
         // 外层：X.toString()
         if lang.kind(id) != NodeKind::Call {
@@ -160,6 +161,14 @@ impl Rule<JavaAst> for StringBuilderFold {
                 }
                 _ => return None,
             }
+        }
+        // 全字面量链折叠结果是常量表达式（javac 池化），而 sb.toString() 是
+        // 运行期新建未池化的串——== 语义会变 → 身份守卫。混合链（含变量/调用）
+        // 折叠后是非常量拼接，运行期行为与 toString 一致，无需守卫。
+        if parts.iter().all(|&p| lang.literal(p).is_some())
+            && has_string_identity_compare(lang, root)
+        {
+            return None;
         }
         if parts.is_empty() {
             // new StringBuilder().toString() → ""
@@ -503,6 +512,85 @@ fn subtree_has_var(lang: &JavaAst, id: JavaId, name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// 引用身份守卫（new String(lit) / SB 常量链 / Base64 解码 / valueOf 剥壳共用）：
+// 这些折叠会把「运行期新建、未池化」的 String 换成「编译期常量、池化」的字面量。
+// String 的 ==/!= 是引用比较，池化与否会改变结果（new String("x") == "x" 为
+// false，折成字面量后为 true）。凡方法内存在操作数可能为 String 的 ==/!=，
+// 一律放弃此类折叠。跨方法逃逸（return / 字段写入后在别处比较）在比较发生的
+// 方法里会被同一守卫拦下——比较点的操作数必然 string-ish。
+// 跨文件边界（本文件折叠、他文件比较）超出单文件简化的作用域，文档已声明。
+// ---------------------------------------------------------------------------
+
+/// 类型可能持有 String 引用吗？（保守近似：无法证明非 String 即视为可能）
+fn type_maybe_string(t: &JType) -> bool {
+    match t {
+        JType::Bool | JType::Byte | JType::Short | JType::Int | JType::Long
+        | JType::Char | JType::Float | JType::Double | JType::Void
+        | JType::Array(_) => false, // 数组引用不是 String 本体（元素访问走 Index 节点）
+        JType::Var => true,         // var / 推断 / 未知
+        JType::Ref(n) => {
+            let base = n.split('<').next().unwrap_or(n).trim();
+            let last = base.rsplit('.').next().unwrap_or(base);
+            matches!(
+                last,
+                "String" | "Object" | "CharSequence" | "Comparable" | "Serializable"
+            ) || n.contains('<') // 泛型容器：剥壳后无法判定 → 保守
+                // 单字母大写：类型参数 T/E/R（无界，运行期可为 String）
+                || (last.len() <= 2 && last.chars().next().is_some_and(|c| c.is_uppercase()))
+        }
+    }
+}
+
+/// `==`/`!=` 的这个操作数可能持有 String 引用吗？
+fn expr_maybe_string(lang: &JavaAst, id: JavaId) -> bool {
+    match lang.data(id) {
+        NodeData::Literal(Lit::Str(_)) => true,
+        // null/this/数组/instanceof/数值布尔字面量：折叠不可能改变其 == 结果
+        NodeData::Literal(_) | NodeData::This | NodeData::Super
+        | NodeData::NewArray { .. } | NodeData::ArrayLit | NodeData::InstanceOf { .. } => false,
+        NodeData::VarRef { .. } => lang.var_type(id).map_or(true, type_maybe_string),
+        NodeData::Cast { ty } => type_maybe_string(ty),
+        NodeData::Paren => lang
+            .children(id)
+            .first()
+            .map_or(true, |&c| expr_maybe_string(lang, c)),
+        // 拼接：任一操作数 String ⇒ 结果 String；其余二元运算结果必为原始类型
+        NodeData::Binary { op } if *op == BinOp::Add => {
+            lang.children(id).iter().any(|&c| expr_maybe_string(lang, c))
+        }
+        NodeData::Binary { .. } => false,
+        NodeData::Ternary => lang
+            .children(id)
+            .get(1..)
+            .map_or(true, |cs| cs.iter().any(|&c| expr_maybe_string(lang, c))),
+        // Call/Member/Index/MethodRef/Raw/Unary/Lambda…：类型未知或引用 → 保守视为可能
+        _ => true,
+    }
+}
+
+/// root 子树内存在「两侧都可能为 String」的 ==/≠ 吗？
+/// （一侧可证为原始类型 ⇒ 数值比较，编译期就不可能容纳 String 引用 ⇒ 忽略；
+///   null 字面量侧同理：折叠前后都恒为 false，不受影响。）
+fn has_string_identity_compare(lang: &JavaAst, root: JavaId) -> bool {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if let NodeData::Binary { op: BinOp::Eq | BinOp::Ne } = lang.data(id) {
+            let ch = lang.children(id);
+            if ch.len() == 2
+                && expr_maybe_string(lang, ch[0])
+                && expr_maybe_string(lang, ch[1])
+            {
+                return true;
+            }
+        }
+        for &c in lang.children(id) {
+            stack.push(c);
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // new String 折叠（混淆器/反编译器产物）：new String("lit") → "lit"、new String() → ""
 // 仅字面量实参（new String(charArray/bytes) 是拷贝语义，不折）。
 // ---------------------------------------------------------------------------
@@ -514,11 +602,16 @@ impl Rule<JavaAst> for NewStringFold {
         "new_string_fold"
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let root = ctx.root();
         let lang = ctx.lang;
         let NodeData::New { ty, .. } = lang.data(id) else {
             return None;
         };
         if !matches!(ty, JType::Ref(n) if n == "String" || n == "java.lang.String" || n.ends_with(".String")) {
+            return None;
+        }
+        // 折叠产出池化字面量，改变 String 引用身份 → 守卫
+        if has_string_identity_compare(lang, root) {
             return None;
         }
         let args = lang.children(id).to_vec();
@@ -706,7 +799,7 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
             return None;
         }
         let wch = lang.children(id).to_vec();
-        let (cond, body) = (wch[0], wch[1]);
+        let body = wch[1];
         // 前置声明：Iterator<…> it = <iterable>.iterator();
         if lang.kind(parent) != NodeKind::Block {
             return None;
@@ -718,7 +811,6 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         // 向上扫描（最多 4 条）找 it 的 VarDecl（声明与 while 之间可能夹
         // 无关语句，如 acc 声明）；中间语句引用 it 则拒
         let cond = wch[0];
-        let _ = &cond;
         let it_hint = match lang.kind(cond) {
             NodeKind::Call => {
                 let cc0 = lang.children(cond).to_vec();
@@ -924,6 +1016,7 @@ impl Rule<JavaAst> for ConcatValueOfDrop {
         "concat_value_of_drop"
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let root = ctx.root();
         let lang = ctx.lang;
         if lang.kind(id) != NodeKind::Binary {
             return None;
@@ -933,6 +1026,11 @@ impl Rule<JavaAst> for ConcatValueOfDrop {
         }
         let ch = lang.children(id).to_vec();
         let (l, r) = (ch[0], ch[1]);
+        // 折叠后若成为常量表达式（双方均字面量），拼接串会被 javac 池化，
+        // 而原 valueOf(...) 调用是运行期新建 → == 语义会变 → 身份守卫
+        let becomes_constant = |x: JavaId, other: JavaId| {
+            lang.literal(x).is_some() && matches!(lang.literal(other), Some(LitRef::Str(_)))
+        };
         let is_value_of = |n: JavaId| -> Option<JavaId> {
             if lang.kind(n) != NodeKind::Call {
                 return None;
@@ -963,6 +1061,9 @@ impl Rule<JavaAst> for ConcatValueOfDrop {
         // String.valueOf(x) + y（y 可证 String）
         if let Some(x) = is_value_of(l) {
             if stringy(r) {
+                if becomes_constant(x, r) && has_string_identity_compare(lang, root) {
+                    return None;
+                }
                 let with = lang.build_bin(BinOp::Add, x, r);
                 return Some(Edit::Replace {
                     target: id,
@@ -973,6 +1074,9 @@ impl Rule<JavaAst> for ConcatValueOfDrop {
         // y + String.valueOf(x)
         if let Some(x) = is_value_of(r) {
             if stringy(l) {
+                if becomes_constant(x, l) && has_string_identity_compare(lang, root) {
+                    return None;
+                }
                 let with = lang.build_bin(BinOp::Add, l, x);
                 return Some(Edit::Replace {
                     target: id,
@@ -1037,6 +1141,7 @@ impl Rule<JavaAst> for StringBuilderStatements {
         // 取结构信息（避免与 ctx 方法借用冲突）
         let parent = ctx.parent(id)?;
         let idx = ctx.index(id)?;
+        let root = ctx.root();
         let lang = ctx.lang;
 
         if lang.kind(id) != NodeKind::VarDecl {
@@ -1229,12 +1334,17 @@ impl Rule<JavaAst> for StringBuilderStatements {
             }
         }
 
-        // 构造拼接表达式
+        // 构造拼接表达式（全字面量链会折叠成常量表达式 → 池化 → 身份守卫）
         let mut all_parts: Vec<JavaId> = Vec::new();
         if let Some(ca) = ctor_arg {
             all_parts.push(ca);
         }
         all_parts.extend(parts);
+        if all_parts.iter().all(|&p| lang.literal(p).is_some())
+            && has_string_identity_compare(&*lang, root)
+        {
+            return None;
+        }
         if all_parts.is_empty() {
             let empty = lang.build_str("");
             return Some(Edit::Multi(vec![
@@ -1448,13 +1558,28 @@ impl Rule<JavaAst> for LiteralEval {
         "literal_eval"
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let root = ctx.root();
         let lang = ctx.lang;
-        match lang.kind(id) {
-            NodeKind::Call => self.eval_call(lang, id),
-            NodeKind::Index => self.eval_index(lang, id),
-            NodeKind::Cast => eval_cast_literal(lang, id),
+        let edit = match lang.kind(id) {
+            NodeKind::Call => self.eval_call(&mut *lang, id),
+            NodeKind::Index => self.eval_index(&mut *lang, id),
+            NodeKind::Cast => eval_cast_literal(&mut *lang, id),
             _ => None,
+        };
+        // Str 字面量结果：原表达式（valueOf/toString/concat/substring…）是运行期
+        // 新建的串，折成字面量会引入池化引用；若方法内存在 String 的 ==/!=，
+        // 身份语义可能改变 → 守卫。Bool/Int 结果走值语义，不受影响。
+        if let Some(Edit::Replace { with, .. }) = &edit {
+            if matches!(lang.literal(*with), Some(LitRef::Str(_)))
+                && has_string_identity_compare(&*lang, root)
+            {
+                if std::env::var("CURE_DEBUG_GATE").is_ok() {
+                    eprintln!("[gate] blocked literal_eval at {id:?}");
+                }
+                return None;
+            }
         }
+        edit
     }
 }
 
@@ -1489,13 +1614,25 @@ impl LiteralEval {
     }
 
     fn eval_index(&self, lang: &mut JavaAst, id: JavaId) -> Option<Edit<JavaAst>> {
-        // {"a","b"}[1] → "b"（字面量数组 + 字面量下标，界内）
+        // {"a","b"}[1] / new String[]{"a","b"}[1] → "b"（字面量数组 + 字面量下标，界内）
         let ch = lang.children(id).to_vec();
-        if lang.kind(ch[0]) != NodeKind::ArrayLit {
-            return None;
-        }
+        // new T[]{…}（解析器归一化形态，sized=0 时唯一子节点是 ArrayLit）
+        let arr = match lang.kind(ch[0]) {
+            NodeKind::ArrayLit => ch[0],
+            NodeKind::NewArray => {
+                let nc = lang.children(ch[0]);
+                let NodeData::NewArray { sized, .. } = lang.data(ch[0]) else {
+                    return None;
+                };
+                if *sized != 0 || nc.len() != 1 || lang.kind(nc[0]) != NodeKind::ArrayLit {
+                    return None;
+                }
+                nc[0]
+            }
+            _ => return None,
+        };
         let idx = lang.literal(ch[1])?.as_int()?;
-        let elems = lang.children(ch[0]).to_vec();
+        let elems = lang.children(arr).to_vec();
         if idx < 0 || idx >= elems.len() as i64 {
             return None;
         }
@@ -1715,11 +1852,16 @@ impl Rule<JavaAst> for Base64NewStringFold {
         "base64_new_string_fold"
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let root = ctx.root();
         let lang = ctx.lang;
         let NodeData::New { ty, .. } = lang.data(id) else {
             return None;
         };
         if !matches!(ty, JType::Ref(n) if n == "String" || n.ends_with(".String")) {
+            return None;
+        }
+        // 折叠产出池化字面量，改变 String 引用身份 → 守卫
+        if has_string_identity_compare(lang, root) {
             return None;
         }
         let args = lang.children(id).to_vec();
@@ -2010,7 +2152,7 @@ impl Rule<JavaAst> for CffRecover {
                 up -= 1;
                 let st = block_ch[up];
                 match scan_cff_event(lang, st, &v) {
-                    Some(CffEvent::Read) | Some(CffEvent::Shadow) => return None,
+                    Some(CffEvent::Read) => return None,
                     Some(CffEvent::Write) | Some(CffEvent::Decl) => {
                         init = parse_cff_init(lang, &v, st);
                         init_idx = up;
@@ -2148,7 +2290,6 @@ fn parse_cff_tail(lang: &JavaAst, v: &str, stmts: &mut Vec<JavaId>) -> Option<Cf
 enum CffEvent {
     Read,
     Write,
-    Shadow,
     /// v 自身的声明（含 init 时为入口源）
     Decl,
 }
@@ -2178,7 +2319,7 @@ fn scan_cff_event(lang: &JavaAst, node: JavaId, name: &str) -> Option<CffEvent> 
             let ch = lang.children(node);
             if let Some(&val) = ch.get(1) {
                 if let Some(e) = scan_cff_event(lang, val, name) {
-                    if matches!(e, CffEvent::Read | CffEvent::Shadow) {
+                    if matches!(e, CffEvent::Read) {
                         return Some(e);
                     }
                 }
