@@ -17,6 +17,9 @@ use cure_java_print::print_unit;
 use cure_java_simplify::simplify_unit;
 
 const CORPUS_ROOT: &str = "/Users/e/Documents/github/google-java-format";
+/// 真实混淆代码：fernflower 仓库的 ProGuard 输出（okhttp3 系列）。
+/// 引用外部类无法独立编译 → 只做鲁棒/自洽/幂等三检（非 javac 差分）。
+const OBF_CORPUS_ROOT: &str = "/Users/e/Documents/github/fernflower/testData/manual/obfuscated";
 
 fn collect_java_files(root: &Path, out: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(root) {
@@ -39,14 +42,23 @@ fn collect_java_files(root: &Path, out: &mut Vec<PathBuf>) {
 
 #[test]
 fn corpus_robust_consistent_idempotent() {
-    if !Path::new(CORPUS_ROOT).is_dir() {
-        eprintln!("skip corpus: {CORPUS_ROOT} not found");
+    run_corpus(CORPUS_ROOT, "google-java-format");
+}
+
+#[test]
+fn obfuscated_corpus_robust_consistent_idempotent() {
+    run_corpus(OBF_CORPUS_ROOT, "fernflower-obfuscated");
+}
+
+fn run_corpus(root: &str, label: &str) {
+    if !Path::new(root).is_dir() {
+        eprintln!("skip corpus {label}: {root} not found");
         return;
     }
     let mut files = Vec::new();
-    collect_java_files(Path::new(CORPUS_ROOT), &mut files);
+    collect_java_files(Path::new(root), &mut files);
     files.sort();
-    assert!(!files.is_empty(), "corpus empty?");
+    assert!(!files.is_empty(), "corpus {label} empty?");
 
     let cfg = Config::default();
     let mut clean = 0usize;
@@ -106,7 +118,7 @@ fn corpus_robust_consistent_idempotent() {
     }
 
     eprintln!(
-        "corpus: {} 文件（干净 {} / 含语法错误 {}），{} 次改写，{} 行 → {} 行",
+        "corpus[{label}]: {} 文件（干净 {} / 含语法错误 {}），{} 次改写，{} 行 → {} 行",
         clean + dirty,
         clean,
         dirty,
@@ -117,9 +129,14 @@ fn corpus_robust_consistent_idempotent() {
     for (k, v) in &per_rule {
         eprintln!("  rule {k}: {v}");
     }
-    // 语料是格式规范的手写代码：改写应存在但稀少（证明"不乱动好代码"）
-    // —— 且不能是 0（证明引擎在真实代码上确实在工作）
-    eprintln!("平均每千行改写: {:.1}", total_edits as f64 * 1000.0 / lines_before as f64);
+    if total_edits > 0 {
+        // 混淆语料期望高改写率（这正是目标域）；干净手写语料期望低改写率
+        // （证明"不乱动好代码"）—— 两者都不能是 0（证明引擎在工作）
+        eprintln!(
+            "平均每千行改写: {:.1}",
+            total_edits as f64 * 1000.0 / lines_before as f64
+        );
+    }
 }
 
 /// 去掉注释与空行后的行数（粗粒度词法剥离）。
