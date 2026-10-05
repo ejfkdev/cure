@@ -166,7 +166,7 @@ impl Rule<JavaAst> for StringBuilderFold {
         // 运行期新建未池化的串——== 语义会变 → 身份守卫。混合链（含变量/调用）
         // 折叠后是非常量拼接，运行期行为与 toString 一致，无需守卫。
         if parts.iter().all(|&p| lang.literal(p).is_some())
-            && has_string_identity_compare(lang, root)
+            && lang.has_string_identity_compare(root)
         {
             return None;
         }
@@ -512,85 +512,6 @@ fn subtree_has_var(lang: &JavaAst, id: JavaId, name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// 引用身份守卫（new String(lit) / SB 常量链 / Base64 解码 / valueOf 剥壳共用）：
-// 这些折叠会把「运行期新建、未池化」的 String 换成「编译期常量、池化」的字面量。
-// String 的 ==/!= 是引用比较，池化与否会改变结果（new String("x") == "x" 为
-// false，折成字面量后为 true）。凡方法内存在操作数可能为 String 的 ==/!=，
-// 一律放弃此类折叠。跨方法逃逸（return / 字段写入后在别处比较）在比较发生的
-// 方法里会被同一守卫拦下——比较点的操作数必然 string-ish。
-// 跨文件边界（本文件折叠、他文件比较）超出单文件简化的作用域，文档已声明。
-// ---------------------------------------------------------------------------
-
-/// 类型可能持有 String 引用吗？（保守近似：无法证明非 String 即视为可能）
-fn type_maybe_string(t: &JType) -> bool {
-    match t {
-        JType::Bool | JType::Byte | JType::Short | JType::Int | JType::Long
-        | JType::Char | JType::Float | JType::Double | JType::Void
-        | JType::Array(_) => false, // 数组引用不是 String 本体（元素访问走 Index 节点）
-        JType::Var => true,         // var / 推断 / 未知
-        JType::Ref(n) => {
-            let base = n.split('<').next().unwrap_or(n).trim();
-            let last = base.rsplit('.').next().unwrap_or(base);
-            matches!(
-                last,
-                "String" | "Object" | "CharSequence" | "Comparable" | "Serializable"
-            ) || n.contains('<') // 泛型容器：剥壳后无法判定 → 保守
-                // 单字母大写：类型参数 T/E/R（无界，运行期可为 String）
-                || (last.len() <= 2 && last.chars().next().is_some_and(|c| c.is_uppercase()))
-        }
-    }
-}
-
-/// `==`/`!=` 的这个操作数可能持有 String 引用吗？
-fn expr_maybe_string(lang: &JavaAst, id: JavaId) -> bool {
-    match lang.data(id) {
-        NodeData::Literal(Lit::Str(_)) => true,
-        // null/this/数组/instanceof/数值布尔字面量：折叠不可能改变其 == 结果
-        NodeData::Literal(_) | NodeData::This | NodeData::Super
-        | NodeData::NewArray { .. } | NodeData::ArrayLit | NodeData::InstanceOf { .. } => false,
-        NodeData::VarRef { .. } => lang.var_type(id).map_or(true, type_maybe_string),
-        NodeData::Cast { ty } => type_maybe_string(ty),
-        NodeData::Paren => lang
-            .children(id)
-            .first()
-            .map_or(true, |&c| expr_maybe_string(lang, c)),
-        // 拼接：任一操作数 String ⇒ 结果 String；其余二元运算结果必为原始类型
-        NodeData::Binary { op } if *op == BinOp::Add => {
-            lang.children(id).iter().any(|&c| expr_maybe_string(lang, c))
-        }
-        NodeData::Binary { .. } => false,
-        NodeData::Ternary => lang
-            .children(id)
-            .get(1..)
-            .map_or(true, |cs| cs.iter().any(|&c| expr_maybe_string(lang, c))),
-        // Call/Member/Index/MethodRef/Raw/Unary/Lambda…：类型未知或引用 → 保守视为可能
-        _ => true,
-    }
-}
-
-/// root 子树内存在「两侧都可能为 String」的 ==/≠ 吗？
-/// （一侧可证为原始类型 ⇒ 数值比较，编译期就不可能容纳 String 引用 ⇒ 忽略；
-///   null 字面量侧同理：折叠前后都恒为 false，不受影响。）
-fn has_string_identity_compare(lang: &JavaAst, root: JavaId) -> bool {
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if let NodeData::Binary { op: BinOp::Eq | BinOp::Ne } = lang.data(id) {
-            let ch = lang.children(id);
-            if ch.len() == 2
-                && expr_maybe_string(lang, ch[0])
-                && expr_maybe_string(lang, ch[1])
-            {
-                return true;
-            }
-        }
-        for &c in lang.children(id) {
-            stack.push(c);
-        }
-    }
-    false
-}
-
-// ---------------------------------------------------------------------------
 // new String 折叠（混淆器/反编译器产物）：new String("lit") → "lit"、new String() → ""
 // 仅字面量实参（new String(charArray/bytes) 是拷贝语义，不折）。
 // ---------------------------------------------------------------------------
@@ -611,7 +532,7 @@ impl Rule<JavaAst> for NewStringFold {
             return None;
         }
         // 折叠产出池化字面量，改变 String 引用身份 → 守卫
-        if has_string_identity_compare(lang, root) {
+        if lang.has_string_identity_compare(root) {
             return None;
         }
         let args = lang.children(id).to_vec();
@@ -1061,7 +982,7 @@ impl Rule<JavaAst> for ConcatValueOfDrop {
         // String.valueOf(x) + y（y 可证 String）
         if let Some(x) = is_value_of(l) {
             if stringy(r) {
-                if becomes_constant(x, r) && has_string_identity_compare(lang, root) {
+                if becomes_constant(x, r) && lang.has_string_identity_compare(root) {
                     return None;
                 }
                 let with = lang.build_bin(BinOp::Add, x, r);
@@ -1074,7 +995,7 @@ impl Rule<JavaAst> for ConcatValueOfDrop {
         // y + String.valueOf(x)
         if let Some(x) = is_value_of(r) {
             if stringy(l) {
-                if becomes_constant(x, l) && has_string_identity_compare(lang, root) {
+                if becomes_constant(x, l) && lang.has_string_identity_compare(root) {
                     return None;
                 }
                 let with = lang.build_bin(BinOp::Add, l, x);
@@ -1341,7 +1262,7 @@ impl Rule<JavaAst> for StringBuilderStatements {
         }
         all_parts.extend(parts);
         if all_parts.iter().all(|&p| lang.literal(p).is_some())
-            && has_string_identity_compare(&*lang, root)
+            && lang.has_string_identity_compare(root)
         {
             return None;
         }
@@ -1571,7 +1492,7 @@ impl Rule<JavaAst> for LiteralEval {
         // 身份语义可能改变 → 守卫。Bool/Int 结果走值语义，不受影响。
         if let Some(Edit::Replace { with, .. }) = &edit {
             if matches!(lang.literal(*with), Some(LitRef::Str(_)))
-                && has_string_identity_compare(&*lang, root)
+                && lang.has_string_identity_compare(root)
             {
                 if std::env::var("CURE_DEBUG_GATE").is_ok() {
                     eprintln!("[gate] blocked literal_eval at {id:?}");
@@ -1861,7 +1782,7 @@ impl Rule<JavaAst> for Base64NewStringFold {
             return None;
         }
         // 折叠产出池化字面量，改变 String 引用身份 → 守卫
-        if has_string_identity_compare(lang, root) {
+        if lang.has_string_identity_compare(root) {
             return None;
         }
         let args = lang.children(id).to_vec();
@@ -2945,8 +2866,169 @@ pub fn simplify_unit(ast: &mut JavaAst, unit: &mut CompilationUnit, cfg: &Config
     for ty in &mut unit.types {
         simplify_type(ast, ty, cfg, &mut total);
     }
+    if cfg.remove_dead_methods {
+        total.edits += remove_dead_private_methods(ast, unit);
+    }
     total
 }
+
+// ---------------------------------------------------------------------------
+// 死私有方法删除（opt-in，Config::remove_dead_methods）：
+// const_method_inline / 解密器还原后残留的 helper 清理。
+// 安全域：
+//   - 仅 private（private 不可能被外部调用或被子类覆盖）；
+//   - 全单元零引用：Call 的 callee 名（Member 名/裸名）与 MethodRef 名，
+//     名字匹配不判签名——匹配只会导致"保留"，方向保守；
+//   - 名字与本单元其他声明（方法重载/字段）撞名 → 保留（混淆器单字母
+//     名高频撞名，保守不删）；
+//   - 修饰符串含 @（注解方法，可能是框架入口）→ 保留；
+//   - 构造器不删（单例模式 private ctor 是活的）。
+// 反射调用无法静态排除 → opt-in 而非默认。
+// 传递性死代码：迭代到不动点（删一层后重收集引用）。
+// ---------------------------------------------------------------------------
+
+fn remove_dead_private_methods(ast: &JavaAst, unit: &mut CompilationUnit) -> usize {
+    use std::collections::{HashMap, HashSet};
+    let mut removed = 0usize;
+    loop {
+        // 1) 全单元引用名（不可变借用阶段）
+        let mut referenced: HashSet<String> = HashSet::new();
+        let mut roots: Vec<JavaId> = Vec::new();
+        for_each_type(unit, &mut |ty| collect_member_roots(ty, &mut roots));
+        for body in roots {
+            collect_call_names(ast, body, &mut referenced);
+        }
+        // 2) 声明名字统计（重载/字段撞名判定）
+        let mut decl_counts: HashMap<String, usize> = HashMap::new();
+        for_each_type(unit, &mut |ty| {
+            for m in &ty.members {
+                match m {
+                    Member::Method { name, .. }
+                    | Member::Constructor { name, .. } => {
+                        *decl_counts.entry(name.clone()).or_insert(0) += 1;
+                    }
+                    Member::Field { declarators, .. } => {
+                        for d in declarators {
+                            *decl_counts.entry(d.name.clone()).or_insert(0) += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        // 3) 删除（可变借用阶段）
+        let mut changed = false;
+        for_each_type_mut(unit, &mut |ty: &mut TypeDecl| {
+            let before = ty.members.len();
+            ty.members.retain(|m| {
+                if let Member::Method { mods, name, .. } = m {
+                    let is_private = mods.split_whitespace().any(|w| w == "private");
+                    let annotated = mods.contains('@');
+                    let keep = !is_private
+                        || annotated
+                        || referenced.contains(name)
+                        // 撞名（同名重载/字段）：名字引用无法区分指向 → 保留
+                        || decl_counts.get(name).copied().unwrap_or(0) > 1;
+                    keep
+                } else {
+                    true
+                }
+            });
+            if ty.members.len() != before {
+                removed += before - ty.members.len();
+                changed = true;
+            }
+        });
+        if !changed {
+            return removed;
+        }
+    }
+}
+
+/// 递归访问（含嵌套类型），只读。
+fn for_each_type(unit: &CompilationUnit, f: &mut dyn FnMut(&TypeDecl)) {
+    for ty in &unit.types {
+        for_each_type_inner(ty, f);
+    }
+}
+fn for_each_type_inner(ty: &TypeDecl, f: &mut dyn FnMut(&TypeDecl)) {
+    f(ty);
+    for m in &ty.members {
+        if let Member::Type(t) = m {
+            for_each_type_inner(t, f);
+        }
+    }
+}
+
+/// 递归访问（含嵌套类型），可变。
+fn for_each_type_mut(unit: &mut CompilationUnit, f: &mut dyn FnMut(&mut TypeDecl)) {
+    for ty in &mut unit.types {
+        for_each_type_mut_inner(ty, f);
+    }
+}
+fn for_each_type_mut_inner(ty: &mut TypeDecl, f: &mut dyn FnMut(&mut TypeDecl)) {
+    f(ty);
+    for m in &mut ty.members {
+        if let Member::Type(t) = m {
+            for_each_type_mut_inner(t, f);
+        }
+    }
+}
+
+/// 汇集一个类型所有可走子树的根（方法体/初始化块/字段初始化器）。
+fn collect_member_roots(ty: &TypeDecl, out: &mut Vec<JavaId>) {
+    for m in &ty.members {
+        match m {
+            Member::Method { body: Some(b), .. }
+            | Member::Constructor { body: Some(b), .. } => out.push(*b),
+            Member::Initializer { body, .. } => out.push(*body),
+            Member::Field { declarators, .. } => {
+                for d in declarators {
+                    if let Some(init) = d.init {
+                        out.push(init);
+                    }
+                }
+            }
+            Member::Type(t) => collect_member_roots(t, out),
+            _ => {}
+        }
+    }
+}
+
+/// 子树内收集所有"被调用"的名字：Call 的 callee（Member 名 / 裸 VarRef 名）
+/// 与 MethodRef 名（`recv::name`）。名字匹配，不判签名。
+fn collect_call_names(ast: &JavaAst, root: JavaId, out: &mut std::collections::HashSet<String>) {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        match ast.data(id) {
+            NodeData::Call => {
+                if let Some(&callee) = ast.children(id).first() {
+                    match ast.data(callee) {
+                        NodeData::Member { name } => {
+                            out.insert(name.clone());
+                        }
+                        NodeData::VarRef { name } => {
+                            out.insert(name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            NodeData::MethodRef { name } => {
+                // `recv::name` / `recv::new`
+                if let Some(short) = name.rsplit("::").next() {
+                    out.insert(short.to_string());
+                }
+            }
+            _ => {}
+        }
+        for &c in ast.children(id) {
+            stack.push(c);
+        }
+    }
+}
+
+
 
 fn simplify_type(ast: &mut JavaAst, ty: &mut TypeDecl, cfg: &Config, total: &mut Report) {
     for m in &mut ty.members {

@@ -16,10 +16,12 @@ use cure_java_parser::parse;
 use cure_java_print::print_unit;
 use cure_java_simplify::simplify_unit;
 
-const CORPUS_ROOT: &str = "/Users/e/Documents/github/google-java-format";
-/// 真实混淆代码：fernflower 仓库的 ProGuard 输出（okhttp3 系列）。
-/// 引用外部类无法独立编译 → 只做鲁棒/自洽/幂等三检（非 javac 差分）。
-const OBF_CORPUS_ROOT: &str = "/Users/e/Documents/github/fernflower/testData/manual/obfuscated";
+/// 语料已复制进仓库（tests/corpus_data/）：代码演进后可随时全量重跑，
+/// 不依赖本机外部 checkout。
+/// - gjf/：google-java-format 仓库 84 个手写源文件（规范代码基准）
+/// - fernflower_obf/：fernflower 测试集 66 个真实 ProGuard 混淆输出（目标域）
+const CORPUS_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus_data/gjf");
+const OBF_CORPUS_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus_data/fernflower_obf");
 
 fn collect_java_files(root: &Path, out: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(root) {

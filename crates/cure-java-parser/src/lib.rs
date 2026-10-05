@@ -89,6 +89,10 @@ impl Parser {
     fn at_kw(&self, s: &str) -> bool {
         matches!(self.tok().tok, Tok::Ident(ref i) if i == s)
     }
+    /// `@interface` 注解类型声明（`@` 是独立 punct，词法层不成单 token）。
+    fn at_annotation_decl(&self) -> bool {
+        self.at_punct("@") && matches!(&self.peek(1).tok, Tok::Ident(ref i) if i == "interface")
+    }
     fn bump(&mut self) -> Token {
         let t = self.t[self.pos.min(self.t.len() - 1)].clone();
         if self.pos < self.t.len() - 1 {
@@ -332,7 +336,7 @@ impl Parser {
                 || self.at_kw("interface")
                 || self.at_kw("enum")
                 || self.at_kw("record")
-                || self.at_kw("@interface")
+                || self.at_annotation_decl()
             {
                 match self.type_decl_body(&mods, mods_start) {
                     Some(t) => unit.types.push(t),
@@ -363,6 +367,10 @@ impl Parser {
         loop {
             guard += 1;
             if guard > 10_000 {
+                break;
+            }
+            if self.at_annotation_decl() {
+                // `@interface` 是注解类型声明关键字，不是注解——留给 type_decl_body
                 break;
             }
             if self.at_punct("@") {
@@ -396,11 +404,14 @@ impl Parser {
             TypeKind::Enum
         } else if self.at_kw("record") {
             TypeKind::Record
-        } else if self.at_kw("@interface") {
+        } else if self.at_annotation_decl() {
             TypeKind::Annotation
         } else {
             return None;
         };
+        if kind == TypeKind::Annotation {
+            self.bump(); // @
+        }
         self.bump(); // kw
         let mut name = match &self.tok().tok {
             Tok::Ident(i) => {
@@ -518,7 +529,7 @@ impl Parser {
                 || self.at_kw("interface")
                 || self.at_kw("enum")
                 || self.at_kw("record")
-                || self.at_kw("@interface")
+                || self.at_annotation_decl()
             {
                 if let Some(t) = self.type_decl_body(&mmods, mstart) {
                     members.push(Member::Type(Box::new(t)));

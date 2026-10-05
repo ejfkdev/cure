@@ -12,6 +12,10 @@ pub struct Config {
     pub max_edits: usize,
     /// 关闭指定名字的规则。
     pub disabled_rules: HashSet<String>,
+    /// 删除全单元零引用的 private 方法（解密器/内联后的死 helper）。
+    /// opt-in：反射（getDeclaredMethod）无法静态排除；名字匹配不分重载，
+    /// 只会更保守地保留。默认 false。
+    pub remove_dead_methods: bool,
 }
 
 impl Default for Config {
@@ -19,6 +23,7 @@ impl Default for Config {
         Config {
             max_edits: 100_000,
             disabled_rules: HashSet::new(),
+            remove_dead_methods: false,
         }
     }
 }

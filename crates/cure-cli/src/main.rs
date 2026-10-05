@@ -55,6 +55,7 @@ struct Options {
     check: bool,
     report: bool,
     disabled: Vec<String>,
+    dead_code: bool,
     strict: bool,
     stdin: bool,
 }
@@ -68,6 +69,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         check: false,
         report: false,
         disabled: Vec::new(),
+        dead_code: false,
         strict: false,
         stdin: false,
     };
@@ -89,6 +91,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--check" => opts.check = true,
             "--report" => opts.report = true,
             "--strict" => opts.strict = true,
+            "--dead-code" => opts.dead_code = true,
             "-o" | "--output" => {
                 i += 1;
                 let v = args.get(i).ok_or("missing value for --output")?;
@@ -183,6 +186,7 @@ fn process_source(
         for r in &opts.disabled {
             cfg.disabled_rules.insert(r.clone());
         }
+        cfg.remove_dead_methods = opts.dead_code;
         let report = simplify_unit(&mut outcome.ast, &mut outcome.unit, &cfg);
         if opts.report {
             // 行数统计（注释在词法层被丢弃，这里按总行数计）

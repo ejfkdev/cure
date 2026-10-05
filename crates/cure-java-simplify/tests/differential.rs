@@ -41,6 +41,10 @@ fn compile_and_run(dir: &Path, class: &str) -> (String, Option<i32>) {
 }
 
 fn differential(name: &str, src: &str) {
+    differential_cfg(name, src, Config::default());
+}
+
+fn differential_cfg(name: &str, src: &str, cfg: Config) {
     if !javac_available() {
         eprintln!("skip differential: javac not found");
         return;
@@ -63,7 +67,7 @@ fn differential(name: &str, src: &str) {
         "{name}: 测试源码本身必须能干净解析：{:?}",
         outcome.errors
     );
-    let report = simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
+    let report = simplify_unit(&mut outcome.ast, &mut outcome.unit, &cfg);
     let simplified = print_unit(&outcome.ast, &outcome.unit);
     let simp_file = simp_dir.join(format!("{name}.java"));
     fs::write(&simp_file, &simplified).unwrap();
@@ -677,4 +681,53 @@ public class ConsBox {
 }
 "#,
     );
+}
+
+#[test]
+fn dead_method_removal_after_inline() {
+    // 解密器 d() 被内联→常量折叠后死掉；unusedHelper 天生死；
+    // alive 被引用必须保留；public 方法永不删。
+    // 行为差分 + 输出内容断言（死方法确实被删掉）。
+    use std::collections::HashSet;
+    if !javac_available() {
+        eprintln!("skip differential: javac not found");
+        return;
+    }
+    let src = r##"
+public class DeadM {
+    static final String[] T = {"c3Vw", "b3I="};
+    private static String d(int i) {
+        return new String(java.util.Base64.getDecoder().decode(T[i]));
+    }
+    private static String unusedHelper(int x) { return "u" + x; }
+    private static int alive() { return 42; }
+    private static String refOverload(String s) { return s + "!"; }
+    private static String refOverload(int n) { return "#" + n; }
+    public static void main(String[] args) {
+        System.out.println(d(0));
+        System.out.println(d(1));
+        System.out.println(alive());
+        System.out.println(refOverload("k"));
+    }
+}
+"##;
+    let cfg = Config {
+        remove_dead_methods: true,
+        ..Default::default()
+    };
+    differential_cfg("DeadM", src, cfg.clone());
+
+    // 内容断言：死方法删除，存活方法保留
+    let mut outcome = parse(src);
+    simplify_unit(&mut outcome.ast, &mut outcome.unit, &cfg);
+    let out = print_unit(&outcome.ast, &outcome.unit);
+    assert!(!out.contains("unusedHelper"), "死方法未删除:\n{out}");
+    // d 内联后零引用 → 删除
+    assert!(!out.contains("private static String d("), "解密器残留:\n{out}");
+    // 被引用的保留
+    assert!(out.contains("alive()"), "{out}");
+    // 撞名重载（refOverload 只有一个被调用，另一个同名也保留）
+    let count = out.matches("refOverload").count();
+    assert!(count >= 2, "撞名重载应保留:\n{out}");
+    let _ = HashSet::<String>::new();
 }

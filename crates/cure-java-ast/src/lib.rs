@@ -163,9 +163,11 @@ pub struct Node {
 pub struct JavaAst {
     pub(crate) nodes: Vec<Node>,
     /// prepare() 重建：JavaId → 聚合效果。
-    effect_cache: HashMap<u32, Effect>,
+    /// 槽位 = arena 下标（稠密 u32）；None = 未算/失效。Vec 索引替代哈希。
+    effect_cache: Vec<Option<Effect>>,
     /// prepare() 重建：VarRef 节点 → 声明类型（作用域解析）。
-    var_types: HashMap<u32, JType>,
+    /// 槽位 = arena 下标；None = 未解析。Vec 索引替代哈希。
+    var_types: Vec<Option<JType>>,
     /// 方法参数类型（由 simplify 门面按方法设置，作为根作用域）。
     param_scope: Vec<(String, JType)>,
     /// 类级常量字段（static final 且字面量/字面量数组初始化、无写、无同名局部）
@@ -174,6 +176,9 @@ pub struct JavaAst {
     /// 可内联的单 return 方法：名字 → (参数名表, 返回表达式节点)。
     /// 由 simplify_unit 填充（解密 helper：d(0) → 方法体）。
     pub inline_methods: HashMap<String, (Vec<String>, JavaId)>,
+    /// String 引用身份比较缓存：(root, 结果)。prepare() 清空（树已变），
+    /// 首次查询时计算——供 new String(lit) 等折叠守卫复用（每轮至多一次全扫）。
+    string_identity: std::cell::Cell<Option<(JavaId, bool)>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -623,8 +628,90 @@ impl JavaAst {
 
     /// 作用域解析后的 VarRef 类型（prepare 之后有效）。
     pub fn var_type(&self, id: JavaId) -> Option<&JType> {
-        self.var_types.get(&id.0)
+        self.var_types.get(id.0 as usize).and_then(|t| t.as_ref())
     }
+
+    /// root 子树内是否存在「两侧都可能为 String」的 ==/!=（引用比较）？
+    /// 折叠守卫用：new String(lit)/常量链等产出池化字面量会改变 == 语义。
+    /// 结果按 (root, prepare 代次) 缓存——prepare 每次改树后清空，
+    /// 首次查询全扫一次，同轮内所有守卫调用复用。
+    pub fn has_string_identity_compare(&self, root: JavaId) -> bool {
+        if let Some((r, v)) = self.string_identity.get() {
+            if r == root {
+                return v;
+            }
+        }
+        let v = Self::scan_string_identity(self, root);
+        self.string_identity.set(Some((root, v)));
+        v
+    }
+
+    fn scan_string_identity(&self, root: JavaId) -> bool {
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if let NodeData::Binary { op: BinOp::Eq | BinOp::Ne } = self.data(id) {
+                let ch = self.children(id);
+                if ch.len() == 2
+                    && self.expr_maybe_string(ch[0])
+                    && self.expr_maybe_string(ch[1])
+                {
+                    return true;
+                }
+            }
+            for &c in self.children(id) {
+                stack.push(c);
+            }
+        }
+        false
+    }
+
+    /// `==`/`!=` 的这个操作数可能持有 String 引用吗？（保守近似）
+    fn expr_maybe_string(&self, id: JavaId) -> bool {
+        match self.data(id) {
+            NodeData::Literal(Lit::Str(_)) => true,
+            // null/this/数组/instanceof/数值布尔字面量：折叠不可能改变其 == 结果
+            NodeData::Literal(_) | NodeData::This | NodeData::Super
+            | NodeData::NewArray { .. } | NodeData::ArrayLit | NodeData::InstanceOf { .. } => false,
+            NodeData::VarRef { .. } => self.var_type(id).is_none_or(Self::type_maybe_string),
+            NodeData::Cast { ty } => Self::type_maybe_string(ty),
+            NodeData::Paren => self
+                .children(id)
+                .first()
+                .is_none_or(|&c| self.expr_maybe_string(c)),
+            // 拼接：任一操作数 String ⇒ 结果 String；其余二元运算结果必为原始类型
+            NodeData::Binary { op } if *op == BinOp::Add => {
+                self.children(id).iter().any(|&c| self.expr_maybe_string(c))
+            }
+            NodeData::Binary { .. } => false,
+            NodeData::Ternary => self
+                .children(id)
+                .get(1..)
+                .is_none_or(|cs| cs.iter().any(|&c| self.expr_maybe_string(c))),
+            // Call/Member/Index/MethodRef/Raw/Unary/Lambda…：类型未知或引用 → 保守视为可能
+            _ => true,
+        }
+    }
+
+    /// 类型可能持有 String 引用吗？
+    fn type_maybe_string(t: &JType) -> bool {
+        match t {
+            JType::Bool | JType::Byte | JType::Short | JType::Int | JType::Long
+            | JType::Char | JType::Float | JType::Double | JType::Void
+            | JType::Array(_) => false, // 数组引用不是 String 本体（元素访问走 Index 节点）
+            JType::Var => true,         // var / 推断 / 未知
+            JType::Ref(n) => {
+                let base = n.split('<').next().unwrap_or(n).trim();
+                let last = base.rsplit('.').next().unwrap_or(base);
+                matches!(
+                    last,
+                    "String" | "Object" | "CharSequence" | "Comparable" | "Serializable"
+                ) || n.contains('<') // 泛型容器：剥壳后无法判定 → 保守
+                // 单字母大写：类型参数 T/E/R（无界，运行期可为 String）
+                || (last.len() <= 2 && last.chars().next().is_some_and(|c| c.is_uppercase()))
+            }
+        }
+    }
+
 
     /// 设置当前方法的参数类型表（作为根作用域参与解析）。
     pub fn set_param_scope(&mut self, params: &[(String, JType)]) {
@@ -703,7 +790,7 @@ impl Lang for JavaAst {
     }
 
     fn effect(&self, id: JavaId) -> Effect {
-        if let Some(&e) = self.effect_cache.get(&id.0) {
+        if let Some(e) = self.effect_cache.get(id.0 as usize).and_then(|x| *x) {
             return e;
         }
         // 缓存未命中（结构不变量被破坏时）退化为按需递归
@@ -787,7 +874,11 @@ impl Lang for JavaAst {
             }
             NodeData::Paren => self.is_bool(self.children(id)[0]),
             NodeData::InstanceOf { .. } => true,
-            NodeData::VarRef { .. } => self.var_types.get(&id.0).is_some_and(|t| t.is_bool()),
+            NodeData::VarRef { .. } => self
+                .var_types
+                .get(id.0 as usize)
+                .and_then(|t| t.as_ref())
+                .is_some_and(|t| t.is_bool()),
             _ => false,
         }
     }
@@ -799,7 +890,7 @@ impl Lang for JavaAst {
                 Lit::Int(_) | Lit::Long(_) | Lit::Char(_) | Lit::NumRaw { val: NumVal::Int(_) | NumVal::Long(_), .. }
             ),
             NodeData::VarRef { .. } => {
-                self.var_types.get(&id.0).is_some_and(|t| t.is_integral())
+                self.var_types.get(id.0 as usize).and_then(|t| t.as_ref()).is_some_and(|t| t.is_integral())
             }
             NodeData::Binary { op } => {
                 let ch = self.children(id);
@@ -872,12 +963,15 @@ impl Lang for JavaAst {
     /// 1) 效果表——arena 按升序扫描（child index < parent index 不变量）；
     /// 2) 变量类型表——从 root 做作用域栈遍历。
     fn prepare(&mut self, root: JavaId) {
+        // 守卫缓存失效：树已变
+        self.string_identity.set(None);
         // ---- 效果表 ----
         // 正常情况一轮升序扫描即可（children index < parent index 的
         // 解析器不变量）。但 Edit::Replace 注入的新节点 append 在 arena
         // 末尾、index 大于其（旧）父节点——单轮 sweep 会让父聚合到 Unknown
         // 并污染祖先链。故迭代到不动点（违例深度有限，2 轮内收敛）。
         self.effect_cache.clear();
+        self.effect_cache.resize(self.nodes.len(), None);
         let n = self.nodes.len() as u32;
         for _round in 0..4 {
             let mut changed = false;
@@ -885,9 +979,15 @@ impl Lang for JavaAst {
                 let id = JavaId(i);
                 let mut e = self.own_effect(id);
                 for &c in &self.nodes[i as usize].children {
-                    e = e.worst(self.effect_cache.get(&c.0).copied().unwrap_or(Effect::Unknown));
+                    e = e.worst(
+                        self.effect_cache
+                            .get(c.0 as usize)
+                            .and_then(|x| *x)
+                            .unwrap_or(Effect::Unknown),
+                    );
                 }
-                if self.effect_cache.insert(i, e) != Some(e) {
+                if self.effect_cache[i as usize] != Some(e) {
+                    self.effect_cache[i as usize] = Some(e);
                     changed = true;
                 }
             }
@@ -898,6 +998,7 @@ impl Lang for JavaAst {
 
         // ---- 变量类型（作用域栈）----
         self.var_types.clear();
+        self.var_types.resize(self.nodes.len(), None);
         #[derive(Clone)]
         enum Frame {
             Enter(JavaId),
@@ -930,7 +1031,7 @@ impl Lang for JavaAst {
                             if let Some(t) =
                                 scopes.iter().rev().find_map(|s| s.get(name)).cloned()
                             {
-                                self.var_types.insert(id.0, t);
+                                self.var_types[id.0 as usize] = Some(t);
                             }
                             Action::None
                         }
