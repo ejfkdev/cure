@@ -639,6 +639,30 @@ fn scan_region<'a, L: Lang>(
     writes: &mut StrSet<'a>,
     shadowed: &mut bool,
 ) {
+    // 使用索引快路径：prepare 预计算的子树事件序列（遍历序与下方递归
+    // 完全一致），过滤即可——O(事件数) 而非 O(节点数)，且不重派发 kind。
+    if let Some(events) = lang.region_events(node) {
+        for e in events {
+            match e.kind {
+                crate::kind::EventKind::Use => {
+                    if lang.var_name(e.node) == Some(name) {
+                        uses.push(e.node);
+                    }
+                }
+                crate::kind::EventKind::Write => {
+                    if let Some(n) = lang.var_name(e.node) {
+                        writes.insert(n);
+                    }
+                }
+                crate::kind::EventKind::Shadow => {
+                    if lang.var_name(e.node) == Some(name) {
+                        *shadowed = true;
+                    }
+                }
+            }
+        }
+        return;
+    }
     match lang.kind(node) {
         NodeKind::Assign => {
             let ch = lang.children(node);

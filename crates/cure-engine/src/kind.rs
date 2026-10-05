@@ -268,3 +268,23 @@ impl<'a> LitRef<'a> {
         }
     }
 }
+
+/// 区域扫描事件（使用索引的原子）：语句子树遍历中的一次读/写/遮蔽。
+/// `node` 指向承载名字的节点（Use→VarRef；Write→赋值目标 VarRef 或
+/// 声明节点；Shadow→VarDecl/ForEach/Catch 绑定节点），名字由
+/// `Lang::var_name(node)` 读取——与 scan_region 原递归的判定一致。
+#[derive(Clone, Copy, Debug)]
+pub struct RegionEvent<Id> {
+    pub kind: EventKind,
+    pub node: Id,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EventKind {
+    /// 变量读（VarRef）
+    Use,
+    /// 显式局部写（赋值目标 / 自增自减目标 / 声明 / ForEach 绑定）
+    Write,
+    /// 同名遮蔽（VarDecl / ForEach / Catch 声明）
+    Shadow,
+}

@@ -16,6 +16,7 @@ use cure_engine::Lang;
 
 // 本 crate 自用 + 供下游 crate（如 cure-java-print/parser）免依赖引擎直接使用
 pub use cure_engine::kind::{BinOp, LitRef, NodeKind, UnOp};
+use cure_engine::kind::{EventKind, RegionEvent};
 pub use cure_engine::Effect;
 
 // ---------------------------------------------------------------------------
@@ -179,6 +180,10 @@ pub struct JavaAst {
     /// String 引用身份比较缓存：(root, 结果)。prepare() 清空（树已变），
     /// 首次查询时计算——供 new String(lit) 等折叠守卫复用（每轮至多一次全扫）。
     string_identity: std::cell::Cell<Option<(JavaId, bool)>>,
+    /// 区域事件索引（使用索引）：语句级节点 → 子树事件序列（prepare 构建，
+    /// 编辑沿祖先失效）。供引擎 scan_region 快路径——遍历序与
+    /// scan_region 原递归严格一致（见 collect_region_events）。
+    region_events: Vec<Vec<cure_engine::kind::RegionEvent<JavaId>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -805,6 +810,18 @@ impl Lang for JavaAst {
         if let Some(slot) = self.effect_cache.get_mut(id.0 as usize) {
             *slot = None;
         }
+        // 事件索引同步失效：本节点子树若被改，其预计算事件已陈旧
+        if let Some(ev) = self.region_events.get_mut(id.0 as usize) {
+            ev.clear();
+        }
+    }
+
+    fn region_events(&self, id: JavaId) -> Option<&[cure_engine::kind::RegionEvent<JavaId>]> {
+        match self.region_events.get(id.0 as usize) {
+            // 空序列 = 未索引（非语句节点或已失效）→ None 走原递归
+            Some(v) if !v.is_empty() => Some(v),
+            _ => None,
+        }
     }
 
     fn own_effect(&self, id: JavaId) -> Effect {
@@ -971,6 +988,10 @@ impl Lang for JavaAst {
     fn prepare(&mut self, root: JavaId) {
         // 守卫缓存失效：树已变
         self.string_identity.set(None);
+        // 区域事件索引重建：语句级节点（Block 的孩子）各得一份子树事件序列
+        self.region_events.clear();
+        self.region_events.resize(self.nodes.len(), Vec::new());
+        self.build_region_index(root);
         // ---- 效果表 ----
         // 正常情况一轮升序扫描即可（children index < parent index 的
         // 解析器不变量）。但 Edit::Replace 注入的新节点 append 在 arena
@@ -1169,5 +1190,98 @@ mod tests {
         a.prepare(l);
         assert!(a.is_exact_int(l));
         assert!(matches!(a.literal(l), Some(LitRef::Int(31))));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 区域事件索引（使用索引）：规则区域扫描的预计算。
+// 遍历序必须与引擎 scan_region 原递归严格一致：
+//   Assign      → [Write(目标)] + value 子树（目标本身不再当 Use 扫）
+//   自增自减    → [Write(目标)]，不扫子
+//   VarDecl     → [Write, Shadow] + 全部孩子
+//   ForEach     → [Write, Shadow] + 全部孩子；Catch → [Shadow] + 孩子
+//   VarRef      → [Use]
+//   其余        → 依序拼接孩子
+// ---------------------------------------------------------------------------
+
+impl JavaAst {
+    fn build_region_index(&mut self, root: JavaId) {
+        // 语句级节点 = Block 的直接孩子（规则只对这些调用 scan_region）。
+        // 遍历整树，遇到 Block 就为其每个孩子收集事件。
+        let mut stack = vec![root];
+        let mut stmt_roots: Vec<JavaId> = Vec::new();
+        while let Some(n) = stack.pop() {
+            if self.kind(n) == NodeKind::Block {
+                for &c in &self.nodes[n.0 as usize].children {
+                    stmt_roots.push(c);
+                }
+            }
+            for &c in &self.nodes[n.0 as usize].children {
+                stack.push(c);
+            }
+        }
+        for sr in stmt_roots {
+            let events = self.collect_region_events(sr);
+            self.region_events[sr.0 as usize] = events;
+        }
+    }
+
+    /// 收集 `node` 子树的事件序列（顺序语义见模块注释）。
+    fn collect_region_events(&self, node: JavaId) -> Vec<RegionEvent<JavaId>> {
+        let mut out = Vec::new();
+        self.collect_events_into(node, &mut out);
+        out
+    }
+
+    fn collect_events_into(&self, node: JavaId, out: &mut Vec<RegionEvent<JavaId>>) {
+        match self.data(node) {
+            NodeData::Assign { .. } => {
+                let ch = self.children(node);
+                if let Some(&t) = ch.first() {
+                    if self.kind(t) == NodeKind::VarRef {
+                        out.push(RegionEvent { kind: EventKind::Write, node: t });
+                    }
+                }
+                if let Some(&v) = ch.get(1) {
+                    self.collect_events_into(v, out);
+                }
+            }
+            NodeData::Unary { op } if op.is_incdec() => {
+                let ch = self.children(node);
+                if let Some(&t) = ch.first() {
+                    if self.kind(t) == NodeKind::VarRef {
+                        out.push(RegionEvent { kind: EventKind::Write, node: t });
+                    }
+                }
+            }
+            NodeData::VarDecl { .. } => {
+                out.push(RegionEvent { kind: EventKind::Write, node });
+                out.push(RegionEvent { kind: EventKind::Shadow, node });
+                for &c in self.children(node) {
+                    self.collect_events_into(c, out);
+                }
+            }
+            NodeData::ForEach { .. } => {
+                out.push(RegionEvent { kind: EventKind::Write, node });
+                out.push(RegionEvent { kind: EventKind::Shadow, node });
+                for &c in self.children(node) {
+                    self.collect_events_into(c, out);
+                }
+            }
+            NodeData::Catch { .. } => {
+                out.push(RegionEvent { kind: EventKind::Shadow, node });
+                for &c in self.children(node) {
+                    self.collect_events_into(c, out);
+                }
+            }
+            NodeData::VarRef { .. } => {
+                out.push(RegionEvent { kind: EventKind::Use, node });
+            }
+            _ => {
+                for &c in self.children(node) {
+                    self.collect_events_into(c, out);
+                }
+            }
+        }
     }
 }

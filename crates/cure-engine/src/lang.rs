@@ -58,6 +58,14 @@ pub trait Lang {
     /// 后续 `effect()` 读取回退为按需重算（子缓存仍有效，代价 O(孩子数)）。
     /// 默认空实现：无缓存的语言每次现算，天然正确。
     fn invalidate_effect(&mut self, _id: Self::Id) {}
+
+    /// `id` 子树的区域事件序列（使用索引，prepare 期间预计算）。
+    /// 事件序必须等于 scan_region 原递归的遍历序；返回 None 表示该
+    /// 节点无索引（未构建/已失效）——scan_region 回退为原递归遍历。
+    /// 引擎在应用编辑后沿祖先链调用 invalidate_effect 使索引失效。
+    fn region_events(&self, _id: Self::Id) -> Option<&[crate::kind::RegionEvent<Self::Id>]> {
+        None
+    }
     /// 节点自身（不含 children）的效果贡献。
     fn own_effect(&self, id: Self::Id) -> Effect {
         match self.kind(id) {
