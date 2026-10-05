@@ -114,6 +114,12 @@ impl Lang for Toy {
         self.nodes[id as usize].bin = Some(op);
         id
     }
+    fn build_ternary(&mut self, c: Id, a: Id, b: Id) -> Id {
+        self.push(NodeKind::Ternary, vec![c, a, b], None)
+    }
+    fn build_assign(&mut self, target: Id, value: Id) -> Id {
+        self.push(NodeKind::Assign, vec![target, value], None)
+    }
     fn copy_subtree(&mut self, id: Id) -> Id {
         let old_children = self.nodes[id as usize].children.clone();
         let mut new_children = Vec::with_capacity(old_children.len());
@@ -643,10 +649,11 @@ fn propagation_impure_adjacent() {
         run("(block (decl x (call foo)) (ret (+ y x)))"),
         "(block (ret (+ y (call foo))))"
     );
-    // 相邻但不是直线语句（if 条件中用）→ 不动
+    // 相邻但不是直线语句（if 条件中用）→ 声明不内联；
+    // if 本身被 IfToTernary 归并成三元（副作用声明仍然保留——传播被正确阻断）
     assert_eq!(
         run("(block (decl x (call foo)) (if x (ret 1) (ret 2)))"),
-        "(block (decl x (call foo)) (if x (ret 1) (ret 2)))"
+        "(block (decl x (call foo)) (ret (ternary x 1 2)))"
     );
     // 不相邻的有副作用值 → 不动
     assert_eq!(

@@ -5,7 +5,7 @@
 //! 引擎规则（布尔、自赋值、常量条件、局部传播……）定义在 cure-engine，
 //! 通过 `Lang` 抽象复用；本 crate 只放需要 Java 类型/负载信息的规则。
 
-use cure_engine::kind::BinOp;
+use cure_engine::kind::{BinOp, UnOp};
 use cure_engine::{Config, Edit, Lang, LitRef, NodeKind, Report, RewriteCtx, Rule};
 use cure_java_ast::{CompilationUnit, JavaAst, JavaId, JType, Member, NodeData, TypeDecl};
 
@@ -442,6 +442,223 @@ fn subtree_has_var(lang: &JavaAst, id: JavaId, name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// new String 折叠（混淆器/反编译器产物）：new String("lit") → "lit"、new String() → ""
+// 仅字面量实参（new String(charArray/bytes) 是拷贝语义，不折）。
+// ---------------------------------------------------------------------------
+
+pub struct NewStringFold;
+
+impl Rule<JavaAst> for NewStringFold {
+    fn name(&self) -> &'static str {
+        "new_string_fold"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        let NodeData::New { ty, .. } = lang.data(id) else {
+            return None;
+        };
+        if !matches!(ty, JType::Ref(n) if n == "String" || n == "java.lang.String" || n.ends_with(".String")) {
+            return None;
+        }
+        let args = lang.children(id).to_vec();
+        match args.len() {
+            0 => {
+                let empty = lang.build_str("");
+                Some(Edit::Replace {
+                    target: id,
+                    with: empty,
+                })
+            }
+            1 => {
+                if matches!(lang.literal(args[0]), Some(LitRef::Str(_))) {
+                    Some(Edit::Replace {
+                        target: id,
+                        with: args[0],
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// 循环头断路还原（jadx/反编译器高频形态）：
+//   while (true) { if (c) { break; } REST }        →  while (!c) { REST }
+//   while (true) { if (c) break; else { REST } … }  →  while (!c) { REST… }
+// 安全性：c 在两种形态下都于每次迭代头部求值一次；break 无标签（目标是本循环）。
+// ---------------------------------------------------------------------------
+
+pub struct LoopHeadBreak;
+
+impl Rule<JavaAst> for LoopHeadBreak {
+    fn name(&self) -> &'static str {
+        "loop_head_break"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::While {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        let (cond, body) = (ch[0], ch[1]);
+        if !matches!(lang.literal(cond), Some(LitRef::Bool(true))) {
+            return None;
+        }
+        if lang.kind(body) != NodeKind::Block {
+            return None;
+        }
+        let bch = lang.children(body).to_vec();
+        let first = *bch.first()?;
+        if lang.kind(first) != NodeKind::If {
+            return None;
+        }
+        let ich = lang.children(first).to_vec();
+        let c = ich[0];
+        // then 分支必须是单个无标签 break
+        let bare_break = |n: JavaId| matches!(lang.data(n), NodeData::Break { label: None });
+        let then_break = match lang.kind(ich[1]) {
+            NodeKind::Break => bare_break(ich[1]),
+            NodeKind::Block if lang.children(ich[1]).len() == 1 => {
+                bare_break(lang.children(ich[1])[0])
+            }
+            _ => false,
+        };
+        if !then_break {
+            return None;
+        }
+        // REST = else 分支（若有）+ body 其余语句
+        let mut rest: Vec<JavaId> = Vec::new();
+        if ich.len() == 3 {
+            match lang.kind(ich[2]) {
+                NodeKind::Block => rest.extend(lang.children(ich[2]).iter().copied()),
+                _ => rest.push(ich[2]),
+            }
+        }
+        rest.extend(bch[1..].iter().copied());
+        let nc = lang.build_unary(UnOp::Not, c);
+        let new_body = lang.build_block(rest);
+        Some(Edit::Splice {
+            node: id,
+            index: 0,
+            remove: 2,
+            insert: vec![nc, new_body],
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// while 形式迭代器还原（jadx 常见，jcdc/ddc 同样产出）：
+//   Iterator<E> it = c.iterator();
+//   while (it.hasNext()) { E e = it.next(); REST }
+//   →  for (E e : c) { REST }
+// 安全性：与 for-each 脱糖同构；守卫：`it` 在 REST 中不再被引用。
+// ---------------------------------------------------------------------------
+
+pub struct WhileIteratorToForEach;
+
+impl Rule<JavaAst> for WhileIteratorToForEach {
+    fn name(&self) -> &'static str {
+        "while_iterator_to_for_each"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        // 先取结构信息（避免 lang 的可变借用与 ctx 方法冲突）
+        let parent = ctx.parent(id)?;
+        let idx = ctx.index(id)?;
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::While {
+            return None;
+        }
+        let wch = lang.children(id).to_vec();
+        let (cond, body) = (wch[0], wch[1]);
+        // 前置声明：Iterator<…> it = <iterable>.iterator();
+        if lang.kind(parent) != NodeKind::Block {
+            return None;
+        }
+        if idx == 0 {
+            return None;
+        }
+        let stmts = lang.children(parent).to_vec();
+        let decl = stmts[idx - 1];
+        if lang.kind(decl) != NodeKind::VarDecl {
+            return None;
+        }
+        let it_name = lang.var_name(decl)?.to_string();
+        let init_call = lang.children(decl).first().copied()?;
+        if lang.kind(init_call) != NodeKind::Call {
+            return None;
+        }
+        let ic = lang.children(init_call).to_vec();
+        let NodeData::Member { name: m0 } = lang.data(*ic.first()?) else {
+            return None;
+        };
+        if m0 != "iterator" || ic.len() != 1 {
+            return None;
+        }
+        let iterable = lang.children(ic[0])[0];
+        if subtree_has_var(&*lang, iterable, &it_name) {
+            return None;
+        }
+        // cond: it.hasNext()
+        if lang.kind(cond) != NodeKind::Call {
+            return None;
+        }
+        let cc = lang.children(cond).to_vec();
+        let NodeData::Member { name: m1 } = lang.data(*cc.first()?) else {
+            return None;
+        };
+        if m1 != "hasNext" || cc.len() != 1 {
+            return None;
+        }
+        if lang.var_name(lang.children(cc[0])[0]) != Some(it_name.as_str()) {
+            return None;
+        }
+        // body: Block[ VarDecl e = it.next();, REST… ]
+        if lang.kind(body) != NodeKind::Block {
+            return None;
+        }
+        let bch = lang.children(body).to_vec();
+        let first = *bch.first()?;
+        let NodeData::VarDecl { name: e_name, ty } = lang.data(first) else {
+            return None;
+        };
+        let (e_name, ty) = (e_name.clone(), ty.clone());
+        let next_call = lang.children(first).first().copied()?;
+        if lang.kind(next_call) != NodeKind::Call {
+            return None;
+        }
+        let nc = lang.children(next_call).to_vec();
+        let NodeData::Member { name: m2 } = lang.data(*nc.first()?) else {
+            return None;
+        };
+        if m2 != "next" || nc.len() != 1 {
+            return None;
+        }
+        if lang.var_name(lang.children(nc[0])[0]) != Some(it_name.as_str()) {
+            return None;
+        }
+        let rest = bch[1..].to_vec();
+        for &r in &rest {
+            if subtree_has_var(&*lang, r, &it_name) {
+                return None;
+            }
+        }
+        let new_body = lang.build_block(rest);
+        let foreach = lang.for_each(&e_name, ty, iterable, new_body);
+        // 用 for-each 同时替换 [decl, while] 两条语句
+        Some(Edit::Splice {
+            node: parent,
+            index: idx - 1,
+            remove: 2,
+            insert: vec![foreach],
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 门面
 // ---------------------------------------------------------------------------
 
@@ -453,6 +670,9 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(StringBuilderFold));
     rules.push(Box::new(BoxUnboxChain));
     rules.push(Box::new(IteratorToForEach));
+    rules.push(Box::new(NewStringFold));
+    rules.push(Box::new(LoopHeadBreak));
+    rules.push(Box::new(WhileIteratorToForEach));
     rules
 }
 

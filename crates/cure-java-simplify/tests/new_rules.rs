@@ -257,3 +257,135 @@ fn unreachable_opt_in() {
         assert!(!printed.contains("call();"), "{printed}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 反混淆新规则
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cmp_const_fold() {
+    assert!(run_src("class A{boolean m(){return 1 < 2;}}").contains("return true;"));
+    assert!(run_src("class A{boolean m(){return 2 == 3;}}").contains("return false;"));
+    assert!(run_src("class A{boolean m(){return 5L >= 5L;}}").contains("return true;"));
+    // 浮点不折叠
+    let out = run_src("class A{boolean m(){return 1.0 < 2.0;}}");
+    assert!(out.contains("1.0 < 2.0"), "{out}");
+    // 不透明谓词整链击穿：boolean always = 2 > 1; if (always) {...} else {junk}
+    let out = run_src(r#"
+class A {
+    String m(int x) {
+        boolean always = 2 > 1;
+        if (always) {
+            return "live";
+        } else {
+            return junk();
+        }
+    }
+}
+"#);
+    assert!(out.contains("return \"live\";"), "{out}");
+    assert!(!out.contains("junk()"), "{out}");
+    assert!(!out.contains("always"), "{out}");
+}
+
+#[test]
+fn bit_identity_rules() {
+    assert!(run_src("class A{int m(int x){return x ^ 0;}}").contains("return x;"));
+    assert!(run_src("class A{int m(int x){return 0 | x;}}").contains("return x;"));
+    assert!(run_src("class A{int m(int x){return x & -1;}}").contains("return x;"));
+    assert!(run_src("class A{int m(int x){return x | -1;}}").contains("return -1;"));
+    assert!(run_src("class A{int m(int x){return x & 0;}}").contains("return 0;"));
+    assert!(run_src("class A{int m(int x){return x ^ x;}}").contains("return 0;"));
+    // x 有副作用不折
+    let out = run_src("class A{int m(){return foo() & 0;}}");
+    assert!(out.contains("& 0"), "{out}");
+}
+
+#[test]
+fn arith_reassoc_rules() {
+    // (x ^ 84) ^ 84 → x（混淆器经典双异或）
+    assert!(run_src("class A{int m(int x){return (x ^ 84) ^ 84;}}").contains("return x;"));
+    assert!(run_src("class A{int m(int x){return (x + 5) - 5;}}").contains("return x;"));
+    assert!(run_src("class A{int m(int x){return (x - 3) - 2;}}").contains("return x - 5;"));
+    assert!(run_src("class A{int m(int x){return (x + 1) + 2;}}").contains("return x + 3;"));
+    let out = run_src("class A{long m(long x){return (x + 5L) - 5L;}}");
+    assert!(out.contains("return x;"), "{out}");
+}
+
+#[test]
+fn if_to_ternary_rules() {
+    // if-else 双 return → 三元
+    assert!(run_src("class A{int m(boolean c){if (c) {return 1;} else {return 2;}}}").contains("return c ? 1 : 2;"));
+    // if-then + 收尾 return → 三元
+    assert!(run_src("class A{int m(boolean c){if (c) {return 1;} return 2;}}").contains("return c ? 1 : 2;"));
+    // 布尔特例 → 直接 return c
+    assert!(run_src("class A{boolean m(boolean c){if (c) {return true;} return false;}}").contains("return c;"));
+    // if-else 双赋值 → 三元赋值
+    assert!(run_src("class A{int m(boolean c){int r; if (c) {r = 1;} else {r = 2;} return r;}}").contains("r = c ? 1 : 2;"));
+    // 副作用条件照常保留
+    let out = run_src("class A{int m(){if (check()) {return 1;} return 2;}}");
+    assert!(out.contains("check() ? 1 : 2"), "{out}");
+}
+
+#[test]
+fn new_string_fold_rule() {
+    assert!(run_src("class A{String m(){return new String(\"lit\");}}").contains(r#"return "lit";"#));
+    // 非 String() 形态不折
+    let out = run_src("class A{String m(byte[] b){return new String(b);}}");
+    assert!(out.contains("new String(b)"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// 真实反编译形态规则（jadx/jcdc 产物）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn loop_head_break_rules() {
+    // while(true){if(c)break;REST} → while(!c){REST}（取反由 not_compare 继续折叠）
+    let out = run_src("class A{int m(int n){int s=0; while (true) { if (n >= 5) { break; } s += n; n++; } return s;}}");
+    assert!(out.contains("while (n < 5)"), "{out}");
+    // else 形态
+    let out = run_src("class A{int m(int n){int s=0; while (true) { if (n >= 5) break; else { s += n; } n++; } return s;}}");
+    assert!(out.contains("while (n < 5)"), "{out}");
+    // 带 continue 的循环体
+    let out = run_src("class A{int m(int n){int s=0; while (true) { if (n > 100) { break; } if (n % 2 == 0) { n++; continue; } s += n; n++; } return s;}}");
+    assert!(out.contains("while (n <= 100)"), "{out}");
+    assert!(out.contains("continue;"), "{out}");
+    // 有标签 break（目标是外层）→ 不动
+    let out = run_src("class A{int m(){int s=0; outer: while (true) { while (true) { if (ok()) { break outer; } s++; } } }}");
+    assert!(out.contains("break outer;"), "{out}");
+}
+
+#[test]
+fn while_iterator_to_for_each_rules() {
+    let out = run_src(r#"
+class A {
+    int m(java.util.List<String> list) {
+        int n = 0;
+        java.util.Iterator<String> it = list.iterator();
+        while (it.hasNext()) {
+            String s = it.next();
+            n += s.length();
+        }
+        return n;
+    }
+}
+"#);
+    assert!(out.contains("for (String s : list)"), "{out}");
+    assert!(!out.contains("Iterator"), "{out}");
+    // it 在后续被引用 → 不动
+    let out = run_src(r#"
+class A {
+    int m(java.util.List<String> list) {
+        int n = 0;
+        java.util.Iterator<String> it = list.iterator();
+        while (it.hasNext()) {
+            String s = it.next();
+            n += s.length() + it.hashCode();
+        }
+        return n;
+    }
+}
+"#);
+    assert!(out.contains("it.hashCode()"), "{out}");
+}

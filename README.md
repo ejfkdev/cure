@@ -77,13 +77,29 @@ echo 'class A{int m(){int a=foo();int b=a;return b;}}' | cure -
 
 ## 规则清单
 
-引擎通用（19）：paren_removal、const_condition、boolean_return、if_else_empty、
-bool_compare、double_not、bool_not_fold、bool_short_circuit、not_compare、
-ternary_fold、ternary_bool、const_fold_bin（Java 回绕语义）、self_assign、
-arith_identity、arith_zero、local_propagation、dead_store + 选配 unreachable_after_terminal。
+引擎通用（24）：paren_removal、const_condition、boolean_return、if_to_ternary
+（if-return 对 → 三元）、if_assign_ternary（if-else 赋值分叉 → 三元赋值）、
+if_else_empty、bool_compare、double_not、bool_not_fold、bool_short_circuit、
+not_compare、ternary_fold、ternary_bool、const_fold_bin（Java 回绕语义）、
+**cmp_const_fold**（`1 < 2 → true`，击穿不透明谓词）、self_assign、
+arith_identity、**arith_zero**、**bit_identity**（`x ^ 0`、`x & -1`、`x ^ x` 等）、
+**arith_reassoc**（`(x ^ 84) ^ 84 → x`，混淆器双异或还原）、
+local_propagation、dead_store + 选配 unreachable_after_terminal。
 
-Java 专属（6）：cast_simplify、self_compare、string_builder_fold（`new SB().append…` → `+` 拼接）、
-box_unbox_chain（`Integer.valueOf(n).intValue()` → n）、iterator_to_for_each（迭代器模式 → for-each）。
+Java 专属（10）：cast_simplify、self_compare、string_builder_fold、box_unbox_chain、
+iterator_to_for_each（for 形迭代器）、**while_iterator_to_for_each**（while 形）、
+**new_string_fold**（`new String("lit") → "lit"`）、**loop_head_break**
+（`while(true){if(c)break;…} → while(!c){…}`，jadx/jcdc 产物）。
+
+## 去混淆验证
+
+- `tests/deobfuscate.rs`：模拟混淆器（不透明谓词/双异或/位噪声/布尔包装/
+  StringBuilder/装箱链/迭代器/死赋值）→ **18 次改写，非空行 -39%**，
+  javac 差分逐字节一致，副作用调用序列保留；
+- `tests/real_tools.rs`：**真实工具链** javac → ProGuard（混淆）→ jadx（反编译）
+  → cure → 编译运行，输出与原始完全一致（环境有 proguard/jadx 时执行）。
+  诚实发现：现代 jadx 输出已较干净，其残留产物（寄存器临时变量、内联
+  `it.next()`、布尔循环旗标）需要**循环级数据流分析**——已在路线图上。
 
 ## 参考
 

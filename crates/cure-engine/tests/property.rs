@@ -108,6 +108,12 @@ impl Lang for Toy {
         self.nodes[id as usize].bin = Some(op);
         id
     }
+    fn build_ternary(&mut self, c: Id, a: Id, b: Id) -> Id {
+        self.push(NodeKind::Ternary, vec![c, a, b], None)
+    }
+    fn build_assign(&mut self, target: Id, value: Id) -> Id {
+        self.push(NodeKind::Assign, vec![target, value], None)
+    }
     fn copy_subtree(&mut self, id: Id) -> Id {
         let old = self.nodes[id as usize].children.clone();
         let mut children = Vec::with_capacity(old.len());
@@ -464,6 +470,7 @@ impl<'a> Gen<'a> {
         // 偏置：30% 取 0/1（触发恒等式/零元素规则）
         let v = match self.rng.range(10) {
             0..=1 => self.rng.range(2) as i64,
+            2 => -1, // 驱动 x & -1 / x | -1
             _ => self.rng.range(100) as i64,
         };
         let id = self.t.push(NodeKind::Literal, vec![], None);
@@ -558,6 +565,13 @@ use BinOp as B;
                     self.t.push(NodeKind::Ternary, vec![c, a, b], None)
                 }
                 6 => self.int_lit(),
+                7 => {
+                    // 位运算（驱动 bit_identity / arith_reassoc / const_fold）
+                    let op = [B::BitXor, B::BitAnd, B::BitOr][self.rng.range(3) as usize];
+                    let a = self.expr(Ty::Int, d);
+                    let b = self.expr(Ty::Int, d);
+                    self.bin(op, a, b)
+                }
                 _ => {
                     let i = self.rng.range(4) as usize;
                     self.var(INT_VARS[i])
@@ -657,6 +671,12 @@ use BinOp as B;
                 } else {
                     self.t.push(NodeKind::If, vec![c, then], None)
                 }
+            }
+            5 if depth > 0 => {
+                // 提前 return（驱动 if→三元 / 布尔返回 归并）
+                let ty = if self.rng.range(2) == 0 { Ty::Int } else { Ty::Bool };
+                let e = self.expr(ty, 2);
+                self.t.push(NodeKind::Return, vec![e], None)
             }
             _ => {
                 // 再来一个表达式语句

@@ -38,6 +38,10 @@ pub trait Lang {
     fn build_int(&mut self, v: i64, long: bool) -> Self::Id;
     /// 构造二元运算节点（常量折叠 / 取反重写等需要重建比较运算时使用）。
     fn build_bin(&mut self, op: BinOp, l: Self::Id, r: Self::Id) -> Self::Id;
+    /// 构造三元表达式 `c ? a : b`（if→ternary 归并）。
+    fn build_ternary(&mut self, c: Self::Id, a: Self::Id, b: Self::Id) -> Self::Id;
+    /// 构造简单赋值 `target = value`（if→三元赋值归并）。
+    fn build_assign(&mut self, target: Self::Id, value: Self::Id) -> Self::Id;
     /// 构造字符串字面量（字符串常量折叠产物）。
     fn build_str(&mut self, s: &str) -> Self::Id;
     /// 深拷贝子树（返回新 Id）。

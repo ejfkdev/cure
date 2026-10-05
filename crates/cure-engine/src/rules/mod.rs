@@ -1150,6 +1150,372 @@ impl<L: Lang> Rule<L> for UnreachableAfterTerminal {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 比较常量折叠（反混淆核心）：1 < 2 → true、2 == 3 → false。
+// 仅整数（含 long）与布尔字面量；浮点（NaN 语义）与字符串（引用比较）不折。
+// 连锁：boolean b = 2 > 1; if (b) {...} → 不透明谓词被完全击穿。
+// ---------------------------------------------------------------------------
+
+pub struct CmpConstFold;
+
+impl<L: Lang> Rule<L> for CmpConstFold {
+    fn name(&self) -> &'static str {
+        "cmp_const_fold"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk: _ } = ctx;
+        if lang.kind(id) != NodeKind::Binary {
+            return None;
+        }
+        let op = lang.bin_op(id)?;
+        if !op.is_comparison() {
+            return None;
+        }
+        let ch = lang.children(id);
+        let (l, r) = (*ch.first()?, *ch.get(1)?);
+        let (a, b) = (lang.literal(l)?, lang.literal(r)?);
+        use LitRef::*;
+        let result: Option<bool> = match (a, b) {
+            (Int(x), Int(y)) => cmp_i64(op, x, y),
+            (Long(x), Long(y)) => cmp_i64(op, x, y),
+            (Int(x), Long(y)) => cmp_i64(op, x, y),
+            (Long(x), Int(y)) => cmp_i64(op, x, y),
+            (Bool(x), Bool(y)) if matches!(op, BinOp::Eq | BinOp::Ne) => {
+                Some(if op == BinOp::Eq { x == y } else { x != y })
+            }
+            _ => None,
+        };
+        let v = result?;
+        let with = lang.build_bool(v);
+        Some(Edit::Replace {
+            target: id,
+            with,
+        })
+    }
+}
+
+fn cmp_i64(op: BinOp, x: i64, y: i64) -> Option<bool> {
+    use BinOp::*;
+    Some(match op {
+        Lt => x < y,
+        Le => x <= y,
+        Gt => x > y,
+        Ge => x >= y,
+        Eq => x == y,
+        Ne => x != y,
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 位运算恒等式（混淆器高频产物）：
+//   x ^ 0 → x、0 ^ x → x、x | 0 → x、0 | x → x、x & -1 → x、-1 & x → x（x 保留，恒安全）
+//   x | -1 → -1、x & 0 → 0、0 & x → 0（x 求值被丢弃 → effect ≤ MayRead）
+//   x ^ x → 0（同名局部整型变量）
+// ---------------------------------------------------------------------------
+
+pub struct BitIdentity;
+
+impl<L: Lang> Rule<L> for BitIdentity {
+    fn name(&self) -> &'static str {
+        "bit_identity"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk: _ } = ctx;
+        if lang.kind(id) != NodeKind::Binary {
+            return None;
+        }
+        let op = lang.bin_op(id)?;
+        if !matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) {
+            return None;
+        }
+        let ch = lang.children(id);
+        let (l, r) = (*ch.first()?, *ch.get(1)?);
+        let int_lit = |n: L::Id| lang.literal(n).and_then(|x| x.as_int());
+
+        // x ^ x → 0（同名局部变量）
+        if op == BinOp::BitXor
+            && lang.kind(l) == NodeKind::VarRef
+            && lang.kind(r) == NodeKind::VarRef
+            && lang.var_name(l) == lang.var_name(r)
+            && lang.is_local_var(l)
+            && lang.is_exact_int(l)
+        {
+            let with = lang.build_int(0, false);
+            return Some(Edit::Replace {
+                target: id,
+                with,
+            });
+        }
+
+        // 字面量在任一侧（互换尝试）
+        for (x, k) in [(l, r), (r, l)] {
+            let Some(kv) = int_lit(k) else {
+                continue;
+            };
+            if !lang.is_exact_int(x) {
+                continue;
+            }
+            let identity = match (op, kv) {
+                (BinOp::BitXor, 0) => Some(x),          // x ^ 0 → x
+                (BinOp::BitOr, 0) => Some(x),           // x | 0 → x
+                (BinOp::BitAnd, -1) => Some(x),         // x & -1 → x
+                (BinOp::BitAnd, 0) | (BinOp::BitOr, -1) => {
+                    // x & 0 → 0 / x | -1 → -1：丢弃 x 求值，需可丢弃
+                    if lang.effect(x) > Effect::MayRead {
+                        None
+                    } else {
+                        Some(k)
+                    }
+                }
+                _ => None,
+            };
+            if let Some(with) = identity {
+                return Some(Edit::Replace {
+                    target: id,
+                    with,
+                });
+            }
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 算术/异或重结合（混淆器经典）：(x + K1) - K2 → x ± K、(x ^ K1) ^ K2 → x ^ K。
+// 整数回绕算术下恒安全；K == 0 时直接得 x（(x + 5) - 5 → x、(x ^ 84) ^ 84 → x）。
+// ---------------------------------------------------------------------------
+
+pub struct ArithReassoc;
+
+impl<L: Lang> Rule<L> for ArithReassoc {
+    fn name(&self) -> &'static str {
+        "arith_reassoc"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk: _ } = ctx;
+        if lang.kind(id) != NodeKind::Binary {
+            return None;
+        }
+        let op2 = lang.bin_op(id)?;
+        if !matches!(op2, BinOp::Add | BinOp::Sub | BinOp::BitXor) {
+            return None;
+        }
+        let och = lang.children(id);
+        let inner = *och.first()?;
+        let k2 = lang.literal(*och.get(1)?).and_then(|x| x.as_int())?;
+        if lang.kind(inner) != NodeKind::Binary {
+            return None;
+        }
+        let op1 = lang.bin_op(inner)?;
+        let ich = lang.children(inner);
+        let x = *ich.first()?;
+        let k1 = lang.literal(*ich.get(1)?).and_then(|x| x.as_int())?;
+        if !lang.is_exact_int(x) {
+            return None;
+        }
+
+        let is_long = matches!(lang.literal(*ich.get(1)?), Some(LitRef::Long(_)))
+            || matches!(lang.literal(*och.get(1)?), Some(LitRef::Long(_)));
+        let sign = |o: BinOp| if o == BinOp::Sub { -1i64 } else { 1i64 };
+        let delta: Option<i64> = match (op1, op2) {
+            (BinOp::BitXor, BinOp::BitXor) => Some(k1 ^ k2),
+            (a, b) if matches!(a, BinOp::Add | BinOp::Sub)
+                && matches!(b, BinOp::Add | BinOp::Sub) =>
+            {
+                Some(sign(a) * k1 + sign(b) * k2)
+            }
+            _ => None,
+        };
+        let d = delta?;
+        let with = if d == 0 {
+            x
+        } else {
+            let (op, mag) = if (op1 == BinOp::BitXor && op2 == BinOp::BitXor) || d > 0 {
+                let mag = if op1 == BinOp::BitXor && op2 == BinOp::BitXor {
+                    d
+                } else {
+                    d
+                };
+                (
+                    if op1 == BinOp::BitXor && op2 == BinOp::BitXor {
+                        BinOp::BitXor
+                    } else {
+                        BinOp::Add
+                    },
+                    mag,
+                )
+            } else {
+                (BinOp::Sub, -d)
+            };
+            let lit = lang.build_int(mag, is_long);
+            lang.build_bin(op, x, lit)
+        };
+        Some(Edit::Replace {
+            target: id,
+            with,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// if→三元归并（反编译器/混淆器经典形态）：
+//   if (c) return a; else return b;    →  return c ? a : b;
+//   if (c) return a; return b;（收尾） →  return c ? a : b;
+// 恒安全：c 单次求值、a/b 条件求值在两种形态下一致（三元是惰性的）。
+// 布尔特例由 ternary_bool 继续收敛成 return c / return !c。
+// ---------------------------------------------------------------------------
+
+pub struct IfToTernary;
+
+impl<L: Lang> Rule<L> for IfToTernary {
+    fn name(&self) -> &'static str {
+        "if_to_ternary"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk } = ctx;
+        if lang.kind(id) != NodeKind::If {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        let c = ch[0];
+
+        // 提取"单 return 语句"分支：Block{Return} 或裸 Return
+        let single_ret = |n: L::Id| -> Option<Option<L::Id>> {
+            match lang.kind(n) {
+                NodeKind::Return => Some(lang.children(n).first().copied()),
+                NodeKind::Block if lang.children(n).len() == 1 => {
+                    let inner = lang.children(n)[0];
+                    if lang.kind(inner) == NodeKind::Return {
+                        Some(lang.children(inner).first().copied())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+
+        if ch.len() == 3 {
+            // 完整 if-else：两支都是单 return
+            let a = single_ret(ch[1])?;
+            let b = single_ret(ch[2])?;
+            let with = match (a, b) {
+                (Some(va), Some(vb)) => {
+                    let t = lang.build_ternary(c, va, vb);
+                    lang.build_return(Some(t))
+                }
+                (None, None) => lang.build_return(None),
+                _ => return None,
+            };
+            return Some(Edit::Replace {
+                target: id,
+                with,
+            });
+        }
+
+        // if-then + 紧随的收尾 return（必须是父块最后一条语句）
+        if ch.len() != 2 {
+            return None;
+        }
+        let a = single_ret(ch[1])?;
+        let parent = walk.parent(id)?;
+        if lang.kind(parent) != NodeKind::Block {
+            return None;
+        }
+        let idx = walk.index(id)?;
+        let stmts = lang.children(parent).to_vec();
+        if idx + 2 != stmts.len() {
+            return None; // return 必须是最后一条
+        }
+        let tail = stmts[idx + 1];
+        if lang.kind(tail) != NodeKind::Return {
+            return None;
+        }
+        let b = lang.children(tail).first().copied();
+        let with = match (a, b) {
+            (Some(va), Some(vb)) => {
+                let t = lang.build_ternary(c, va, vb);
+                lang.build_return(Some(t))
+            }
+            (None, None) => lang.build_return(None),
+            _ => return None,
+        };
+        Some(Edit::Splice {
+            node: parent,
+            index: idx,
+            remove: 2,
+            insert: vec![with],
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// if→三元赋值归并：
+//   if (c) { x = a; } else { x = b; }  →  x = c ? a : b;
+// 恒安全（x 为变量名，两种形态各求值一次；a/b 条件求值一致）。
+// ---------------------------------------------------------------------------
+
+pub struct IfAssignTernary;
+
+impl<L: Lang> Rule<L> for IfAssignTernary {
+    fn name(&self) -> &'static str {
+        "if_assign_ternary"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk: _ } = ctx;
+        if lang.kind(id) != NodeKind::If {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        if ch.len() != 3 {
+            return None;
+        }
+        let c = ch[0];
+        // 单赋值分支：Block{Assign} / Block{ExprStmt{Assign}} / 裸（ExprStmt 包裹的）Assign
+        let single_assign = |n: L::Id| -> Option<(L::Id, L::Id)> {
+            let unwrap = |i: L::Id| -> L::Id {
+                if lang.kind(i) == NodeKind::ExprStmt {
+                    let ch = lang.children(i);
+                    if ch.len() == 1 && lang.kind(ch[0]) == NodeKind::Assign {
+                        return ch[0];
+                    }
+                }
+                i
+            };
+            let inner = match lang.kind(n) {
+                NodeKind::Assign => n,
+                NodeKind::ExprStmt => unwrap(n),
+                NodeKind::Block if lang.children(n).len() == 1 => unwrap(lang.children(n)[0]),
+                _ => return None,
+            };
+            if lang.kind(inner) != NodeKind::Assign {
+                return None;
+            }
+            if lang.assign_op(inner).is_some() {
+                return None;
+            }
+            let a = lang.children(inner).to_vec();
+            if lang.kind(a[0]) != NodeKind::VarRef {
+                return None;
+            }
+            Some((a[0], a[1]))
+        };
+        let (t1, va) = single_assign(ch[1])?;
+        let (t2, vb) = single_assign(ch[2])?;
+        if lang.var_name(t1) != lang.var_name(t2) || lang.var_name(t1).is_none() {
+            return None;
+        }
+        let t = lang.build_ternary(c, va, vb);
+        let with = lang.build_assign(t1, t);
+        Some(Edit::Replace {
+            target: id,
+            with,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 注册表
 // ---------------------------------------------------------------------------
@@ -1160,6 +1526,8 @@ pub fn default_rules<L: Lang>() -> Vec<Box<dyn Rule<L>>> {
         Box::new(ParenRemoval),
         Box::new(ConstCondition),
         Box::new(BooleanReturn),
+        Box::new(IfToTernary),
+        Box::new(IfAssignTernary),
         Box::new(IfElseEmpty),
         Box::new(BoolCompare),
         Box::new(DoubleNot),
@@ -1169,6 +1537,9 @@ pub fn default_rules<L: Lang>() -> Vec<Box<dyn Rule<L>>> {
         Box::new(TernaryFold),
         Box::new(TernaryBool),
         Box::new(ConstFoldBin),
+        Box::new(CmpConstFold),
+        Box::new(BitIdentity),
+        Box::new(ArithReassoc),
         Box::new(SelfAssign),
         Box::new(ArithIdentity),
         Box::new(ArithZero),

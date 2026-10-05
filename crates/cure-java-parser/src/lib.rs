@@ -1742,6 +1742,15 @@ impl Parser {
                 return self.parse_unary();
             }
             self.bump();
+            // 负数字面量：-1 / -1.5 直接折叠为字面量（常量规则的规范化形态）
+            if t.is_punct("-") {
+                if let Tok::Num(text) = &self.tok().tok {
+                    let neg = format!("-{text}");
+                    let lit = num_lit(&neg);
+                    self.bump();
+                    return Some(self.ast.lit(lit));
+                }
+            }
             let operand = self.parse_unary()?;
             return Some(self.ast.un(op, operand));
         }

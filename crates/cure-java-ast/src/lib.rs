@@ -671,6 +671,12 @@ impl Lang for JavaAst {
     fn build_bin(&mut self, op: BinOp, l: JavaId, r: JavaId) -> JavaId {
         self.bin(op, l, r)
     }
+    fn build_ternary(&mut self, c: JavaId, a: JavaId, b: JavaId) -> JavaId {
+        self.ternary(c, a, b)
+    }
+    fn build_assign(&mut self, target: JavaId, value: JavaId) -> JavaId {
+        self.assign(target, value)
+    }
     fn copy_subtree(&mut self, id: JavaId) -> JavaId {
         let old_children = self.nodes[id.0 as usize].children.clone();
         let mut children = Vec::with_capacity(old_children.len());
