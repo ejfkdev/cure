@@ -293,8 +293,8 @@ public class NegC {
 }
 
 #[test]
-fn cff_negative_unreachable_case() {
-    // 有不可达 case → 保守拒绝
+fn cff_unreachable_case_dropped_as_dead_code() {
+    // 不可达 case 是死代码（从入口不可达 → 永不执行）→ 随状态机一并丢弃
     let src = r#"
 public class UnrC {
     public static void main(String[] args) {
@@ -323,7 +323,13 @@ public class UnrC {
 "#;
     let mut outcome = parse(src);
     assert!(outcome.errors.is_empty());
-    simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
+    let report = simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
     let after = print_unit(&outcome.ast, &outcome.unit);
-    assert!(after.contains("switch"), "不可达 case → 不应还原：\n{after}");
+    assert!(
+        report.by_rule.contains_key("cff_recover"),
+        "不可达 case 应作为死代码丢弃并还原：\n{after}"
+    );
+    assert!(after.contains(r#"println("x=5")"#), "{after}");
+    assert!(!after.contains("x = 6;"), "死 case 体必须消失：\n{after}");
+    assert!(!after.contains("switch"), "{after}");
 }

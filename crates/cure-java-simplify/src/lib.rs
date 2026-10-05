@@ -702,9 +702,6 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         let parent = ctx.parent(id)?;
         let idx = ctx.index(id)?;
         let lang = ctx.lang;
-        if std::env::var("CURE_DBG").is_ok() {
-            eprintln!("[cff] check called: {:?}", lang.kind(id));
-        }
         if lang.kind(id) != NodeKind::While {
             return None;
         }
@@ -718,10 +715,41 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
             return None;
         }
         let stmts = lang.children(parent).to_vec();
-        let decl = stmts[idx - 1];
-        if lang.kind(decl) != NodeKind::VarDecl {
-            return None;
+        // 向上扫描（最多 4 条）找 it 的 VarDecl（声明与 while 之间可能夹
+        // 无关语句，如 acc 声明）；中间语句引用 it 则拒
+        let cond = wch[0];
+        let _ = &cond;
+        let it_hint = match lang.kind(cond) {
+            NodeKind::Call => {
+                let cc0 = lang.children(cond).to_vec();
+                match lang.data(*cc0.first()?) {
+                    NodeData::Member { name } if name == "hasNext" => {
+                        lang.var_name(lang.children(cc0[0])[0]).map(|x| x.to_string())
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let mut decl = None;
+        if let Some(hint) = it_hint {
+            let mut up = idx;
+            for _ in 0..4 {
+                if up == 0 {
+                    break;
+                }
+                up -= 1;
+                let st = stmts[up];
+                if lang.kind(st) == NodeKind::VarDecl && lang.var_name(st) == Some(hint.as_str()) {
+                    decl = Some(st);
+                    break;
+                }
+                if subtree_has_var(lang, st, &hint) {
+                    break;
+                }
+            }
         }
+        let decl = decl?;
         let it_name = lang.var_name(decl)?.to_string();
         let init_call = lang.children(decl).first().copied()?;
         if lang.kind(init_call) != NodeKind::Call {
@@ -825,10 +853,11 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
                 },
                 Edit::Splice {
                     node: parent,
-                    index: idx - 1,
-                    remove: 2,
+                    index: idx,
+                    remove: 1,
                     insert: vec![foreach],
                 },
+                Edit::Delete { node: decl },
             ]));
         }
         let NodeData::VarDecl { name: e_name, ty } = lang.data(first) else {
@@ -866,16 +895,19 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         }
         let new_body = lang.build_block(rest);
         let foreach = lang.for_each(&e_name, ty, iterable, new_body);
-        // 用 for-each 同时替换 [decl, while] 两条语句
-        Some(Edit::Splice {
-            node: parent,
-            index: idx - 1,
-            remove: 2,
-            insert: vec![foreach],
-        })
+        // 用 for-each 替换 while + 删除 it 声明（两处独立位置，
+        // 顺序先 Splice（较大索引）后 Delete）
+        Some(Edit::Multi(vec![
+            Edit::Splice {
+                node: parent,
+                index: idx,
+                remove: 1,
+                insert: vec![foreach],
+            },
+            Edit::Delete { node: decl },
+        ]))
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // 拼接中的 String.valueOf 剥离（混淆器/反编译器包装）：
@@ -1842,9 +1874,6 @@ impl Rule<JavaAst> for CffRecover {
         let parent = ctx.parent(id)?;
         let idx = ctx.index(id)?;
         let lang = ctx.lang;
-        if std::env::var("CURE_DBG").is_ok() {
-            eprintln!("[cff] check called: {:?}", lang.kind(id));
-        }
         if lang.kind(id) != NodeKind::While {
             return None;
         }
@@ -1862,7 +1891,6 @@ impl Rule<JavaAst> for CffRecover {
             _ => return None,
         };
         if lang.kind(switch) != NodeKind::Switch {
-            if std::env::var("CURE_DBG").is_ok() { eprintln!("[cff] body[0] not switch: {:?}", lang.kind(switch)); }
             return None;
         }
         let sch = lang.children(switch).to_vec();
@@ -1965,14 +1993,34 @@ impl Rule<JavaAst> for CffRecover {
             return None;
         }
 
-        // 入口：while 前一条语句设置 v = IntLit
+        // 入口：向上扫描（最多 8 条）找设置 v = IntLit 的语句；
+        // 中间语句不得有 v 事件（读写皆拒）
         if idx == 0 {
-            if std::env::var("CURE_DBG").is_ok() { eprintln!("[cff] idx==0"); }
             return None;
         }
         let block_ch = lang.children(parent).to_vec();
-        let init_stmt = block_ch.get(idx - 1).copied()?;
-        let init = parse_cff_init(lang, &v, init_stmt)?;
+        let mut init = None;
+        let mut init_idx = idx;
+        {
+            let mut up = idx;
+            for _ in 0..8 {
+                if up == 0 {
+                    break;
+                }
+                up -= 1;
+                let st = block_ch[up];
+                match scan_cff_event(lang, st, &v) {
+                    Some(CffEvent::Read) | Some(CffEvent::Shadow) => return None,
+                    Some(CffEvent::Write) | Some(CffEvent::Decl) => {
+                        init = parse_cff_init(lang, &v, st);
+                        init_idx = up;
+                        break;
+                    }
+                    None => continue,
+                }
+            }
+        }
+        let init = init?;
 
         // 循环后 v 不得被使用
         for &st in &block_ch[idx + 1..] {
@@ -2009,23 +2057,25 @@ impl Rule<JavaAst> for CffRecover {
         };
         let stmts = cff_run(&mut c, init)?;
 
-        // 全部 case 可达；default 若存在必须被走到
-        if !c.cases.keys().all(|k| c.reached.contains(k)) {
-            return None;
-        }
-        if c.default_term.is_some() && !c.used_default {
-            return None;
-        }
+        // 不可达 case 是死代码（从入口不可达 → 永不执行），可安全丢弃；
+        // default 未被走到同理。至少要求发射序列非空。
         if stmts.is_empty() {
             return None;
         }
 
-        Some(Edit::Splice {
-            node: parent,
-            index: idx - 1,
-            remove: 2,
-            insert: stmts,
-        })
+        // 用恢复序列替换 while + 删除 init 语句（两处独立位置：init 与 while
+        // 之间的无关语句保留；顺序先 Splice（较大索引）后 Delete）
+        Some(Edit::Multi(vec![
+            Edit::Splice {
+                node: parent,
+                index: idx,
+                remove: 1,
+                insert: stmts,
+            },
+            Edit::Delete {
+                node: block_ch[init_idx],
+            },
+        ]))
     }
 }
 
@@ -2091,6 +2141,82 @@ fn parse_cff_tail(lang: &JavaAst, v: &str, stmts: &mut Vec<JavaId>) -> Option<Cf
         return Some(CffTail::Cond { cond: ich[0], a, b });
     }
     None
+}
+
+
+/// CFF 入口向上扫描的事件判定（必经路径语义）。
+enum CffEvent {
+    Read,
+    Write,
+    Shadow,
+    /// v 自身的声明（含 init 时为入口源）
+    Decl,
+}
+
+fn scan_cff_event(lang: &JavaAst, node: JavaId, name: &str) -> Option<CffEvent> {
+    match lang.kind(node) {
+        NodeKind::VarRef => {
+            if lang.var_name(node) == Some(name) {
+                Some(CffEvent::Read)
+            } else {
+                None
+            }
+        }
+        NodeKind::VarDecl => {
+            if lang.var_name(node) == Some(name) {
+                Some(CffEvent::Decl)
+            } else {
+                for &c in lang.children(node) {
+                    if let Some(e) = scan_cff_event(lang, c, name) {
+                        return Some(e);
+                    }
+                }
+                None
+            }
+        }
+        NodeKind::Assign => {
+            let ch = lang.children(node);
+            if let Some(&val) = ch.get(1) {
+                if let Some(e) = scan_cff_event(lang, val, name) {
+                    if matches!(e, CffEvent::Read | CffEvent::Shadow) {
+                        return Some(e);
+                    }
+                }
+            }
+            if lang.assign_op(node).is_none() {
+                if let Some(&t) = ch.first() {
+                    if lang.kind(t) == NodeKind::VarRef && lang.var_name(t) == Some(name) {
+                        return Some(CffEvent::Write);
+                    }
+                }
+            }
+            None
+        }
+        NodeKind::If | NodeKind::While => scan_cff_event(lang, *lang.children(node).first()?, name),
+        NodeKind::Ternary => scan_cff_event(lang, *lang.children(node).first()?, name),
+        NodeKind::Binary => {
+            let op = lang.bin_op(node)?;
+            let ch = lang.children(node);
+            if op.is_short_circuit() {
+                scan_cff_event(lang, *ch.first()?, name)
+            } else {
+                for &c in ch {
+                    if let Some(e) = scan_cff_event(lang, c, name) {
+                        return Some(e);
+                    }
+                }
+                None
+            }
+        }
+        _ => {
+            for &c in lang.children(node) {
+                if let Some(e) = scan_cff_event(lang, c, name) {
+                    return Some(e);
+                }
+            }
+            None
+        }
+    }
 }
 
 fn parse_cff_init(lang: &JavaAst, v: &str, stmt: JavaId) -> Option<i64> {
@@ -2340,6 +2466,295 @@ fn cff_structure(c: &mut CffCtx, mut path: Vec<(i64, Vec<JavaId>)>, mut flow: Fl
 }
 
 
+
+// ---------------------------------------------------------------------------
+// 跨方法常量知识（string-array 解密器的过程间分析入口）：
+// simplify_unit 把类级常量字段与单 return 方法体填入 JavaAst 侧表，
+// 下面两条规则在 fixed point 中消费，与部分求值/数组下标/Base64 折叠
+// 自然组合：d(0) → 方法体 → T[0] → "c3Vw" → Base64 解码 → "sup"。
+// ---------------------------------------------------------------------------
+
+/// 收集类级常量：static final 字面量/数组字段（无写、无局部同名）
+/// 与单 return 方法体。
+pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
+    ast.const_fields.clear();
+    ast.inline_methods.clear();
+
+    // 第一遍：所有体内对字段名的写与局部/参数同名 → 污染集合
+    let mut tainted: std::collections::HashSet<String> = Default::default();
+    let mut bodies: Vec<JavaId> = Vec::new();
+    for ty in &unit.types {
+        for m in &ty.members {
+            match m {
+                Member::Method { body: Some(b), params, .. }
+                | Member::Constructor { body: Some(b), params, .. } => {
+                    bodies.push(*b);
+                    for p in params {
+                        tainted.insert(p.name.clone());
+                    }
+                }
+                Member::Initializer { body, .. } => bodies.push(*body),
+                Member::Field { declarators, .. } => {
+                    for d in declarators {
+                        if let Some(init) = d.init {
+                            bodies.push(init);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // 污染扫描：字段写（含数组元素写/incdec）+ 局部同名声明（遮蔽）
+    for &root in &bodies {
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            if ast.kind(n) == NodeKind::VarDecl {
+                if let Some(nm) = ast.var_name(n) {
+                    tainted.insert(nm.to_string());
+                }
+            }
+            match ast.data(n) {
+                NodeData::Assign { .. } => {
+                    let t = ast.children(n)[0];
+                    let mut ts = vec![t];
+                    while let Some(x) = ts.pop() {
+                        if ast.kind(x) == NodeKind::VarRef {
+                            if let Some(nm) = ast.var_name(x) {
+                                tainted.insert(nm.to_string());
+                            }
+                        }
+                        for &c in ast.children(x) {
+                            ts.push(c);
+                        }
+                    }
+                }
+                NodeData::Unary { op } if op.is_incdec() => {
+                    let t = ast.children(n)[0];
+                    if ast.kind(t) == NodeKind::VarRef {
+                        if let Some(nm) = ast.var_name(t) {
+                            tainted.insert(nm.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for &c in ast.children(n) {
+                stack.push(c);
+            }
+        }
+    }
+
+    // 第二遍：常量字段收集
+    for ty in &unit.types {
+        for m in &ty.members {
+            if let Member::Field { mods, declarators, .. } = m {
+                if !mods.contains("final") {
+                    continue;
+                }
+                for d in declarators {
+                    if let Some(init) = d.init {
+                        if is_const_init(&ast, init) && !tainted.contains(&d.name) {
+                            if ast.const_fields.contains_key(&d.name) {
+                                ast.const_fields.remove(&d.name);
+                            } else {
+                                ast.const_fields.insert(d.name.clone(), init);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 单 return 方法收集
+    for ty in &unit.types {
+        for m in &ty.members {
+            if let Member::Method { name, params, body: Some(b), .. } = m {
+                let ch = ast.children(*b).to_vec();
+                if ch.len() == 1 && ast.kind(ch[0]) == NodeKind::Return {
+                    if let Some(&expr) = ast.children(ch[0]).first() {
+                        if params.len() <= 3 && !subtree_calls_self(&ast, expr, name) {
+                            let ps: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+                            if ast.inline_methods.contains_key(name) {
+                                ast.inline_methods.remove(name);
+                            } else {
+                                ast.inline_methods.insert(name.clone(), (ps, expr));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 常量初始化判定：字面量，或字面量数组（new T[]{…} / {…}）。
+fn is_const_init(ast: &JavaAst, init: JavaId) -> bool {
+    match ast.kind(init) {
+        NodeKind::Literal => true,
+        NodeKind::ArrayLit => ast.children(init).iter().all(|&e| ast.kind(e) == NodeKind::Literal),
+        NodeKind::NewArray => {
+            let ch = ast.children(init).to_vec();
+            ch.len() == 1
+                && ast.kind(ch[0]) == NodeKind::ArrayLit
+                && ast.children(ch[0]).iter().all(|&e| ast.kind(e) == NodeKind::Literal)
+        }
+        _ => false,
+    }
+}
+
+fn subtree_calls_self(ast: &JavaAst, root: JavaId, name: &str) -> bool {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if ast.kind(n) == NodeKind::Call {
+            let callee = ast.children(n)[0];
+            if ast.var_name(callee) == Some(name) {
+                return true;
+            }
+        }
+        for &c in ast.children(n) {
+            stack.push(c);
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// 常量字段下标折叠：T[i]（T 为字面量数组常量字段）→ 元素字面量
+// ---------------------------------------------------------------------------
+
+pub struct StaticArrayIndexFold;
+
+impl Rule<JavaAst> for StaticArrayIndexFold {
+    fn name(&self) -> &'static str {
+        "static_array_index_fold"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::Index {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        if lang.kind(ch[0]) != NodeKind::VarRef {
+            return None;
+        }
+        let name = lang.var_name(ch[0])?.to_string();
+        let idx = lang.literal(ch[1]).and_then(|x| x.as_int())?;
+        let init = *lang.const_fields.get(&name)?;
+        let arr = match lang.kind(init) {
+            NodeKind::ArrayLit => init,
+            NodeKind::NewArray => {
+                let ic = lang.children(init).to_vec();
+                if ic.len() == 1 && lang.kind(ic[0]) == NodeKind::ArrayLit {
+                    ic[0]
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        let elems = lang.children(arr).to_vec();
+        if idx < 0 || idx >= elems.len() as i64 {
+            return None;
+        }
+        let elem = lang.copy_subtree(elems[idx as usize]);
+        Some(Edit::Replace {
+            target: id,
+            with: elem,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 常量实参方法内联（解密 helper）：d(0) → 方法体（参数→实参字面量替换）。
+// 语义恒安全：单 return 表达式在调用点求值一次，两种形态一致；
+// 自递归方法拒绝；实参须全为字面量。
+// 【结构性规则】豁免成本门槛：内联暂时变贵、由后续常量折叠回本。
+// 终止性：守卫"体内不含任何内联名的裸调用"——每次内联严格消费一个
+// 此类调用点且不引入新的同类节点。
+// ---------------------------------------------------------------------------
+
+pub struct ConstMethodInline;
+
+impl Rule<JavaAst> for ConstMethodInline {
+    fn name(&self) -> &'static str {
+        "const_method_inline"
+    }
+    fn structural(&self) -> bool {
+        true
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::Call {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        let method_name = match lang.data(ch[0]) {
+            NodeData::VarRef { name } => name.clone(),
+            NodeData::Member { name } => {
+                let recv = lang.children(ch[0])[0];
+                match lang.var_name(recv) {
+                    Some(r) if r == "this" || r.chars().next().is_some_and(|c| c.is_uppercase()) => {
+                        name.clone()
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let entry = lang.inline_methods.get(&method_name).cloned()?;
+        let (params, body_expr) = entry;
+        // 终止守卫：方法体内不得含任何【内联名】的裸调用
+        {
+            let names: Vec<String> = lang.inline_methods.keys().cloned().collect();
+            for nm in &names {
+                if subtree_calls_self(lang, body_expr, nm) {
+                    return None;
+                }
+            }
+        }
+        let args = ch[1..].to_vec();
+        if args.len() != params.len() || params.is_empty() {
+            return None;
+        }
+        for &a in &args {
+            if lang.literal(a).is_none() {
+                return None;
+            }
+        }
+        let map: std::collections::HashMap<String, JavaId> = params
+            .iter()
+            .zip(args.iter())
+            .map(|(p, &a)| (p.clone(), a))
+            .collect();
+        let with = copy_subst(lang, body_expr, &map);
+        Some(Edit::Replace {
+            target: id,
+            with,
+        })
+    }
+}
+
+/// 深拷贝 + VarRef 参数替换。
+fn copy_subst(
+    lang: &mut JavaAst,
+    node: JavaId,
+    map: &std::collections::HashMap<String, JavaId>,
+) -> JavaId {
+    if let NodeData::VarRef { name } = lang.data(node) {
+        if let Some(&repl) = map.get(name) {
+            return lang.copy_subtree(repl);
+        }
+    }
+    let children: Vec<JavaId> = lang.children(node).to_vec();
+    let new_children: Vec<JavaId> = children
+        .iter()
+        .map(|&c| copy_subst(lang, c, map))
+        .collect();
+    lang.clone_node(node, new_children)
+}
+
 // ---------------------------------------------------------------------------
 // 门面
 // ---------------------------------------------------------------------------
@@ -2363,6 +2778,8 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(LiteralEval));
     rules.push(Box::new(Base64NewStringFold));
     rules.push(Box::new(CffRecover));
+    rules.push(Box::new(StaticArrayIndexFold));
+    rules.push(Box::new(ConstMethodInline));
     rules
 }
 
@@ -2382,6 +2799,7 @@ pub fn simplify(ast: &mut JavaAst, root: JavaId, cfg: &Config) -> Report {
 
 /// 整个编译单元：逐个方法体/初始化块/字段初始化器优化，签名不动。
 pub fn simplify_unit(ast: &mut JavaAst, unit: &mut CompilationUnit, cfg: &Config) -> Report {
+    collect_unit_consts(ast, unit);
     let mut total = Report::default();
     for ty in &mut unit.types {
         simplify_type(ast, ty, cfg, &mut total);

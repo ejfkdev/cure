@@ -94,7 +94,7 @@ local_propagation、**decl_assign_merge**、**assign_propagation**（拷贝赋�
 **trailing_continue**（标签感知：循环体尾部 continue，标签指向本循环才删）、
 dead_store + 选配 unreachable_after_terminal。
 
-Java 专属（15）：cast_simplify、self_compare、string_builder_fold、box_unbox_chain、
+Java 专属（17）：cast_simplify、self_compare、string_builder_fold、box_unbox_chain、
 iterator_to_for_each、while_iterator_to_for_each（支持 Cast/Paren 包裹的 next()）、
 new_string_fold、loop_head_break（`while(true){if(c)break;…}` + **do-while 形态**
 `do{if(c){REST;continue}else{break}}while(true)` + 正/负极性 continue/break 组合）、concat_value_of_drop、
@@ -127,6 +127,14 @@ new_string_fold、loop_head_break（`while(true){if(c)break;…}` + **do-while �
 javac 差分逐字节一致。模式来源：obfuscator.io / javascript-obfuscator
 的 string-array 与字符串编码家族的 Java 等价形态（跨方法解密器与
 控制流扁平化需要过程间分析，暂不覆盖）。
+
+## 终极组合混淆验证（tests/gauntlet.rs）
+
+跨方法字符串解密器（string-array + Base64 helper）× CFF 状态机（体内含
+解密调用 + 寄存器噪声 + 不透明谓词）× SB 语句链 × 迭代器 × XOR 副作用包裹
+× 虚拟执行——全部叠在一个程序：**24 次改写、非空行 87 → 32（-64%）**，
+javac 差分逐字节一致（`d(0)+d(1)+"!"` → `println("super!")`，
+副作用 mark 调用序列完整保留）。
 
 ## 控制流扁平化还原验证（tests/cff_obfuscation.rs）
 

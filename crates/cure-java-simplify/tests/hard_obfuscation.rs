@@ -190,10 +190,9 @@ fn hard_composed_obfuscation_deobfuscated() {
     // 布尔旗标三元嵌套 → 合取
     assert!(cleaned.contains("v25 > 3 && v25 > 5"), "{cleaned}");
 
-    // 迭代器 + SB 语句链 → while(hasNext) + 累加拼接（e 声明被传播内联进拼接，
-    // for-each 还原需要"提取 it.next() 引入循环变量"——记录为后续项）
-    assert!(cleaned.contains("while (it.hasNext())"), "{cleaned}");
-    assert!(cleaned.contains("acc = acc + (String) it.next() + \"-\";"), "{cleaned}");
+    // 迭代器 + SB 语句链 → for-each + 累加拼接（内联 next() 提取已支持）
+    assert!(cleaned.contains("for (String e : list)"), "{cleaned}");
+    assert!(cleaned.contains("acc = acc + e + \"-\";"), "{cleaned}");
     assert!(!cleaned.contains("new StringBuilder"), "{cleaned}");
     assert!(!cleaned.contains("continue"), "{cleaned}");
     assert!(!cleaned.contains("acc2"), "{cleaned}");

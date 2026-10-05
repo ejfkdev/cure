@@ -85,6 +85,13 @@ pub trait Rule<L: Lang> {
     /// 在节点 `id` 处检查是否可改写。
     /// 契约：只读既有结构（可向 arena 追加新节点）；结构变更只经 `Edit` 提案。
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>>;
+
+    /// 结构性规则：**豁免成本严格下降约束**。
+    /// 适用于"内联后暂时变贵、由后续折叠回本"的变换（如方法内联）。
+    /// 实现方必须自证终止（如：每次消费一类节点且不引入新的同类节点）。
+    fn structural(&self) -> bool {
+        false
+    }
 }
 
 /// runner 内部：用父表应用编辑。

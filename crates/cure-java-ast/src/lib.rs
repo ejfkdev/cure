@@ -168,6 +168,12 @@ pub struct JavaAst {
     var_types: HashMap<u32, JType>,
     /// 方法参数类型（由 simplify 门面按方法设置，作为根作用域）。
     param_scope: Vec<(String, JType)>,
+    /// 类级常量字段（static final 且字面量/字面量数组初始化、无写、无同名局部）
+    /// → 初始化节点。由 simplify_unit 填充（跨方法解密的字符串表）。
+    pub const_fields: HashMap<String, JavaId>,
+    /// 可内联的单 return 方法：名字 → (参数名表, 返回表达式节点)。
+    /// 由 simplify_unit 填充（解密 helper：d(0) → 方法体）。
+    pub inline_methods: HashMap<String, (Vec<String>, JavaId)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +288,12 @@ pub struct ParseError {
 impl JavaAst {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 以 node 的负载 + 指定 children 构造新节点（深拷贝/替换用）。
+    pub fn clone_node(&mut self, id: JavaId, children: Vec<JavaId>) -> JavaId {
+        let data = self.nodes[id.0 as usize].data.clone();
+        self.push(data, children)
     }
 
     fn push(&mut self, data: NodeData, children: Vec<JavaId>) -> JavaId {

@@ -65,13 +65,14 @@ pub fn simplify<L: Lang>(
                 };
                 let proposal = rule.check(ctx, id);
                 if let Some(edit) = proposal {
+                    let structural = rule.structural();
                     let reduction = edit.cost_reduction(lang);
                     debug_assert!(
-                        reduction > 0,
+                        structural || reduction > 0,
                         "rule `{}` proposed a non-simplifying edit",
                         rule.name()
                     );
-                    if reduction == 0 {
+                    if !structural && reduction == 0 {
                         continue;
                     }
                     if apply_edit(lang, &snap, &edit).is_ok() {
