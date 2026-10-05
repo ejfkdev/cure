@@ -1,0 +1,13 @@
+[package]
+name = "cure-java-parser"
+description = "Fault-tolerant Java source parser producing cure-java-ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cure-engine = { path = "../cure-engine" }
+cure-java-ast = { path = "../cure-java-ast" }
+
+[dev-dependencies]
+cure-java-print = { path = "../cure-java-print" }

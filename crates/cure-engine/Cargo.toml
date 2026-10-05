@@ -1,0 +1,8 @@
+[package]
+name = "cure-engine"
+description = "Language-agnostic semantic code simplification engine (patterns, rewrites, passes, fixed point, cost model)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

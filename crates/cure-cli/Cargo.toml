@@ -1,0 +1,22 @@
+[package]
+name = "cure-cli"
+description = "CLI for cure: fault-tolerant Java simplifier/formatter (source in, source out)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cure"
+path = "src/main.rs"
+
+[dependencies]
+cure-java-parser = { path = "../cure-java-parser" }
+cure-java-simplify = { path = "../cure-java-simplify" }
+cure-java-print = { path = "../cure-java-print" }
+cure-java-ast = { path = "../cure-java-ast" }
+cure-engine = { path = "../cure-engine" }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "1"
+tempfile = "3"

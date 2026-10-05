@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cure-engine",
+    "crates/cure-java-ast",
+    "crates/cure-java-print",
+    "crates/cure-java-simplify",
+    "crates/cure-java-parser",
+    "crates/cure-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"

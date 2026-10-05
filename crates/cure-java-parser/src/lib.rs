@@ -1,0 +1,2324 @@
+//! # cure-java-parser
+//!
+//! 容错式 Java 源码解析器：源码文本 → [`cure_java_ast::CompilationUnit`] + arena 节点。
+//!
+//! **容错语义**（本 crate 的核心承诺）：
+//! - 永不 panic、永不放弃：无论输入多坏都返回"尽力而为"的解析结果；
+//! - 哪里坏跳哪里：出错的语句 → `Raw` 语句节点（原文保真），出错的方法 →
+//!   `Member::Raw`，出错的顶层区域 → `unit.raws`；其余部分照常解析、照常可被简化；
+//! - [`parse`] 同时返回所有 [`ParseError`]（1-based 行列）。
+//!
+//! 覆盖范围：package/import、类/接口/枚举（成员、字段、方法、构造器、初始化块、
+//! 嵌套类型）、完整语句集（if/while/do/for/for-each/try/catch/finally/
+//! try-with-resources/switch 经典+箭头/synchronized/labeled/assert）、
+//! 完整表达式（赋值、三元、短路、instanceof、lambda、方法引用、数组创建、
+//! 泛型钻石、匿名类体原文保真）。签名泛型/注解/throws 以原文保真。
+
+mod lexer;
+
+use cure_java_ast::*;
+
+use lexer::{lex, Token, Tok};
+
+/// 解析结果：arena + 编译单元 + 错误列表。
+#[derive(Debug)]
+pub struct ParseOutcome {
+    pub ast: JavaAst,
+    pub unit: CompilationUnit,
+    pub errors: Vec<ParseError>,
+}
+
+/// 解析 Java 源码（容错，永不失败）。
+pub fn parse(src: &str) -> ParseOutcome {
+    let (tokens, lex_errs) = lex(src);
+    let mut p = Parser {
+        t: tokens,
+        pos: 0,
+        src: src.to_string(),
+        errs: Vec::new(),
+        ast: JavaAst::new(),
+        in_case_label: false,
+    };
+    for e in lex_errs {
+        p.errs.push(ParseError {
+            line: e.line,
+            col: e.col,
+            message: format!("lex: {}", e.message),
+        });
+    }
+    let unit = p.compilation_unit();
+    ParseOutcome {
+        ast: p.ast,
+        unit,
+        errors: p.errs,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 解析器
+// ---------------------------------------------------------------------------
+
+struct Parser {
+    t: Vec<Token>,
+    pos: usize,
+    src: String,
+    errs: Vec<ParseError>,
+    ast: JavaAst,
+    /// case 标签解析中：`AOSP ->` 不是单参 lambda
+    in_case_label: bool,
+}
+
+/// 解析深度上限（防御恶意/超长输入导致的失控）。
+const STEP_GUARD: usize = 2_000_000;
+
+impl Parser {
+    // ---- 基础 ----
+
+    fn tok(&self) -> &Token {
+        &self.t[self.pos.min(self.t.len() - 1)]
+    }
+    fn peek(&self, off: usize) -> &Token {
+        &self.t[(self.pos + off).min(self.t.len() - 1)]
+    }
+    fn at(&self, s: &str) -> bool {
+        self.tok().text() == s
+    }
+    fn at_punct(&self, s: &str) -> bool {
+        self.tok().is_punct(s)
+    }
+    fn at_kw(&self, s: &str) -> bool {
+        matches!(self.tok().tok, Tok::Ident(ref i) if i == s)
+    }
+    fn bump(&mut self) -> Token {
+        let t = self.t[self.pos.min(self.t.len() - 1)].clone();
+        if self.pos < self.t.len() - 1 {
+            self.pos += 1;
+        }
+        t
+    }
+    fn eat(&mut self, s: &str) -> bool {
+        if self.at(s) {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+    fn at_eof(&self) -> bool {
+        matches!(self.tok().tok, Tok::Eof)
+    }
+    fn err_at(&mut self, msg: &str) {
+        let (line, col) = (self.tok().line, self.tok().col);
+        self.errs.push(ParseError {
+            line,
+            col,
+            message: msg.into(),
+        });
+    }
+    fn expect(&mut self, s: &str) -> bool {
+        if self.eat(s) {
+            true
+        } else {
+            self.err_at(&format!("expected `{s}`, found `{}`", self.tok().text()));
+            false
+        }
+    }
+    fn text_of(&self, a: usize, b: usize) -> String {
+        let (a, b) = (a.min(self.src.len()), b.min(self.src.len()));
+        if a >= b {
+            String::new()
+        } else {
+            self.src[a..b].to_string()
+        }
+    }
+    /// 当前 token 起始的字节偏移。
+    fn cur_start(&self) -> usize {
+        self.tok().start
+    }
+
+    // ---- 恢复 ----
+
+    /// 从 `byte_start` 起做语句级恢复，返回覆盖整条残缺语句的原文。
+    fn raw_from(&mut self, byte_start: usize) -> JavaId {
+        let _ = self.sync_stmt();
+        let end = self.t[self.pos.min(self.t.len() - 1)].start;
+        let text = self.text_of(byte_start, end).trim().to_string();
+        if text.is_empty() {
+            self.ast.empty()
+        } else {
+            self.ast.raw(&text)
+        }
+    }
+
+    /// 语句级恢复：跳到 `;`（消费）或语句起始关键字 / `}` / EOF（不消费）。
+    /// 返回被跳过的原文。
+    fn sync_stmt(&mut self) -> String {
+        let start = self.cur_start();
+        let mut depth = 0i32;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > STEP_GUARD || self.at_eof() {
+                break;
+            }
+            let t = self.tok().clone();
+            if depth == 0 {
+                if t.is_punct(";") {
+                    self.bump();
+                    break;
+                }
+                if t.is_punct("}") || t.is_punct("{") {
+                    break;
+                }
+                if matches!(&t.tok, Tok::Ident(i) if matches!(
+                    i.as_str(),
+                    "if" | "for" | "while" | "do" | "try" | "return" | "throw" | "break"
+                        | "continue" | "switch" | "synchronized" | "assert" | "final" | "class"
+                ) || is_primitive_kw(i))
+                {
+                    break;
+                }
+            }
+            // 闭括号在 depth==0：停在不消费位置（防止把后续代码吞进 Raw）
+            if depth == 0
+                && matches!(&t.tok, Tok::Punct("}") | Tok::Punct(")") | Tok::Punct("]"))
+            {
+                break;
+            }
+            match &t.tok {
+                Tok::Punct("{") | Tok::Punct("(") | Tok::Punct("[") => depth += 1,
+                Tok::Punct("}") | Tok::Punct(")") | Tok::Punct("]") => depth -= 1,
+                _ => {}
+            }
+            self.bump();
+        }
+        let text = self.text_of(start, self.t[self.pos.min(self.t.len() - 1)].start);
+        text.trim().to_string()
+    }
+
+    /// 成员级恢复：跳过平衡区域直到 `;`（消费）或回到成员边界 `}`（不消费）。
+    fn sync_member(&mut self) -> String {
+        let start = self.cur_start();
+        let mut depth = 0i32;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > STEP_GUARD || self.at_eof() {
+                break;
+            }
+            let t = self.tok().clone();
+            if depth == 0 && t.is_punct(";") {
+                self.bump();
+                break;
+            }
+            if depth <= 0 && t.is_punct("}") {
+                break;
+            }
+            match &t.tok {
+                Tok::Punct("{") => depth += 1,
+                Tok::Punct("}") => depth -= 1,
+                _ => {}
+            }
+            self.bump();
+        }
+        let text = self.text_of(start, self.t[self.pos.min(self.t.len() - 1)].start);
+        text.trim().to_string()
+    }
+
+    /// 跳过一个平衡的 `{...}`（要求当前指向 `{`），返回原文。
+    fn skip_balanced_braces(&mut self) -> Option<String> {
+        if !self.at_punct("{") {
+            return None;
+        }
+        let start = self.cur_start();
+        let mut depth = 0i32;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > STEP_GUARD || self.at_eof() {
+                return None;
+            }
+            match &self.tok().tok {
+                Tok::Punct("{") => depth += 1,
+                Tok::Punct("}") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.bump();
+                        return Some(self.text_of(start, self.t[self.pos - 1].end));
+                    }
+                }
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
+    /// 跳过一个平衡的括号组（要求当前指向 `(` 或 `<` 等开括号），返回原文。
+    fn skip_balanced(&mut self, open: &str, close: &str) -> Option<String> {
+        if !self.at_punct(open) {
+            return None;
+        }
+        let start = self.cur_start();
+        let mut depth = 0i32;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > STEP_GUARD || self.at_eof() {
+                return None;
+            }
+            if self.at_punct(open) {
+                depth += 1;
+            } else if self.at_punct(close) {
+                depth -= 1;
+                if depth == 0 {
+                    self.bump();
+                    return Some(self.text_of(start, self.t[self.pos - 1].end));
+                }
+            }
+            self.bump();
+        }
+    }
+
+    // ---- 编译单元 ----
+
+    fn compilation_unit(&mut self) -> CompilationUnit {
+        let mut unit = CompilationUnit::default();
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > STEP_GUARD || self.at_eof() {
+                break;
+            }
+            if self.at_kw("package") {
+                let start = self.cur_start();
+                while !self.at_eof() && !self.at_punct(";") {
+                    self.bump();
+                }
+                let text = self.text_of(
+                    self.t[1.min(self.t.len() - 1)].start,
+                    self.tok().start,
+                );
+                // 重新截取：从 package 关键字之后到 ;
+                let after = self.text_of(start, self.tok().start);
+                let pkg = after
+                    .trim()
+                    .trim_start_matches("package")
+                    .trim()
+                    .to_string();
+                unit.package = Some(pkg);
+                let _ = text;
+                self.eat(";");
+                continue;
+            }
+            if self.at_kw("import") {
+                let start = self.cur_start();
+                while !self.at_eof() && !self.at_punct(";") {
+                    self.bump();
+                }
+                let after = self.text_of(start, self.tok().start);
+                let imp = after.trim().trim_start_matches("import").trim().to_string();
+                unit.imports.push(imp);
+                self.eat(";");
+                continue;
+            }
+            if self.at_punct(";") {
+                self.bump();
+                continue;
+            }
+            // 类型声明（带注解/修饰符）
+            let mods_start = self.cur_start();
+            let mods = self.modifiers();
+            if self.at_kw("class")
+                || self.at_kw("interface")
+                || self.at_kw("enum")
+                || self.at_kw("record")
+                || self.at_kw("@interface")
+            {
+                match self.type_decl_body(&mods, mods_start) {
+                    Some(t) => unit.types.push(t),
+                    None => {
+                        let text = self.sync_member();
+                        if !text.is_empty() {
+                            unit.raws.push(text);
+                        }
+                    }
+                }
+                continue;
+            }
+            // 顶层无法识别 → 原文保真
+            self.err_at("expected type declaration");
+            let text = self.sync_member();
+            if !text.is_empty() {
+                unit.raws.push(text);
+            }
+        }
+        unit
+    }
+
+    /// 修饰符与注解原文（不含尾随空格）。
+    fn modifiers(&mut self) -> String {
+        let start = self.cur_start();
+        let mut last_end = start;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > 10_000 {
+                break;
+            }
+            if self.at_punct("@") {
+                self.bump();
+                self.bump(); // 注解名
+                // 注解参数（可能多层嵌套）
+                if self.at_punct("(") {
+                    self.skip_balanced("(", ")");
+                }
+                last_end = self.t[self.pos - 1].end;
+                continue;
+            }
+            if matches!(&self.tok().tok, Tok::Ident(i) if is_modifier_kw(i)) {
+                self.bump();
+                last_end = self.t[self.pos - 1].end;
+                continue;
+            }
+            break;
+        }
+        self.text_of(start, last_end)
+    }
+
+    // ---- 类型声明 ----
+
+    fn type_decl_body(&mut self, mods: &str, mods_start: usize) -> Option<TypeDecl> {
+        let kind = if self.at_kw("class") {
+            TypeKind::Class
+        } else if self.at_kw("interface") {
+            TypeKind::Interface
+        } else if self.at_kw("enum") {
+            TypeKind::Enum
+        } else if self.at_kw("record") {
+            TypeKind::Record
+        } else if self.at_kw("@interface") {
+            TypeKind::Annotation
+        } else {
+            return None;
+        };
+        self.bump(); // kw
+        let name = match &self.tok().tok {
+            Tok::Ident(i) => {
+                let n = i.clone();
+                self.bump();
+                n
+            }
+            _ => {
+                self.err_at("expected type name");
+                return None;
+            }
+        };
+        // 泛型参数原文
+        let mut ty_params = String::new();
+        if self.at_punct("<") {
+            ty_params = self.skip_balanced("<", ">").unwrap_or_default();
+        }
+        // record 头
+        let mut header = String::new();
+        if kind == TypeKind::Record && self.at_punct("(") {
+            header = self.skip_balanced("(", ")").unwrap_or_default();
+        }
+        let mut extends = Vec::new();
+        let mut implements = Vec::new();
+        loop {
+            if self.at_kw("extends") {
+                self.bump();
+                extends = self.type_list();
+                continue;
+            }
+            if self.at_kw("implements") {
+                self.bump();
+                implements = self.type_list();
+                continue;
+            }
+            if self.at_kw("permits") {
+                self.bump();
+                let _ = self.type_list();
+                continue;
+            }
+            break;
+        }
+        if !self.expect("{") {
+            // 允许 `;`（如注释掉的声明体）
+            self.eat(";");
+            return Some(TypeDecl {
+                kind,
+                mods: mods.to_string(),
+                name,
+                ty_params,
+                header,
+                extends,
+                implements,
+                enum_constants: Vec::new(),
+                members: Vec::new(),
+            });
+        }
+        let mut enum_constants = Vec::new();
+        let mut members = Vec::new();
+        if kind == TypeKind::Enum {
+            // 枚举常量（原文保真）
+            while !self.at_eof() && !self.at_punct(";") && !self.at_punct("}") {
+                let cstart = self.cur_start();
+                if !matches!(self.tok().tok, Tok::Ident(_)) {
+                    break;
+                }
+                self.bump();
+                if self.at_punct("(") {
+                    self.skip_balanced("(", ")");
+                }
+                if self.at_punct("{") {
+                    self.skip_balanced_braces();
+                }
+                let text = self
+                    .text_of(cstart, self.t[self.pos.saturating_sub(1)].end)
+                    .trim()
+                    .to_string();
+                enum_constants.push(text);
+                if !self.eat(",") {
+                    break;
+                }
+            }
+            self.eat(";");
+        }
+        let _ = mods_start;
+        // 成员循环
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > STEP_GUARD || self.at_eof() {
+                break;
+            }
+            if self.at_punct("}") {
+                self.bump();
+                break;
+            }
+            if self.at_punct(";") {
+                self.bump();
+                continue;
+            }
+            let mstart = self.cur_start();
+            let mmods = self.modifiers();
+            // 嵌套类型
+            if self.at_kw("class")
+                || self.at_kw("interface")
+                || self.at_kw("enum")
+                || self.at_kw("record")
+                || self.at_kw("@interface")
+            {
+                if let Some(t) = self.type_decl_body(&mmods, mstart) {
+                    members.push(Member::Type(Box::new(t)));
+                    continue;
+                }
+                let text = self.sync_member();
+                members.push(Member::Raw(text));
+                continue;
+            }
+            // 初始化块
+            if self.at_punct("{") {
+                let is_static = mmods.contains("static");
+                let body = self.parse_block_raw();
+                members.push(Member::Initializer { is_static, body });
+                continue;
+            }
+            match self.member_rest(&mmods, &name) {
+                Some(m) => members.push(m),
+                None => {
+                    let text = self.sync_member();
+                    members.push(Member::Raw(self.text_of(mstart, mstart) + &text));
+                }
+            }
+        }
+        Some(TypeDecl {
+            kind,
+            mods: mods.to_string(),
+            name,
+            ty_params,
+            header,
+            extends,
+            implements,
+            enum_constants,
+            members,
+        })
+    }
+
+    /// `extends A, B` 风格的类型列表（原文逐项）。
+    fn type_list(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > 10_000 {
+                break;
+            }
+            let start = self.cur_start();
+            if self.parse_type().is_none() {
+                break;
+            }
+            let text = self.text_of(start, self.t[self.pos - 1].end);
+            out.push(text.trim().to_string());
+            if !self.eat(",") {
+                break;
+            }
+        }
+        out
+    }
+
+    /// 修饰符/注解之后的成员主体：字段 / 方法 / 构造器。
+    fn member_rest(&mut self, mods: &str, class_name: &str) -> Option<Member> {
+        // 泛型参数（方法/构造器都可能带）
+        let mut ty_params = String::new();
+        if self.at_punct("<") {
+            ty_params = self.skip_balanced("<", ">")?;
+        }
+        // 构造器：Name( … 或 record 紧凑构造器 Name {
+        if let Tok::Ident(n) = &self.tok().tok {
+            if n == class_name && (self.peek(1).is_punct("(") || self.peek(1).is_punct("{")) {
+                let name = n.clone();
+                self.bump();
+                let compact = self.at_punct("{");
+                let params = if compact { Vec::new() } else { self.param_list() };
+                let throws = self.throws_clause();
+                let body = self.member_body();
+                return Some(Member::Constructor {
+                    mods: mods.to_string(),
+                    ty_params,
+                    name,
+                    params,
+                    throws,
+                    body,
+                    compact,
+                });
+            }
+        }
+
+        // 字段或方法：Type name
+        let ty = self.parse_type()?;
+        let name = match &self.tok().tok {
+            Tok::Ident(i) => {
+                let n = i.clone();
+                self.bump();
+                n
+            }
+            _ => {
+                self.err_at("expected member name");
+                return None;
+            }
+        };
+        // C 风格维度 int a[]
+        let mut extra_dims = 0u16;
+        while self.at_punct("[") && self.peek(1).is_punct("]") {
+            self.bump();
+            self.bump();
+            extra_dims += 1;
+        }
+        let ty = wrap_dims(ty, extra_dims as u32);
+        if self.at_punct("(") {
+            // 方法
+            let params = self.param_list();
+            let throws = self.throws_clause();
+            let body = self.member_body();
+            return Some(Member::Method {
+                mods: mods.to_string(),
+                ty_params,
+                ret: ty,
+                name,
+                params,
+                throws,
+                body,
+            });
+        }
+        // 字段（多声明符）
+        let mut declarators = Vec::new();
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > 10_000 {
+                break;
+            }
+            let mut d_dims = 0u16;
+            while self.at_punct("[") && self.peek(1).is_punct("]") {
+                self.bump();
+                self.bump();
+                d_dims += 1;
+            }
+            let init = if self.eat("=") {
+                match self.parse_expr(PREC_ASSIGN) {
+                    Some(e) => Some(e),
+                    None => {
+                        self.err_at("bad field initializer");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            declarators.push(Declarator {
+                name: name.clone(),
+                extra_dims: d_dims,
+                init,
+            });
+            if !self.eat(",") {
+                break;
+            }
+            // 后续声明符需要新名字
+            if !matches!(self.tok().tok, Tok::Ident(_)) {
+                break;
+            }
+            let _ = self.bump();
+            continue;
+        }
+        self.expect(";");
+        Some(Member::Field {
+            mods: mods.to_string(),
+            ty,
+            declarators,
+        })
+    }
+
+    fn member_body(&mut self) -> Option<JavaId> {
+        if self.eat(";") {
+            return None;
+        }
+        if self.at_punct("{") {
+            return Some(self.parse_block_raw());
+        }
+        self.err_at("expected method body");
+        let text = self.sync_member();
+        Some(self.ast.raw(&text))
+    }
+
+    fn param_list(&mut self) -> Vec<Param> {
+        let mut out = Vec::new();
+        if !self.expect("(") {
+            return out;
+        }
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > 10_000 || self.at_eof() {
+                break;
+            }
+            if self.at_punct(")") {
+                self.bump();
+                break;
+            }
+            let start = self.cur_start();
+            let mods = self.modifiers();
+            if mods.is_empty() {
+                let _ = start;
+            }
+            let ty = match self.parse_type() {
+                Some(t) => t,
+                None => {
+                    self.err_at("bad parameter type");
+                    self.sync_param();
+                    continue;
+                }
+            };
+            // varargs：`T... name`（词法器产出单 token "..."）
+            let varargs = if self.at_punct("...") {
+                self.bump();
+                true
+            } else {
+                false
+            };
+            let name = match &self.tok().tok {
+                Tok::Ident(i) => {
+                    let n = i.clone();
+                    self.bump();
+                    n
+                }
+                _ => {
+                    self.err_at("bad parameter name");
+                    self.sync_param();
+                    continue;
+                }
+            };
+            // 参数名后的额外维度 int a[]
+            let mut dims = 0u32;
+            while self.at_punct("[") && self.peek(1).is_punct("]") {
+                self.bump();
+                self.bump();
+                dims += 1;
+            }
+            out.push(Param {
+                mods,
+                ty: wrap_dims(ty, dims),
+                varargs,
+                name,
+            });
+            if !self.eat(",") {
+                self.expect(")");
+                break;
+            }
+        }
+        out
+    }
+
+    fn sync_param(&mut self) {
+        // 跳到 `,` 或 `)`
+        let mut depth = 0i32;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > STEP_GUARD || self.at_eof() {
+                break;
+            }
+            if depth == 0 && self.at_punct(",") {
+                self.bump();
+                break;
+            }
+            if depth == 0 && self.at_punct(")") {
+                self.bump();
+                break;
+            }
+            match &self.tok().tok {
+                Tok::Punct("(") | Tok::Punct("[") | Tok::Punct("{") | Tok::Punct("<") => {
+                    depth += 1
+                }
+                Tok::Punct(")") | Tok::Punct("]") | Tok::Punct("}") | Tok::Punct(">") => {
+                    depth -= 1
+                }
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
+    fn throws_clause(&mut self) -> Vec<String> {
+        if !self.at_kw("throws") {
+            return Vec::new();
+        }
+        self.bump();
+        self.type_list()
+    }
+
+    // ---- 类型 ----
+
+    /// 解析类型（含数组后缀）；失败返回 None（调用方自行保存 pos 回滚）。
+    fn parse_type(&mut self) -> Option<JType> {
+        let base = self.parse_type_base()?;
+        let mut ty = base;
+        while self.at_punct("[") && self.peek(1).is_punct("]") {
+            self.bump();
+            self.bump();
+            ty = JType::Array(Box::new(ty));
+        }
+        Some(ty)
+    }
+
+    /// 解析"基类型"（不含 `[]` 后缀）——`new int[3]` 的 `[]` 属于数组创建。
+    fn parse_type_base(&mut self) -> Option<JType> {
+        let base = match &self.tok().tok {
+            Tok::Ident(i) if is_primitive_kw(i) => {
+                let t = match i.as_str() {
+                    "byte" => JType::Byte,
+                    "short" => JType::Short,
+                    "int" => JType::Int,
+                    "long" => JType::Long,
+                    "char" => JType::Char,
+                    "float" => JType::Float,
+                    "double" => JType::Double,
+                    "boolean" => JType::Bool,
+                    _ => JType::Void,
+                };
+                self.bump();
+                t
+            }
+            Tok::Ident(i) if !is_type_reserved(i) => {
+                let mut name = i.clone();
+                self.bump();
+                // 点分名
+                while self.at_punct(".") {
+                    if let Tok::Ident(_) = &self.peek(1).tok {
+                        self.bump();
+                        let seg = match &self.tok().tok {
+                            Tok::Ident(s) => s.clone(),
+                            _ => break,
+                        };
+                        self.bump();
+                        name.push('.');
+                        name.push_str(&seg);
+                    } else {
+                        break;
+                    }
+                }
+                // 泛型参数（原文并入类型名）
+                if self.at_punct("<") {
+                    if let Some(text) = self.type_args_raw() {
+                        name.push_str(&text);
+                    }
+                }
+                JType::Ref(name)
+            }
+            _ => return None,
+        };
+        Some(base)
+    }
+
+    /// 泛型实参原文（含尖括号）。处理 `>>`/`>>>` 多重闭合。
+    fn type_args_raw(&mut self) -> Option<String> {
+        if !self.at_punct("<") {
+            return None;
+        }
+        let start = self.cur_start();
+        let mut depth = 0i32;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > 100_000 || self.at_eof() {
+                return None;
+            }
+            if self.at_punct("<") {
+                depth += 1;
+                self.bump();
+                continue;
+            }
+            let closes = match &self.tok().tok {
+                Tok::Punct(">") => 1,
+                Tok::Punct(">>") => 2,
+                Tok::Punct(">>>") => 3,
+                _ => 0,
+            };
+            if closes > 0 {
+                depth -= closes;
+                self.bump();
+                if depth <= 0 {
+                    break;
+                }
+                continue;
+            }
+            if matches!(self.tok().tok, Tok::Ident(_))
+                || matches!(&self.tok().tok, Tok::Punct(p) if matches!(*p, "." | "," | "?" | "&" | "|" | "[" | "]" | "(" | ")"))
+            {
+                self.bump();
+                continue;
+            }
+            return None; // 非法字符出现在泛型里
+        }
+        Some(self.text_of(start, self.t[self.pos - 1].end))
+    }
+
+    // ---- 语句 ----
+
+    fn parse_block_raw(&mut self) -> JavaId {
+        if !self.at_punct("{") {
+            self.err_at("expected block");
+            let text = self.sync_member();
+            return self.ast.raw(&text);
+        }
+        let mut children = Vec::new();
+        self.bump(); // {
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > STEP_GUARD {
+                break;
+            }
+            if self.at_eof() {
+                self.err_at("unexpected EOF in block");
+                break;
+            }
+            if self.at_punct("}") {
+                self.bump();
+                break;
+            }
+            let s = self.parse_stmt();
+            children.push(s);
+        }
+        self.ast.block(children)
+    }
+
+    fn parse_stmt(&mut self) -> JavaId {
+        let start = self.cur_start();
+        // 块
+        if self.at_punct("{") {
+            return self.parse_block_raw();
+        }
+        // 语句级注解：@Anno(...) 后跟声明/语句 → 整条原文保真（注解附着性暂不建模）
+        if self.at_punct("@") {
+            self.bump();
+            self.bump(); // 注解名
+            if self.at_punct("(") {
+                self.skip_balanced("(", ")");
+            }
+            let _ = self.parse_stmt();
+            let end = self.tok().start;
+            let text = self.text_of(start, end).trim().to_string();
+            return if text.is_empty() {
+                self.ast.empty()
+            } else {
+                self.ast.raw(&text)
+            };
+        }
+        // 空语句
+        if self.at_punct(";") {
+            self.bump();
+            return self.ast.empty();
+        }
+        // 语句关键字
+        if self.at_kw("if") {
+            self.bump();
+            let cond = self
+                .paren_expr()
+                .unwrap_or_else(|| self.ast.raw("/*bad cond*/"));
+            let then = self.stmt_or_block();
+            let mut els = None;
+            if self.at_kw("else") {
+                self.bump();
+                els = Some(self.stmt_or_block());
+            }
+            return self.ast.if_(cond, then, els);
+        }
+        if self.at_kw("while") {
+            self.bump();
+            let cond = self
+                .paren_expr()
+                .unwrap_or_else(|| self.ast.raw("/*bad cond*/"));
+            let body = self.stmt_or_block();
+            return self.ast.while_(cond, body);
+        }
+        if self.at_kw("do") {
+            self.bump();
+            let body = self.stmt_or_block();
+            if !self.expect("while") {
+                let text = self.take_raw(start);
+                return self.ast.raw(&text);
+            }
+            let cond = self
+                .paren_expr()
+                .unwrap_or_else(|| self.ast.raw("/*bad cond*/"));
+            self.expect(";");
+            return self.ast.do_while(body, cond);
+        }
+        if self.at_kw("for") {
+            self.bump();
+            return self.parse_for();
+        }
+        if self.at_kw("try") {
+            self.bump();
+            return self.parse_try();
+        }
+        if self.at_kw("switch") {
+            self.bump();
+            return self.parse_switch();
+        }
+        if self.at_kw("synchronized") {
+            self.bump();
+            let lock = self
+                .paren_expr()
+                .unwrap_or_else(|| self.ast.raw("/*bad lock*/"));
+            let body = self.parse_block_raw();
+            return self.ast.synchronized(lock, body);
+        }
+        if self.at_kw("return") {
+            self.bump();
+            let value = if self.at_punct(";") {
+                None
+            } else {
+                self.parse_expr(PREC_ASSIGN)
+            };
+            self.expect(";");
+            return self.ast.ret(value);
+        }
+        if self.at_kw("throw") {
+            self.bump();
+            let e = self.parse_expr(PREC_ASSIGN);
+            self.expect(";");
+            match e {
+                Some(e) => return self.ast.throw(e),
+                None => {
+                    let t = self.ast.raw("/*bad throw*/");
+                    return self.ast.throw(t);
+                }
+            }
+        }
+        if self.at_kw("break") || self.at_kw("continue") {
+            let is_break = self.at_kw("break");
+            self.bump();
+            let label = match &self.tok().tok {
+                Tok::Ident(i) if !self.at_punct(";") => {
+                    let l = i.clone();
+                    self.bump();
+                    Some(l)
+                }
+                _ => None,
+            };
+            self.expect(";");
+            return if is_break {
+                self.ast.break_(label.as_deref())
+            } else {
+                self.ast.continue_(label.as_deref())
+            };
+        }
+        if self.at_kw("yield") {
+            // switch 表达式块内的 yield：原文保真（语义不触碰）
+            let start = self.cur_start();
+            self.bump();
+            if self.parse_expr(PREC_ASSIGN).is_none() {
+                self.err_at("bad yield");
+            }
+            let end = if self.eat(";") {
+                self.t[self.pos - 1].end
+            } else {
+                self.tok().start
+            };
+            let text = self.text_of(start, end).trim().to_string();
+            return self.ast.raw(&text);
+        }
+        if self.at_kw("assert") {
+            self.bump();
+            let cond = self
+                .parse_expr(PREC_TERNARY)
+                .unwrap_or_else(|| self.ast.raw("/*bad assert*/"));
+            let msg = if self.eat(":") {
+                self.parse_expr(PREC_ASSIGN)
+            } else {
+                None
+            };
+            self.expect(";");
+            return self.ast.assert_(cond, msg);
+        }
+        if self.at_kw("class")
+            || self.at_kw("interface")
+            || self.at_kw("enum")
+            || self.at_kw("record")
+        {
+            // 局部类声明：原文保真
+            let text = self.sync_member();
+            return self.ast.raw(&text);
+        }
+        // 标签语句： Ident ':'
+        if let Tok::Ident(_) = &self.tok().tok {
+            if self.peek(1).is_punct(":") && !self.peek(2).text().starts_with(':') {
+                let name = match &self.tok().tok {
+                    Tok::Ident(i) => i.clone(),
+                    _ => unreachable!(),
+                };
+                self.bump();
+                self.bump();
+                let inner = self.parse_stmt();
+                return self.ast.label(&name, inner);
+            }
+        }
+        // 局部变量声明 vs 表达式语句（回溯判定）
+        let save = self.pos;
+        if let Some(ty) = self.try_decl_prefix() {
+            let mut first_name = match &self.tok().tok {
+                Tok::Ident(i) => {
+                    let n = i.clone();
+                    self.bump();
+                    Some(n)
+                }
+                _ => None,
+            };
+            if first_name.is_none() {
+                self.pos = save;
+                return self.expr_stmt_fallback(start);
+            }
+            let name0 = first_name.take().unwrap();
+            let mut extra = 0u32;
+            while self.at_punct("[") && self.peek(1).is_punct("]") {
+                self.bump();
+                self.bump();
+                extra += 1;
+            }
+            let ty0 = wrap_dims(ty, extra);
+            let mut decls: Vec<(String, JType, Option<JavaId>)> = Vec::new();
+            // 第一个声明符
+            let had_eq = self.eat("=");
+            let init0 = if had_eq {
+                self.parse_expr(PREC_ASSIGN)
+            } else {
+                None
+            };
+            if had_eq && init0.is_none() {
+                // `int x = ;` 这类残缺：整条语句原文保真
+                return self.raw_from(start);
+            }
+            decls.push((name0, ty0, init0));
+            // 后续声明符 `, name [= init]`
+            let mut guard = 0usize;
+            loop {
+                guard += 1;
+                if guard > 10_000 {
+                    break;
+                }
+                if !self.eat(",") {
+                    break;
+                }
+                let name = match &self.tok().tok {
+                    Tok::Ident(i) => {
+                        let n = i.clone();
+                        self.bump();
+                        n
+                    }
+                    _ => {
+                        self.err_at("bad declarator");
+                        break;
+                    }
+                };
+                let mut d_extra = 0u32;
+                while self.at_punct("[") && self.peek(1).is_punct("]") {
+                    self.bump();
+                    self.bump();
+                    d_extra += 1;
+                }
+                let had_eq = self.eat("=");
+                let init = if had_eq {
+                    self.parse_expr(PREC_ASSIGN)
+                } else {
+                    None
+                };
+                if had_eq && init.is_none() {
+                    return self.raw_from(start);
+                }
+                // 后续声明符继承首声明符类型（去掉数组维度后），JType::Var 不回加
+                let base = match &decls[0].1 {
+                    JType::Array(inner) => (**inner).clone(),
+                    other => other.clone(),
+                };
+                decls.push((name, wrap_dims(base, d_extra), init));
+            }
+            self.expect(";");
+            if decls.len() == 1 {
+                let (n, t, i) = &decls[0];
+                return self.ast.var_decl(n, t.clone(), i.clone());
+            }
+            // 多声明符 → 兄弟语句，用无语义差 Block 承载（打印时同缩进展开）
+            let stmts = decls
+                .iter()
+                .map(|(n, t, i)| self.ast.var_decl(n, t.clone(), i.clone()))
+                .collect();
+            return self.ast.block(stmts);
+        }
+        self.pos = save;
+        self.expr_stmt_fallback(start)
+    }
+
+    fn expr_stmt_fallback(&mut self, start: usize) -> JavaId {
+        match self.parse_expr(PREC_ASSIGN) {
+            Some(e) => {
+                if self.eat(";") || self.at_punct("}") || self.at_eof() {
+                    // 正常，或块尾缺分号（容忍）
+                    self.ast.expr_stmt(e)
+                } else {
+                    // 表达式后还有残留 token → 语句不完整，整体 Raw 保真
+                    self.raw_from(start)
+                }
+            }
+            None => self.raw_from(start),
+        }
+    }
+
+    /// 尝试判定"局部变量声明"前缀（类型 + 名字）。成功则消费类型与名字之前的
+    /// token（名字不消费，由调用方处理），失败回滚。
+    fn try_decl_prefix(&mut self) -> Option<JType> {
+        let save = self.pos;
+        // var x = ...（上下文关键字）
+        if self.at_kw("var") {
+            if let Tok::Ident(_) = &self.peek(1).tok {
+                let t = JType::Var;
+                self.bump();
+                return Some(t);
+            }
+            return None;
+        }
+        // final 修饰
+        let saw_final = self.eat("final");
+        let ty = self.parse_type();
+        if ty.is_none() {
+            self.pos = save;
+            return None;
+        }
+        let ty = ty.unwrap();
+        let _ = saw_final;
+        match &self.tok().tok {
+            Tok::Ident(_) => Some(ty),
+            _ => {
+                self.pos = save;
+                None
+            }
+        }
+    }
+
+    fn stmt_or_block(&mut self) -> JavaId {
+        if self.at_punct("{") {
+            self.parse_block_raw()
+        } else if self.at_punct(";") {
+            self.bump();
+            self.ast.empty()
+        } else {
+            self.parse_stmt()
+        }
+    }
+
+    fn paren_expr(&mut self) -> Option<JavaId> {
+        if !self.expect("(") {
+            return None;
+        }
+        let e = self.parse_expr(PREC_ASSIGN);
+        self.expect(")");
+        e
+    }
+
+    fn parse_for(&mut self) -> JavaId {
+        let for_start = self.cur_start();
+        if !self.expect("(") {
+            let text = self.sync_stmt();
+            return self.ast.raw(&text);
+        }
+        // for-each 判定
+        let save = self.pos;
+        while self.at_kw("final") {
+            self.bump();
+        }
+        if let Some(ty) = self.parse_type() {
+            if let Tok::Ident(n) = &self.tok().tok {
+                let name = n.clone();
+                self.bump();
+                if self.at_punct(":") {
+                    self.bump();
+                    let iterable = self.parse_expr(PREC_ASSIGN);
+                    self.expect(")");
+                    let body = self.stmt_or_block();
+                    let iterable = match iterable {
+                        Some(e) => e,
+                        None => self.ast.empty(),
+                    };
+                    return self.ast.for_each(&name, ty, iterable, body);
+                }
+            }
+        }
+        self.pos = save;
+        // 经典 for
+        let mut inits: Vec<JavaId> = Vec::new();
+        if !self.at_punct(";") {
+            let save2 = self.pos;
+            if let Some(ty) = self.try_decl_prefix() {
+                // 声明式 init：`int i = 0, j = 1`（后续声明符无类型 token）
+                let name = match &self.tok().tok {
+                    Tok::Ident(i) => {
+                        let n = i.clone();
+                        self.bump();
+                        n
+                    }
+                    _ => {
+                        self.err_at("bad for-init");
+                        String::new()
+                    }
+                };
+                let mut extra = 0u32;
+                while self.at_punct("[") && self.peek(1).is_punct("]") {
+                    self.bump();
+                    self.bump();
+                    extra += 1;
+                }
+                let had_eq = self.eat("=");
+                let init = if had_eq {
+                    self.parse_expr(PREC_ASSIGN)
+                } else {
+                    None
+                };
+                if had_eq && init.is_none() {
+                    return self.raw_from(for_start);
+                }
+                inits.push(self.ast.var_decl(&name, wrap_dims(ty, extra), init));
+                while self.eat(",") {
+                    let n2 = match &self.tok().tok {
+                        Tok::Ident(i) => {
+                            let n = i.clone();
+                            self.bump();
+                            n
+                        }
+                        _ => {
+                            self.err_at("bad for-init declarator");
+                            break;
+                        }
+                    };
+                    let mut d_extra = 0u32;
+                    while self.at_punct("[") && self.peek(1).is_punct("]") {
+                        self.bump();
+                        self.bump();
+                        d_extra += 1;
+                    }
+                    let init2 = if self.eat("=") {
+                        self.parse_expr(PREC_ASSIGN)
+                    } else {
+                        None
+                    };
+                    // with_type=false 打印时只输出名字，类型用 Var 占位即可
+                    inits.push(self.ast.var_decl(&n2, wrap_dims(JType::Var, d_extra), init2));
+                }
+                self.expect(";");
+            } else {
+                self.pos = save2;
+                // 表达式 init
+                loop {
+                    if self.at_punct(";") || self.at_eof() {
+                        break;
+                    }
+                    match self.parse_expr(PREC_ASSIGN) {
+                        Some(e) => inits.push(self.ast.expr_stmt(e)),
+                        None => break,
+                    }
+                    if !self.eat(",") {
+                        break;
+                    }
+                }
+                self.expect(";");
+            }
+        } else {
+            self.bump();
+        }
+        let cond = if self.at_punct(";") {
+            None
+        } else {
+            self.parse_expr(PREC_ASSIGN)
+        };
+        self.expect(";");
+        let mut steps = Vec::new();
+        while !self.at_punct(")") && !self.at_eof() {
+            if let Some(e) = self.parse_expr(PREC_ASSIGN) {
+                steps.push(self.ast.expr_stmt(e));
+            } else {
+                break;
+            }
+            if !self.eat(",") {
+                break;
+            }
+        }
+        self.expect(")");
+        let body = self.stmt_or_block();
+        // steps 存的是 ExprStmt，解包成裸表达式（For 头部打印不带分号）
+        let steps_bare: Vec<JavaId> = steps
+            .into_iter()
+            .map(|s| match self.ast.data(s) {
+                NodeData::ExprStmt => self.ast.children(s)[0],
+                _ => s,
+            })
+            .collect();
+        self.ast.for_(inits, cond, steps_bare, body)
+    }
+
+    fn parse_try(&mut self) -> JavaId {
+        let mut resources = Vec::new();
+        if self.at_punct("(") {
+            self.bump();
+            let mut guard = 0usize;
+            loop {
+                guard += 1;
+                if guard > 10_000 || self.at_eof() {
+                    break;
+                }
+                if self.at_punct(")") {
+                    self.bump();
+                    break;
+                }
+                // 资源：声明或表达式
+                let save = self.pos;
+                let mut is_decl = false;
+                if self.at_kw("var") || self.at_kw("final") || self.try_decl_prefix().is_some() {
+                    is_decl = true;
+                }
+                self.pos = save;
+                if is_decl {
+                    if let Some(ty) = self.try_decl_prefix() {
+                        let name = match &self.tok().tok {
+                            Tok::Ident(i) => {
+                                let n = i.clone();
+                                self.bump();
+                                n
+                            }
+                            _ => {
+                                self.err_at("bad resource");
+                                break;
+                            }
+                        };
+                        let init = if self.eat("=") {
+                            self.parse_expr(PREC_ASSIGN)
+                        } else {
+                            None
+                        };
+                        resources.push(self.ast.var_decl(&name, ty, init));
+                    }
+                } else if let Some(e) = self.parse_expr(PREC_ASSIGN) {
+                    resources.push(self.ast.expr_stmt(e));
+                } else {
+                    self.err_at("bad resource");
+                    break;
+                }
+                if !self.eat(";") {
+                    self.expect(")");
+                    break;
+                }
+            }
+        }
+        let try_block = self.parse_block_raw();
+        let mut catches = Vec::new();
+        while self.at_kw("catch") {
+            self.bump();
+            if !self.expect("(") {
+                break;
+            }
+            // 多类型 catch：A | B | C
+            let mut ty_parts: Vec<String> = Vec::new();
+            let mut guard = 0usize;
+            loop {
+                guard += 1;
+                if guard > 10_000 {
+                    break;
+                }
+                let start = self.cur_start();
+                if self.parse_type().is_none() {
+                    self.err_at("bad catch type");
+                    break;
+                }
+                ty_parts.push(self.text_of(start, self.t[self.pos - 1].end).trim().to_string());
+                if !self.eat("|") {
+                    break;
+                }
+            }
+            let name = match &self.tok().tok {
+                Tok::Ident(i) => {
+                    let n = i.clone();
+                    self.bump();
+                    n
+                }
+                _ => {
+                    self.err_at("bad catch parameter");
+                    String::new()
+                }
+            };
+            self.expect(")");
+            let block = self.parse_block_raw();
+            catches.push(self.ast.catch_(&ty_parts.join(" | "), &name, block));
+        }
+        let mut finally = None;
+        if self.at_kw("finally") {
+            self.bump();
+            finally = Some(self.parse_block_raw());
+        }
+        self.ast.try_(resources, try_block, catches, finally)
+    }
+
+    fn parse_switch(&mut self) -> JavaId {
+        let subject = self
+            .paren_expr()
+            .unwrap_or_else(|| self.ast.raw("/*bad subject*/"));
+        if !self.expect("{") {
+            let text = self.sync_stmt();
+            return self.ast.raw(&text);
+        }
+        let mut cases = Vec::new();
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > 100_000 || self.at_eof() {
+                break;
+            }
+            if self.at_punct("}") {
+                self.bump();
+                break;
+            }
+            let mut labels = Vec::new();
+            let mut is_default = false;
+            if self.at_kw("case") {
+                self.bump();
+                self.in_case_label = true;
+                loop {
+                    // 类型模式：case Foo f [when cond] -> …（Ident + Ident 形态）
+                    if matches!(self.tok().tok, Tok::Ident(_))
+                        && matches!(self.peek(1).tok, Tok::Ident(_))
+                    {
+                        let start = self.cur_start();
+                        if self.parse_type().is_some() {
+                            if let Tok::Ident(_) = &self.tok().tok {
+                                self.bump();
+                            }
+                            // when 守卫（Java 21）：一并并入保真文本
+                            if self.at_kw("when") && !self.peek(1).is_punct("->") {
+                                self.bump();
+                                let _ = self.parse_expr(PREC_TERNARY);
+                            }
+                            let text = self.text_of(start, self.t[self.pos - 1].end);
+                            labels.push(self.ast.raw(text.trim()));
+                        } else {
+                            self.err_at("bad case label");
+                            break;
+                        }
+                    } else if let Some(e) = self.parse_expr(PREC_TERNARY) {
+                        labels.push(e);
+                    } else {
+                        self.err_at("bad case label");
+                        break;
+                    }
+                    if self.eat(",") {
+                        continue;
+                    }
+                    break;
+                }
+                self.in_case_label = false;
+            } else if self.at_kw("default") {
+                self.bump();
+                is_default = true;
+            } else {
+                // case 区外的垃圾 → 原文
+                let text = self.sync_stmt();
+                cases.push(self.ast.raw(&text));
+                continue;
+            }
+            let arrow = self.eat("->");
+            let mut stmts = Vec::new();
+            if arrow {
+                if self.at_punct("{") {
+                    stmts.push(self.parse_block_raw());
+                } else {
+                    let s = self.parse_stmt();
+                    stmts.push(s);
+                }
+            } else {
+                self.expect(":");
+                let mut g2 = 0usize;
+                loop {
+                    g2 += 1;
+                    if g2 > STEP_GUARD || self.at_eof() {
+                        break;
+                    }
+                    if self.at_kw("case") || self.at_kw("default") || self.at_punct("}") {
+                        break;
+                    }
+                    stmts.push(self.parse_stmt());
+                }
+            }
+            cases.push(self.ast.case_(labels, is_default, arrow, stmts));
+        }
+        self.ast.switch_(subject, cases)
+    }
+
+    // ---- 表达式（Pratt）----
+
+    fn parse_expr(&mut self, min_prec: u8) -> Option<JavaId> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            let (op_prec, right_assoc) = self.binop_at();
+            if self.at_kw("instanceof") && PREC_RELATIONAL >= min_prec {
+                self.bump();
+                let ty = self.parse_type()?;
+                let bind = match &self.tok().tok {
+                    Tok::Ident(i) if !is_reserved_after_type(i) => {
+                        let b = i.clone();
+                        self.bump();
+                        Some(b)
+                    }
+                    _ => None,
+                };
+                lhs = self.ast.instance_of(lhs, ty, bind.as_deref());
+                continue;
+            }
+            if op_prec == 0 || op_prec < min_prec {
+                break;
+            }
+            if right_assoc {
+                // 赋值 / 三元
+                if self.at_punct("?") {
+                    self.bump();
+                    let a = self.parse_expr(PREC_ASSIGN)?;
+                    self.expect(":");
+                    let b = self.parse_expr(PREC_TERNARY)?;
+                    lhs = self.ast.ternary(lhs, a, b);
+                    continue;
+                }
+                let op = self.assign_op_take();
+                let rhs = self.parse_expr(PREC_ASSIGN)?;
+                lhs = match op {
+                    Some(o) => self.ast.assign_op(o, lhs, rhs),
+                    None => self.ast.assign(lhs, rhs),
+                };
+                continue;
+            }
+            let op = self.binop_take();
+            let rhs = self.parse_expr(op_prec + 1)?;
+            lhs = self.ast.bin(op, lhs, rhs);
+        }
+        Some(lhs)
+    }
+
+    /// 当前 token 是否为二元运算符；返回 (优先级, 是否右结合)。
+    fn binop_at(&self) -> (u8, bool) {
+        let t = self.tok();
+        if let Tok::Punct(p) = &t.tok {
+            let prec = match *p {
+                "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>="
+                | ">>>=" => PREC_ASSIGN,
+                "?" => PREC_TERNARY,
+                "||" => PREC_OR,
+                "&&" => PREC_AND,
+                "|" => PREC_BITOR,
+                "^" => PREC_BITXOR,
+                "&" => PREC_BITAND,
+                "==" | "!=" => PREC_EQUALITY,
+                "<" | ">" | "<=" | ">=" => PREC_RELATIONAL,
+                "<<" | ">>" | ">>>" => PREC_SHIFT,
+                "+" | "-" => PREC_ADDITIVE,
+                "*" | "/" | "%" => PREC_MULTIPLICATIVE,
+                _ => return (0, false),
+            };
+            let ra = prec == PREC_ASSIGN || prec == PREC_TERNARY;
+            return (prec, ra);
+        }
+        (0, false)
+    }
+
+    /// 消费二元运算符（仅非赋值、非三元）。
+    fn binop_take(&mut self) -> BinOp {
+        use BinOp::*;
+        let t = self.bump();
+        let s = t.text();
+        match s.as_str() {
+            "||" => Or,
+            "&&" => And,
+            "|" => BitOr,
+            "^" => BitXor,
+            "&" => BitAnd,
+            "==" => Eq,
+            "!=" => Ne,
+            "<" => Lt,
+            "<=" => Le,
+            ">" => Gt,
+            ">=" => Ge,
+            "<<" => Shl,
+            ">>" => Shr,
+            ">>>" => UShr,
+            "+" => Add,
+            "-" => Sub,
+            "*" => Mul,
+            "/" => Div,
+            "%" => Rem,
+            _ => unreachable!("{s}"),
+        }
+    }
+
+    fn assign_op_take(&mut self) -> Option<BinOp> {
+        let t = self.bump();
+        match t.text().as_str() {
+            "=" => None,
+            "+=" => Some(BinOp::Add),
+            "-=" => Some(BinOp::Sub),
+            "*=" => Some(BinOp::Mul),
+            "/=" => Some(BinOp::Div),
+            "%=" => Some(BinOp::Rem),
+            "&=" => Some(BinOp::BitAnd),
+            "|=" => Some(BinOp::BitOr),
+            "^=" => Some(BinOp::BitXor),
+            "<<=" => Some(BinOp::Shl),
+            ">>=" => Some(BinOp::Shr),
+            ">>>=" => Some(BinOp::UShr),
+            _ => None,
+        }
+    }
+
+    fn parse_unary(&mut self) -> Option<JavaId> {
+        // 前缀一元
+        let t = self.tok().clone();
+        let prefix = match &t.tok {
+            Tok::Punct("!") => Some(UnOp::Not),
+            Tok::Punct("~") => Some(UnOp::BitNot),
+            Tok::Punct("-") => Some(UnOp::Neg),
+            Tok::Punct("++") => Some(UnOp::PreInc),
+            Tok::Punct("--") => Some(UnOp::PreDec),
+            Tok::Punct("+") => Some(UnOp::Neg), // 一元 + 用 Neg 占位，实际直接忽略
+            _ => None,
+        };
+        if let Some(op) = prefix {
+            if t.is_punct("+") {
+                // 一元 + 无语义（数值提升），直接丢弃
+                self.bump();
+                return self.parse_unary();
+            }
+            self.bump();
+            let operand = self.parse_unary()?;
+            return Some(self.ast.un(op, operand));
+        }
+        // ( → lambda / cast / 括号（后缀循环仍需处理其后的 .member/[i] 等）
+        let mut e = if self.at_punct("(") {
+            self.parse_paren_prefixed()?
+        } else {
+            self.parse_primary()?
+        };
+        // 后缀循环
+        loop {
+            if self.at_punct(".") {
+                self.bump();
+                match &self.tok().tok {
+                    Tok::Ident(name) => {
+                        let n = name.clone();
+                        self.bump();
+                        if self.at_punct("(") {
+                            let args = self.call_args()?;
+                            let m = self.ast.member(e, &n);
+                            e = self.ast.call(m, args);
+                        } else {
+                            e = self.ast.member(e, &n);
+                        }
+                    }
+                    Tok::Punct("<") => {
+                        // 显式泛型方法调用 this.<T>foo() —— 罕见，跳过泛型原文
+                        if self.type_args_raw().is_none() {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+                continue;
+            }
+            if self.at_punct("[") {
+                self.bump();
+                let idx = self.parse_expr(PREC_ASSIGN)?;
+                self.expect("]");
+                e = self.ast.index(e, idx);
+                continue;
+            }
+            if self.at_punct("++") {
+                self.bump();
+                e = self.ast.un(UnOp::PostInc, e);
+                continue;
+            }
+            if self.at_punct("--") {
+                self.bump();
+                e = self.ast.un(UnOp::PostDec, e);
+                continue;
+            }
+            if self.at_punct("::") {
+                self.bump();
+                let name = match &self.tok().tok {
+                    Tok::Ident(i) => {
+                        let n = i.clone();
+                        self.bump();
+                        n
+                    }
+                    Tok::Punct("<") => {
+                        let _ = self.type_args_raw();
+                        match &self.tok().tok {
+                            Tok::Ident(i) => {
+                                let n = i.clone();
+                                self.bump();
+                                n
+                            }
+                            _ => break,
+                        }
+                    }
+                    _ => break,
+                };
+                e = self.ast.method_ref(e, &name);
+                continue;
+            }
+            break;
+        }
+        Some(e)
+    }
+
+    fn parse_paren_prefixed(&mut self) -> Option<JavaId> {
+        // 1) lambda: ( ... ) ->
+        let save = self.pos;
+        if let Some(inner) = self.skip_balanced("(", ")") {
+            if self.at_punct("->") {
+                self.bump();
+                // 去掉 skip_balanced 带回的外层括号
+                let params = inner
+                    .trim()
+                    .strip_prefix('(')
+                    .and_then(|t| t.strip_suffix(')'))
+                    .unwrap_or(inner.trim())
+                    .trim()
+                    .to_string();
+                let body = if self.at_punct("{") {
+                    self.parse_block_raw()
+                } else {
+                    self.parse_expr(PREC_ASSIGN)?
+                };
+                return Some(self.ast.lambda(&params, body));
+            }
+        }
+        self.pos = save;
+        // 2) cast: ( Type ) unary
+        if let Some(ty) = self.try_cast_type() {
+            let operand = self.parse_unary()?;
+            return Some(self.ast.cast(ty, operand));
+        }
+        // 3) 括号表达式
+        self.bump(); // (
+        let e = self.parse_expr(PREC_ASSIGN)?;
+        self.expect(")");
+        Some(e)
+    }
+
+    /// 判定 `( T ) e` 形态的 cast：类型解析成功且后随 token 可开始一元表达式。
+    fn try_cast_type(&mut self) -> Option<JType> {
+        let save = self.pos;
+        self.bump(); // (
+        let ty = self.parse_type();
+        let ok = match ty {
+            Some(ty) => {
+                if self.at_punct(")") {
+                    let nxt = self.peek(1);
+                    if starts_unary_operand(nxt) {
+                        self.bump(); // )
+                        Some(ty)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        if ok.is_none() {
+            self.pos = save;
+        }
+        ok
+    }
+
+    fn parse_primary(&mut self) -> Option<JavaId> {
+        let t = self.tok().clone();
+        match &t.tok {
+            Tok::Num(text) => {
+                self.bump();
+                Some(self.ast.lit(num_lit(text)))
+            }
+            Tok::Str(s) => {
+                self.bump();
+                Some(self.ast.lit(Lit::Str(unescape_java_str(&s[1..s.len().saturating_sub(1)]))))
+            }
+            Tok::Char(c) => {
+                self.bump();
+                let inner = &c[1..c.len().saturating_sub(1)];
+                Some(self.ast.lit(Lit::Char(unescape_java_char(inner))))
+            }
+            Tok::TextBlock(content) => {
+                self.bump();
+                Some(self.ast.lit(Lit::TextBlock(content.clone())))
+            }
+            Tok::Ident(i) => {
+                let name = i.clone();
+                match name.as_str() {
+                    "true" => {
+                        self.bump();
+                        return Some(self.ast.lit(Lit::Bool(true)));
+                    }
+                    "false" => {
+                        self.bump();
+                        return Some(self.ast.lit(Lit::Bool(false)));
+                    }
+                    "null" => {
+                        self.bump();
+                        return Some(self.ast.lit(Lit::Null));
+                    }
+                    "new" => {
+                        self.bump();
+                        return self.parse_new();
+                    }
+                    "switch" => {
+                        // switch 表达式：return switch (x) { … }
+                        self.bump();
+                        return Some(self.parse_switch());
+                    }
+                    "this" => {
+                        self.bump();
+                        // this(...) 构造器调用
+                        if self.at_punct("(") {
+                            let recv = self.ast.this();
+                            let args = self.call_args()?;
+                            return Some(self.ast.call(recv, args));
+                        }
+                        return Some(self.ast.this());
+                    }
+                    "super" => {
+                        self.bump();
+                        if self.at_punct("(") {
+                            let recv = self.ast.super_();
+                            let args = self.call_args()?;
+                            return Some(self.ast.call(recv, args));
+                        }
+                        return Some(self.ast.super_());
+                    }
+                    _ => {}
+                }
+                self.bump();
+                // 类字面量 Foo.class / int.class
+                if self.at_punct(".") && self.peek(1).is_ident("class") {
+                    self.bump();
+                    self.bump();
+                    return Some(self.ast.var(&format!("{name}.class")));
+                }
+                // 标识符 lambda: x -> ...（case 标签内 `A ->` 是 switch 箭头，不是 lambda）
+                if self.at_punct("->") && !self.in_case_label {
+                    self.bump();
+                    let body = if self.at_punct("{") {
+                        self.parse_block_raw()
+                    } else {
+                        self.parse_expr(PREC_ASSIGN)?
+                    };
+                    return Some(self.ast.lambda(&name, body));
+                }
+                if self.at_punct("(") {
+                    let callee = self.ast.var(&name);
+                    let args = self.call_args()?;
+                    return Some(self.ast.call(callee, args));
+                }
+                Some(self.ast.var(&name))
+            }
+            Tok::Punct("(") => self.parse_paren_prefixed(),
+            Tok::Punct("{") => {
+                // 裸数组初始化（仅声明处合法，这里兜底）
+                self.array_lit()
+            }
+            Tok::Error(_) => {
+                self.err_at("unexpected token");
+                None
+            }
+            Tok::Eof => None,
+            _ => {
+                self.err_at("unexpected token in expression");
+                None
+            }
+        }
+    }
+
+    /// 实参列表。任一参数解析失败 → 返回 None（把失败传播给整条语句，
+    /// 让语句级恢复以 Raw 保真），并同步越过本调用的右括号。
+    fn call_args(&mut self) -> Option<Vec<JavaId>> {
+        let mut args = Vec::new();
+        if !self.expect("(") {
+            return Some(args);
+        }
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > 100_000 || self.at_eof() {
+                return None;
+            }
+            if self.at_punct(")") {
+                self.bump();
+                break;
+            }
+            match self.parse_expr(PREC_ASSIGN) {
+                Some(a) => args.push(a),
+                None => {
+                    self.err_at("bad argument");
+                    self.sync_call_end();
+                    return None;
+                }
+            }
+            if !self.eat(",") {
+                self.expect(")");
+                break;
+            }
+        }
+        Some(args)
+    }
+
+    /// 消费到本调用的收尾 `)`（含），供参数解析失败后清理现场。
+    fn sync_call_end(&mut self) {
+        loop {
+            self.sync_arg();
+            if self.eat(",") {
+                continue;
+            }
+            self.eat(")");
+            break;
+        }
+    }
+
+    /// 参数失败恢复：推进到 depth-0 的 `,` 或 `)`（不消费停止 token）。
+    fn sync_arg(&mut self) {
+        let mut depth = 0i32;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > STEP_GUARD || self.at_eof() {
+                break;
+            }
+            if depth == 0 && (self.at_punct(",") || self.at_punct(")")) {
+                break;
+            }
+            match &self.tok().tok {
+                Tok::Punct("(") | Tok::Punct("[") | Tok::Punct("{") => depth += 1,
+                Tok::Punct(")") | Tok::Punct("]") | Tok::Punct("}") => depth -= 1,
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
+    fn array_lit(&mut self) -> Option<JavaId> {
+        if !self.expect("{") {
+            return None;
+        }
+        let mut elems = Vec::new();
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > 100_000 || self.at_eof() {
+                break;
+            }
+            if self.at_punct("}") {
+                self.bump();
+                break;
+            }
+            if self.at_punct(",") {
+                // 尾逗号
+                self.bump();
+                continue;
+            }
+            if let Some(e) = self.parse_expr(PREC_ASSIGN) {
+                elems.push(e);
+            } else {
+                break;
+            }
+        }
+        Some(self.ast.array_lit(elems))
+    }
+
+    fn parse_new(&mut self) -> Option<JavaId> {
+        // new Type<...>(args) [anon] | new Type[size…] [init]
+        let ty = self.parse_type_base()?;
+        if self.at_punct("(") {
+            let args = self.call_args()?;
+            let anon_raw = if self.at_punct("{") {
+                self.skip_balanced_braces()
+            } else {
+                None
+            };
+            if let Some(raw) = anon_raw {
+                return Some(self.ast.new_anon(ty, args, raw));
+            }
+            return Some(self.ast.new_(ty, args));
+        }
+        if self.at_punct("[") {
+            let mut sizes = Vec::new();
+            let mut sized = 0u16;
+            let mut dims = 0u16;
+            let mut init = None;
+            while self.at_punct("[") {
+                self.bump();
+                if self.at_punct("]") {
+                    self.bump();
+                    dims += 1;
+                    continue;
+                }
+                let e = self.parse_expr(PREC_ASSIGN)?;
+                self.expect("]");
+                sizes.push(e);
+                sized += 1;
+                dims += 1;
+            }
+            if self.at_punct("{") {
+                init = self.array_lit();
+            }
+            return Some(self.ast.new_array(ty, dims, sized, sizes, init));
+        }
+        self.err_at("bad new expression");
+        None
+    }
+
+    fn take_raw(&mut self, start: usize) -> String {
+        let text = self.sync_stmt();
+        if text.is_empty() {
+            self.text_of(start, self.tok().start)
+        } else {
+            text
+        }
+    }
+}
+
+fn starts_unary_operand(t: &Token) -> bool {
+    match &t.tok {
+        Tok::Ident(_) => true,
+        Tok::Num(_) | Tok::Str(_) | Tok::Char(_) | Tok::TextBlock(_) => true,
+        Tok::Punct(p) => matches!(*p, "(" | "!" | "~"),
+        _ => false,
+    }
+}
+
+fn is_reserved_after_type(s: &str) -> bool {
+    matches!(s, "=" | ";" | ")" | "." | ",")
+}
+
+/// 不能作为**类型起始**的 Java 保留字（含字面量关键字）。
+/// 上下文关键字（var/record/sealed/yield/permits）不在此列——它们可作类型名。
+fn is_type_reserved(s: &str) -> bool {
+    matches!(
+        s,
+        "new" | "return" | "throw" | "break" | "continue" | "if" | "else" | "while" | "do"
+            | "for" | "try" | "catch" | "finally" | "switch" | "case" | "default"
+            | "instanceof" | "assert" | "synchronized" | "class" | "interface" | "enum"
+            | "extends" | "implements" | "import" | "package" | "public" | "private"
+            | "protected" | "static" | "abstract" | "native" | "strictfp" | "transient"
+            | "volatile" | "final" | "this" | "super" | "throws" | "goto" | "const"
+            | "null" | "true" | "false"
+    )
+}
+
+fn is_primitive_kw(s: &str) -> bool {
+    matches!(
+        s,
+        "byte" | "short" | "int" | "long" | "char" | "float" | "double" | "boolean" | "void"
+    )
+}
+
+fn is_modifier_kw(s: &str) -> bool {
+    matches!(
+        s,
+        "public" | "private" | "protected" | "static" | "final" | "abstract" | "native"
+            | "synchronized" | "strictfp" | "transient" | "volatile" | "default" | "sealed"
+            | "non" | "non-sealed"
+    )
+}
+
+fn wrap_dims(ty: JType, n: u32) -> JType {
+    let mut t = ty;
+    for _ in 0..n {
+        t = JType::Array(Box::new(t));
+    }
+    t
+}
+
+// ---- 字面量解析 ----
+
+fn num_lit(text: &str) -> Lit {
+    let t = text.replace('_', "");
+    let lower = t.to_ascii_lowercase();
+    let (core, suffix) = if lower.ends_with("l") {
+        (&t[..t.len() - 1], "l")
+    } else if lower.ends_with("f") {
+        (&t[..t.len() - 1], "f")
+    } else if lower.ends_with("d") {
+        (&t[..t.len() - 1], "d")
+    } else {
+        (&t[..], "")
+    };
+    let is_float_lit = core.contains('.')
+        || core.contains('e')
+        || core.contains('E')
+        || ((core.starts_with("0x") || core.starts_with("0X")) && core.contains('p'))
+        || suffix == "f"
+        || suffix == "d";
+    if !is_float_lit {
+        let radix = if core.starts_with("0x") || core.starts_with("0X") {
+            16
+        } else if core.starts_with("0b") || core.starts_with("0B") {
+            2
+        } else if core.len() > 1 && core.starts_with('0') {
+            8
+        } else {
+            10
+        };
+        let digits: String = match radix {
+            16 => core[2..].to_string(),
+            2 => core[2..].to_string(),
+            _ => core.trim_start_matches('0').to_string(),
+        };
+        let digits: String = if digits.is_empty() { "0".to_string() } else { digits };
+        if suffix == "l" {
+            if let Ok(v) = i64::from_str_radix(&digits, radix) {
+                return Lit::NumRaw {
+                    text: text.into(),
+                    val: NumVal::Long(v),
+                };
+            }
+        } else if let Ok(v) = i64::from_str_radix(&digits, radix) {
+            return Lit::NumRaw {
+                text: text.into(),
+                val: NumVal::Int(v),
+            };
+        }
+    }
+    // 浮点
+    let mut core2 = core.to_string();
+    if (core2.starts_with("0x") || core2.starts_with("0X")) && !core2.contains('p') {
+        core2.push('p');
+        core2.push('0');
+    }
+    if suffix == "f" {
+        if let Ok(v) = core2.parse::<f32>() {
+            return Lit::NumRaw {
+                text: text.into(),
+                val: NumVal::Float(v as f64),
+            };
+        }
+    }
+    if let Ok(v) = core2.parse::<f64>() {
+        return Lit::NumRaw {
+            text: text.into(),
+            val: NumVal::Double(v),
+        };
+    }
+    Lit::NumRaw {
+        text: text.into(),
+        val: NumVal::Double(0.0),
+    }
+}
+
+/// 解析 Java 字符串转义（输入不含外层引号）。
+fn unescape_java_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{8}'),
+            Some('r') => out.push('\r'),
+            Some('f') => out.push('\u{c}'),
+            Some('0') => out.push('\0'),
+            Some('s') => out.push(' '),
+            Some('"') => out.push('"'),
+            Some('\'') => out.push('\''),
+            Some('\\') => out.push('\\'),
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                if let Ok(v) = u32::from_str_radix(&hex, 16) {
+                    if let Some(c) = char::from_u32(v) {
+                        out.push(c);
+                    }
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn unescape_java_char(s: &str) -> char {
+    let un = unescape_java_str(s);
+    un.chars().next().unwrap_or('\0')
+}
+
+// ---- 优先级常量 ----
+const PREC_ASSIGN: u8 = 2;
+const PREC_TERNARY: u8 = 3;
+const PREC_OR: u8 = 4;
+const PREC_AND: u8 = 5;
+const PREC_BITOR: u8 = 6;
+const PREC_BITXOR: u8 = 7;
+const PREC_BITAND: u8 = 8;
+const PREC_EQUALITY: u8 = 9;
+const PREC_RELATIONAL: u8 = 10;
+const PREC_SHIFT: u8 = 11;
+const PREC_ADDITIVE: u8 = 12;
+const PREC_MULTIPLICATIVE: u8 = 13;

@@ -1,0 +1,9 @@
+[package]
+name = "cure-java-print"
+description = "Canonical Java source printer / formatter over cure-java-ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cure-java-ast = { path = "../cure-java-ast" }
