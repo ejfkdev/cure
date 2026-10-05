@@ -2,8 +2,7 @@
 //!
 //! 每条规则文档化其语义前提；所有提案都必须严格降低成本（runner 校验）。
 
-/// 规则热路径的字符串集合：快速定长 hasher（Sip13 对短混淆名纯浪费）。
-type StrSet = std::collections::HashSet<String, crate::walk::IdBuild>;
+use crate::walk::StrSet;
 
 
 use crate::analysis::{prefix_effects_readable, reads_vars, subtree_contains};
@@ -541,7 +540,7 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         let use_id = uses[0];
         // 写冲突窗口 = [decl 后, 使用语句]：纯值移动到使用点，
         // 使用点之后的写不影响（值已被消费）
-        let mut writes: StrSet = StrSet::default();
+        let mut writes = StrSet::default();
         let mut use_stmt_idx = None;
         for (off, &s) in stmts[index + 1..].iter().enumerate() {
             let mut w = StrSet::default();
@@ -562,7 +561,7 @@ impl<L: Lang> Rule<L> for LocalPropagation {
                 let mut tail_shadowed = false;
                 scan_region(&*lang, s, &name, &mut tail_uses, &mut tail_writes, &mut tail_shadowed);
                 if !tail_uses.is_empty()
-                    || tail_writes.contains(&name)
+                    || tail_writes.contains(&name.as_str())
                     || tail_shadowed
                 {
                     return None;
@@ -576,10 +575,12 @@ impl<L: Lang> Rule<L> for LocalPropagation {
             // （对声明变量自身的写也包含在 writes 里，一票否决）
             let mut reads = StrSet::default();
             reads_vars(&*lang, value, &mut reads);
-            reads.insert(name.clone());
+            reads.insert(name.as_str());
             let mut effective_writes = writes.clone();
-            if let Some(target) = use_stmt_target_write(&*lang, &stmts[index + 1..], use_id, name.as_str()) {
-                effective_writes.remove(&target);
+            if let Some(target) =
+                use_stmt_target_write(&*lang, &stmts[index + 1..], use_id, name.as_str())
+            {
+                effective_writes.remove(target.as_str());
             }
             for w in &effective_writes {
                 if reads.contains(w) {
@@ -630,12 +631,12 @@ impl<L: Lang> Rule<L> for LocalPropagation {
 }
 
 /// 扫描一个语句子树：收集对 `name` 的**读**、所有显式局部写、同名声明遮蔽。
-fn scan_region<L: Lang>(
-    lang: &L,
+fn scan_region<'a, L: Lang>(
+    lang: &'a L,
     node: L::Id,
     name: &str,
     uses: &mut Vec<L::Id>,
-    writes: &mut StrSet,
+    writes: &mut StrSet<'a>,
     shadowed: &mut bool,
 ) {
     match lang.kind(node) {
@@ -644,7 +645,7 @@ fn scan_region<L: Lang>(
             if let Some(&t) = ch.first() {
                 if lang.kind(t) == NodeKind::VarRef {
                     if let Some(n) = lang.var_name(t) {
-                        writes.insert(n.to_string());
+                        writes.insert(n);
                     }
                 }
             }
@@ -657,7 +658,7 @@ fn scan_region<L: Lang>(
             if let Some(&t) = ch.first() {
                 if lang.kind(t) == NodeKind::VarRef {
                     if let Some(n) = lang.var_name(t) {
-                        writes.insert(n.to_string());
+                        writes.insert(n);
                     }
                 }
             }
@@ -667,7 +668,7 @@ fn scan_region<L: Lang>(
                 if n == name {
                     *shadowed = true;
                 }
-                writes.insert(n.to_string());
+                writes.insert(n);
             }
             for &c in lang.children(node) {
                 scan_region(lang, c, name, uses, writes, shadowed);
@@ -681,7 +682,7 @@ fn scan_region<L: Lang>(
                     *shadowed = true;
                 }
                 if lang.kind(node) == NodeKind::ForEach {
-                    writes.insert(n.to_string());
+                    writes.insert(n);
                 }
             }
             for &c in lang.children(node) {
@@ -1222,7 +1223,7 @@ impl<L: Lang> Rule<L> for DeadStore {
                 scan_region(&*lang, s, &name, &mut uses, &mut writes, &mut shadowed);
             }
             // 只判**本名字**的读/写：writes 收集的是区域内全部写者
-            if !uses.is_empty() || writes.contains(&name) || shadowed {
+            if !uses.is_empty() || writes.contains(&name.as_str()) || shadowed {
                 return None;
             }
             if lang.effect(first_value) > Effect::MayRead {
@@ -1874,11 +1875,11 @@ impl<L: Lang> Rule<L> for AssignPropagation {
         }
         // x 自身在窗口内被写 → 赋值会被覆盖，拒绝
         let use_id = uses[0];
-        let mut writes: StrSet = StrSet::default();
+        let mut writes = StrSet::default();
         for &s in &stmts[idx + 1..] {
             let mut w = StrSet::default();
             scan_region(&*lang, s, &name, &mut Vec::new(), &mut w, &mut false);
-            if w.contains(&name) {
+            if w.contains(&name.as_str()) {
                 return None;
             }
             writes.extend(w);
@@ -1893,7 +1894,7 @@ impl<L: Lang> Rule<L> for AssignPropagation {
             reads_vars(&*lang, value, &mut reads);
             let mut effective_writes = writes.clone();
             if let Some(target) = use_stmt_target_write(&*lang, &stmts[idx + 1..], use_id, name.as_str()) {
-                effective_writes.remove(&target);
+                effective_writes.remove(target.as_str());
             }
             for w in &effective_writes {
                 if reads.contains(w) {
@@ -2090,7 +2091,7 @@ impl<L: Lang> Rule<L> for MultiUseCopyPropagation {
 
         // 扫描后续：收集 x 的全部读；对 x 的任何写 / 对 y 的任何写 / 遮蔽 → 拒绝
         let mut uses: Vec<L::Id> = Vec::new();
-        let mut writes: StrSet = StrSet::default();
+        let mut writes = StrSet::default();
         let mut shadowed = false;
         for &s in &stmts[idx + 1..] {
             scan_region(&*lang, s, &name, &mut uses, &mut writes, &mut shadowed);

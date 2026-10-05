@@ -7,14 +7,14 @@ use crate::lang::Lang;
 /// `node` 子树中**显式写**的局部变量名集合。
 /// 注意：`Call`/`Member` 等不可知的写不计入——但那些节点的 effect 会是
 /// Unknown/MayThrow，调用方须先按 effect 分类，再对“只读局部”路径用本函数。
-pub fn local_writes<L: Lang>(lang: &L, id: L::Id, out: &mut crate::walk::StrSet) {
+pub fn local_writes<'a, L: Lang>(lang: &'a L, id: L::Id, out: &mut crate::walk::StrSet<'a>) {
     match lang.kind(id) {
         NodeKind::Assign => {
             let children = lang.children(id);
             if let Some(&t) = children.first() {
                 if lang.kind(t) == NodeKind::VarRef {
                     if let Some(n) = lang.var_name(t) {
-                        out.insert(n.to_string());
+                        out.insert(n);
                     }
                 }
             }
@@ -29,7 +29,7 @@ pub fn local_writes<L: Lang>(lang: &L, id: L::Id, out: &mut crate::walk::StrSet)
                     if let Some(&t) = children.first() {
                         if lang.kind(t) == NodeKind::VarRef {
                             if let Some(n) = lang.var_name(t) {
-                                out.insert(n.to_string());
+                                out.insert(n);
                             }
                         }
                     }
@@ -41,7 +41,7 @@ pub fn local_writes<L: Lang>(lang: &L, id: L::Id, out: &mut crate::walk::StrSet)
         }
         NodeKind::VarDecl => {
             if let Some(n) = lang.var_name(id) {
-                out.insert(n.to_string());
+                out.insert(n);
             }
             for &c in lang.children(id) {
                 local_writes(lang, c, out);
@@ -56,10 +56,10 @@ pub fn local_writes<L: Lang>(lang: &L, id: L::Id, out: &mut crate::walk::StrSet)
 }
 
 /// `node` 子树中所有被**读**的变量名（VarRef）。
-pub fn reads_vars<L: Lang>(lang: &L, id: L::Id, out: &mut crate::walk::StrSet) {
+pub fn reads_vars<'a, L: Lang>(lang: &'a L, id: L::Id, out: &mut crate::walk::StrSet<'a>) {
     if lang.kind(id) == NodeKind::VarRef {
         if let Some(n) = lang.var_name(id) {
-            out.insert(n.to_string());
+            out.insert(n);
         }
     }
     for &c in lang.children(id) {

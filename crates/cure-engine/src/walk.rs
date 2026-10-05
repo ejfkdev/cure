@@ -46,7 +46,8 @@ impl Hasher for IdHasher {
 pub type IdBuild = BuildHasherDefault<IdHasher>;
 pub(crate) type IdMap<K, V> = HashMap<K, V, IdBuild>;
 /// 字符串集合（规则热路径）：同一快速 hasher。
-pub type StrSet = std::collections::HashSet<String, IdBuild>;
+/// 借用字符串集合（规则热路径）：键借自 AST，零分配。
+pub type StrSet<'a> = std::collections::HashSet<&'a str, IdBuild>;
 
 /// 先序遍历的快照：id 列表 + 每个非根节点的 (parent, child_index)。
 ///
