@@ -91,7 +91,7 @@ local_propagation、**decl_assign_merge**、**assign_propagation**（拷贝赋�
 **trailing_continue**（标签感知：循环体尾部 continue，标签指向本循环才删）、
 dead_store + 选配 unreachable_after_terminal。
 
-Java 专属（14）：cast_simplify、self_compare、string_builder_fold、box_unbox_chain、
+Java 专属（15）：cast_simplify、self_compare、string_builder_fold、box_unbox_chain、
 iterator_to_for_each、while_iterator_to_for_each（支持 Cast/Paren 包裹的 next()）、
 new_string_fold、loop_head_break、concat_value_of_drop、
 **string_builder_statements**（语句级 SB 链还原：重赋值+新变量混合形态
@@ -106,7 +106,13 @@ new_string_fold、loop_head_break、concat_value_of_drop、
 **只在求值成功时折叠**——解析失败/越界/异常路径保持原样；
 不折 toUpperCase/toLowerCase（locale 敏感））、
 **base64_new_string_fold**（`new String(Base64.getDecoder().decode("aGVsbG8=")) → "hello"`，
-标准/URL 字母表，UTF-8 合法时折叠）。
+标准/URL 字母表，UTF-8 合法时折叠）、
+**cff_recover**（**控制流扁平化还原**：`while(true){switch(s)}` 状态机 →
+结构化控制流——线性链顺序拼接、菱形找公共后继 if/else{前缀}+单次续接、
+分支回环 → while(cond){体}、链内后向边 → while(true){后缀}；
+支持哨兵出口与 default: return 两种出口形态；嵌套条件/发散/外部跳转保守拒绝）。
+引擎侧 char 参与算术按 Java 语义提升为 int 折叠；Str+Char/Int/Long/Bool
+字面量拼接直接折成字符串（浮点除外——Double.toString 算法不保证逐位一致）。
 引擎侧 char 参与算术按 Java 语义提升为 int 折叠；Str+Char/Int/Long/Bool
 字面量拼接直接折成字符串（浮点除外——Double.toString 算法不保证逐位一致）。
 
@@ -117,6 +123,13 @@ new_string_fold、loop_head_break、concat_value_of_drop、
 javac 差分逐字节一致。模式来源：obfuscator.io / javascript-obfuscator
 的 string-array 与字符串编码家族的 Java 等价形态（跨方法解密器与
 控制流扁平化需要过程间分析，暂不覆盖）。
+
+## 控制流扁平化还原验证（tests/cff_obfuscation.rs）
+
+obfuscator.io / Allatori 风格的状态机混淆——线性链（32 → 12 行）、菱形分叉
+（还原出 if/else 后继续被接力折叠成内联三元）、循环形态（`case 0: if(i<5)...`
+回环 → `while (i < 5) {...}`）、default: return 出口，全部 javac 差分逐字节一致；
+安全负例（状态变量循环后被使用 / 存在不可达 case）正确拒绝还原。
 
 ## 刁钻混淆验证（tests/hard_obfuscation.rs）
 

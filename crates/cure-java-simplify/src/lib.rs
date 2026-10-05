@@ -585,6 +585,9 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         let parent = ctx.parent(id)?;
         let idx = ctx.index(id)?;
         let lang = ctx.lang;
+        if std::env::var("CURE_DBG").is_ok() {
+            eprintln!("[cff] check called: {:?}", lang.kind(id));
+        }
         if lang.kind(id) != NodeKind::While {
             return None;
         }
@@ -1576,6 +1579,522 @@ fn base64_decode(s: &str, url_safe: bool) -> Option<Vec<u8>> {
     Some(out)
 }
 
+
+// ---------------------------------------------------------------------------
+// 控制流扁平化还原（CFF recovery，obfuscator.io / Allatori 风格）：
+//   int s = 0;
+//   while (true) {
+//       switch (s) {
+//           case 0: { A(); s = 1; break; }
+//           case 1: { if (c) { s = 2; } else { s = 3; } break; }
+//           case 2: { B(); s = 5; break; }
+//           case 3: { C(); s = 5; break; }
+//       }
+//       if (s == 5) break;      // 或 default: return
+//   }
+//   →  A(); if (c) { B(); } else { C(); }
+//
+// 状态图 → 结构化控制流：
+//   线性链顺序拼接；菱形找公共后继 if/else{前缀}+续接（单次发射）；
+//   分支回环到条件状态 → while(cond){体}；链内后向边 → while(true){后缀}。
+//   其余形态（发散/外部跳转/嵌套异常）保守拒绝。
+// 守卫：v 仅作状态变量、循环后不使用、全部 case 可达、每状态体恰发射一次。
+// ---------------------------------------------------------------------------
+
+pub struct CffRecover;
+
+struct CffCase {
+    body: Vec<JavaId>,
+    tail: CffTail,
+}
+
+enum CffTail {
+    Goto(i64),
+    Cond { cond: JavaId, a: i64, b: i64 },
+    Term(JavaId),
+    Exit,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Flow {
+    Done,
+    Stop,
+    Cycle(usize),
+    Cond(i64),
+    External(i64),
+}
+
+struct CffCtx<'a> {
+    lang: &'a mut JavaAst,
+    cases: std::collections::HashMap<i64, CffCase>,
+    /// default: return 的语句（goto 未知状态时发射）
+    default_term: Option<Vec<JavaId>>,
+    used_default: bool,
+    /// 可达性记账（含试探性分支走查）
+    reached: std::collections::HashSet<i64>,
+    /// 已实际发射的状态（分支试探不得穿入）
+    emitted: std::collections::HashSet<i64>,
+}
+
+impl Rule<JavaAst> for CffRecover {
+    fn name(&self) -> &'static str {
+        "cff_recover"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let parent = ctx.parent(id)?;
+        let idx = ctx.index(id)?;
+        let lang = ctx.lang;
+        if std::env::var("CURE_DBG").is_ok() {
+            eprintln!("[cff] check called: {:?}", lang.kind(id));
+        }
+        if lang.kind(id) != NodeKind::While {
+            return None;
+        }
+        let wch = lang.children(id).to_vec();
+        if !matches!(lang.literal(wch[0]), Some(LitRef::Bool(true))) {
+            return None;
+        }
+        if lang.kind(wch[1]) != NodeKind::Block {
+            return None;
+        }
+                let body_ch = lang.children(wch[1]).to_vec();
+        let (switch, exit_if) = match body_ch.len() {
+            1 => (body_ch[0], None),
+            2 => (body_ch[0], Some(body_ch[1])),
+            _ => return None,
+        };
+        if lang.kind(switch) != NodeKind::Switch {
+            if std::env::var("CURE_DBG").is_ok() { eprintln!("[cff] body[0] not switch: {:?}", lang.kind(switch)); }
+            return None;
+        }
+        let sch = lang.children(switch).to_vec();
+        if lang.kind(sch[0]) != NodeKind::VarRef || !lang.is_local_var(sch[0]) {
+            return None;
+        }
+        let v = lang.var_name(sch[0])?.to_string();
+
+        // 尾随出口：if (v == SENT) break;
+        let sentinel = match exit_if {
+            None => None,
+            Some(ei) => {
+                if lang.kind(ei) != NodeKind::If {
+                    return None;
+                }
+                let ich = lang.children(ei).to_vec();
+                if ich.len() != 2 || lang.bin_op(ich[0]) != Some(BinOp::Eq) {
+                    return None;
+                }
+                let cch = lang.children(ich[0]).to_vec();
+                let sent = if lang.kind(cch[0]) == NodeKind::VarRef
+                    && lang.var_name(cch[0]) == Some(v.as_str())
+                {
+                    lang.literal(cch[1]).and_then(|x| x.as_int())
+                } else if lang.kind(cch[1]) == NodeKind::VarRef
+                    && lang.var_name(cch[1]) == Some(v.as_str())
+                {
+                    lang.literal(cch[0]).and_then(|x| x.as_int())
+                } else {
+                    return None;
+                }?;
+                let then_ok = match lang.kind(ich[1]) {
+                    NodeKind::Break => matches!(lang.data(ich[1]), NodeData::Break { label: None }),
+                    NodeKind::Block if lang.children(ich[1]).len() == 1 => {
+                        matches!(lang.data(lang.children(ich[1])[0]), NodeData::Break { label: None })
+                    }
+                    _ => false,
+                };
+                if !then_ok {
+                    return None;
+                }
+                Some(sent)
+            }
+        };
+
+        // 解析 case 表
+        let mut cases: std::collections::HashMap<i64, CffCase> = Default::default();
+        let mut default_term: Option<Vec<JavaId>> = None;
+        for &c in &sch[1..] {
+            let NodeData::Case { labels, is_default, arrow } = lang.data(c) else {
+                return None;
+            };
+            let (labels, is_default, arrow) = (*labels, *is_default, *arrow);
+            let ch = lang.children(c).to_vec();
+            let mut stmts: Vec<JavaId> = ch[labels as usize..].to_vec();
+            // 经典形态：剥尾部 break（块外或块内）
+            if !arrow
+                && stmts
+                    .last()
+                    .is_some_and(|&n| matches!(lang.data(n), NodeData::Break { label: None }))
+            {
+                stmts.pop();
+            }
+            if stmts.len() == 1 && lang.kind(stmts[0]) == NodeKind::Block {
+                let mut inner = lang.children(stmts[0]).to_vec();
+                if !arrow
+                    && inner
+                        .last()
+                        .is_some_and(|&n| matches!(lang.data(n), NodeData::Break { label: None }))
+                {
+                    inner.pop();
+                }
+                stmts = inner;
+            }
+            if is_default {
+                if stmts.len() == 1 && lang.kind(stmts[0]) == NodeKind::Return {
+                    default_term = Some(stmts);
+                    continue;
+                }
+                return None;
+            }
+            // 状态标签：单一整数字面量
+            if labels != 1 {
+                return None;
+            }
+            let state = match lang.literal(ch[0]) {
+                Some(LitRef::Int(v)) => v,
+                _ => return None,
+            };
+            let tail = parse_cff_tail(lang, &v, &mut stmts)?;
+            // 尾部剥离后，剩余体不得引用状态变量
+            for &st in &stmts {
+                if subtree_has_var(lang, st, &v) {
+                    return None;
+                }
+            }
+            cases.insert(state, CffCase { body: stmts, tail });
+        }
+        if cases.is_empty() {
+            return None;
+        }
+
+        // 入口：while 前一条语句设置 v = IntLit
+        if idx == 0 {
+            if std::env::var("CURE_DBG").is_ok() { eprintln!("[cff] idx==0"); }
+            return None;
+        }
+        let block_ch = lang.children(parent).to_vec();
+        let init_stmt = block_ch.get(idx - 1).copied()?;
+        let init = parse_cff_init(lang, &v, init_stmt)?;
+
+        // 循环后 v 不得被使用
+        for &st in &block_ch[idx + 1..] {
+            if subtree_has_var(lang, st, &v) {
+                return None;
+            }
+        }
+
+        // Goto(未知状态) → Exit（须有出口机制）
+        let mut to_exit: Vec<i64> = Vec::new();
+        for (k, ci) in cases.iter() {
+            if let CffTail::Goto(g) = ci.tail {
+                if !cases.contains_key(&g) {
+                    if !(sentinel == Some(g) || default_term.is_some()) {
+                        return None;
+                    }
+                    to_exit.push(*k);
+                }
+            }
+        }
+        for k in to_exit {
+            if let Some(ci) = cases.get_mut(&k) {
+                ci.tail = CffTail::Exit;
+            }
+        }
+
+        let mut c = CffCtx {
+            lang,
+            cases,
+            default_term,
+            used_default: false,
+            reached: Default::default(),
+            emitted: Default::default(),
+        };
+        let stmts = cff_run(&mut c, init)?;
+
+        // 全部 case 可达；default 若存在必须被走到
+        if !c.cases.keys().all(|k| c.reached.contains(k)) {
+            return None;
+        }
+        if c.default_term.is_some() && !c.used_default {
+            return None;
+        }
+        if stmts.is_empty() {
+            return None;
+        }
+
+        Some(Edit::Splice {
+            node: parent,
+            index: idx - 1,
+            remove: 2,
+            insert: stmts,
+        })
+    }
+}
+
+fn parse_cff_tail(lang: &JavaAst, v: &str, stmts: &mut Vec<JavaId>) -> Option<CffTail> {
+    let last = *stmts.last()?;
+    if lang.kind(last) == NodeKind::Return {
+        stmts.pop();
+        return Some(CffTail::Term(last));
+    }
+    let assign_of = |n: JavaId| -> Option<JavaId> {
+        let inner = match lang.kind(n) {
+            NodeKind::Assign => n,
+            NodeKind::ExprStmt => {
+                let ch = lang.children(n);
+                if ch.len() == 1 && lang.kind(ch[0]) == NodeKind::Assign {
+                    ch[0]
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        if lang.assign_op(inner).is_some() {
+            return None;
+        }
+        let ch = lang.children(inner).to_vec();
+        if lang.kind(ch[0]) != NodeKind::VarRef || lang.var_name(ch[0]) != Some(v) {
+            return None;
+        }
+        Some(inner)
+    };
+    if let Some(assign) = assign_of(last) {
+        let value = lang.children(assign)[1];
+        if let Some(k) = lang.literal(value).and_then(|x| x.as_int()) {
+            stmts.pop();
+            return Some(CffTail::Goto(k));
+        }
+        if lang.kind(value) == NodeKind::Ternary {
+            let tch = lang.children(value).to_vec();
+            let a = lang.literal(tch[1]).and_then(|x| x.as_int())?;
+            let b = lang.literal(tch[2]).and_then(|x| x.as_int())?;
+            stmts.pop();
+            return Some(CffTail::Cond { cond: tch[0], a, b });
+        }
+        return None;
+    }
+    if lang.kind(last) == NodeKind::If {
+        let ich = lang.children(last).to_vec();
+        if ich.len() != 3 {
+            return None;
+        }
+        let arm = |n: JavaId| -> Option<i64> {
+            let target = match lang.kind(n) {
+                NodeKind::Assign | NodeKind::ExprStmt => assign_of(n)?,
+                NodeKind::Block if lang.children(n).len() == 1 => assign_of(lang.children(n)[0])?,
+                _ => return None,
+            };
+            lang.literal(lang.children(target)[1]).and_then(|x| x.as_int())
+        };
+        let a = arm(ich[1])?;
+        let b = arm(ich[2])?;
+        stmts.pop();
+        return Some(CffTail::Cond { cond: ich[0], a, b });
+    }
+    None
+}
+
+fn parse_cff_init(lang: &JavaAst, v: &str, stmt: JavaId) -> Option<i64> {
+    match lang.kind(stmt) {
+        NodeKind::VarDecl => {
+            let ch = lang.children(stmt).to_vec();
+            if ch.len() != 1 || lang.var_name(stmt) != Some(v) {
+                return None;
+            }
+            lang.literal(ch[0]).and_then(|x| x.as_int())
+        }
+        NodeKind::Assign => {
+            if lang.assign_op(stmt).is_some() {
+                return None;
+            }
+            let ch = lang.children(stmt).to_vec();
+            if lang.kind(ch[0]) != NodeKind::VarRef || lang.var_name(ch[0]) != Some(v) {
+                return None;
+            }
+            lang.literal(ch[1]).and_then(|x| x.as_int())
+        }
+        NodeKind::ExprStmt => {
+            let ch = lang.children(stmt).to_vec();
+            if ch.len() == 1 {
+                parse_cff_init(lang, v, ch[0])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn flatten(pairs: &[(i64, Vec<JavaId>)], out: &mut Vec<JavaId>, c: &mut CffCtx) {
+    for (s, stmts) in pairs {
+        c.emitted.insert(*s);
+        out.extend(stmts.iter().copied());
+    }
+}
+
+fn flatten_prefix(pairs: &[(i64, Vec<JavaId>)], m: i64, out: &mut Vec<JavaId>) {
+    for (s, stmts) in pairs {
+        if *s == m {
+            break;
+        }
+        out.extend(stmts.iter().copied());
+    }
+}
+
+fn suffix_pairs(pairs: &[(i64, Vec<JavaId>)], m: i64) -> Vec<(i64, Vec<JavaId>)> {
+    let pos = pairs.iter().position(|(s, _)| *s == m).unwrap();
+    pairs[pos..].to_vec()
+}
+
+/// 纯收集：沿无条件 goto 前进，不消费条件 case。
+fn collect(c: &mut CffCtx, start: i64, stop: Option<i64>) -> Option<(Vec<(i64, Vec<JavaId>)>, Flow)> {
+    let mut path: Vec<(i64, Vec<JavaId>)> = Vec::new();
+    let mut cur = start;
+    let mut guard = 0usize;
+    loop {
+        guard += 1;
+        if guard > 10_000 {
+            return None;
+        }
+        if Some(cur) == stop {
+            return Some((path, Flow::Stop));
+        }
+        if let Some(i) = path.iter().position(|(s, _)| *s == cur) {
+            return Some((path, Flow::Cycle(i)));
+        }
+        if c.emitted.contains(&cur) {
+            return Some((path, Flow::External(cur)));
+        }
+        c.reached.insert(cur);
+        let ci = c.cases.get(&cur)?;
+        let mut body = ci.body.clone();
+        match ci.tail {
+            CffTail::Goto(k) => {
+                path.push((cur, body));
+                cur = k;
+            }
+            CffTail::Term(r) => {
+                body.push(r);
+                path.push((cur, body));
+                return Some((path, Flow::Done));
+            }
+            CffTail::Exit => {
+                if c.default_term.is_some() {
+                    if let Some(dt) = c.default_term.clone() {
+                        body.extend(dt);
+                        c.used_default = true;
+                    }
+                }
+                path.push((cur, body));
+                return Some((path, Flow::Done));
+            }
+            CffTail::Cond { .. } => return Some((path, Flow::Cond(cur))),
+        }
+    }
+}
+
+/// 顶层：从入口状态结构化整个状态机。
+fn cff_run(c: &mut CffCtx, init: i64) -> Option<Vec<JavaId>> {
+    let mut stmts: Vec<JavaId> = Vec::new();
+    let (mut path, mut flow) = collect(c, init, None)?;
+    loop {
+        match flow {
+            Flow::Done => {
+                flatten(&path, &mut stmts, c);
+                return Some(stmts);
+            }
+            Flow::Cycle(i) => {
+                flatten(&path[..i], &mut stmts, c);
+                let mut suffix = Vec::new();
+                flatten(&path[i..], &mut suffix, c);
+                let inner = c.lang.build_block(suffix);
+                let cond = c.lang.build_bool(true);
+                let w = c.lang.while_(cond, inner);
+                stmts.push(w);
+                return Some(stmts);
+            }
+            Flow::Stop | Flow::External(_) => return None,
+            Flow::Cond(state) => {
+                flatten(&path, &mut stmts, c);
+                path.clear();
+                let ci = c.cases.get(&state)?;
+                stmts.extend(ci.body.iter().copied());
+                c.emitted.insert(state);
+                let CffTail::Cond { cond, a, b } = ci.tail else {
+                    return None;
+                };
+                // 循环形态：分支走回条件状态
+                let (pa, fa) = collect(c, a, Some(state))?;
+                if fa == Flow::Stop {
+                    let mut lb = Vec::new();
+                    flatten(&pa, &mut lb, c);
+                    let inner = c.lang.build_block(lb);
+                    let w = c.lang.while_(cond, inner);
+                    stmts.push(w);
+                    let (p2, f2) = collect(c, b, None)?;
+                    path = p2;
+                    flow = f2;
+                    continue;
+                }
+                let (pb, fb) = collect(c, b, Some(state))?;
+                if fb == Flow::Stop {
+                    let mut lb = Vec::new();
+                    flatten(&pb, &mut lb, c);
+                    let inner = c.lang.build_block(lb);
+                    let nc = c.lang.build_unary(UnOp::Not, cond);
+                    let w = c.lang.while_(nc, inner);
+                    stmts.push(w);
+                    let (p2, f2) = collect(c, a, None)?;
+                    path = p2;
+                    flow = f2;
+                    continue;
+                }
+                // 菱形：两支共享后继
+                let common = pa
+                    .iter()
+                    .find(|(s, _)| pb.iter().any(|(t, _)| *s == *t))
+                    .map(|(s, _)| *s);
+                let same_end = match (fa, fb) {
+                    (Flow::Done, Flow::Done) => true,
+                    (Flow::Cond(x), Flow::Cond(y)) => x == y,
+                    _ => false,
+                };
+                match common {
+                    Some(m) if same_end => {
+                        let mut pre_a = Vec::new();
+                        let mut pre_b = Vec::new();
+                        flatten_prefix(&pa, m, &mut pre_a);
+                        flatten_prefix(&pb, m, &mut pre_b);
+                        let ba = c.lang.build_block(pre_a);
+                        let bb = c.lang.build_block(pre_b);
+                        let ifs = c.lang.if_(cond, ba, Some(bb));
+                        stmts.push(ifs);
+                        path = suffix_pairs(&pa, m);
+                        flow = fa;
+                        continue;
+                    }
+                    Some(_) => return None,
+                    None => {
+                        if !matches!((fa, fb), (Flow::Done, Flow::Done)) {
+                            return None;
+                        }
+                        let mut fa_stmts = Vec::new();
+                        let mut fb_stmts = Vec::new();
+                        flatten(&pa, &mut fa_stmts, c);
+                        flatten(&pb, &mut fb_stmts, c);
+                        let ba = c.lang.build_block(fa_stmts);
+                        let bb = c.lang.build_block(fb_stmts);
+                        let ifs = c.lang.if_(cond, ba, Some(bb));
+                        stmts.push(ifs);
+                        return Some(stmts);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 门面
 // ---------------------------------------------------------------------------
@@ -1598,6 +2117,7 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(StrLenFold));
     rules.push(Box::new(LiteralEval));
     rules.push(Box::new(Base64NewStringFold));
+    rules.push(Box::new(CffRecover));
     rules
 }
 
