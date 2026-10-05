@@ -77,29 +77,39 @@ echo 'class A{int m(){int a=foo();int b=a;return b;}}' | cure -
 
 ## 规则清单
 
-引擎通用（27）：paren_removal、const_condition、boolean_return、if_to_ternary、
+引擎通用（30）：paren_removal、const_condition、boolean_return、if_to_ternary、
 if_assign_ternary、if_else_empty、bool_compare、double_not、bool_not_fold、
 bool_short_circuit、not_compare、ternary_fold、ternary_bool、const_fold_bin、
 **cmp_const_fold**（`1 < 2 → true`，击穿不透明谓词）、self_assign、
 arith_identity、**arith_zero**、**bit_identity**、**arith_reassoc**（双异或/
 加减重结合/字符串拼接常量合并 `("a"+x)+"b"+"c" → "a"+x+"bc"`）、
-local_propagation、**decl_assign_merge**（`int x; x = v; → int x = v;`）、
-**assign_propagation**（拷贝赋值 `x = v; …读 x` → 内联 v 并删除赋值——
-带块内声明锚点防逃逸）、dead_store + 选配 unreachable_after_terminal。
+local_propagation、**decl_assign_merge**、**assign_propagation**（拷贝赋值内联，
+块内声明锚点防逃逸；使用语句写排除：`target = use` 的 RHS 先于写求值）、
+**multi_use_copy**（多用途拷贝传播：`x = y; …N 处读 x` → 全部替换为 y）、
+**trailing_return**（void 方法尾部裸 `return;` 删除）、
+**trailing_continue**（标签感知：循环体尾部 continue，标签指向本循环才删）、
+dead_store + 选配 unreachable_after_terminal。
 
-Java 专属（11）：cast_simplify、self_compare、string_builder_fold、box_unbox_chain、
-iterator_to_for_each、while_iterator_to_for_each、new_string_fold、loop_head_break、
-**concat_value_of_drop**（拼接中的 `String.valueOf(x)` → x）。
+Java 专属（12）：cast_simplify、self_compare、string_builder_fold、box_unbox_chain、
+iterator_to_for_each、while_iterator_to_for_each（支持 Cast/Paren 包裹的 next()）、
+new_string_fold、loop_head_break、concat_value_of_drop、
+**string_builder_statements**（语句级 SB 链还原：重赋值+新变量混合形态
+`sb = sb.append(x); sb2 = sb.append(y); s = sb2.toString()` → `s = …拼接…`）。
 
 ## 去混淆验证
 
 - `tests/deobfuscate.rs`：模拟混淆器（不透明谓词/双异或/位噪声/布尔包装/
   StringBuilder/装箱链/迭代器/死赋值/拆分声明/拷贝链/valueOf 包装/常量分散拼接）
   → **29 次改写，非空行 -48%**，javac 差分逐字节一致，副作用调用序列保留；
-- `tests/real_tools.rs`：**真实工具链** javac → ProGuard（混淆）→ jadx（反编译）
-  → cure → 编译运行，输出与原始完全一致（环境有 proguard/jadx 时执行）。
-  诚实发现：现代 jadx 输出已较干净，其残留产物（寄存器临时变量、内联
-  `it.next()`、布尔循环旗标）需要**循环级数据流分析**——已在路线图上。
+- `tests/real_tools.rs`：javac → **ProGuard** → **jadx** → cure → 编译运行，
+  输出与原始完全一致（jadx 去混淆较强，残留产物需要循环级数据流）；
+- `tests/ddc_tools.rs`：javac → d8 → **ddc** → cure → 编译运行，
+  **81 → 46 行（-44%）**，输出与 ddc 行为逐字节一致（ddc 产物是主目标素材：
+  寄存器拷贝/语句级 SB 链/while(true)+break 全部被还原）；
+- `tests/asc_tools.rs`：javac → d8 → zip APK → **ASC（androguard DAD）** → cure，
+  **65 → 37 行（-43%）**。DAD 去混淆最弱（类型推断错误、`class LDemo;` 描述符
+  泄漏、尾部 `return;`）——其输出本身无法通过 javac，本测试验证容错解析 0 错误
+  + 净化显著 + 输出自洽 + 幂等；DAD 自身的类型错误被原样保留（不发明类型）。
 
 ## 参考
 

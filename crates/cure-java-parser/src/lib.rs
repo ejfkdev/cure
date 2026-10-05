@@ -402,7 +402,7 @@ impl Parser {
             return None;
         };
         self.bump(); // kw
-        let name = match &self.tok().tok {
+        let mut name = match &self.tok().tok {
             Tok::Ident(i) => {
                 let n = i.clone();
                 self.bump();
@@ -413,6 +413,16 @@ impl Parser {
                 return None;
             }
         };
+        // DAD/androguard 伪影：class LDemo; { —— 名字是 Dalvik 描述符
+        // （合法 Java 不会有 `Name; {`），剥前导 L 与悬挂分号
+        if self.at_punct(";") && self.peek(1).is_punct("{") {
+            self.bump();
+            if let Some(stripped) = name.strip_prefix('L') {
+                if !stripped.is_empty() {
+                    name = stripped.to_string();
+                }
+            }
+        }
         // 泛型参数原文
         let mut ty_params = String::new();
         if self.at_punct("<") {

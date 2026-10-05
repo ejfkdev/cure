@@ -443,3 +443,124 @@ fn concat_value_of_drop_rule() {
     let out = run_src("class A{String m(int n, Object o){return String.valueOf(n) + o;}}");
     assert!(out.contains("String.valueOf(n)"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// ddc 真实产物规则（A/B/C/D）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn loop_register_tail_inline() {
+    // ddc 循环尾寄存器回拷：int v = x + s; x = v; → x = x + s
+    //（使用语句的写发生在求值之后，不算冲突）
+    let out = run_src("class A{int m(int x, int s){while (x < 5) { int v = x + s; x = v; } return x;}}");
+    assert!(out.contains("x = x + s;"), "{out}");
+    // 自赋值场景：self_assign 先删 i = i，传播继续内联 → return 1;
+    let out = run_src("class A{int m(){int i = 1; i = i; return i;}}");
+    assert!(out.contains("return 1;"), "{out}");
+}
+
+#[test]
+fn trailing_continue_removed() {
+    let out = run_src("class A{int m(java.util.List<String> l){int n = 0; for (String s : l) { n += s.length(); continue; } return n;}}");
+    assert!(!out.contains("continue;"), "{out}");
+    // 标签指向外层循环的 continue（内层尾部）不删；标签即本循环的可删
+    let out = run_src("class A{int m(int a, int b){int n = 0; outer: while (a > 0) { while (b > 0) { n++; continue outer; } a--; } return n;}}");
+    assert!(out.contains("continue outer;"), "{out}");
+    let out = run_src("class A{int m(){int n = 0; self: while (n < 3) { n++; continue self; } return n;}}");
+    assert!(!out.contains("continue"), "{out}");
+}
+
+#[test]
+fn multi_use_copy_propagation() {
+    // v30 = v25; 多处读 → 全部替换为 v25（ddc 寄存器副本）
+    let out = run_src("class A{int m(int y){int x = 0; int z = 0; x = y; if (x > 1) { z = x; } return x + z;}}");
+    assert!(out.contains("if (y > 1)"), "{out}");
+    assert!(out.contains("return y + z;"), "{out}");
+    assert!(!out.contains("x = y;"), "{out}");
+    // y 被写 → 不传播
+    let out = run_src("class A{int m(int y, int w){int x = 0; x = y; y = w; return x;}}");
+    assert!(out.contains("return x;"), "{out}");
+    assert!(!out.contains("return y;"), "{out}");
+}
+
+#[test]
+fn string_builder_statement_chain() {
+    // ddc 三种形态混合：重赋值 + 新变量 + toString 收尾
+    let out = run_src(r#"
+class A {
+    String m(String x, String y) {
+        StringBuilder sb = new StringBuilder().append("h");
+        sb = sb.append(x);
+        StringBuilder sb2 = sb.append("-");
+        sb2 = sb2.append(y);
+        String s = sb2.toString();
+        return s;
+    }
+}
+"#);
+    assert!(out.contains(r#"return "h" + x + "-" + y;"#), "{out}");
+
+    // 链变量有链外使用 → 不折叠
+    let out = run_src(r#"
+class A {
+    String m(String x) {
+        StringBuilder sb = new StringBuilder().append("h");
+        sb = sb.append(x);
+        int len = sb.length();
+        String s = sb.toString();
+        return s + len;
+    }
+}
+"#);
+    assert!(out.contains("new StringBuilder"), "{out}");
+
+    // 空链：new SB().toString() → ""
+    let out = run_src("class A{String m(){StringBuilder sb = new StringBuilder(); String s = sb.toString(); return s;}}");
+    assert!(out.contains("return \"\";"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// DAD/ASC 伪影规则
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dad_artifact_class_name_and_trailing_return() {
+    // class LDemo; {（Dalvik 描述符泄漏）→ class Demo，构造器可正常解析
+    let out = run_src("public class LDemo; {\n    public Demo(int p1) {\n        this.base = p1;\n        return;\n    }\n}\nclass Aux {\n    int x;\n}");
+    assert!(out.contains("public class Demo {"), "{out}");
+    assert!(out.contains("this.base = p1;"), "{out}");
+    assert!(!out.contains("return;"), "{out}"); // 尾部裸 return 删除
+}
+
+#[test]
+fn trailing_return_rule() {
+    // void 方法尾部裸 return → 删除
+    let out = run_src("class A{void m(){foo(); return;}}");
+    assert!(out.contains("foo();"), "{out}");
+    assert!(!out.contains("return;"), "{out}");
+    // 带值 return 保留
+    let out = run_src("class A{int m(){return 1;}}");
+    assert!(out.contains("return 1;"), "{out}");
+    // 块中间的提前 return 保留
+    let out = run_src("class A{void m(int x){if (x > 0) {return;} foo(); return;}}");
+    assert!(out.contains("if (x > 0) {"), "{out}");
+    let cnt = out.matches("return;").count();
+    assert_eq!(cnt, 1, "{out}"); // 只剩 if 里的那个
+}
+
+#[test]
+fn iterator_with_cast_and_paren() {
+    // DAD：String s = (String) it.next(); → for-each 还原仍工作
+    let out = run_src(r#"
+class A {
+    void m(java.util.List<String> list) {
+        java.util.Iterator it = list.iterator();
+        while (it.hasNext()) {
+            String s = ((String) it.next());
+            System.out.println(s);
+        }
+    }
+}
+"#);
+    assert!(out.contains("for (String s : list)"), "{out}");
+}

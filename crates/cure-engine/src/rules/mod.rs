@@ -508,8 +508,12 @@ impl<L: Lang> Rule<L> for LocalPropagation {
             // （对声明变量自身的写也包含在 writes 里，一票否决）
             let mut reads = HashSet::new();
             reads_vars(&*lang, value, &mut reads);
-            reads.insert(name);
-            for w in &writes {
+            reads.insert(name.clone());
+            let mut effective_writes = writes.clone();
+            if let Some(target) = use_stmt_target_write(&*lang, &stmts[index + 1..], use_id, name.as_str()) {
+                effective_writes.remove(&target);
+            }
+            for w in &effective_writes {
                 if reads.contains(w) {
                     return None;
                 }
@@ -1665,7 +1669,11 @@ impl<L: Lang> Rule<L> for AssignPropagation {
         if ve <= Effect::MayRead {
             let mut reads = HashSet::new();
             reads_vars(&*lang, value, &mut reads);
-            for w in &writes {
+            let mut effective_writes = writes.clone();
+            if let Some(target) = use_stmt_target_write(&*lang, &stmts[idx + 1..], use_id, name.as_str()) {
+                effective_writes.remove(&target);
+            }
+            for w in &effective_writes {
                 if reads.contains(w) {
                     return None;
                 }
@@ -1711,6 +1719,207 @@ impl<L: Lang> Rule<L> for AssignPropagation {
     }
 }
 
+
+/// 单一使用点若恰为 `target = use` 的 RHS，则该语句对 target 的写发生在
+/// use 求值**之后**——从写冲突集中排除（否则 `int v = x + s; x = v;` 这类
+/// 循环尾寄存器回拷永远无法内联）。
+/// 排除目标必须≠被传播变量自身：`int i = 1; i = i;` 里排除 `i` 会删掉声明
+/// 留下无绑定的赋值（该场景由 self_assign 处理）。
+fn use_stmt_target_write<L: Lang>(
+    lang: &L,
+    stmts_after: &[L::Id],
+    use_id: L::Id,
+    propagated_name: &str,
+) -> Option<String> {
+    for &s in stmts_after {
+        if subtree_contains(lang, s, |n| n == use_id) {
+            let assign = match lang.kind(s) {
+                NodeKind::Assign => s,
+                NodeKind::ExprStmt => {
+                    let ch = lang.children(s);
+                    if ch.len() == 1 && lang.kind(ch[0]) == NodeKind::Assign {
+                        ch[0]
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            };
+            if lang.assign_op(assign).is_some() {
+                return None;
+            }
+            let ch = lang.children(assign);
+            if ch.len() == 2 && ch[1] == use_id && lang.kind(ch[0]) == NodeKind::VarRef {
+                let target = lang.var_name(ch[0])?;
+                if target == propagated_name {
+                    return None;
+                }
+                return Some(target.to_string());
+            }
+            return None;
+        }
+    }
+    None
+}
+
+
+// ---------------------------------------------------------------------------
+// 尾部 continue 删除（反编译器产物）：
+//   while (c) { …; continue; }  →  while (c) { … }
+// 循环体最后一条无标签 continue 与顺序落入下一轮等价。恒安全。
+// ---------------------------------------------------------------------------
+
+pub struct TrailingContinue;
+
+impl<L: Lang> Rule<L> for TrailingContinue {
+    fn name(&self) -> &'static str {
+        "trailing_continue"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk: _ } = ctx;
+        // While/For/DoWhile/ForEach 的 body 为 Block 且末语句为无标签 continue
+        let body = match lang.kind(id) {
+            NodeKind::While | NodeKind::For | NodeKind::DoWhile | NodeKind::ForEach => {
+                *lang.children(id).last()?
+            }
+            _ => return None,
+        };
+        if lang.kind(body) != NodeKind::Block {
+            return None;
+        }
+        let ch = lang.children(body).to_vec();
+        let last = *ch.last()?;
+        if lang.kind(last) != NodeKind::Continue || !lang.children(last).is_empty() {
+            // JavaAST 的 Continue 标签在负载里，children 为空即无标签（引擎层约定）
+            // 对带标签的语言实现：children[last] 非空即有标签 → 不动
+            if lang.kind(last) != NodeKind::Continue {
+                return None;
+            }
+        }
+        Some(Edit::Delete { node: last })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 多用途拷贝传播（寄存器副本消除）：
+//   x = y;（y 为简单 VarRef，x 有本块声明锚点，之后无对 x/y 的写、无遮蔽）
+//   → 把 x 的**所有**后续读替换为 y，删除赋值。
+// 守卫 y 不被写：替换后各使用点读的是 y 的当前值，须与原 x 的值一致。
+// ---------------------------------------------------------------------------
+
+pub struct MultiUseCopyPropagation;
+
+impl<L: Lang> Rule<L> for MultiUseCopyPropagation {
+    fn name(&self) -> &'static str {
+        "multi_use_copy"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk } = ctx;
+        // 语句形态：Assign(x, VarRef y) / ExprStmt{Assign(...)}
+        let (assign, stmt_node) = match lang.kind(id) {
+            NodeKind::Assign => (id, id),
+            NodeKind::ExprStmt => {
+                let ch = lang.children(id);
+                if ch.len() == 1 && lang.kind(ch[0]) == NodeKind::Assign {
+                    (ch[0], id)
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        if lang.assign_op(assign).is_some() {
+            return None;
+        }
+        let ach = lang.children(assign).to_vec();
+        let (target, value) = (ach[0], ach[1]);
+        if lang.kind(target) != NodeKind::VarRef || lang.kind(value) != NodeKind::VarRef {
+            return None;
+        }
+        if !lang.is_local_var(target) {
+            return None;
+        }
+        let name = lang.var_name(target)?.to_string();
+        let src = lang.var_name(value)?.to_string();
+        if name == src {
+            return None;
+        }
+
+        let parent = walk.parent(stmt_node)?;
+        if lang.kind(parent) != NodeKind::Block {
+            return None;
+        }
+        let idx = walk.index(stmt_node)?;
+        let stmts = lang.children(parent).to_vec();
+
+        // 锚点：x 在本块 idx 之前有 VarDecl
+        let anchored = stmts[..idx].iter().any(|&s| {
+            lang.kind(s) == NodeKind::VarDecl && lang.var_name(s) == Some(name.as_str())
+        });
+        if !anchored {
+            return None;
+        }
+
+        // 扫描后续：收集 x 的全部读；对 x 的任何写 / 对 y 的任何写 / 遮蔽 → 拒绝
+        let mut uses: Vec<L::Id> = Vec::new();
+        let mut writes: HashSet<String> = HashSet::new();
+        let mut shadowed = false;
+        for &s in &stmts[idx + 1..] {
+            scan_region(&*lang, s, &name, &mut uses, &mut writes, &mut shadowed);
+        }
+        if shadowed || uses.is_empty() {
+            return None;
+        }
+        for w in &writes {
+            if *w == name || *w == src {
+                return None;
+            }
+        }
+        // y 也不得在【赋值前】与 x 指向不同值（x=y 之前 y 已是其所值，无需检查）；
+        // 但 x=y 之间不能有对 y 的写（相邻语句，天然无中间）——赋值本身就是当前值 ✓
+
+        let mut edits: Vec<Edit<L>> = uses
+            .iter()
+            .map(|&u| Edit::Replace {
+                target: u,
+                with: value,
+            })
+            .collect();
+        edits.push(Edit::Delete { node: stmt_node });
+        Some(Edit::Multi(edits))
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// 尾部裸 return 删除（DAD/androguard 伪影）：
+//   void 方法/构造器体最后一条无值 return 与自然结束等价，删除。
+// 仅匹配根块（方法体）末语句，避免动到块中间的提前 return。
+// ---------------------------------------------------------------------------
+
+pub struct TrailingReturn;
+
+impl<L: Lang> Rule<L> for TrailingReturn {
+    fn name(&self) -> &'static str {
+        "trailing_return"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let root = ctx.root();
+        let parent = ctx.parent(id)?;
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::Return || !lang.children(id).is_empty() {
+            return None;
+        }
+        if parent != root || lang.kind(parent) != NodeKind::Block {
+            return None;
+        }
+        if lang.children(parent).last() != Some(&id) {
+            return None;
+        }
+        Some(Edit::Delete { node: id })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 注册表
 // ---------------------------------------------------------------------------
@@ -1741,6 +1950,8 @@ pub fn default_rules<L: Lang>() -> Vec<Box<dyn Rule<L>>> {
         Box::new(DeclAssignMerge),
         Box::new(LocalPropagation),
         Box::new(AssignPropagation),
+        Box::new(MultiUseCopyPropagation),
+        Box::new(TrailingReturn),
         Box::new(DeadStore),
     ]
 }

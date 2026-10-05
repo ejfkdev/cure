@@ -428,6 +428,22 @@ impl Rule<JavaAst> for IteratorToForEach {
     }
 }
 
+/// 剥掉 next() 调用外围的 Paren / Cast 包装（DAD：`String s = (String) it.next();`）
+fn unwrap_paren_cast(lang: &JavaAst, mut n: JavaId) -> JavaId {
+    loop {
+        match lang.kind(n) {
+            NodeKind::Paren | NodeKind::Cast => {
+                let ch = lang.children(n);
+                if ch.is_empty() {
+                    return n;
+                }
+                n = ch[0];
+            }
+            _ => return n,
+        }
+    }
+}
+
 fn subtree_has_var(lang: &JavaAst, id: JavaId, name: &str) -> bool {
     let mut stack = vec![id];
     while let Some(n) = stack.pop() {
@@ -627,6 +643,7 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         };
         let (e_name, ty) = (e_name.clone(), ty.clone());
         let next_call = lang.children(first).first().copied()?;
+        let next_call = unwrap_paren_cast(&*lang, next_call);
         if lang.kind(next_call) != NodeKind::Call {
             return None;
         }
@@ -734,6 +751,352 @@ impl Rule<JavaAst> for ConcatValueOfDrop {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 语句级 StringBuilder 链还原（ddc/jcdc 经典产物）：
+//   StringBuilder v0 = new StringBuilder().append(a0);
+//   v0 = v0.append(a1);              // 重赋值形态
+//   StringBuilder v1 = v0.append(a2); // 新变量形态
+//   String s = v1.toString();
+//   →  String s = <a0 + a1 + a2>;
+// 守卫：链上每个变量的读次数恰为 1（仅作下一步 receiver），
+// 首参非 String 时前置 ""（与表达式版一致）；容量构造不折叠。
+// 语义：各实参按序求值一次，两种形态一致。
+// ---------------------------------------------------------------------------
+
+pub struct StringBuilderStatements;
+
+fn count_var_uses_in(lang: &JavaAst, root: JavaId, name: &str) -> usize {
+    // 语义上是【读】的 VarRef 计数：简单赋值的 target 是纯写（不计）；
+    // 复合赋值（x += 1）与 inc/dec 的 target 是读+写（计）。
+    let mut n = 0;
+    let mut stack = vec![root];
+    while let Some(x) = stack.pop() {
+        if lang.kind(x) == NodeKind::Assign && lang.assign_op(x).is_none() {
+            let ch = lang.children(x).to_vec();
+            if let Some(&t) = ch.first() {
+                let is_named_target =
+                    lang.kind(t) == NodeKind::VarRef && lang.var_name(t) == Some(name);
+                if !is_named_target {
+                    stack.push(t);
+                }
+                for &c in &ch[1..] {
+                    stack.push(c);
+                }
+            }
+            continue;
+        }
+        if lang.kind(x) == NodeKind::VarRef && lang.var_name(x) == Some(name) {
+            n += 1;
+        }
+        for &c in lang.children(x) {
+            stack.push(c);
+        }
+    }
+    n
+}
+
+impl Rule<JavaAst> for StringBuilderStatements {
+    fn name(&self) -> &'static str {
+        "string_builder_statements"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        // 取结构信息（避免与 ctx 方法借用冲突）
+        let parent = ctx.parent(id)?;
+        let idx = ctx.index(id)?;
+        let lang = ctx.lang;
+
+        if lang.kind(id) != NodeKind::VarDecl {
+            return None;
+        }
+        if lang.kind(parent) != NodeKind::Block {
+            return None;
+        }
+        let v0 = lang.var_name(id)?.to_string();
+        // init: new SB().append(a0)
+        let init = *lang.children(id).first()?;
+        if lang.kind(init) != NodeKind::Call {
+            return None;
+        }
+        let ic = lang.children(init).to_vec();
+        if ic.len() != 2 {
+            return None;
+        }
+        let NodeData::Member { name: m0 } = lang.data(ic[0]) else {
+            return None;
+        };
+        if m0 != "append" {
+            return None;
+        }
+        let sb_new = lang.children(ic[0])[0];
+        let (ctor_arg, a0) = match lang.data(sb_new) {
+            NodeData::New { ty, .. } => {
+                let is_sb = matches!(ty, JType::Ref(n) if n == "StringBuilder" || n == "java.lang.StringBuilder" || n.ends_with(".StringBuilder"));
+                if !is_sb {
+                    return None;
+                }
+                let args = lang.children(sb_new).to_vec();
+                match args.len() {
+                    0 => (None, ic[1]),
+                    1 => {
+                        let a = args[0];
+                        let stringy = matches!(lang.literal(a), Some(LitRef::Str(_)))
+                            || lang
+                                .var_type(a)
+                                .is_some_and(|t| matches!(t, JType::Ref(n) if n == "String"));
+                        if !stringy {
+                            return None; // 容量构造
+                        }
+                        (Some(a), ic[1])
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+
+        let stmts = lang.children(parent).to_vec();
+        // 沿链前进：收集 append 实参与链语句
+        let mut parts: Vec<JavaId> = vec![a0];
+        let mut expected_reads: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut chain_len = 1usize; // 已消费 v0 的 decl
+        let mut cur = v0.clone();
+        while idx + chain_len < stmts.len() {
+            let s = stmts[idx + chain_len];
+            let (recv, arg, new_var, consumed) = match lang.data(s) {
+                // v = v.append(arg)（重赋值；ExprStmt 包裹或裸）
+                NodeData::Assign { op: None } => {
+                    let ch = lang.children(s).to_vec();
+                    if ch.len() != 2 {
+                        break;
+                    }
+                    let (t, v) = (ch[0], ch[1]);
+                    if lang.kind(t) != NodeKind::VarRef
+                        || lang.var_name(t) != Some(cur.as_str())
+                        || lang.kind(v) != NodeKind::Call
+                    {
+                        break;
+                    }
+                    let vc = lang.children(v).to_vec();
+                    if vc.len() != 2 {
+                        break;
+                    }
+                    let NodeData::Member { name: mn } = lang.data(vc[0]) else {
+                        break;
+                    };
+                    if mn != "append" {
+                        break;
+                    }
+                    let recv = lang.children(vc[0])[0];
+                    (recv, vc[1], false, s)
+                }
+                NodeData::ExprStmt => {
+                    let ch = lang.children(s).to_vec();
+                    if ch.len() != 1 {
+                        break;
+                    }
+                    let inner = ch[0];
+                    if !matches!(lang.data(inner), NodeData::Assign { op: None }) {
+                        break;
+                    }
+                    let ach = lang.children(inner).to_vec();
+                    if ach.len() != 2 {
+                        break;
+                    }
+                    let (t, v) = (ach[0], ach[1]);
+                    if lang.kind(t) != NodeKind::VarRef
+                        || lang.var_name(t) != Some(cur.as_str())
+                        || lang.kind(v) != NodeKind::Call
+                    {
+                        break;
+                    }
+                    let vc = lang.children(v).to_vec();
+                    if vc.len() != 2 {
+                        break;
+                    }
+                    let NodeData::Member { name: mn } = lang.data(vc[0]) else {
+                        break;
+                    };
+                    if mn != "append" {
+                        break;
+                    }
+                    let recv = lang.children(vc[0])[0];
+                    (recv, vc[1], false, s)
+                }
+                // StringBuilder v2 = v.append(arg)（新变量）
+                NodeData::VarDecl { .. } => {
+                    let init = match lang.children(s).first() {
+                        Some(&x) => x,
+                        None => break,
+                    };
+                    if lang.kind(init) != NodeKind::Call {
+                        break;
+                    }
+                    let vc = lang.children(init).to_vec();
+                    if vc.len() != 2 {
+                        break;
+                    }
+                    let NodeData::Member { name: mn } = lang.data(vc[0]) else {
+                        break;
+                    };
+                    if mn != "append" {
+                        break;
+                    }
+                    let recv = lang.children(vc[0])[0];
+                    if lang.var_name(recv) != Some(cur.as_str()) {
+                        break;
+                    }
+                    (recv, vc[1], true, s)
+                }
+                _ => break,
+            };
+            // receiver 必须是当前变量
+            if lang.var_name(recv) != Some(cur.as_str()) {
+                break;
+            }
+            parts.push(arg);
+            *expected_reads.entry(cur.clone()).or_insert(0) += 1;
+            if new_var {
+                cur = lang.var_name(consumed)?.to_string();
+            }
+            chain_len += 1;
+            let _ = consumed;
+        }
+
+        // 链后必须紧跟：String s = <cur>.toString();
+        let final_stmt = *stmts.get(idx + chain_len)?;
+        let NodeData::VarDecl { .. } = lang.data(final_stmt) else {
+            return None;
+        };
+        let s_init = *lang.children(final_stmt).first()?;
+        if lang.kind(s_init) != NodeKind::Call {
+            return None;
+        }
+        let sc = lang.children(s_init).to_vec();
+        if sc.len() != 1 {
+            return None;
+        }
+        let NodeData::Member { name: mn } = lang.data(sc[0]) else {
+            return None;
+        };
+        if mn != "toString" {
+            return None;
+        }
+        if lang.var_name(lang.children(sc[0])[0]) != Some(cur.as_str()) {
+            return None;
+        }
+
+        // 读次数守卫：实际读数 == 链内预期读数（receiver 次数 + toString 1 次），
+        // 差值即存在链外使用 → 拒绝
+        *expected_reads.entry(cur.clone()).or_insert(0) += 1; // toString receiver
+        for (v, exp) in &expected_reads {
+            if count_var_uses_in(&*lang, parent, v) != *exp {
+                return None;
+            }
+        }
+
+        // 构造拼接表达式
+        let mut all_parts: Vec<JavaId> = Vec::new();
+        if let Some(ca) = ctor_arg {
+            all_parts.push(ca);
+        }
+        all_parts.extend(parts);
+        if all_parts.is_empty() {
+            let empty = lang.build_str("");
+            return Some(Edit::Multi(vec![
+                Edit::Replace {
+                    target: s_init,
+                    with: empty,
+                },
+                Edit::Splice {
+                    node: parent,
+                    index: idx,
+                    remove: chain_len,
+                    insert: Vec::new(),
+                },
+            ]));
+        }
+        let first = all_parts[0];
+        let stringy_first = matches!(lang.literal(first), Some(LitRef::Str(_)))
+            || lang
+                .var_type(first)
+                .is_some_and(|t| matches!(t, JType::Ref(n) if n == "String"));
+        let mut acc = if stringy_first {
+            first
+        } else {
+            let empty = lang.build_str("");
+            lang.build_bin(BinOp::Add, empty, first)
+        };
+        for &p in &all_parts[1..] {
+            acc = lang.build_bin(BinOp::Add, acc, p);
+        }
+        Some(Edit::Multi(vec![
+            Edit::Replace {
+                target: s_init,
+                with: acc,
+            },
+            Edit::Splice {
+                node: parent,
+                index: idx,
+                remove: chain_len,
+                insert: Vec::new(),
+            },
+        ]))
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// 尾部 continue 删除（标签感知版，从引擎移入）：
+//   循环体最后一条 continue：无标签，或标签即本循环 → 与落入下一轮等价，删除。
+//   标签指向外层循环 → 语义不同，保留。
+// ---------------------------------------------------------------------------
+
+pub struct TrailingContinueJava;
+
+impl Rule<JavaAst> for TrailingContinueJava {
+    fn name(&self) -> &'static str {
+        "trailing_continue"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let parent = ctx.parent(id)?;
+        let lang = ctx.lang;
+        let body = match lang.kind(id) {
+            NodeKind::While | NodeKind::For | NodeKind::DoWhile | NodeKind::ForEach => {
+                *lang.children(id).last()?
+            }
+            _ => return None,
+        };
+        if lang.kind(body) != NodeKind::Block {
+            return None;
+        }
+        let ch = lang.children(body).to_vec();
+        let last = *ch.last()?;
+        if lang.kind(last) != NodeKind::Continue {
+            return None;
+        }
+        let label = match lang.data(last) {
+            NodeData::Continue { label } => label.clone(),
+            _ => return None,
+        };
+        match label {
+            None => Some(Edit::Delete { node: last }),
+            Some(l) => {
+                // 标签必须命名本循环：父链上是 Label{l} 包着本循环
+                if lang.kind(parent) == NodeKind::Label {
+                    if let NodeData::Label { name } = lang.data(parent) {
+                        if *name == l {
+                            return Some(Edit::Delete { node: last });
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 门面
 // ---------------------------------------------------------------------------
@@ -750,6 +1113,8 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(LoopHeadBreak));
     rules.push(Box::new(WhileIteratorToForEach));
     rules.push(Box::new(ConcatValueOfDrop));
+    rules.push(Box::new(StringBuilderStatements));
+    rules.push(Box::new(TrailingContinueJava));
     rules
 }
 
