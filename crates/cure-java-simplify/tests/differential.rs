@@ -415,3 +415,69 @@ public class DiffFlow {
 "#,
     );
 }
+
+#[test]
+fn diff_assign_propagation_and_copies() {
+    differential(
+        "DiffCopy",
+        r#"
+public class DiffCopy {
+    static int side = 0;
+    static int next() { side += 3; return side; }
+    public static void main(String[] args) {
+        // 拆分声明 + 拷贝链
+        int p;
+        p = 11;
+        int q;
+        q = p;
+        int w;
+        w = q;
+        System.out.println(w);
+        // 有副作用的赋值传播（求值顺序敏感：next 先于 println 前的 f）
+        int t = 0;
+        t = next();
+        int u = t;
+        System.out.println(u);
+        System.out.println(u + w);
+        // 死赋值 + 重赋值
+        int x = 5;
+        x = 7;
+        System.out.println(x);
+        // valueOf + 拼接
+        String v = String.valueOf(42) + "x";
+        String m = "a" + v + "b" + "c";
+        System.out.println(m);
+        System.out.println(side);
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn diff_string_concat_and_valueof() {
+    differential(
+        "DiffStr",
+        r#"
+public class DiffStr {
+    public static void main(String[] args) {
+        String a = "a";
+        String s1 = "x" + a + "y" + "z";
+        String s2 = "p" + "q" + a;
+        String s3 = String.valueOf(9) + "-";
+        String s4 = "-" + String.valueOf(8);
+        Object nil = null;
+        String s5 = String.valueOf(nil) + "!";
+        System.out.println(s1);
+        System.out.println(s2);
+        System.out.println(s3);
+        System.out.println(s4);
+        System.out.println(s5);
+        int n = 5;
+        String s6 = String.valueOf(n) + "u";
+        System.out.println(s6);
+    }
+}
+"#,
+    );
+}

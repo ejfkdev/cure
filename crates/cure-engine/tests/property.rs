@@ -410,6 +410,10 @@ use BinOp as B;
                     })
                 }
             }
+            (V::Str(a), V::Str(b)) => match op {
+                B::Add => V::Str(format!("{a}{b}")),
+                _ => panic!("str op {op:?}"),
+            },
             (V::Bool(a), V::Bool(b)) => V::Bool(match op {
                 B::Eq => a == b,
                 B::Ne => a != b,
@@ -452,12 +456,15 @@ impl Rng {
 enum Ty {
     Int,
     Bool,
+    Str,
 }
 
 const INT_VARS: &[&str] = &["i0", "i1", "i2", "i3"];
 const BOOL_VARS: &[&str] = &["b0", "b1", "b2"];
+const STR_VARS: &[&str] = &["sv0", "sv1"];
 const INT_CALLS: &[&str] = &["f0", "f1", "f2", "f3"];
 const BOOL_CALLS: &[&str] = &["g0", "g1", "g2"];
+const STR_CALLS: &[&str] = &["sc0", "sc1"];
 
 struct Gen<'a> {
     rng: Rng,
@@ -466,6 +473,14 @@ struct Gen<'a> {
 }
 
 impl<'a> Gen<'a> {
+    fn str_lit(&mut self) -> Id {
+        let n = self.rng.range(3) as usize;
+        let text = ["a", "b", "c"][n].to_string();
+        let id = self.t.push(NodeKind::Literal, vec![], None);
+        self.t.nodes[id as usize].lit = Some(Lit::Str(text));
+        id
+    }
+
     fn int_lit(&mut self) -> Id {
         // 偏置：30% 取 0/1（触发恒等式/零元素规则）
         let v = match self.rng.range(10) {
@@ -516,6 +531,18 @@ use BinOp as B;
                         self.call(INT_CALLS[i])
                     }
                 }
+                Ty::Str => {
+                    let k = self.rng.range(4);
+                    if k == 0 {
+                        self.str_lit()
+                    } else if k <= 2 {
+                        let i = self.rng.range(2) as usize;
+                        self.var(STR_VARS[i])
+                    } else {
+                        let i = self.rng.range(2) as usize;
+                        self.call(STR_CALLS[i])
+                    }
+                }
                 Ty::Bool => {
                     let k = self.rng.range(6);
                     if k == 0 || k == 1 {
@@ -534,6 +561,26 @@ use BinOp as B;
         }
         let d = depth - 1;
         match ty {
+            Ty::Str => {
+                let k = self.rng.range(6);
+                if k <= 1 {
+                    self.str_lit()
+                } else if k == 2 {
+                    let i = self.rng.range(2) as usize;
+                    self.var(STR_VARS[i])
+                } else if k == 3 {
+                    let i = self.rng.range(2) as usize;
+                    self.call(STR_CALLS[i])
+                } else if k == 4 {
+                    // 拼接（驱动 reassoc/常量折叠）
+                    let a = self.expr(Ty::Str, d);
+                    let b = self.expr(Ty::Str, d);
+                    self.bin(B::Add, a, b)
+                } else {
+                    let e = self.expr(Ty::Str, d);
+                    self.t.push(NodeKind::Paren, vec![e], None)
+                }
+            }
             Ty::Int => match self.rng.range(8) {
                 0 => {
                     let a = self.expr(Ty::Int, d);
@@ -636,11 +683,14 @@ use BinOp as B;
                 id
             }
             1 | 2 => {
-                // 赋值既有变量
-                let use_bool = self.rng.range(3) == 0;
-                let (name, ty) = if use_bool {
+                // 赋值既有变量（含字符串变量）
+                let k = self.rng.range(4);
+                let (name, ty) = if k == 0 {
                     let i = self.rng.range(3) as usize;
                     (BOOL_VARS[i].to_string(), Ty::Bool)
+                } else if k == 3 {
+                    let i = self.rng.range(2) as usize;
+                    (STR_VARS[i].to_string(), Ty::Str)
                 } else {
                     let i = self.rng.range(4) as usize;
                     (INT_VARS[i].to_string(), Ty::Int)
@@ -648,6 +698,13 @@ use BinOp as B;
                 let v = self.expr(ty, 2);
                 let target = self.var(&name);
                 self.t.push(NodeKind::Assign, vec![target, v], None)
+            }
+            7 => {
+                // 裸声明（后续可能被赋值——驱动 decl_assign_merge）
+                let ty = [Ty::Int, Ty::Bool, Ty::Str][self.rng.range(3) as usize];
+                let name = format!("t{}", self.temp_n);
+                self.temp_n += 1;
+                self.t.push(NodeKind::VarDecl, vec![], Some(name))
             }
             3 => {
                 // 纯副作用调用语句
@@ -714,6 +771,13 @@ fn gen_program(seed: u64) -> Toy {
         let d = t.push(NodeKind::VarDecl, vec![id], Some(name.to_string()));
         stmts.push(d);
     }
+    for name in STR_VARS {
+        let n = rng.range(3) as usize;
+        let id = t.push(NodeKind::Literal, vec![], None);
+        t.nodes[id as usize].lit = Some(Lit::Str(["a", "b", "c"][n].to_string()));
+        let d = t.push(NodeKind::VarDecl, vec![id], Some(name.to_string()));
+        stmts.push(d);
+    }
     let n = 2 + rng.range(4) as usize;
     let mut g = Gen {
         rng,
@@ -724,7 +788,7 @@ fn gen_program(seed: u64) -> Toy {
         stmts.push(g.stmt(1));
     }
     // 末尾 return
-    let ret_ty = if g.rng.range(2) == 0 { Ty::Int } else { Ty::Bool };
+    let ret_ty = [Ty::Int, Ty::Bool, Ty::Str][g.rng.range(3) as usize];
     let e = g.expr(ret_ty, 2);
     let r = g.t.push(NodeKind::Return, vec![e], None);
     stmts.push(r);

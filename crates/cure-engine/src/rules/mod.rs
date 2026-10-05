@@ -1302,22 +1302,39 @@ impl<L: Lang> Rule<L> for ArithReassoc {
         if !matches!(op2, BinOp::Add | BinOp::Sub | BinOp::BitXor) {
             return None;
         }
-        let och = lang.children(id);
-        let inner = *och.first()?;
-        let k2 = lang.literal(*och.get(1)?).and_then(|x| x.as_int())?;
+        let och = lang.children(id).to_vec();
+        let inner = och[0];
         if lang.kind(inner) != NodeKind::Binary {
             return None;
         }
         let op1 = lang.bin_op(inner)?;
-        let ich = lang.children(inner);
-        let x = *ich.first()?;
-        let k1 = lang.literal(*ich.get(1)?).and_then(|x| x.as_int())?;
+        let ich = lang.children(inner).to_vec();
+        let x = ich[0];
+
+        // 字符串拼接重结合：(x + "K1") + "K2" → x + "K1K2"
+        // （拼接满足结合律且各操作数恰按序求值一次；x 任意类型）
+        if op1 == BinOp::Add && op2 == BinOp::Add {
+            if let (Some(LitRef::Str(k1)), Some(LitRef::Str(k2))) =
+                (lang.literal(ich[1]), lang.literal(och[1]))
+            {
+                let joined = format!("{k1}{k2}");
+                let lit = lang.build_str(&joined);
+                let with = lang.build_bin(BinOp::Add, x, lit);
+                return Some(Edit::Replace {
+                    target: id,
+                    with,
+                });
+            }
+        }
+
+        // 整数重结合：(x ± K1) ± K2 → x ± K、(x ^ K1) ^ K2 → x ^ K
+        let k1 = lang.literal(ich[1]).and_then(|x| x.as_int())?;
+        let k2 = lang.literal(och[1]).and_then(|x| x.as_int())?;
         if !lang.is_exact_int(x) {
             return None;
         }
-
-        let is_long = matches!(lang.literal(*ich.get(1)?), Some(LitRef::Long(_)))
-            || matches!(lang.literal(*och.get(1)?), Some(LitRef::Long(_)));
+        let is_long = matches!(lang.literal(ich[1]), Some(LitRef::Long(_)))
+            || matches!(lang.literal(och[1]), Some(LitRef::Long(_)));
         let sign = |o: BinOp| if o == BinOp::Sub { -1i64 } else { 1i64 };
         let delta: Option<i64> = match (op1, op2) {
             (BinOp::BitXor, BinOp::BitXor) => Some(k1 ^ k2),
@@ -1331,26 +1348,15 @@ impl<L: Lang> Rule<L> for ArithReassoc {
         let d = delta?;
         let with = if d == 0 {
             x
+        } else if op1 == BinOp::BitXor && op2 == BinOp::BitXor {
+            let lit = lang.build_int(d, is_long);
+            lang.build_bin(BinOp::BitXor, x, lit)
+        } else if d > 0 {
+            let lit = lang.build_int(d, is_long);
+            lang.build_bin(BinOp::Add, x, lit)
         } else {
-            let (op, mag) = if (op1 == BinOp::BitXor && op2 == BinOp::BitXor) || d > 0 {
-                let mag = if op1 == BinOp::BitXor && op2 == BinOp::BitXor {
-                    d
-                } else {
-                    d
-                };
-                (
-                    if op1 == BinOp::BitXor && op2 == BinOp::BitXor {
-                        BinOp::BitXor
-                    } else {
-                        BinOp::Add
-                    },
-                    mag,
-                )
-            } else {
-                (BinOp::Sub, -d)
-            };
-            let lit = lang.build_int(mag, is_long);
-            lang.build_bin(op, x, lit)
+            let lit = lang.build_int(-d, is_long);
+            lang.build_bin(BinOp::Sub, x, lit)
         };
         Some(Edit::Replace {
             target: id,
@@ -1516,6 +1522,195 @@ impl<L: Lang> Rule<L> for IfAssignTernary {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 声明-赋值合并（反编译器把声明与赋值拆开的形态）：
+//   int x; x = 5;  →  int x = 5;
+// 守卫：相邻同块、简单赋值、value 不引用 x（依赖旧值则非法）。
+// 之后 local_propagation 可继续把 init 内联到唯一使用处。
+// ---------------------------------------------------------------------------
+
+pub struct DeclAssignMerge;
+
+impl<L: Lang> Rule<L> for DeclAssignMerge {
+    fn name(&self) -> &'static str {
+        "decl_assign_merge"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk } = ctx;
+        if lang.kind(id) != NodeKind::VarDecl || !lang.children(id).is_empty() {
+            return None; // 必须是无 init 声明
+        }
+        let name = lang.var_name(id)?.to_string();
+        let parent = walk.parent(id)?;
+        if lang.kind(parent) != NodeKind::Block {
+            return None;
+        }
+        let idx = walk.index(id)?;
+        let stmts = lang.children(parent).to_vec();
+        let next = *stmts.get(idx + 1)?;
+        // 下一条：Assign(x, v) / ExprStmt{Assign(x, v)}（简单赋值）
+        let assign = match lang.kind(next) {
+            NodeKind::Assign => next,
+            NodeKind::ExprStmt => {
+                let ch = lang.children(next);
+                if ch.len() == 1 && lang.kind(ch[0]) == NodeKind::Assign {
+                    ch[0]
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        if lang.assign_op(assign).is_some() {
+            return None;
+        }
+        let ach = lang.children(assign).to_vec();
+        let (target, value) = (ach[0], ach[1]);
+        if lang.kind(target) != NodeKind::VarRef || lang.var_name(target) != Some(name.as_str()) {
+            return None;
+        }
+        // value 不得引用 x（读旧值）
+        if subtree_contains(&*lang, value, |n| {
+            lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name.as_str())
+        }) {
+            return None;
+        }
+        Some(Edit::Multi(vec![
+            Edit::Splice {
+                node: id,
+                index: 0,
+                remove: 0,
+                insert: vec![value],
+            },
+            Edit::Delete { node: next },
+        ]))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 赋值传播（寄存器拷贝消除，jadx/jcdc 产物）：
+//   x = v; …唯一一次读 x（区间内无对 x / v 读集的写、无遮蔽）…
+//   → 用 v 替换该次读，删除赋值。
+// 安全锚点：x 必须在本块内有前置声明（赋值无作用域，块外读取会破坏语义）。
+// v 纯/只读 → 自由移动（写冲突检查）；v 有副作用 → 相邻 + 直线 + 可读前缀。
+// ---------------------------------------------------------------------------
+
+pub struct AssignPropagation;
+
+impl<L: Lang> Rule<L> for AssignPropagation {
+    fn name(&self) -> &'static str {
+        "assign_propagation"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk } = ctx;
+        // 语句形态：Assign / ExprStmt{Assign}
+        let (assign, stmt_node) = match lang.kind(id) {
+            NodeKind::Assign => (id, id),
+            NodeKind::ExprStmt => {
+                let ch = lang.children(id);
+                if ch.len() == 1 && lang.kind(ch[0]) == NodeKind::Assign {
+                    (ch[0], id)
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        if lang.assign_op(assign).is_some() {
+            return None;
+        }
+        let ach = lang.children(assign).to_vec();
+        let (target, value) = (ach[0], ach[1]);
+        if lang.kind(target) != NodeKind::VarRef || !lang.is_local_var(target) {
+            return None;
+        }
+        let name = lang.var_name(target)?.to_string();
+
+        let parent = walk.parent(stmt_node)?;
+        if lang.kind(parent) != NodeKind::Block {
+            return None;
+        }
+        let idx = walk.index(stmt_node)?;
+        let stmts = lang.children(parent).to_vec();
+
+        // 锚点：x 在本块 idx 之前有 VarDecl（保证 x 不会逃逸到块外）
+        let anchored = stmts[..idx].iter().any(|&s| {
+            lang.kind(s) == NodeKind::VarDecl && lang.var_name(s) == Some(name.as_str())
+        });
+        if !anchored {
+            return None;
+        }
+
+        // value 不引用 x（x = x + 1 之类）
+        if subtree_contains(&*lang, value, |n| {
+            lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name.as_str())
+        }) {
+            return None;
+        }
+
+        // 扫描赋值之后的区域
+        let mut uses: Vec<L::Id> = Vec::new();
+        let mut writes: HashSet<String> = HashSet::new();
+        let mut shadowed = false;
+        for &s in &stmts[idx + 1..] {
+            scan_region(&*lang, s, &name, &mut uses, &mut writes, &mut shadowed);
+        }
+        if shadowed || uses.len() != 1 || writes.contains(&name) {
+            return None;
+        }
+        let use_id = uses[0];
+        let ve = lang.effect(value);
+
+        if ve <= Effect::MayRead {
+            let mut reads = HashSet::new();
+            reads_vars(&*lang, value, &mut reads);
+            for w in &writes {
+                if reads.contains(w) {
+                    return None;
+                }
+            }
+            return Some(Edit::Multi(vec![
+                Edit::Replace {
+                    target: use_id,
+                    with: value,
+                },
+                Edit::Delete { node: stmt_node },
+            ]));
+        }
+
+        // 有副作用：相邻 + 直线 + 可读前缀（与 local_propagation 同判据）
+        if idx + 1 >= stmts.len() {
+            return None;
+        }
+        let stmt = stmts[idx + 1];
+        if !subtree_contains(&*lang, stmt, |n| n == use_id) {
+            return None;
+        }
+        match lang.kind(stmt) {
+            NodeKind::Return
+            | NodeKind::ExprStmt
+            | NodeKind::Assign
+            | NodeKind::Throw
+            | NodeKind::VarDecl => {}
+            _ => return None,
+        }
+        if !straight_path(&*lang, stmt, use_id) {
+            return None;
+        }
+        if !prefix_effects_readable(&*lang, stmt, use_id) {
+            return None;
+        }
+        Some(Edit::Multi(vec![
+            Edit::Replace {
+                target: use_id,
+                with: value,
+            },
+            Edit::Delete { node: stmt_node },
+        ]))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 注册表
 // ---------------------------------------------------------------------------
@@ -1543,7 +1738,9 @@ pub fn default_rules<L: Lang>() -> Vec<Box<dyn Rule<L>>> {
         Box::new(SelfAssign),
         Box::new(ArithIdentity),
         Box::new(ArithZero),
+        Box::new(DeclAssignMerge),
         Box::new(LocalPropagation),
+        Box::new(AssignPropagation),
         Box::new(DeadStore),
     ]
 }

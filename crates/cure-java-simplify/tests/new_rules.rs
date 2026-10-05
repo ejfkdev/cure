@@ -108,9 +108,8 @@ fn arith_zero() {
 fn dead_store() {
     // int x = 1; x = 2; → int x = 2; → 传播继续 → return 2;
     assert!(run_src("class A{int m(){int x = 1; x = 2; return x;}}").contains("return 2;"));
-    let out = run_src("class A{int m(){int x; x = 1; x = 2; return x;}}");
-    assert!(out.contains("x = 2;"), "{out}");
-    assert!(!out.contains("x = 1;"), "{out}");
+    // 拆分形态：int x; x = 1; x = 2; → 合并 → 死赋值 → 传播 → return 2;
+    assert!(run_src("class A{int m(){int x; x = 1; x = 2; return x;}}").contains("return 2;"));
     // a 有副作用 → 保留
     let out = run_src("class A{int m(){int x; x = foo(); x = 2; return x;}}");
     assert!(out.contains("x = foo();"), "{out}");
@@ -320,8 +319,8 @@ fn if_to_ternary_rules() {
     assert!(run_src("class A{int m(boolean c){if (c) {return 1;} return 2;}}").contains("return c ? 1 : 2;"));
     // 布尔特例 → 直接 return c
     assert!(run_src("class A{boolean m(boolean c){if (c) {return true;} return false;}}").contains("return c;"));
-    // if-else 双赋值 → 三元赋值
-    assert!(run_src("class A{int m(boolean c){int r; if (c) {r = 1;} else {r = 2;} return r;}}").contains("r = c ? 1 : 2;"));
+    // if-else 双赋值 → 三元赋值 → r 内联到唯一使用处
+    assert!(run_src("class A{int m(boolean c){int r; if (c) {r = 1;} else {r = 2;} return r;}}").contains("return c ? 1 : 2;"));
     // 副作用条件照常保留
     let out = run_src("class A{int m(){if (check()) {return 1;} return 2;}}");
     assert!(out.contains("check() ? 1 : 2"), "{out}");
@@ -388,4 +387,59 @@ class A {
 }
 "#);
     assert!(out.contains("it.hashCode()"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// 声明-赋值合并 / 赋值传播 / 拼接重结合 / valueOf 剥离
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decl_assign_merge_rule() {
+    // int x; x = 5; return x; → return 5;（合并 + 传播连锁）
+    assert!(run_src("class A{int m(){int x; x = 5; return x;}}").contains("return 5;"));
+    // 合并 + 传播 + 常量折叠连锁：y = x + 1（x=1 单用途）→ return 2;
+    assert!(run_src("class A{int m(){int x; x = 1; int y; y = x + 1; return y;}}").contains("return 2;"));
+    // value 引用声明自身（未初始化读）→ 不合并
+    let out = run_src("class A{int m(){int y; y = y + 1; return y;}}");
+    assert!(out.contains("y = y + 1;"), "{out}");
+}
+
+#[test]
+fn assign_propagation_rules() {
+    // 纯拷贝赋值：x = y; …唯一读 → 内联 y
+    let out = run_src("class A{int m(int y){int x = 0; x = y; return x;}}");
+    assert!(out.contains("return y;"), "{out}");
+    // 有副作用值 + 相邻 VarDecl 使用点（真实 jadx 形态）→ 传播内联到 return
+    let out = run_src("class A{int m(){int t = 0; t = foo(); int u = t; return u;}}");
+    assert!(out.contains("return foo();"), "{out}");
+    assert!(!out.contains("t = foo();"), "{out}");
+    assert!(!out.contains("int u"), "{out}");
+    // 区间内对 x 再赋值 → 不传播 y；死赋值删除 x=y，z 传播进 return
+    let out = run_src("class A{int m(int y, int z){int x = 0; x = y; x = z; return x;}}");
+    assert!(out.contains("return z;"), "{out}");
+    assert!(!out.contains("x = y;"), "{out}");
+    assert!(!out.contains("return y;"), "{out}");
+    // value 读到的变量被写 → 不传播
+    let out = run_src("class A{int m(int y){int x = 0; x = y; y = 9; return x;}}");
+    assert!(out.contains("x = y;") || out.contains("return x;"), "{out}");
+    assert!(!out.contains("return y;"), "{out}");
+}
+
+#[test]
+fn string_concat_reassoc_rules() {
+    // "a" + x + "b" + "c" → "a" + x + "bc"
+    let out = run_src("class A{String m(String x){return \"a\" + x + \"b\" + \"c\";}}");
+    assert!(out.contains(r#"return "a" + x + "bc";"#), "{out}");
+    // 三个字面量全折
+    let out = run_src("class A{String m(String x){return \"a\" + \"b\" + x;}}");
+    assert!(out.contains(r#"return "ab" + x;"#), "{out}");
+}
+
+#[test]
+fn concat_value_of_drop_rule() {
+    let out = run_src("class A{String m(int n){return String.valueOf(n) + \"-\";}}");
+    assert!(out.contains("return n + \"-\";"), "{out}");
+    // 另一侧不可证 String（数值 + 数值形态不存在 valueOf…这里构造 valueOf+未知变量）
+    let out = run_src("class A{String m(int n, Object o){return String.valueOf(n) + o;}}");
+    assert!(out.contains("String.valueOf(n)"), "{out}");
 }

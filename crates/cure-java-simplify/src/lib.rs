@@ -658,6 +658,82 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 拼接中的 String.valueOf 剥离（混淆器/反编译器包装）：
+//   String.valueOf(x) + y  →  x + y（y 为 String 字面量/已知 String 时）
+//   y + String.valueOf(x)  →  y + x（同上）
+// 安全性：valueOf 的字符串化语义与 + 拼接的隐式转换一致（null → "null"）；
+// 守卫：另一侧必须可证为 String（保证 + 是拼接而非数值加法）。
+// ---------------------------------------------------------------------------
+
+pub struct ConcatValueOfDrop;
+
+impl Rule<JavaAst> for ConcatValueOfDrop {
+    fn name(&self) -> &'static str {
+        "concat_value_of_drop"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::Binary {
+            return None;
+        }
+        if lang.bin_op(id) != Some(BinOp::Add) {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        let (l, r) = (ch[0], ch[1]);
+        let is_value_of = |n: JavaId| -> Option<JavaId> {
+            if lang.kind(n) != NodeKind::Call {
+                return None;
+            }
+            let c = lang.children(n).to_vec();
+            if c.len() != 2 {
+                return None;
+            }
+            let callee = c[0];
+            if let NodeData::Member { name } = lang.data(callee) {
+                if name == "valueOf" && lang.var_name(lang.children(callee)[0]) == Some("String") {
+                    return Some(c[1]);
+                }
+            }
+            if let NodeData::VarRef { name } = lang.data(callee) {
+                if name == "valueOf" {
+                    return Some(c[1]);
+                }
+            }
+            None
+        };
+        let stringy = |n: JavaId| -> bool {
+            matches!(lang.literal(n), Some(LitRef::Str(_)))
+                || lang
+                    .var_type(n)
+                    .is_some_and(|t| matches!(t, JType::Ref(n) if n == "String"))
+        };
+        // String.valueOf(x) + y（y 可证 String）
+        if let Some(x) = is_value_of(l) {
+            if stringy(r) {
+                let with = lang.build_bin(BinOp::Add, x, r);
+                return Some(Edit::Replace {
+                    target: id,
+                    with,
+                });
+            }
+        }
+        // y + String.valueOf(x)
+        if let Some(x) = is_value_of(r) {
+            if stringy(l) {
+                let with = lang.build_bin(BinOp::Add, l, x);
+                return Some(Edit::Replace {
+                    target: id,
+                    with,
+                });
+            }
+        }
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 门面
 // ---------------------------------------------------------------------------
@@ -673,6 +749,7 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(NewStringFold));
     rules.push(Box::new(LoopHeadBreak));
     rules.push(Box::new(WhileIteratorToForEach));
+    rules.push(Box::new(ConcatValueOfDrop));
     rules
 }
 

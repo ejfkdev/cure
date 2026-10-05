@@ -91,6 +91,23 @@ public class ObfDemo {
         }
         System.out.println(r);
 
+        // [拆分声明 + 拷贝链]（jadx 寄存器形态的顺序部分）
+        int p;
+        p = 11;
+        int q;
+        q = p;
+        int w;
+        w = q;
+        System.out.println(w);
+
+        // [valueOf 包装]
+        String v = String.valueOf(42) + "x";
+        System.out.println(v);
+
+        // [拼接常量分散]
+        String m2 = "a" + v + "b" + "c";
+        System.out.println(m2);
+
         System.out.println(sideCount);
     }
 }
@@ -192,14 +209,25 @@ fn deobfuscate_simulated_obfuscator() {
     assert!(cleaned.contains("for (String e : list)"), "{cleaned}");
     assert!(!cleaned.contains("Iterator"), "{cleaned}");
 
-    // if-else 赋值分叉 → 三元赋值
-    assert!(cleaned.contains("r = flag ? 1 : 2;"), "{cleaned}");
+    // if-else 赋值分叉 → 三元赋值 → r 唯一使用处继续内联
+    assert!(cleaned.contains("println(flag ? 1 : 2);"), "{cleaned}");
+    assert!(!cleaned.contains("int r;"), "{cleaned}");
 
-    // 副作用安全：bump(1) 的调用必须保留（死赋值规则正确拒绝删除）
-    assert!(cleaned.contains("t = bump(1);"), "{cleaned}");
-    assert!(cleaned.contains("t = bump(2);"), "{cleaned}");
-    // 临时变量 u 被传播消除
-    assert!(!cleaned.contains("int u ="), "{cleaned}");
+    // 副作用安全：bump(1)/bump(2) 调用都保留（带副作用的死赋值不删），
+    // 且赋值传播把 `t = bump(2); int u = t;` 归并为 `int u = bump(2);`
+    assert!(cleaned.contains("int t = bump(1);"), "{cleaned}");
+    assert!(cleaned.contains("int u = bump(2);"), "{cleaned}");
+    assert!(!cleaned.contains("t = bump(2);"), "{cleaned}");
+
+    // 拆分声明 + 拷贝链 → 全链塌缩为常量
+    assert!(cleaned.contains("println(11);"), "{cleaned}");
+    assert!(!cleaned.contains("int p;"), "{cleaned}");
+    assert!(!cleaned.contains("q = p;"), "{cleaned}");
+
+    // valueOf 剥离 + 拼接常量合并
+    assert!(!cleaned.contains("String.valueOf"), "{cleaned}");
+    assert!(cleaned.contains("42 + \"x\""), "{cleaned}");
+    assert!(cleaned.contains(r#""a" + v + "bc""#), "{cleaned}");
 
     // ---- 3. 统计 ----
     let obf_lines = OBFUSCATED.lines().filter(|l| !l.trim().is_empty()).count();
