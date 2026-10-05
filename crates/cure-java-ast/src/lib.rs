@@ -857,16 +857,28 @@ impl Lang for JavaAst {
     /// 1) 效果表——arena 按升序扫描（child index < parent index 不变量）；
     /// 2) 变量类型表——从 root 做作用域栈遍历。
     fn prepare(&mut self, root: JavaId) {
-        // ---- 效果表（升序 = 后序）----
+        // ---- 效果表 ----
+        // 正常情况一轮升序扫描即可（children index < parent index 的
+        // 解析器不变量）。但 Edit::Replace 注入的新节点 append 在 arena
+        // 末尾、index 大于其（旧）父节点——单轮 sweep 会让父聚合到 Unknown
+        // 并污染祖先链。故迭代到不动点（违例深度有限，2 轮内收敛）。
         self.effect_cache.clear();
         let n = self.nodes.len() as u32;
-        for i in 0..n {
-            let id = JavaId(i);
-            let mut e = self.own_effect(id);
-            for &c in &self.nodes[i as usize].children {
-                e = e.worst(self.effect_cache.get(&c.0).copied().unwrap_or(Effect::Unknown));
+        for _round in 0..4 {
+            let mut changed = false;
+            for i in 0..n {
+                let id = JavaId(i);
+                let mut e = self.own_effect(id);
+                for &c in &self.nodes[i as usize].children {
+                    e = e.worst(self.effect_cache.get(&c.0).copied().unwrap_or(Effect::Unknown));
+                }
+                if self.effect_cache.insert(i, e) != Some(e) {
+                    changed = true;
+                }
             }
-            self.effect_cache.insert(i, e);
+            if !changed {
+                break;
+            }
         }
 
         // ---- 变量类型（作用域栈）----

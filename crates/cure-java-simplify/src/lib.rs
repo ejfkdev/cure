@@ -1097,6 +1097,104 @@ impl Rule<JavaAst> for TrailingContinueJava {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 异或噪声消除（Java 语义版）：Java 中 ^ 的操作数必为整型，
+// 故无需 is_exact_int 类型证明即可折叠——覆盖含副作用/未知类型的场景：
+//   (mark(5) ^ 0x5A) ^ 0x5A → mark(5)（调用保留、位置不变）
+//   x ^ 0 / 0 ^ x → x
+// ---------------------------------------------------------------------------
+
+pub struct XorNoise;
+
+impl Rule<JavaAst> for XorNoise {
+    fn name(&self) -> &'static str {
+        "xor_noise"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::Binary {
+            return None;
+        }
+        let op = lang.bin_op(id)?;
+        if op != BinOp::BitXor {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        let (l, r) = (ch[0], ch[1]);
+        // x ^ 0 / 0 ^ x → x（x 任意：求值位置与次数都不变）
+        let int_lit = |n: JavaId| lang.literal(n).and_then(|x| x.as_int());
+        if int_lit(r) == Some(0) {
+            return Some(Edit::Replace {
+                target: id,
+                with: l,
+            });
+        }
+        if int_lit(l) == Some(0) {
+            return Some(Edit::Replace {
+                target: id,
+                with: r,
+            });
+        }
+        // (x ^ K1) ^ K2 → x ^ (K1^K2)；K1^K2 == 0 → x（x 任意，保留原位）
+        if lang.kind(l) != NodeKind::Binary || lang.bin_op(l) != Some(BinOp::BitXor) {
+            return None;
+        }
+        let ich = lang.children(l).to_vec();
+        let k1 = lang.literal(ich[1]).and_then(|x| x.as_int())?;
+        let k2 = int_lit(r)?;
+        let x = ich[0];
+        let k = k1 ^ k2;
+        let with = if k == 0 {
+            x
+        } else {
+            let lit = lang.build_int(k, false);
+            lang.build_bin(BinOp::BitXor, x, lit)
+        };
+        Some(Edit::Replace {
+            target: id,
+            with,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 字面量 length 折叠："abc".length() → 3（字符串字面量长度编译期已知）。
+// ---------------------------------------------------------------------------
+
+pub struct StrLenFold;
+
+impl Rule<JavaAst> for StrLenFold {
+    fn name(&self) -> &'static str {
+        "str_len_fold"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::Call {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        if ch.len() != 1 {
+            return None;
+        }
+        let NodeData::Member { name } = lang.data(ch[0]) else {
+            return None;
+        };
+        if name != "length" {
+            return None;
+        }
+        let recv = lang.children(ch[0])[0];
+        if let Some(LitRef::Str(s)) = lang.literal(recv) {
+            let with = lang.build_int(s.chars().count() as i64, false);
+            return Some(Edit::Replace {
+                target: id,
+                with,
+            });
+        }
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 门面
 // ---------------------------------------------------------------------------
@@ -1115,6 +1213,8 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(ConcatValueOfDrop));
     rules.push(Box::new(StringBuilderStatements));
     rules.push(Box::new(TrailingContinueJava));
+    rules.push(Box::new(XorNoise));
+    rules.push(Box::new(StrLenFold));
     rules
 }
 

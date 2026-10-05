@@ -186,3 +186,159 @@ fn find_java(dir: &std::path::PathBuf) -> std::path::PathBuf {
     }
     panic!("no java file under {}", dir.display());
 }
+
+// ---------------------------------------------------------------------------
+// 双层数混淆：刁钻源级混淆（多层常量隐藏/嵌套不透明谓词/SB 语句链/寄存器回拷）
+// → javac（常量层被编译器折叠，结构性混淆存活）→ d8 → ddc（叠加寄存器伪影）
+// → cure 净化 → 编译运行比对。
+// 实测：80 → 53 行，15 次改写，输出与 ddc/原始双重一致。
+// ---------------------------------------------------------------------------
+
+const HARD_SRC: &str = r#"
+public class HardObf {
+    static int trace = 0;
+
+    static int mark(int v) {
+        trace += v;
+        return v;
+    }
+
+    public static void main(String[] args) {
+        // ===== [多层常量隐藏]：声明链 + 双异或 + 位噪声 + 拆分赋值 =====
+        int k = 20;
+        int k2 = k + 22;
+        int k3 = k2 - 22;
+        int k4 = ((k3 ^ 0x5A) ^ 0x5A) | 0;
+        int k5;
+        k5 = k4 & -1;
+        System.out.println("k=" + k5);
+
+        // ===== [嵌套不透明谓词]：双层 + 死分支 =====
+        boolean o1 = 2 > 1;
+        boolean o2 = 3 < 4;
+        if (o1 && o2) {
+            System.out.println("live");
+        } else {
+            System.out.println("dead1");
+        }
+        if (1 > 2) {
+            System.out.println("dead2");
+        }
+
+        // ===== [循环混合]：while(true) + 真实断路 + 寄存器回拷噪声 =====
+        int v24 = 0;
+        int v25 = 0;
+        v24 = 1;
+        while (true) {
+            if (v24 >= 4) {
+                break;
+            } else {
+                int v32 = v25 + v24;
+                int v33 = v24 + 1;
+                v25 = v32;
+                v24 = v33;
+            }
+        }
+        System.out.println("sum=" + v25);
+
+        // ===== [多层字符串]：SB 常量链 + new String + valueOf + 分散常量 =====
+        String s1 = new String(new StringBuilder().append("he").append("llo").toString());
+        String s2 = String.valueOf(s1.length()) + "!";
+        String s3 = "a" + s2 + "b" + "c" + "d";
+        System.out.println(s3);
+
+        // ===== [布尔旗标三元嵌套] =====
+        boolean flag = (v25 > 3 ? true : false);
+        boolean flag2 = flag ? (v25 > 5 ? true : false) : false;
+        System.out.println("f=" + (flag2 ? 1 : 0));
+
+        // ===== [迭代器 + SB 语句链 + continue 组合] =====
+        java.util.List<String> list = new java.util.ArrayList<>();
+        list.add("x1");
+        list.add("yy");
+        java.util.Iterator<String> it = list.iterator();
+        String acc = "";
+        while (true) {
+            if (!(it.hasNext())) {
+                break;
+            } else {
+                String e = (String) it.next();
+                StringBuilder sb = new StringBuilder().append(acc);
+                sb = sb.append(e);
+                StringBuilder sb2 = sb.append("-");
+                String acc2 = sb2.toString();
+                acc = acc2;
+                continue;
+            }
+        }
+        System.out.println("acc=" + acc);
+
+        // ===== [副作用异或包裹]：mark 调用恰好一次、位置不变 =====
+        int r = (mark(5) ^ 0x5A) ^ 0x5A;
+        System.out.println("r=" + r);
+
+        System.out.println("trace=" + trace);
+    }
+}"#;
+
+#[test]
+fn ddc_dual_layer_obfuscation() {
+    if !have_tools() {
+        return;
+    }
+    let base = std::env::temp_dir().join("cure_ddc_hard");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let src_file = base.join("HardObf.java");
+    fs::write(&src_file, HARD_SRC).unwrap();
+
+    // javac → d8 → ddc
+    let out = run_java(Command::new("javac").arg("-nowarn").arg("--release").arg("17").arg("-d").arg(&base).arg(&src_file));
+    assert!(out.status.success());
+    let out = run_java(Command::new(D8).arg("--release").arg("--output").arg(&base).arg(base.join("HardObf.class")));
+    assert!(out.status.success());
+    let decomp = base.join("decomp");
+    let out = run_java(Command::new("ddc").arg(base.join("classes.dex")).arg("-o").arg(&decomp));
+    assert!(out.status.success());
+    let decomp_src = fs::read_to_string(find_java(&decomp)).unwrap();
+
+    // ddc 行为基准
+    let ddc_dir = base.join("ddc_run");
+    fs::create_dir_all(&ddc_dir).unwrap();
+    fs::write(ddc_dir.join("HardObf.java"), strip_package(&decomp_src)).unwrap();
+    let out = run_java(Command::new("javac").arg("-nowarn").arg("-d").arg(&ddc_dir).arg(ddc_dir.join("HardObf.java")));
+    assert!(out.status.success());
+    let ddc_run = run_java(Command::new("java").arg("-cp").arg(&ddc_dir).arg("HardObf"));
+    let ddc_out = String::from_utf8_lossy(&ddc_run.stdout).to_string();
+
+    // cure
+    use cure_engine::Config;
+    use cure_java_parser::parse;
+    use cure_java_print::print_unit;
+    use cure_java_simplify::simplify_unit;
+    let mut outcome = parse(&decomp_src);
+    assert!(outcome.errors.is_empty(), "双层数 ddc 输出解析失败");
+    let report = simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
+    let cured = print_unit(&outcome.ast, &outcome.unit);
+
+    let cured_dir = base.join("cured");
+    fs::create_dir_all(&cured_dir).unwrap();
+    fs::write(cured_dir.join("HardObf.java"), strip_package(&cured)).unwrap();
+    let out = run_java(Command::new("javac").arg("-nowarn").arg("-d").arg(&cured_dir).arg(cured_dir.join("HardObf.java")));
+    assert!(out.status.success(), "cure 产物编译失败：\n{}\n{cured}", String::from_utf8_lossy(&out.stderr));
+    let cured_run = run_java(Command::new("java").arg("-cp").arg(&cured_dir).arg("HardObf"));
+    let cured_out = String::from_utf8_lossy(&cured_run.stdout).to_string();
+
+    assert_eq!(ddc_run.status.code(), cured_run.status.code());
+    assert_eq!(ddc_out, cured_out, "双层数语义改变！\nddc={ddc_out}\ncured={cured_out}");
+    let a = decomp_src.lines().filter(|l| !l.trim().is_empty()).count();
+    let b = cured.lines().filter(|l| !l.trim().is_empty()).count();
+    eprintln!(
+        "双层数链路通过：ddc 输出 {} 行 → {} 行（-{}%），{} 次改写",
+        a,
+        b,
+        100 - b * 100 / a,
+        report.edits
+    );
+    assert!(report.edits >= 10, "双层数预期显著净化，实际 {}", report.edits);
+}

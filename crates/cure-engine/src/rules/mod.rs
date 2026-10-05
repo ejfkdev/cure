@@ -490,17 +490,28 @@ impl<L: Lang> Rule<L> for LocalPropagation {
             return None;
         }
 
-        // 扫描 decl 之后的区域
+        // 扫描 decl 之后的区域（用途/遮蔽全区间；写冲突窗口见下）
         let mut uses: Vec<L::Id> = Vec::new();
-        let mut writes: HashSet<String> = HashSet::new();
         let mut shadowed = false;
         for &s in &stmts[index + 1..] {
-            scan_region(&*lang, s, &name, &mut uses, &mut writes, &mut shadowed);
+            let mut w = HashSet::new();
+            scan_region(&*lang, s, &name, &mut uses, &mut w, &mut shadowed);
         }
         if shadowed || uses.len() != 1 {
             return None;
         }
         let use_id = uses[0];
+        // 写冲突窗口 = [decl 后, 使用语句]：纯值移动到使用点，
+        // 使用点之后的写不影响（值已被消费）
+        let mut writes: HashSet<String> = HashSet::new();
+        for &s in &stmts[index + 1..] {
+            let mut w = HashSet::new();
+            scan_region(&*lang, s, &name, &mut Vec::new(), &mut w, &mut false);
+            writes.extend(w);
+            if subtree_contains(&*lang, s, |n| n == use_id) {
+                break; // 使用语句之后的写不参与冲突判定
+            }
+        }
         let ve = lang.effect(value);
 
         if ve <= Effect::MayRead {
@@ -1653,17 +1664,30 @@ impl<L: Lang> Rule<L> for AssignPropagation {
             return None;
         }
 
-        // 扫描赋值之后的区域
+        // 扫描赋值之后的区域（用途/遮蔽全区间；写冲突窗口见下）
         let mut uses: Vec<L::Id> = Vec::new();
-        let mut writes: HashSet<String> = HashSet::new();
         let mut shadowed = false;
         for &s in &stmts[idx + 1..] {
-            scan_region(&*lang, s, &name, &mut uses, &mut writes, &mut shadowed);
+            let mut w = HashSet::new();
+            scan_region(&*lang, s, &name, &mut uses, &mut w, &mut shadowed);
         }
-        if shadowed || uses.len() != 1 || writes.contains(&name) {
+        if shadowed || uses.len() != 1 {
             return None;
         }
+        // x 自身在窗口内被写 → 赋值会被覆盖，拒绝
         let use_id = uses[0];
+        let mut writes: HashSet<String> = HashSet::new();
+        for &s in &stmts[idx + 1..] {
+            let mut w = HashSet::new();
+            scan_region(&*lang, s, &name, &mut Vec::new(), &mut w, &mut false);
+            if w.contains(&name) {
+                return None;
+            }
+            writes.extend(w);
+            if subtree_contains(&*lang, s, |n| n == use_id) {
+                break; // 使用语句之后的写不参与冲突判定
+            }
+        }
         let ve = lang.effect(value);
 
         if ve <= Effect::MayRead {
@@ -1920,6 +1944,49 @@ impl<L: Lang> Rule<L> for TrailingReturn {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 三元-布尔运算归并（反混淆产物）：
+//   c ? a : false → c && a、c ? true : a → c || a（a 为布尔）
+//   c 单次求值、a 条件求值，两种形态完全一致。
+// ---------------------------------------------------------------------------
+
+pub struct TernaryBoolOp;
+
+impl<L: Lang> Rule<L> for TernaryBoolOp {
+    fn name(&self) -> &'static str {
+        "ternary_bool_op"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk: _ } = ctx;
+        if lang.kind(id) != NodeKind::Ternary {
+            return None;
+        }
+        let ch = lang.children(id);
+        let (c, a, b) = (*ch.first()?, *ch.get(1)?, *ch.get(2)?);
+        let lb = |n: L::Id| matches!(lang.literal(n), Some(LitRef::Bool(v)) if v);
+        let is_false = |n: L::Id| matches!(lang.literal(n), Some(LitRef::Bool(v)) if !v);
+        let with = if is_false(b) && lang.is_bool(a) {
+            lang.build_bin(BinOp::And, c, a)
+        } else if lb(b) && lang.is_bool(a) {
+            // c ? a : true ≡ !c || a —— 少见，跳过保持保守
+            return None;
+        } else if lb(a) && lang.is_bool(b) {
+            // c ? true : b ≡ c || b
+            lang.build_bin(BinOp::Or, c, b)
+        } else if is_false(a) && lang.is_bool(b) {
+            // c ? false : b ≡ !c && b —— 少见，跳过保持保守
+            return None;
+        } else {
+            return None;
+        };
+        Some(Edit::Replace {
+            target: id,
+            with,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 注册表
 // ---------------------------------------------------------------------------
@@ -1940,6 +2007,7 @@ pub fn default_rules<L: Lang>() -> Vec<Box<dyn Rule<L>>> {
         Box::new(NotCompare),
         Box::new(TernaryFold),
         Box::new(TernaryBool),
+        Box::new(TernaryBoolOp),
         Box::new(ConstFoldBin),
         Box::new(CmpConstFold),
         Box::new(BitIdentity),

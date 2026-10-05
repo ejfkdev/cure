@@ -161,7 +161,7 @@ class A {
 "#);
     assert!(out.contains("new StringBuilder(16)"), "{out}");
 
-    // toString 结果继续被使用（如 .length()）：折叠仍语义安全（String 值等价）
+    // toString 结果继续被使用（如 .length()）：SB 折叠 + 字面量长度折叠连锁 → 1
     let out = run_src(r#"
 class A {
     int m() {
@@ -169,7 +169,7 @@ class A {
     }
 }
 "#);
-    assert!(out.contains(r#""x".length()"#), "{out}");
+    assert!(out.contains("return 1;"), "{out}");
 }
 
 #[test]

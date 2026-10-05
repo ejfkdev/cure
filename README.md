@@ -77,12 +77,13 @@ echo 'class A{int m(){int a=foo();int b=a;return b;}}' | cure -
 
 ## 规则清单
 
-引擎通用（30）：paren_removal、const_condition、boolean_return、if_to_ternary、
+引擎通用（31）：paren_removal、const_condition、boolean_return、if_to_ternary、
 if_assign_ternary、if_else_empty、bool_compare、double_not、bool_not_fold、
 bool_short_circuit、not_compare、ternary_fold、ternary_bool、const_fold_bin、
 **cmp_const_fold**（`1 < 2 → true`，击穿不透明谓词）、self_assign、
 arith_identity、**arith_zero**、**bit_identity**、**arith_reassoc**（双异或/
 加减重结合/字符串拼接常量合并 `("a"+x)+"b"+"c" → "a"+x+"bc"`）、
+**ternary_bool_op**（`c ? a : false → c && a`）、
 local_propagation、**decl_assign_merge**、**assign_propagation**（拷贝赋值内联，
 块内声明锚点防逃逸；使用语句写排除：`target = use` 的 RHS 先于写求值）、
 **multi_use_copy**（多用途拷贝传播：`x = y; …N 处读 x` → 全部替换为 y）、
@@ -90,11 +91,25 @@ local_propagation、**decl_assign_merge**、**assign_propagation**（拷贝赋�
 **trailing_continue**（标签感知：循环体尾部 continue，标签指向本循环才删）、
 dead_store + 选配 unreachable_after_terminal。
 
-Java 专属（12）：cast_simplify、self_compare、string_builder_fold、box_unbox_chain、
+Java 专属（14）：cast_simplify、self_compare、string_builder_fold、box_unbox_chain、
 iterator_to_for_each、while_iterator_to_for_each（支持 Cast/Paren 包裹的 next()）、
 new_string_fold、loop_head_break、concat_value_of_drop、
 **string_builder_statements**（语句级 SB 链还原：重赋值+新变量混合形态
-`sb = sb.append(x); sb2 = sb.append(y); s = sb2.toString()` → `s = …拼接…`）。
+`sb = sb.append(x); sb2 = sb.append(y); s = sb2.toString()` → `s = …拼接…`）、
+**xor_noise**（Java 语义下 XOR 操作数必为整型 → 含副作用调用也能剥
+`(mark(5) ^ 0x5A) ^ 0x5A → mark(5)`）、
+**str_len_fold**（`"abc".length() → 3`）。
+
+## 刁钻混淆验证（tests/hard_obfuscation.rs）
+
+多层常量隐藏（声明链×异或对×位噪声×死赋值）、嵌套不透明谓词、循环混合断路+
+寄存器回拷、多层字符串混淆（SB×new String×valueOf×分散常量×length）、布尔旗标
+三元嵌套、迭代器+SB 语句链+continue 组合、副作用异或包裹——**44 次改写，
+非空行 76 → 33（-57%）**，javac 差分逐字节一致，副作用调用序列完整保留。
+
+另有**双层数链路**（ddc_tools.rs 第二测）：刁钻混淆源 → javac（常量层被
+编译器折叠、结构性混淆存活）→ d8 → ddc（叠加寄存器伪影）→ cure：
+15 次改写，输出与 ddc/原始双重一致。
 
 ## 去混淆验证
 
