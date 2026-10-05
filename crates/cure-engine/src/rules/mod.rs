@@ -2,7 +2,9 @@
 //!
 //! 每条规则文档化其语义前提；所有提案都必须严格降低成本（runner 校验）。
 
-use std::collections::HashSet;
+/// 规则热路径的字符串集合：快速定长 hasher（Sip13 对短混淆名纯浪费）。
+type StrSet = std::collections::HashSet<String, crate::walk::IdBuild>;
+
 
 use crate::analysis::{prefix_effects_readable, reads_vars, subtree_contains};
 use crate::effect::Effect;
@@ -20,6 +22,9 @@ pub struct ParenRemoval;
 impl<L: Lang> Rule<L> for ParenRemoval {
     fn name(&self) -> &'static str {
         "paren_removal"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Paren]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
@@ -43,6 +48,9 @@ pub struct ConstCondition;
 impl<L: Lang> Rule<L> for ConstCondition {
     fn name(&self) -> &'static str {
         "const_condition"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::If]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk } = ctx;
@@ -153,6 +161,9 @@ impl<L: Lang> Rule<L> for BooleanReturn {
     fn name(&self) -> &'static str {
         "boolean_return"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::If]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
         if lang.kind(id) != NodeKind::If {
@@ -203,6 +214,9 @@ pub struct IfElseEmpty;
 impl<L: Lang> Rule<L> for IfElseEmpty {
     fn name(&self) -> &'static str {
         "if_else_empty"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::If]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
@@ -270,6 +284,9 @@ impl<L: Lang> Rule<L> for BoolCompare {
     fn name(&self) -> &'static str {
         "bool_compare"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Binary]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
         if lang.kind(id) != NodeKind::Binary {
@@ -325,6 +342,9 @@ impl<L: Lang> Rule<L> for DoubleNot {
     fn name(&self) -> &'static str {
         "double_not"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Unary]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
         if lang.kind(id) != NodeKind::Unary || lang.un_op(id) != Some(UnOp::Not) {
@@ -352,6 +372,9 @@ pub struct BoolNotFold;
 impl<L: Lang> Rule<L> for BoolNotFold {
     fn name(&self) -> &'static str {
         "bool_not_fold"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Unary]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
@@ -381,6 +404,9 @@ pub struct SelfAssign;
 impl<L: Lang> Rule<L> for SelfAssign {
     fn name(&self) -> &'static str {
         "self_assign"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Assign]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
@@ -412,6 +438,9 @@ pub struct ArithIdentity;
 impl<L: Lang> Rule<L> for ArithIdentity {
     fn name(&self) -> &'static str {
         "arith_identity"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Binary]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
@@ -463,6 +492,9 @@ impl<L: Lang> Rule<L> for LocalPropagation {
     fn name(&self) -> &'static str {
         "local_propagation"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::VarDecl]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk } = ctx;
         if lang.kind(id) != NodeKind::VarDecl {
@@ -500,7 +532,7 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         let mut uses: Vec<L::Id> = Vec::new();
         let mut shadowed = false;
         for &s in &stmts[index + 1..] {
-            let mut w = HashSet::new();
+            let mut w = StrSet::default();
             scan_region(&*lang, s, &name, &mut uses, &mut w, &mut shadowed);
         }
         if shadowed || uses.len() != 1 {
@@ -509,10 +541,10 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         let use_id = uses[0];
         // 写冲突窗口 = [decl 后, 使用语句]：纯值移动到使用点，
         // 使用点之后的写不影响（值已被消费）
-        let mut writes: HashSet<String> = HashSet::new();
+        let mut writes: StrSet = StrSet::default();
         let mut use_stmt_idx = None;
         for (off, &s) in stmts[index + 1..].iter().enumerate() {
-            let mut w = HashSet::new();
+            let mut w = StrSet::default();
             scan_region(&*lang, s, &name, &mut Vec::new(), &mut w, &mut false);
             writes.extend(w);
             if subtree_contains(&*lang, s, |n| n == use_id) {
@@ -526,7 +558,7 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         if let Some(ui) = use_stmt_idx {
             for &s in &stmts[ui + 1..] {
                 let mut tail_uses = Vec::new();
-                let mut tail_writes = HashSet::new();
+                let mut tail_writes = StrSet::default();
                 let mut tail_shadowed = false;
                 scan_region(&*lang, s, &name, &mut tail_uses, &mut tail_writes, &mut tail_shadowed);
                 if !tail_uses.is_empty()
@@ -542,7 +574,7 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         if ve <= Effect::MayRead {
             // 自由移动：区间内的显式局部写不得触碰 V 读到的变量
             // （对声明变量自身的写也包含在 writes 里，一票否决）
-            let mut reads = HashSet::new();
+            let mut reads = StrSet::default();
             reads_vars(&*lang, value, &mut reads);
             reads.insert(name.clone());
             let mut effective_writes = writes.clone();
@@ -603,7 +635,7 @@ fn scan_region<L: Lang>(
     node: L::Id,
     name: &str,
     uses: &mut Vec<L::Id>,
-    writes: &mut HashSet<String>,
+    writes: &mut StrSet,
     shadowed: &mut bool,
 ) {
     match lang.kind(node) {
@@ -706,6 +738,9 @@ impl<L: Lang> Rule<L> for BoolShortCircuit {
     fn name(&self) -> &'static str {
         "bool_short_circuit"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Binary]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
         if lang.kind(id) != NodeKind::Binary {
@@ -759,6 +794,9 @@ impl<L: Lang> Rule<L> for NotCompare {
     fn name(&self) -> &'static str {
         "not_compare"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Unary]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
         if lang.kind(id) != NodeKind::Unary || lang.un_op(id) != Some(UnOp::Not) {
@@ -808,6 +846,9 @@ impl<L: Lang> Rule<L> for TernaryFold {
     fn name(&self) -> &'static str {
         "ternary_fold"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Ternary]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
         if lang.kind(id) != NodeKind::Ternary {
@@ -836,6 +877,9 @@ pub struct TernaryBool;
 impl<L: Lang> Rule<L> for TernaryBool {
     fn name(&self) -> &'static str {
         "ternary_bool"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Ternary]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
@@ -874,6 +918,9 @@ pub struct ConstFoldBin;
 impl<L: Lang> Rule<L> for ConstFoldBin {
     fn name(&self) -> &'static str {
         "const_fold_bin"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Binary]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
@@ -1006,6 +1053,9 @@ impl<L: Lang> Rule<L> for ArithZero {
     fn name(&self) -> &'static str {
         "arith_zero"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Binary]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
         if lang.kind(id) != NodeKind::Binary {
@@ -1068,6 +1118,9 @@ pub struct DeadStore;
 impl<L: Lang> Rule<L> for DeadStore {
     fn name(&self) -> &'static str {
         "dead_store"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::VarDecl, NodeKind::Assign, NodeKind::ExprStmt]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk } = ctx;
@@ -1163,7 +1216,7 @@ impl<L: Lang> Rule<L> for DeadStore {
                 return None;
             }
             let mut uses: Vec<L::Id> = Vec::new();
-            let mut writes = HashSet::new();
+            let mut writes = StrSet::default();
             let mut shadowed = false;
             for &s in &stmts[idx + 1..] {
                 scan_region(&*lang, s, &name, &mut uses, &mut writes, &mut shadowed);
@@ -1243,6 +1296,9 @@ impl<L: Lang> Rule<L> for UnreachableAfterTerminal {
     fn name(&self) -> &'static str {
         "unreachable_after_terminal"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Block]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
         if lang.kind(id) != NodeKind::Block {
@@ -1284,6 +1340,9 @@ pub struct CmpConstFold;
 impl<L: Lang> Rule<L> for CmpConstFold {
     fn name(&self) -> &'static str {
         "cmp_const_fold"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Binary]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
@@ -1352,6 +1411,9 @@ pub struct BitIdentity;
 impl<L: Lang> Rule<L> for BitIdentity {
     fn name(&self) -> &'static str {
         "bit_identity"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Binary]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
@@ -1424,6 +1486,9 @@ pub struct ArithReassoc;
 impl<L: Lang> Rule<L> for ArithReassoc {
     fn name(&self) -> &'static str {
         "arith_reassoc"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Binary]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
@@ -1510,6 +1575,9 @@ pub struct IfToTernary;
 impl<L: Lang> Rule<L> for IfToTernary {
     fn name(&self) -> &'static str {
         "if_to_ternary"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::If]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk } = ctx;
@@ -1601,6 +1669,9 @@ impl<L: Lang> Rule<L> for IfAssignTernary {
     fn name(&self) -> &'static str {
         "if_assign_ternary"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::If]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
         if lang.kind(id) != NodeKind::If {
@@ -1668,6 +1739,9 @@ impl<L: Lang> Rule<L> for DeclAssignMerge {
     fn name(&self) -> &'static str {
         "decl_assign_merge"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::VarDecl]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk } = ctx;
         if lang.kind(id) != NodeKind::VarDecl || !lang.children(id).is_empty() {
@@ -1734,6 +1808,9 @@ impl<L: Lang> Rule<L> for AssignPropagation {
     fn name(&self) -> &'static str {
         "assign_propagation"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Assign, NodeKind::ExprStmt]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk } = ctx;
         // 语句形态：Assign / ExprStmt{Assign}
@@ -1789,7 +1866,7 @@ impl<L: Lang> Rule<L> for AssignPropagation {
         let mut uses: Vec<L::Id> = Vec::new();
         let mut shadowed = false;
         for &s in &stmts[idx + 1..] {
-            let mut w = HashSet::new();
+            let mut w = StrSet::default();
             scan_region(&*lang, s, &name, &mut uses, &mut w, &mut shadowed);
         }
         if shadowed || uses.len() != 1 {
@@ -1797,9 +1874,9 @@ impl<L: Lang> Rule<L> for AssignPropagation {
         }
         // x 自身在窗口内被写 → 赋值会被覆盖，拒绝
         let use_id = uses[0];
-        let mut writes: HashSet<String> = HashSet::new();
+        let mut writes: StrSet = StrSet::default();
         for &s in &stmts[idx + 1..] {
-            let mut w = HashSet::new();
+            let mut w = StrSet::default();
             scan_region(&*lang, s, &name, &mut Vec::new(), &mut w, &mut false);
             if w.contains(&name) {
                 return None;
@@ -1812,7 +1889,7 @@ impl<L: Lang> Rule<L> for AssignPropagation {
         let ve = lang.effect(value);
 
         if ve <= Effect::MayRead {
-            let mut reads = HashSet::new();
+            let mut reads = StrSet::default();
             reads_vars(&*lang, value, &mut reads);
             let mut effective_writes = writes.clone();
             if let Some(target) = use_stmt_target_write(&*lang, &stmts[idx + 1..], use_id, name.as_str()) {
@@ -1920,6 +1997,9 @@ impl<L: Lang> Rule<L> for TrailingContinue {
     fn name(&self) -> &'static str {
         "trailing_continue"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::While, NodeKind::For, NodeKind::DoWhile, NodeKind::ForEach]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
         // While/For/DoWhile/ForEach 的 body 为 Block 且末语句为无标签 continue
@@ -1957,6 +2037,9 @@ pub struct MultiUseCopyPropagation;
 impl<L: Lang> Rule<L> for MultiUseCopyPropagation {
     fn name(&self) -> &'static str {
         "multi_use_copy"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Assign, NodeKind::ExprStmt]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk } = ctx;
@@ -2007,7 +2090,7 @@ impl<L: Lang> Rule<L> for MultiUseCopyPropagation {
 
         // 扫描后续：收集 x 的全部读；对 x 的任何写 / 对 y 的任何写 / 遮蔽 → 拒绝
         let mut uses: Vec<L::Id> = Vec::new();
-        let mut writes: HashSet<String> = HashSet::new();
+        let mut writes: StrSet = StrSet::default();
         let mut shadowed = false;
         for &s in &stmts[idx + 1..] {
             scan_region(&*lang, s, &name, &mut uses, &mut writes, &mut shadowed);
@@ -2048,6 +2131,9 @@ impl<L: Lang> Rule<L> for TrailingReturn {
     fn name(&self) -> &'static str {
         "trailing_return"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Return]
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let root = ctx.root();
         let parent = ctx.parent(id)?;
@@ -2077,6 +2163,9 @@ pub struct TernaryBoolOp;
 impl<L: Lang> Rule<L> for TernaryBoolOp {
     fn name(&self) -> &'static str {
         "ternary_bool_op"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Ternary]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk: _ } = ctx;
@@ -2266,6 +2355,9 @@ fn scan_kill_event<L: Lang>(
 impl<L: Lang> Rule<L> for StoreKill {
     fn name(&self) -> &'static str {
         "store_kill"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::VarDecl, NodeKind::Assign, NodeKind::ExprStmt]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk } = ctx;

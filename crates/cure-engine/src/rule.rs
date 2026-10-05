@@ -82,6 +82,14 @@ impl<'a, L: Lang> RewriteCtx<'a, L> {
 pub trait Rule<L: Lang> {
     fn name(&self) -> &'static str;
 
+    /// 本规则关注的节点类别（**空 = 全部类别**）。pass 循环按类别建分派桶，
+    /// 无关节点直接跳过检查——"全部规则 × 每节点一次虚调用"是扫描主开销。
+    /// 声明必须覆盖 check() 入口的真实类别判定：多报只是浪费检查（正确），
+    /// 漏报会让规则失效（漏改写，回归测试会暴露）。
+    fn kinds(&self) -> &'static [crate::kind::NodeKind] {
+        &[]
+    }
+
     /// 在节点 `id` 处检查是否可改写。
     /// 契约：只读既有结构（可向 arena 追加新节点）；结构变更只经 `Edit` 提案。
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>>;

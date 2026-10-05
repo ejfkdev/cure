@@ -65,22 +65,63 @@ pub fn simplify<L: Lang>(
 ) -> Report {
     let mut report = Report::default();
     lang.prepare(root);
+    // 类别分派桶：kind → 关注该类别的规则下标（含 kinds()==空 的通用规则）。
+    // 惰性建桶（每类别至多一次，O(规则数)）；Vec 按 discriminant 索引，
+    // 新变体自动扩容——没有"漏桶"风险。
+    let mut dispatch: Vec<Option<Box<[u32]>>> = vec![None; NodeKind::SLOT_COUNT];
     loop {
-        let snap = walk(lang, root);
+        let mut snap = walk(lang, root);
+        // touched = 立即应用的编辑足迹（真已脱离树）。已排队（未应用）的
+        // 编辑不改树 → 其足迹不进 touched：后续提案照常扫描/照常排队，
+        // 靠应用时的重跑检查消化（见 pass 末级联）。
         let mut touched: crate::walk::IdMap<L::Id, ()> = std::collections::HashMap::default();
+        // 搬移集：立即 Replace 把既有节点挪进新位置（with 复用旧节点）。
+        // 这些节点的快照 parent 已过期——后续提案不得以其为目标（应用会
+        // 写进幽灵父=半应用）。下一 pass 新鲜 walk 后自然解除。
+        let mut moved: crate::walk::IdMap<L::Id, ()> = std::collections::HashMap::default();
         struct Queued<L: Lang> {
+            /// 规则下标/提案节点：级联重查模式遗留（现按提案直接校验应用），
+            /// 保留字段供 CURE_DEBUG_PASS 追踪与未来级联复用
+            #[allow(dead_code)]
+            rule_idx: usize,
+            #[allow(dead_code)]
+            node: L::Id,
             rule: &'static str,
             edit: Edit<L>,
             expects: Vec<Vec<L::Id>>,
         }
         let mut queued: Vec<Queued<L>> = Vec::new();
         let mut applied = false;
+        #[allow(unused_mut)]
+        let applied_immediate = false;
 
         'scan: for &id in &snap.ids {
             if touched.contains_key(&id) {
                 continue;
             }
-            for rule in rules {
+            let kind = lang.kind(id);
+            let ki = kind.slot();
+            debug_assert!(ki < NodeKind::SLOT_COUNT);
+            let bucket: &[u32] = {
+                let slot = &mut dispatch[ki];
+                if slot.is_none() {
+                    *slot = Some(
+                        rules
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, r)| {
+                                let ks = r.kinds();
+                                ks.is_empty() || ks.contains(&kind)
+                            })
+                            .map(|(i, _)| i as u32)
+                            .collect::<Vec<u32>>()
+                            .into_boxed_slice(),
+                    );
+                }
+                slot.as_deref().unwrap()
+            };
+            for &ri in bucket {
+                let rule = &rules[ri as usize];
                 if !cfg.enabled(rule.name()) {
                     continue;
                 }
@@ -102,14 +143,25 @@ pub fn simplify<L: Lang>(
                 if !structural && reduction == 0 {
                     continue;
                 }
-                // 足迹冲突：与已承诺编辑（立即应用或排队中）相交 → 本轮放弃
-                let mut fp = Vec::new();
-                crate::rule::collect_footprint(&*lang, &edit, &mut fp);
-                if fp.iter().any(|n| touched.contains_key(n)) {
-                    continue;
-                }
                 if crate::rule::is_replace_only(&edit) {
+                    // 足迹冲突：立即应用会真改树，与已应用足迹/搬移节点相交 →
+                    // 放弃本轮（下一 pass 新鲜快照重提）
+                    let mut fp = Vec::new();
+                    crate::rule::collect_footprint(&*lang, &edit, &mut fp);
+                    if fp.iter().any(|n| touched.contains_key(n) || moved.contains_key(n)) {
+                        continue;
+                    }
                     if apply_edit(lang, &snap, &edit).is_ok() {
+                        // with 子树里的既有节点（不在快照中）已被搬移
+                        let mut stack = with_roots_of(&edit);
+                        while let Some(n) = stack.pop() {
+                            if n != snap.root && !snap.parents.contains_key(&n) {
+                                moved.insert(n, ());
+                            }
+                            for &c in lang.children(n) {
+                                stack.push(c);
+                            }
+                        }
                         if std::env::var("CURE_DEBUG_PASS").is_ok() {
                             eprintln!(
                                 "[pass] immediate {} :: {}",
@@ -134,9 +186,18 @@ pub fn simplify<L: Lang>(
                         continue 'scan;
                     }
                 } else {
+                    // 足迹冲突：与其他已排队提案相交 → 放弃（守卫对提案时树成立，
+                    // 应用时不再重验——无重叠 + 单次新鲜重建保证一致性）
+                    let mut fp = Vec::new();
+                    crate::rule::collect_footprint(&*lang, &edit, &mut fp);
+                    if fp.iter().any(|n| touched.contains_key(n) || moved.contains_key(n)) {
+                        continue;
+                    }
                     let mut expects = Vec::new();
                     crate::rule::collect_splice_expectations(&*lang, &edit, &mut expects);
                     queued.push(Queued {
+                        rule_idx: ri as usize,
+                        node: id,
                         rule: rule.name(),
                         edit,
                         expects,
@@ -149,28 +210,40 @@ pub fn simplify<L: Lang>(
             }
         }
 
-        // pass 末：延迟应用结构编辑（降序 + 校验，失配丢弃）
-        queued.sort_by(|a, b| {
-            let ka = crate::rule::structural_sort_key(&snap, &a.edit);
-            let kb = crate::rule::structural_sort_key(&snap, &b.edit);
-            kb.cmp(&ka)
-        });
-        for q in queued {
-            let mut expects = q.expects.as_slice();
-            let ok = crate::rule::verify_deferred(&*lang, &snap, &q.edit, &mut expects);
-            if std::env::var("CURE_DEBUG_PASS").is_ok() {
-                eprintln!(
-                    "[pass] deferred {} {} :: {}",
-                    if ok { "apply" } else { "DISCARD" },
-                    q.rule,
-                    describe_edit(&*lang, &q.edit)
-                );
+        // pass 末：应用结构编辑队列。
+        // 立即路径的编辑已改树（含既有节点搬移到新位置——其快照 parent 已
+        // 过期）：先重建 walk+prepare 使一切新鲜，再逐条校验应用。
+        // 校验：Replace/Delete 按节点身份搜索定位；Splice 要求被删区间仍
+        // 等于提案时记录的节点序列。失配（提案假设不再成立）→ 丢弃，
+        // 下一 pass 重新提案——丢弃不降成本，单调性不受影响。
+        // 重建条件：仅本 pass 有立即编辑（搬移过既有节点）时快照才过期；
+        // 校验是纯结构操作（孩子表查找），不需要效果/类型缓存——只建 walk。
+        if !queued.is_empty() {
+            if applied_immediate {
+                snap = walk(lang, root);
             }
-            if ok {
-                crate::rule::apply_deferred(&mut *lang, &snap, &q.edit);
-                *report.by_rule.entry(q.rule).or_insert(0) += 1;
-                report.edits += 1;
-                applied = true;
+            queued.sort_by(|a, b| {
+                let ka = crate::rule::structural_sort_key(&snap, &a.edit);
+                let kb = crate::rule::structural_sort_key(&snap, &b.edit);
+                kb.cmp(&ka)
+            });
+            for q in queued {
+                let mut expects = q.expects.as_slice();
+                let ok = crate::rule::verify_deferred(&*lang, &snap, &q.edit, &mut expects);
+                if std::env::var("CURE_DEBUG_PASS").is_ok() {
+                    eprintln!(
+                        "[pass] deferred {} {} :: {}",
+                        if ok { "apply" } else { "DISCARD" },
+                        q.rule,
+                        describe_edit(&*lang, &q.edit)
+                    );
+                }
+                if ok {
+                    crate::rule::apply_deferred(&mut *lang, &snap, &q.edit);
+                    *report.by_rule.entry(q.rule).or_insert(0) += 1;
+                    report.edits += 1;
+                    applied = true;
+                }
             }
         }
 
@@ -181,6 +254,21 @@ pub fn simplify<L: Lang>(
         lang.prepare(root);
     }
     report
+}
+
+/// 编辑全部 with 根（Replace / 全 Replace Multi）。
+fn with_roots_of<L: Lang>(edit: &Edit<L>) -> Vec<L::Id> {
+    match edit {
+        Edit::Replace { with, .. } => vec![*with],
+        Edit::Multi(es) => es
+            .iter()
+            .filter_map(|e| match e {
+                Edit::Replace { with, .. } => Some(*with),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// 调试用：编辑的紧凑描述（节点 kind + 变体形态，不要求 L: Debug）。

@@ -9,7 +9,7 @@ use crate::lang::Lang;
 /// 通常只写一个 u32/u64，Sip13 的全量安全哈希在这里纯属浪费。
 /// 冲突安全性由 HashMap 的探测保证，这里只提供廉价混合。
 #[derive(Default)]
-pub(crate) struct IdHasher(u64);
+pub struct IdHasher(u64);
 
 impl IdHasher {
     #[inline]
@@ -43,8 +43,10 @@ impl Hasher for IdHasher {
     }
 }
 
-pub(crate) type IdBuild = BuildHasherDefault<IdHasher>;
+pub type IdBuild = BuildHasherDefault<IdHasher>;
 pub(crate) type IdMap<K, V> = HashMap<K, V, IdBuild>;
+/// 字符串集合（规则热路径）：同一快速 hasher。
+pub type StrSet = std::collections::HashSet<String, IdBuild>;
 
 /// 先序遍历的快照：id 列表 + 每个非根节点的 (parent, child_index)。
 ///

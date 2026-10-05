@@ -47,6 +47,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[derive(Clone)]
 struct Options {
     files: Vec<PathBuf>,
     output: Option<PathBuf>,
@@ -137,6 +138,52 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         let (changed, errored) = process_source(&src, &opts, None)?;
         any_changed |= changed;
         any_error |= errored;
+        return Ok(final_code(any_changed, any_error, &opts));
+    }
+
+    // 多文件并行（std::thread::scope，零依赖）：文件之间完全独立。
+    // stdout 输出模式只允许单文件（parse_args 已保证），并行时全部走
+    // -w/-o 或 --check，无输出交错问题；stderr 诊断按文件前缀。
+    if opts.files.len() > 1 && opts.output.is_none() {
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(opts.files.len())
+            .max(1);
+        let chunk = opts.files.len().div_ceil(n_threads);
+        let owned: Vec<Vec<PathBuf>> = opts.files.chunks(chunk).map(|c| c.to_vec()).collect();
+        let opts2 = opts.clone();
+        let results: Vec<Result<Vec<(bool, bool)>, String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = owned
+                .into_iter()
+                .map(|c| {
+                    let opts = opts2.clone();
+                    s.spawn(move || {
+                        let mut out = Vec::new();
+                        for path in &c {
+                            let src = fs::read_to_string(path).map_err(|e| {
+                                format!("读取 {} 失败: {e}", path.display())
+                            })?;
+                            let out_path = if opts.in_place {
+                                Some(path.clone())
+                            } else {
+                                None
+                            };
+                            let r = process_source(&src, &opts, out_path)?;
+                            out.push(r);
+                        }
+                        Ok(out)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("cure 线程 panic")).collect()
+        });
+        for r in results {
+            for (changed, errored) in r? {
+                any_changed |= changed;
+                any_error |= errored;
+            }
+        }
         return Ok(final_code(any_changed, any_error, &opts));
     }
 

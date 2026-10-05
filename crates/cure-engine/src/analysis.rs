@@ -1,6 +1,5 @@
 //! 通用轻量分析：局部变量读/写集合（只依赖 `Lang` 规范词汇表）。
 
-use std::collections::HashSet;
 
 use crate::kind::NodeKind;
 use crate::lang::Lang;
@@ -8,7 +7,7 @@ use crate::lang::Lang;
 /// `node` 子树中**显式写**的局部变量名集合。
 /// 注意：`Call`/`Member` 等不可知的写不计入——但那些节点的 effect 会是
 /// Unknown/MayThrow，调用方须先按 effect 分类，再对“只读局部”路径用本函数。
-pub fn local_writes<L: Lang>(lang: &L, id: L::Id, out: &mut HashSet<String>) {
+pub fn local_writes<L: Lang>(lang: &L, id: L::Id, out: &mut crate::walk::StrSet) {
     match lang.kind(id) {
         NodeKind::Assign => {
             let children = lang.children(id);
@@ -57,7 +56,7 @@ pub fn local_writes<L: Lang>(lang: &L, id: L::Id, out: &mut HashSet<String>) {
 }
 
 /// `node` 子树中所有被**读**的变量名（VarRef）。
-pub fn reads_vars<L: Lang>(lang: &L, id: L::Id, out: &mut HashSet<String>) {
+pub fn reads_vars<L: Lang>(lang: &L, id: L::Id, out: &mut crate::walk::StrSet) {
     if lang.kind(id) == NodeKind::VarRef {
         if let Some(n) = lang.var_name(id) {
             out.insert(n.to_string());

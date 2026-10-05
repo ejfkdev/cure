@@ -72,47 +72,115 @@ fn run_corpus(root: &str, label: &str) {
     let mut lines_after = 0usize;
     let mut per_rule: std::collections::BTreeMap<&'static str, usize> = Default::default();
 
-    for f in &files {
-        let src = match fs::read_to_string(f) {
-            Ok(s) => s,
-            Err(_) => continue, // 非 UTF-8 文件：跳过读取，不 panic
-        };
+    // 跨文件多核并行（std::thread::scope，零依赖）：文件之间完全独立
+    //（各自独立的 parse/simplify/print/再解析/幂等二轮），结果收集后统一断言。
+    struct FileOutcome {
+        path: PathBuf,
+        was_clean: bool,
+        edits: usize,
+        by_rule: Vec<(&'static str, usize)>,
+        lines_before: usize,
+        lines_after: usize,
+        // 自洽性：输出重新解析的错误（应为空）
+        reparse_errs: Vec<(usize, String)>,
+        // 幂等性：第二轮的编辑数（应为 0）
+        second_edits: usize,
+        second_by_rule: Vec<(&'static str, usize)>,
+        // 调试上下文
+        reparse_context: String,
+    }
+    let process = |f: &Path| -> Option<FileOutcome> {
+        let src = fs::read_to_string(f).ok()?; // 非 UTF-8：跳过
         // 1. 鲁棒性：任何输入都不 panic
         let mut outcome = parse(&src);
         let was_clean = outcome.errors.is_empty();
         let report = simplify_unit(&mut outcome.ast, &mut outcome.unit, &cfg);
         let printed = print_unit(&outcome.ast, &outcome.unit);
 
-        total_edits += report.edits;
-        for (k, v) in report.by_rule {
-            *per_rule.entry(k).or_insert(0) += v;
-        }
-        lines_before += count_code_lines(&src);
-        lines_after += count_code_lines(&printed);
         if !was_clean {
             eprintln!("  dirty: {}", f.display());
+            return Some(FileOutcome {
+                path: f.to_path_buf(),
+                was_clean,
+                edits: report.edits,
+                by_rule: report.by_rule.into_iter().collect(),
+                lines_before: count_code_lines(&src),
+                lines_after: count_code_lines(&printed),
+                reparse_errs: Vec::new(),
+                second_edits: 0,
+                second_by_rule: Vec::new(),
+                reparse_context: String::new(),
+            });
         }
+        // 2. 自洽性：输出必须再次干净解析
+        let reparsed = parse(&printed);
+        let reparse_errs: Vec<(usize, String)> = reparsed
+            .errors
+            .iter()
+            .take(3)
+            .map(|e| (e.line, e.message.clone()))
+            .collect();
+        let ctx = context_of(
+            &printed,
+            reparsed.errors.first().map(|e| e.line).unwrap_or(0),
+        );
+        // 3. 幂等性：第二轮 0 改写
+        let mut second = reparsed;
+        let r2 = simplify_unit(&mut second.ast, &mut second.unit, &cfg);
+        Some(FileOutcome {
+            path: f.to_path_buf(),
+            was_clean,
+            edits: report.edits,
+            by_rule: report.by_rule.into_iter().collect(),
+            lines_before: count_code_lines(&src),
+            lines_after: count_code_lines(&printed),
+            reparse_errs,
+            second_edits: r2.edits,
+            second_by_rule: r2.by_rule.into_iter().collect(),
+            reparse_context: ctx,
+        })
+    };
 
-        if was_clean {
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(files.len())
+        .max(1);
+    let chunk = files.len().div_ceil(n_threads);
+    let mut outcomes: Vec<FileOutcome> = Vec::with_capacity(files.len());
+    std::thread::scope(|s| {
+        let handles: Vec<_> = files
+            .chunks(chunk)
+            .map(|c| s.spawn(move || c.iter().filter_map(|f| process(f)).collect::<Vec<_>>()))
+            .collect();
+        for h in handles {
+            outcomes.extend(h.join().expect("corpus 线程 panic"));
+        }
+    });
+    outcomes.sort_by(|a, b| a.path.cmp(&b.path));
+
+    for o in &outcomes {
+        total_edits += o.edits;
+        for (k, v) in &o.by_rule {
+            *per_rule.entry(k).or_insert(0) += v;
+        }
+        lines_before += o.lines_before;
+        lines_after += o.lines_after;
+        if o.was_clean {
             clean += 1;
-            // 2. 自洽性：输出必须再次干净解析
-            let reparsed = parse(&printed);
             assert!(
-                reparsed.errors.is_empty(),
+                o.reparse_errs.is_empty(),
                 "{}: 输出无法干净重新解析：{:?}\n== 附近输出 ==\n{}",
-                f.display(),
-                &reparsed.errors[..reparsed.errors.len().min(3)],
-                context_of(&printed, reparsed.errors.first().map(|e| e.line).unwrap_or(0))
+                o.path.display(),
+                o.reparse_errs,
+                o.reparse_context
             );
-            // 3. 幂等性：第二轮 0 改写
-            let mut second = reparsed;
-            let r2 = simplify_unit(&mut second.ast, &mut second.unit, &cfg);
             assert_eq!(
-                r2.edits, 0,
+                o.second_edits, 0,
                 "{}: 第二轮仍有 {} 次改写（未收敛）\n{:?}",
-                f.display(),
-                r2.edits,
-                &r2.by_rule
+                o.path.display(),
+                o.second_edits,
+                &o.second_by_rule
             );
         } else {
             dirty += 1;

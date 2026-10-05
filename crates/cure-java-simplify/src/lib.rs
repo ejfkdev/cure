@@ -22,6 +22,9 @@ impl Rule<JavaAst> for CastSimplify {
     fn name(&self) -> &'static str {
         "cast_simplify"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Cast]
+    }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let lang = ctx.lang;
         let NodeData::Cast { ty } = lang.data(id) else {
@@ -60,6 +63,9 @@ pub struct SelfCompare;
 impl Rule<JavaAst> for SelfCompare {
     fn name(&self) -> &'static str {
         "self_compare"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Binary]
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         use cure_engine::kind::BinOp::{Eq, Ne};
@@ -103,6 +109,9 @@ pub struct StringBuilderFold;
 impl Rule<JavaAst> for StringBuilderFold {
     fn name(&self) -> &'static str {
         "string_builder_fold"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Call]
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let root = ctx.root();
@@ -233,6 +242,9 @@ impl Rule<JavaAst> for BoxUnboxChain {
     fn name(&self) -> &'static str {
         "box_unbox_chain"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Call]
+    }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let lang = ctx.lang;
         // 外层：inner.xxxValue()
@@ -339,6 +351,9 @@ pub struct IteratorToForEach;
 impl Rule<JavaAst> for IteratorToForEach {
     fn name(&self) -> &'static str {
         "iterator_to_for_each"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::For]
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let lang = ctx.lang;
@@ -522,6 +537,9 @@ impl Rule<JavaAst> for NewStringFold {
     fn name(&self) -> &'static str {
         "new_string_fold"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::New]
+    }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let root = ctx.root();
         let lang = ctx.lang;
@@ -572,6 +590,9 @@ pub struct LoopHeadBreak;
 impl Rule<JavaAst> for LoopHeadBreak {
     fn name(&self) -> &'static str {
         "loop_head_break"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::While, NodeKind::DoWhile]
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let lang = ctx.lang;
@@ -710,6 +731,9 @@ pub struct WhileIteratorToForEach;
 impl Rule<JavaAst> for WhileIteratorToForEach {
     fn name(&self) -> &'static str {
         "while_iterator_to_for_each"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::While]
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         // 先取结构信息（避免 lang 的可变借用与 ctx 方法冲突）
@@ -936,6 +960,9 @@ impl Rule<JavaAst> for ConcatValueOfDrop {
     fn name(&self) -> &'static str {
         "concat_value_of_drop"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Binary]
+    }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let root = ctx.root();
         let lang = ctx.lang;
@@ -1057,6 +1084,9 @@ fn count_var_uses_in(lang: &JavaAst, root: JavaId, name: &str) -> usize {
 impl Rule<JavaAst> for StringBuilderStatements {
     fn name(&self) -> &'static str {
         "string_builder_statements"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::VarDecl]
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         // 取结构信息（避免与 ctx 方法借用冲突）
@@ -1323,6 +1353,9 @@ impl Rule<JavaAst> for TrailingContinueJava {
     fn name(&self) -> &'static str {
         "trailing_continue"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::While, NodeKind::For, NodeKind::DoWhile, NodeKind::ForEach]
+    }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let parent = ctx.parent(id)?;
         let lang = ctx.lang;
@@ -1374,6 +1407,9 @@ pub struct XorNoise;
 impl Rule<JavaAst> for XorNoise {
     fn name(&self) -> &'static str {
         "xor_noise"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Binary]
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let lang = ctx.lang;
@@ -1432,6 +1468,9 @@ impl Rule<JavaAst> for StrLenFold {
     fn name(&self) -> &'static str {
         "str_len_fold"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Call]
+    }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let lang = ctx.lang;
         if lang.kind(id) != NodeKind::Call {
@@ -1477,6 +1516,9 @@ pub struct LiteralEval;
 impl Rule<JavaAst> for LiteralEval {
     fn name(&self) -> &'static str {
         "literal_eval"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Call, NodeKind::Index, NodeKind::Cast]
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let root = ctx.root();
@@ -1772,6 +1814,9 @@ impl Rule<JavaAst> for Base64NewStringFold {
     fn name(&self) -> &'static str {
         "base64_new_string_fold"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::New]
+    }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let root = ctx.root();
         let lang = ctx.lang;
@@ -1932,6 +1977,9 @@ struct CffCtx<'a> {
 impl Rule<JavaAst> for CffRecover {
     fn name(&self) -> &'static str {
         "cff_recover"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::While]
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let parent = ctx.parent(id)?;
@@ -2692,6 +2740,9 @@ impl Rule<JavaAst> for StaticArrayIndexFold {
     fn name(&self) -> &'static str {
         "static_array_index_fold"
     }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Index]
+    }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let lang = ctx.lang;
         if lang.kind(id) != NodeKind::Index {
@@ -2742,6 +2793,9 @@ pub struct ConstMethodInline;
 impl Rule<JavaAst> for ConstMethodInline {
     fn name(&self) -> &'static str {
         "const_method_inline"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Call]
     }
     fn structural(&self) -> bool {
         true

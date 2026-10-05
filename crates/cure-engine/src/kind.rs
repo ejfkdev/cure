@@ -96,6 +96,59 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
+    /// 数组分派用的小整数键：字段变体 Custom 折叠到统一槽位。
+    /// 穷尽 match —— 枚举加变体时编译器强制补分支（不会静默漏桶）。
+    #[inline]
+    pub fn slot(self) -> usize {
+        match self {
+            NodeKind::Block => 0,
+            NodeKind::Empty => 1,
+            NodeKind::ExprStmt => 2,
+            NodeKind::VarDecl => 3,
+            NodeKind::Assign => 4,
+            NodeKind::If => 5,
+            NodeKind::While => 6,
+            NodeKind::DoWhile => 7,
+            NodeKind::For => 8,
+            NodeKind::ForEach => 9,
+            NodeKind::Return => 10,
+            NodeKind::Break => 11,
+            NodeKind::Continue => 12,
+            NodeKind::Throw => 13,
+            NodeKind::Try => 14,
+            NodeKind::Catch => 15,
+            NodeKind::Synchronized => 16,
+            NodeKind::Switch => 17,
+            NodeKind::Case => 18,
+            NodeKind::Label => 19,
+            NodeKind::Assert => 20,
+            NodeKind::Binary => 21,
+            NodeKind::Unary => 22,
+            NodeKind::Call => 23,
+            NodeKind::Literal => 24,
+            NodeKind::VarRef => 25,
+            NodeKind::Ternary => 26,
+            NodeKind::Cast => 27,
+            NodeKind::Paren => 28,
+            NodeKind::Member => 29,
+            NodeKind::Index => 30,
+            NodeKind::New => 31,
+            NodeKind::NewArray => 32,
+            NodeKind::ArrayLit => 33,
+            NodeKind::This => 34,
+            NodeKind::InstanceOf => 35,
+            NodeKind::Lambda => 36,
+            NodeKind::MethodRef => 37,
+            NodeKind::Raw => 38,
+            NodeKind::Custom(_) => 39,
+        }
+    }
+
+    /// slot 的上界（分派表定容用）。
+    pub const SLOT_COUNT: usize = 41;
+}
+
+impl NodeKind {
     pub fn is_stmt(self) -> bool {
         use NodeKind::*;
         matches!(
