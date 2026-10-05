@@ -564,3 +564,109 @@ class A {
 "#);
     assert!(out.contains("for (String s : list)"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// StoreKill（远距死存储/寄存器预声明清理）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn store_kill_rules() {
+    // 字面量提升 + 传播接力：int v = 0; foo(); v = 1; return v; → foo(); return 1;
+    let out = run_src("class A{int m(){int v = 0; foo(); v = 1; return v;}}");
+    assert!(out.contains("foo();"), "{out}");
+    assert!(out.contains("return 1;"), "{out}");
+    assert!(!out.contains("int v"), "{out}");
+    // 剥除 init + 传播接力：int v = 0; foo(); v = y; return v; → foo(); return y;
+    let out = run_src("class A{int m(int y){int v = 0; foo(); v = y; return v;}}");
+    assert!(out.contains("foo();"), "{out}");
+    assert!(out.contains("return y;"), "{out}");
+    // 赋值形态远距死存储 + 传播接力：v = 0; …; v = y; return v; → return y;
+    let out = run_src("class A{int m(int y){int v = 0; v = 0; foo(); v = y; return v;}}");
+    assert!(!out.contains("v = 0;"), "{out}");
+    assert!(out.contains("return y;"), "{out}");
+}
+
+#[test]
+fn store_kill_safety_cases() {
+    // 副作用 init：int v = bump(); v = 5; → 不动（调用不能丢）
+    let out = run_src("class A{int m(){int v = bump(); v = 5; return v;}}");
+    assert!(out.contains("int v = bump();"), "{out}");
+    // 击杀写在条件分支内 → 不动（definite assignment + 分支可能不执行）
+    let out = run_src("class A{int m(int c){int v = 0; if (c > 0) { v = 1; } return v;}}");
+    assert!(out.contains("int v = 0;"), "{out}");
+    // 击杀写在循环体内 → 不动（可能零次执行）
+    let out = run_src("class A{int m(){int v = 0; while (v < 3) { v = 9; } return v;}}");
+    assert!(out.contains("int v = 0;") || out.contains("int v = 0;\n"), "{out}");
+    // 中间语句的 init 里读 v → 不动（读事件阻断）
+    let out = run_src("class A{String m(){String v = \"\"; String w = v + \"x\"; v = \"y\"; return w;}}");
+    assert!(out.contains("v = \"y\";"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// CFF 嵌套条件（分支到达同一后续条件 case）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cff_nested_conditional() {
+    let src = r#"
+public class NestC {
+    public static void main(String[] args) {
+        int x = 8;
+        String r = null;
+        int s = 0;
+        while (true) {
+            switch (s) {
+                case 0: {
+                    if (x > 0) {
+                        s = 1;
+                    } else {
+                        s = 5;
+                    }
+                    break;
+                }
+                case 1: {
+                    if (x > 10) {
+                        s = 2;
+                    } else {
+                        s = 3;
+                    }
+                    break;
+                }
+                case 2: {
+                    r = "big";
+                    s = 4;
+                    break;
+                }
+                case 3: {
+                    r = "mid";
+                    s = 4;
+                    break;
+                }
+                case 5: {
+                    r = "neg";
+                    s = 4;
+                    break;
+                }
+            }
+            if (s == 4) {
+                break;
+            }
+        }
+        System.out.println("r=" + r);
+    }
+}
+"#;
+    let mut outcome = parse(src);
+    assert!(outcome.errors.is_empty());
+    let report = cure_java_simplify::simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
+    let cleaned = cure_java_print::print_unit(&outcome.ast, &outcome.unit);
+    assert!(report.by_rule.contains_key("cff_recover"), "CFF 未触发：\n{cleaned}");
+    assert!(!cleaned.contains("switch"), "{cleaned}");
+    assert!(cleaned.contains("x > 0"), "{cleaned}");
+    assert!(cleaned.contains("x > 10"), "{cleaned}");
+    // 嵌套条件还原为 if/else 链后，三元归并接力折成嵌套三元
+    assert!(
+        cleaned.contains(r#"x > 0 ? x > 10 ? "big" : "mid" : "neg""#),
+        "{cleaned}"
+    );
+}

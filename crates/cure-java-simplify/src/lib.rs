@@ -1996,8 +1996,21 @@ fn collect(c: &mut CffCtx, start: i64, stop: Option<i64>) -> Option<(Vec<(i64, V
 
 /// 顶层：从入口状态结构化整个状态机。
 fn cff_run(c: &mut CffCtx, init: i64) -> Option<Vec<JavaId>> {
+    let (path, flow) = collect(c, init, None)?;
+    cff_structure(c, path, flow)
+}
+
+/// 从某状态起递归结构化（混合终点分支的续接构造用）。
+fn cff_run_from(c: &mut CffCtx, start: i64) -> Option<Vec<JavaId>> {
+    let (path, flow) = collect(c, start, None)?;
+    cff_structure(c, path, flow)
+}
+
+/// 核心结构化循环：携带当前链（path + flow），直到终止。
+/// 混合终点（一支终止、另一支续接）时，续接必须放进继续分支**内部**
+/// （续接代码只在走该分支时执行）。
+fn cff_structure(c: &mut CffCtx, mut path: Vec<(i64, Vec<JavaId>)>, mut flow: Flow) -> Option<Vec<JavaId>> {
     let mut stmts: Vec<JavaId> = Vec::new();
-    let (mut path, mut flow) = collect(c, init, None)?;
     loop {
         match flow {
             Flow::Done => {
@@ -2076,24 +2089,58 @@ fn cff_run(c: &mut CffCtx, init: i64) -> Option<Vec<JavaId>> {
                     }
                     Some(_) => return None,
                     None => {
-                        if !matches!((fa, fb), (Flow::Done, Flow::Done)) {
-                            return None;
-                        }
+                        // 无公共后继的分叉
                         let mut fa_stmts = Vec::new();
                         let mut fb_stmts = Vec::new();
                         flatten(&pa, &mut fa_stmts, c);
                         flatten(&pb, &mut fb_stmts, c);
-                        let ba = c.lang.build_block(fa_stmts);
-                        let bb = c.lang.build_block(fb_stmts);
-                        let ifs = c.lang.if_(cond, ba, Some(bb));
-                        stmts.push(ifs);
-                        return Some(stmts);
+                        match (fa, fb) {
+                            (Flow::Done, Flow::Done) => {
+                                let ba = c.lang.build_block(fa_stmts);
+                                let bb = c.lang.build_block(fb_stmts);
+                                let ifs = c.lang.if_(cond, ba, Some(bb));
+                                stmts.push(ifs);
+                                return Some(stmts);
+                            }
+                            // 两支都续接到同一条件 → if/else 后无条件续接（合流）
+                            (Flow::Cond(x), Flow::Cond(y)) if x == y => {
+                                let ba = c.lang.build_block(fa_stmts);
+                                let bb = c.lang.build_block(fb_stmts);
+                                let ifs = c.lang.if_(cond, ba, Some(bb));
+                                stmts.push(ifs);
+                                let (p2, f2) = collect(c, x, None)?;
+                                path = p2;
+                                flow = f2;
+                                continue;
+                            }
+                            // 混合：一支终止、另一支续接 → 续接放进继续分支【内部】
+                            (Flow::Done, Flow::Cond(x)) => {
+                                let cont = cff_run_from(c, x)?;
+                                fb_stmts.extend(cont);
+                                let ba = c.lang.build_block(fa_stmts);
+                                let bb = c.lang.build_block(fb_stmts);
+                                let ifs = c.lang.if_(cond, ba, Some(bb));
+                                stmts.push(ifs);
+                                return Some(stmts);
+                            }
+                            (Flow::Cond(x), Flow::Done) => {
+                                let cont = cff_run_from(c, x)?;
+                                fa_stmts.extend(cont);
+                                let ba = c.lang.build_block(fa_stmts);
+                                let bb = c.lang.build_block(fb_stmts);
+                                let ifs = c.lang.if_(cond, ba, Some(bb));
+                                stmts.push(ifs);
+                                return Some(stmts);
+                            }
+                            _ => return None,
+                        }
                     }
                 }
             }
         }
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // 门面

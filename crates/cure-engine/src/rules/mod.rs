@@ -2018,6 +2018,238 @@ impl<L: Lang> Rule<L> for TernaryBoolOp {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 远距存储消除（寄存器预声明清理，ddc/jcdc 产物）：
+//   int x = 0; …（无 x 事件）…; x = 1;   →  int x = 1;（字面量提升）
+//   int x = 0; …（无 x 事件）…; x = v;   →  int x;（init 死亡，剥除）
+//   x = 0; …（无 x 事件）…; x = v;       →  删除第一条（值 ≤ MayRead）
+// 守卫：首个 x 事件必须是写；语句内 x 出现若非简单赋值目标即视为读（阻断）。
+// ---------------------------------------------------------------------------
+
+pub struct StoreKill;
+
+/// 支配路径上的首个事件。
+enum DomEvent<L: Lang> {
+    Read,
+    /// 简单赋值（写）节点
+    Write(L::Id),
+    Shadow,
+}
+
+/// 只扫描**必经**（直线）路径：If/While 的 cond 必经、分支体不必经；
+/// Ternary 的 cond 必经、分支不必经；短路右支不必经；Try 块整体跳过。
+/// 条件路径内的事件不影响 init 的死活（分支可能不执行）→ 保守忽略。
+fn scan_dominating<L: Lang>(lang: &L, node: L::Id, name: &str) -> Option<DomEvent<L>> {
+    match lang.kind(node) {
+        NodeKind::VarRef => {
+            if lang.var_name(node) == Some(name) {
+                Some(DomEvent::Read)
+            } else {
+                None
+            }
+        }
+        NodeKind::VarDecl => {
+            if lang.var_name(node) == Some(name) {
+                Some(DomEvent::Shadow)
+            } else {
+                // 其他变量的声明：init 仍是必经求值（其中可能有 name 的读）
+                for &c in lang.children(node) {
+                    if let Some(e) = scan_dominating(lang, c, name) {
+                        return Some(e);
+                    }
+                }
+                None
+            }
+        }
+        NodeKind::Assign => {
+            let ch = lang.children(node);
+            // RHS 先求值：其中的读优先于 LHS 的写
+            if let Some(&v) = ch.get(1) {
+                if let Some(e) = scan_dominating(lang, v, name) {
+                    if matches!(e, DomEvent::Read | DomEvent::Shadow) {
+                        return Some(e);
+                    }
+                }
+            }
+            if lang.assign_op(node).is_none() {
+                if let Some(&t) = ch.first() {
+                    if lang.kind(t) == NodeKind::VarRef && lang.var_name(t) == Some(name) {
+                        return Some(DomEvent::Write(node));
+                    }
+                }
+            }
+            None
+        }
+        NodeKind::If | NodeKind::While => {
+            // cond 必经；then/else/body 不必经
+            scan_dominating(lang, *lang.children(node).first()?, name)
+        }
+        NodeKind::For => {
+            // children: [inits…, cond?, steps…, body]
+            // init/cond 必经；steps 与 body 仅在进入循环后执行 → 不必经
+            let ch = lang.children(node);
+            if ch.len() >= 3 {
+                // inits + cond（倒数第二个之前的布局：last 是 body，
+                // 其余中最后一个 cond（若有）——由 For payload 决定，简化：
+                // 只扫 inits（children[..len-2]）+ 倒数第二个（cond 或 step）
+                for &c in &ch[..ch.len() - 2] {
+                    if let Some(e) = scan_dominating(lang, c, name) {
+                        return Some(e);
+                    }
+                }
+            }
+            None
+        }
+        NodeKind::ForEach => {
+            // iterable 必经；循环体不必经
+            scan_dominating(lang, *lang.children(node).first()?, name)
+        }
+        NodeKind::DoWhile => None, // body 不必经；尾部 cond 也可能不达
+        NodeKind::Switch => {
+            // subject 必经；case 体不必经
+            scan_dominating(lang, *lang.children(node).first()?, name)
+        }
+        NodeKind::Ternary => scan_dominating(lang, *lang.children(node).first()?, name),
+        NodeKind::Binary => {
+            let op = lang.bin_op(node)?;
+            let ch = lang.children(node);
+            if op.is_short_circuit() {
+                // 左支必经，右支条件求值
+                scan_dominating(lang, *ch.first()?, name)
+            } else {
+                for &c in ch {
+                    if let Some(e) = scan_dominating(lang, c, name) {
+                        return Some(e);
+                    }
+                }
+                None
+            }
+        }
+        NodeKind::Try => None, // try/catch 路径复杂 → 保守跳过
+        _ => {
+            for &c in lang.children(node) {
+                if let Some(e) = scan_dominating(lang, c, name) {
+                    return Some(e);
+                }
+            }
+            None
+        }
+    }
+}
+
+impl<L: Lang> Rule<L> for StoreKill {
+    fn name(&self) -> &'static str {
+        "store_kill"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk } = ctx;
+        // 形态：VarDecl(带 init) 或 Assign（裸/ExprStmt 包裹）
+        let (is_decl, stmt_node, first_value) = match lang.kind(id) {
+            NodeKind::VarDecl => {
+                if lang.children(id).is_empty() {
+                    return None;
+                }
+                (true, id, *lang.children(id).first()?)
+            }
+            NodeKind::Assign => {
+                if lang.assign_op(id).is_some() {
+                    return None;
+                }
+                (false, id, *lang.children(id).get(1)?)
+            }
+            NodeKind::ExprStmt => {
+                let ch = lang.children(id);
+                if ch.len() == 1 && lang.kind(ch[0]) == NodeKind::Assign {
+                    let a = ch[0];
+                    if lang.assign_op(a).is_some() {
+                        return None;
+                    }
+                    (false, id, *lang.children(a).get(1)?)
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        let name = if is_decl {
+            lang.var_name(id)?.to_string()
+        } else {
+            let a = match lang.kind(id) {
+                NodeKind::Assign => id,
+                _ => lang.children(id)[0],
+            };
+            let t = *lang.children(a).first()?;
+            if lang.kind(t) != NodeKind::VarRef || !lang.is_local_var(t) {
+                return None;
+            }
+            lang.var_name(t)?.to_string()
+        };
+
+        let parent = walk.parent(stmt_node)?;
+        if lang.kind(parent) != NodeKind::Block {
+            return None;
+        }
+        let idx = walk.index(stmt_node)?;
+        let stmts = lang.children(parent).to_vec();
+
+        // 支配路径扫描：首个事件
+        let mut killed_by: Option<(usize, L::Id)> = None;
+        for (si, &s) in stmts.iter().enumerate().skip(idx + 1) {
+            match scan_dominating(&*lang, s, &name) {
+                Some(DomEvent::Read) | Some(DomEvent::Shadow) => return None,
+                Some(DomEvent::Write(assign)) => {
+                    killed_by = Some((si, assign));
+                    break;
+                }
+                None => continue,
+            }
+        }
+        let (si, kill_assign) = killed_by?;
+
+        if is_decl {
+            // 击杀赋值的值是字面量 → 提升进声明 init
+            // （原 init 被替换丢弃——同样必须可丢弃，副作用调用不得删！）
+            if lang.effect(first_value) > Effect::MayRead {
+                return None;
+            }
+            let value = *lang.children(kill_assign).get(1)?;
+            if is_literal(lang, value) {
+                let assign_stmt = stmts[si];
+                return Some(Edit::Multi(vec![
+                    Edit::Splice {
+                        node: id,
+                        index: 0,
+                        remove: 1,
+                        insert: vec![value],
+                    },
+                    Edit::Delete { node: assign_stmt },
+                ]));
+            }
+            // 否则：剥除 init（裸声明）——init 必须可丢弃（副作用调用不得删！）
+            if lang.effect(first_value) > Effect::MayRead {
+                return None;
+            }
+            return Some(Edit::Splice {
+                node: id,
+                index: 0,
+                remove: 1,
+                insert: Vec::new(),
+            });
+        }
+        // 赋值形态：首值必须可丢弃
+        if lang.effect(first_value) > Effect::MayRead {
+            return None;
+        }
+        Some(Edit::Delete { node: stmt_node })
+    }
+}
+
+/// value 是否为字面量（提升安全：无求值位置问题）。
+fn is_literal<L: Lang>(lang: &L, n: L::Id) -> bool {
+    matches!(lang.kind(n), NodeKind::Literal)
+}
+
 // ---------------------------------------------------------------------------
 // 注册表
 // ---------------------------------------------------------------------------
@@ -2052,6 +2284,7 @@ pub fn default_rules<L: Lang>() -> Vec<Box<dyn Rule<L>>> {
         Box::new(MultiUseCopyPropagation),
         Box::new(TrailingReturn),
         Box::new(DeadStore),
+        Box::new(StoreKill),
     ]
 }
 

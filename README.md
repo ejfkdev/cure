@@ -77,7 +77,7 @@ echo 'class A{int m(){int a=foo();int b=a;return b;}}' | cure -
 
 ## 规则清单
 
-引擎通用（31）：paren_removal、const_condition、boolean_return、if_to_ternary、
+引擎通用（32）：paren_removal、const_condition、boolean_return、if_to_ternary、
 if_assign_ternary、if_else_empty、bool_compare、double_not、bool_not_fold、
 bool_short_circuit、not_compare、ternary_fold、ternary_bool、const_fold_bin、
 **cmp_const_fold**（`1 < 2 → true`，击穿不透明谓词）、self_assign、
@@ -86,6 +86,9 @@ arith_identity、**arith_zero**、**bit_identity**、**arith_reassoc**（双异�
 **ternary_bool_op**（`c ? a : false → c && a`）、
 local_propagation、**decl_assign_merge**、**assign_propagation**（拷贝赋值内联，
 块内声明锚点防逃逸；使用语句写排除：`target = use` 的 RHS 先于写求值）、
+**store_kill**（远距死存储/寄存器预声明清理：首个事件在**支配路径**上是写时
+击杀——字面量提升进 init / 剥 init / 删语句；条件分支、循环体、try 内的事件
+不算必经，副作用 init 永不丢），
 **multi_use_copy**（多用途拷贝传播：`x = y; …N 处读 x` → 全部替换为 y）、
 **trailing_return**（void 方法尾部裸 `return;` 删除）、
 **trailing_continue**（标签感知：循环体尾部 continue，标签指向本循环才删）、
