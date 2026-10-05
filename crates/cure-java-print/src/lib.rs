@@ -174,7 +174,7 @@ fn param_str(p: &Param) -> String {
     format!("{}{}{} {}", mods_prefix(&p.mods), ty_str(&p.ty), dots, p.name)
 }
 
-fn declarator_str(ast: &JavaAst, d: &Declarator) -> String {
+fn declarator_str(ast: &JavaAst, ty: &JType, d: &Declarator) -> String {
     let mut p = Printer {
         ast,
         out: String::new(),
@@ -186,10 +186,43 @@ fn declarator_str(ast: &JavaAst, d: &Declarator) -> String {
     }
     if let Some(init) = d.init {
         s.push_str(" = ");
+        let full = wrap_dims(ty, d.extra_dims);
+        let init = decl_init_expr(ast, &full, init);
         p.expr(init, prec::ASSIGN);
         s.push_str(&p.out);
     }
     s
+}
+
+/// `T[] x = new T[]{…}` 在声明处回退惯用短形态 `T[] x = {…}`：
+/// 解析器把裸 `{…}` 归一化成 `new T[]{…}`（表达式位置合法），
+/// 打印在声明上下文镜像还原。仅当维度匹配、无尺寸、唯一 ArrayLit 子节点。
+fn decl_init_expr(ast: &JavaAst, ty: &JType, init: JavaId) -> JavaId {
+    if let NodeData::NewArray { dims, sized, .. } = ast.data(init) {
+        if *sized == 0 && ast.children(init).len() == 1 {
+            let only = ast.children(init)[0];
+            if matches!(ast.data(only), NodeData::ArrayLit) {
+                let mut n = 0u16;
+                let mut t = ty;
+                while let JType::Array(inner) = t {
+                    t = inner;
+                    n += 1;
+                }
+                if n == *dims && !matches!(t, JType::Var) {
+                    return only;
+                }
+            }
+        }
+    }
+    init
+}
+
+fn wrap_dims(ty: &JType, n: u16) -> JType {
+    let mut t = ty.clone();
+    for _ in 0..n {
+        t = JType::Array(Box::new(t));
+    }
+    t
 }
 
 fn throws_str(throws: &[String]) -> String {
@@ -295,7 +328,7 @@ impl<'a> Printer<'a> {
                 self.out.push(' ');
                 let ds: Vec<String> = declarators
                     .iter()
-                    .map(|d| declarator_str(ast, d))
+                    .map(|d| declarator_str(ast, ty, d))
                     .collect();
                 self.out.push_str(&ds.join(", "));
                 self.out.push(';');
@@ -436,6 +469,7 @@ impl<'a> Printer<'a> {
                 self.out.push_str(name);
                 if let Some(&init) = ast.children(id).first() {
                     self.out.push_str(" = ");
+                    let init = decl_init_expr(ast, ty, init);
                     self.expr(init, prec::ASSIGN);
                 }
                 self.out.push(';');
@@ -633,6 +667,7 @@ impl<'a> Printer<'a> {
                 self.out.push_str(name);
                 if let Some(&init) = ast.children(id).first() {
                     self.out.push_str(" = ");
+                    let init = decl_init_expr(ast, ty, init);
                     self.expr(init, prec::ASSIGN);
                 }
             }
@@ -773,6 +808,7 @@ impl<'a> Printer<'a> {
             self.out.push_str(name);
             if let Some(&init) = ast.children(id).first() {
                 self.out.push_str(" = ");
+                let init = decl_init_expr(ast, ty, init);
                 self.expr(init, prec::ASSIGN);
             }
         } else if with_type {
@@ -1125,19 +1161,23 @@ fn push_escaped(out: &mut String, c: char) {
         '\n' => out.push_str("\\n"),
         '\t' => out.push_str("\\t"),
         '\r' => out.push_str("\\r"),
+        // 其余控制字符：\uXXXX（\u000a/\u000d 会被 JLS 预处理成行终止符，
+        // 必须用上面的专用转义；其余控制码无此问题）
+        c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+            out.push_str(&format!("\\u{:04X}", c as u32));
+        }
         c => out.push(c),
     }
 }
 
 fn escape_char(c: char) -> String {
-    let mut s = String::new();
     match c {
-        '\'' => s.push_str("\\'"),
-        '\\' => s.push_str("\\\\"),
-        '\n' => s.push_str("\\n"),
-        '\t' => s.push_str("\\t"),
-        '\r' => s.push_str("\\r"),
-        c => s.push(c),
+        '\'' => "\\'".to_string(),
+        '\\' => "\\\\".to_string(),
+        '\n' => "\\n".to_string(),
+        '\t' => "\\t".to_string(),
+        '\r' => "\\r".to_string(),
+        c if (c as u32) < 0x20 || c as u32 == 0x7f => format!("\\u{:04X}", c as u32),
+        c => c.to_string(),
     }
-    s
 }

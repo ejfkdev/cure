@@ -474,6 +474,12 @@ impl<L: Lang> Rule<L> for LocalPropagation {
             return None; // 必须有且仅有 init
         }
         let value = ch[0];
+        // 裸数组字面量只在声明/赋值 RHS 位置合法（Java/多数语言同此）；
+        // 传播到任意表达式位置会产出非法源码，且多站点传播会破坏数组对象
+        // 同一性 → 拒绝（显式 new T[]{…} 形态可安全传播）
+        if lang.kind(value) == NodeKind::ArrayLit {
+            return None;
+        }
         // 自引用 init（int x = x + 1 之类）直接放弃
         if subtree_contains(&*lang, value, |n| {
             lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name.as_str())
@@ -547,7 +553,13 @@ impl<L: Lang> Rule<L> for LocalPropagation {
             return None;
         }
         match lang.kind(stmt) {
-            NodeKind::Return | NodeKind::ExprStmt | NodeKind::Assign | NodeKind::Throw => {}
+            // VarDecl 同样合法：init 就是语句的全部求值，V 内联进 init 的
+            // 求值时机与原声明位置一致（相邻保证无插入效果）
+            NodeKind::Return
+            | NodeKind::ExprStmt
+            | NodeKind::Assign
+            | NodeKind::Throw
+            | NodeKind::VarDecl => {}
             _ => return None,
         }
         if !straight_path(&*lang, stmt, use_id) {
@@ -1671,6 +1683,10 @@ impl<L: Lang> Rule<L> for AssignPropagation {
         if lang.kind(target) != NodeKind::VarRef || !lang.is_local_var(target) {
             return None;
         }
+        // 裸数组字面量只在声明/赋值 RHS 位置合法，传播会产出非法源码 → 拒绝
+        if lang.kind(value) == NodeKind::ArrayLit {
+            return None;
+        }
         let name = lang.var_name(target)?.to_string();
 
         let parent = walk.parent(stmt_node)?;
@@ -2029,33 +2045,42 @@ impl<L: Lang> Rule<L> for TernaryBoolOp {
 
 pub struct StoreKill;
 
-/// 支配路径上的首个事件。
-enum DomEvent<L: Lang> {
+/// 语句级事件分类：任意路径的读都保活 init；只有**支配写**才击杀。
+/// （条件分支里的读在部分路径消费旧值——`x = C ? x+1 : x+2` 的分支读
+/// 就是活引用；条件分支里的写不必然执行 → 不击杀，继续扫。）
+enum KillEvent<L: Lang> {
+    /// 任意位置的读 → init 活着
     Read,
-    /// 简单赋值（写）节点
-    Write(L::Id),
+    /// 支配位置的简单赋值（写）
+    DomWrite(L::Id),
+    /// 同名重声明（遮蔽）
     Shadow,
 }
 
-/// 只扫描**必经**（直线）路径：If/While 的 cond 必经、分支体不必经；
-/// Ternary 的 cond 必经、分支不必经；短路右支不必经；Try 块整体跳过。
-/// 条件路径内的事件不影响 init 的死活（分支可能不执行）→ 保守忽略。
-fn scan_dominating<L: Lang>(lang: &L, node: L::Id, name: &str) -> Option<DomEvent<L>> {
+/// 扫描一个节点在 `name` 上的事件。
+/// `dominating`：当前子树是否在必经路径上（If/While 的 cond、Ternary 的
+/// cond、For 的 init/cond、非短路二元两侧 = true；分支体/循环体 = false）。
+fn scan_kill_event<L: Lang>(
+    lang: &L,
+    node: L::Id,
+    name: &str,
+    dominating: bool,
+) -> Option<KillEvent<L>> {
     match lang.kind(node) {
         NodeKind::VarRef => {
             if lang.var_name(node) == Some(name) {
-                Some(DomEvent::Read)
+                Some(KillEvent::Read)
             } else {
                 None
             }
         }
         NodeKind::VarDecl => {
             if lang.var_name(node) == Some(name) {
-                Some(DomEvent::Shadow)
+                Some(KillEvent::Shadow)
             } else {
-                // 其他变量的声明：init 仍是必经求值（其中可能有 name 的读）
+                // 其他变量声明：init 必经求值
                 for &c in lang.children(node) {
-                    if let Some(e) = scan_dominating(lang, c, name) {
+                    if let Some(e) = scan_kill_event(lang, c, name, dominating) {
                         return Some(e);
                     }
                 }
@@ -2064,10 +2089,10 @@ fn scan_dominating<L: Lang>(lang: &L, node: L::Id, name: &str) -> Option<DomEven
         }
         NodeKind::Assign => {
             let ch = lang.children(node);
-            // RHS 先求值：其中的读优先于 LHS 的写
-            if let Some(&v) = ch.get(1) {
-                if let Some(e) = scan_dominating(lang, v, name) {
-                    if matches!(e, DomEvent::Read | DomEvent::Shadow) {
+            // RHS 先求值
+            if let Some(&val) = ch.get(1) {
+                if let Some(e) = scan_kill_event(lang, val, name, dominating) {
+                    if matches!(e, KillEvent::Read | KillEvent::Shadow) {
                         return Some(e);
                     }
                 }
@@ -2075,61 +2100,87 @@ fn scan_dominating<L: Lang>(lang: &L, node: L::Id, name: &str) -> Option<DomEven
             if lang.assign_op(node).is_none() {
                 if let Some(&t) = ch.first() {
                     if lang.kind(t) == NodeKind::VarRef && lang.var_name(t) == Some(name) {
-                        return Some(DomEvent::Write(node));
+                        if dominating {
+                            return Some(KillEvent::DomWrite(node));
+                        }
+                        return None; // 条件写：不击杀，也不算读
                     }
                 }
             }
             None
         }
-        NodeKind::If | NodeKind::While => {
-            // cond 必经；then/else/body 不必经
-            scan_dominating(lang, *lang.children(node).first()?, name)
-        }
-        NodeKind::For => {
-            // children: [inits…, cond?, steps…, body]
-            // init/cond 必经；steps 与 body 仅在进入循环后执行 → 不必经
+        NodeKind::If | NodeKind::While | NodeKind::Ternary => {
+            // cond 必经；分支体/循环体不必然——但其中的【读】仍保活 init，
+            // 必须扫描（以非支配标记：读传播，写不击杀）
             let ch = lang.children(node);
-            if ch.len() >= 3 {
-                // inits + cond（倒数第二个之前的布局：last 是 body，
-                // 其余中最后一个 cond（若有）——由 For payload 决定，简化：
-                // 只扫 inits（children[..len-2]）+ 倒数第二个（cond 或 step）
-                for &c in &ch[..ch.len() - 2] {
-                    if let Some(e) = scan_dominating(lang, c, name) {
+            if let Some(&c) = ch.first() {
+                if let Some(e) = scan_kill_event(lang, c, name, true) {
+                    return Some(e);
+                }
+            }
+            for &c in &ch[1..] {
+                if let Some(e) = scan_kill_event(lang, c, name, false) {
+                    if matches!(e, KillEvent::Read | KillEvent::Shadow) {
                         return Some(e);
                     }
                 }
             }
             None
         }
-        NodeKind::ForEach => {
-            // iterable 必经；循环体不必经
-            scan_dominating(lang, *lang.children(node).first()?, name)
-        }
-        NodeKind::DoWhile => None, // body 不必经；尾部 cond 也可能不达
-        NodeKind::Switch => {
-            // subject 必经；case 体不必经
-            scan_dominating(lang, *lang.children(node).first()?, name)
-        }
-        NodeKind::Ternary => scan_dominating(lang, *lang.children(node).first()?, name),
         NodeKind::Binary => {
             let op = lang.bin_op(node)?;
             let ch = lang.children(node);
             if op.is_short_circuit() {
-                // 左支必经，右支条件求值
-                scan_dominating(lang, *ch.first()?, name)
+                // 左支必经；右支条件求值（读→保活；写→不击杀）
+                if let Some(&l) = ch.first() {
+                    if let Some(e) = scan_kill_event(lang, l, name, true) {
+                        return Some(e);
+                    }
+                }
+                if let Some(&r) = ch.get(1) {
+                    if let Some(e) = scan_kill_event(lang, r, name, false) {
+                        if matches!(e, KillEvent::Read | KillEvent::Shadow) {
+                            return Some(e);
+                        }
+                    }
+                }
+                None
             } else {
                 for &c in ch {
-                    if let Some(e) = scan_dominating(lang, c, name) {
+                    if let Some(e) = scan_kill_event(lang, c, name, dominating) {
                         return Some(e);
                     }
                 }
                 None
             }
         }
-        NodeKind::Try => None, // try/catch 路径复杂 → 保守跳过
+        NodeKind::For | NodeKind::ForEach | NodeKind::Switch | NodeKind::Try => {
+            // 必经部分（For 的 inits+cond / ForEach 的 iterable / Switch 的
+            // subject）以支配标记扫；其余（循环体/case 体/try 块）以非支配
+            // 标记扫——其中的读仍保活
+            let ch = lang.children(node);
+            let dom_len = match lang.kind(node) {
+                NodeKind::For => ch.len().saturating_sub(2),
+                NodeKind::ForEach | NodeKind::Switch => 1,
+                _ => 0,
+            };
+            for &c in &ch[..dom_len] {
+                if let Some(e) = scan_kill_event(lang, c, name, true) {
+                    return Some(e);
+                }
+            }
+            for &c in &ch[dom_len..] {
+                if let Some(e) = scan_kill_event(lang, c, name, false) {
+                    if matches!(e, KillEvent::Read | KillEvent::Shadow) {
+                        return Some(e);
+                    }
+                }
+            }
+            None
+        }
         _ => {
             for &c in lang.children(node) {
-                if let Some(e) = scan_dominating(lang, c, name) {
+                if let Some(e) = scan_kill_event(lang, c, name, dominating) {
                     return Some(e);
                 }
             }
@@ -2193,12 +2244,12 @@ impl<L: Lang> Rule<L> for StoreKill {
         let idx = walk.index(stmt_node)?;
         let stmts = lang.children(parent).to_vec();
 
-        // 支配路径扫描：首个事件
+        // 扫描：读（任意路径）→ 保活；支配写 → 击杀；条件写 → 继续
         let mut killed_by: Option<(usize, L::Id)> = None;
         for (si, &s) in stmts.iter().enumerate().skip(idx + 1) {
-            match scan_dominating(&*lang, s, &name) {
-                Some(DomEvent::Read) | Some(DomEvent::Shadow) => return None,
-                Some(DomEvent::Write(assign)) => {
+            match scan_kill_event(&*lang, s, &name, true) {
+                Some(KillEvent::Read) | Some(KillEvent::Shadow) => return None,
+                Some(KillEvent::DomWrite(assign)) => {
                     killed_by = Some((si, assign));
                     break;
                 }

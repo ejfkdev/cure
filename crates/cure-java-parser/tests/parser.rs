@@ -173,7 +173,8 @@ class E {
     assert!(out.contains("Runnable rn = () -> doIt();"), "{out}");
     assert!(out.contains("java.util.function.IntUnaryOperator f = (x) -> x + 1;"), "{out}");
     assert!(out.contains("java.util.Comparator<String> c = String::compareToIgnoreCase;"), "{out}");
-    assert!(out.contains("int[] xs = new int[] {1, 2, 3};"), "{out}");
+    // 声明处 new T[]{…} 规范化为惯用短形态 {…}（语义等价，JLS）
+    assert!(out.contains("int[] xs = {1, 2, 3};"), "{out}");
     assert!(out.contains("int[][] grid = new int[3][4];"), "{out}");
     assert!(out.contains("Object lst = new java.util.ArrayList<String>(10);"), "{out}");
 }

@@ -667,6 +667,8 @@ impl Parser {
             } else {
                 None
             };
+            let full_ty = wrap_dims(ty.clone(), d_dims as u32);
+            let init = self.wrap_decl_init_array(init, &full_ty);
             declarators.push(Declarator {
                 name: name.clone(),
                 extra_dims: d_dims,
@@ -1147,6 +1149,7 @@ impl Parser {
             } else {
                 None
             };
+            let init0 = self.wrap_decl_init_array(init0, &ty0);
             if had_eq && init0.is_none() {
                 // `int x = ;` 这类残缺：整条语句原文保真
                 return self.raw_from(start);
@@ -1193,7 +1196,9 @@ impl Parser {
                     JType::Array(inner) => (**inner).clone(),
                     other => other.clone(),
                 };
-                decls.push((name, wrap_dims(base, d_extra), init));
+                let decl_ty = wrap_dims(base, d_extra);
+                let init = self.wrap_decl_init_array(init, &decl_ty);
+                decls.push((name, decl_ty, init));
             }
             self.expect(";");
             if decls.len() == 1 {
@@ -1338,7 +1343,9 @@ impl Parser {
                 if had_eq && init.is_none() {
                     return self.raw_from(for_start);
                 }
-                inits.push(self.ast.var_decl(&name, wrap_dims(ty, extra), init));
+                let for_ty = wrap_dims(ty, extra);
+                let init = self.wrap_decl_init_array(init, &for_ty);
+                inits.push(self.ast.var_decl(&name, for_ty, init));
                 while self.eat(",") {
                     let n2 = match &self.tok().tok {
                         Tok::Ident(i) => {
@@ -1363,7 +1370,9 @@ impl Parser {
                         None
                     };
                     // with_type=false 打印时只输出名字，类型用 Var 占位即可
-                    inits.push(self.ast.var_decl(&n2, wrap_dims(JType::Var, d_extra), init2));
+                    let for_ty2 = wrap_dims(JType::Var, d_extra);
+                    let init2 = self.wrap_decl_init_array(init2, &for_ty2);
+                    inits.push(self.ast.var_decl(&n2, for_ty2, init2));
                 }
                 self.expect(";");
             } else {
@@ -2074,6 +2083,29 @@ impl Parser {
             }
             self.bump();
         }
+    }
+
+    /// 声明处的裸数组初始化 `{…}` 归一化为 `new T[…]{…}`（sized=0，无尺寸）：
+    /// 裸 `{…}` 只在声明/赋值 RHS 位置合法，被局部传播移到任意表达式位置会
+    /// 产出非法源码；包裹后在所有位置合法，打印侧在声明处回退短形态。
+    /// 语义不变：`T[] x = {…}` 与 `T[] x = new T[]{…}` 在 JLS 下等价。
+    fn wrap_decl_init_array(&mut self, init: Option<JavaId>, ty: &JType) -> Option<JavaId> {
+        let init = init?;
+        if !matches!(self.ast.data(init), &NodeData::ArrayLit) {
+            return Some(init);
+        }
+        let mut dims = 0u16;
+        let mut elem = ty;
+        while let JType::Array(inner) = elem {
+            elem = inner;
+            dims += 1;
+        }
+        // 元素类型未知（var/推断形态）或非数组类型却给了 {…}：
+        // 无法安全包裹，原样保留
+        if dims == 0 || matches!(elem, JType::Var) {
+            return Some(init);
+        }
+        Some(self.ast.new_array(elem.clone(), dims, 0, vec![], Some(init)))
     }
 
     fn array_lit(&mut self) -> Option<JavaId> {

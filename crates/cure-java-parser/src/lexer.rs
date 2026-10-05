@@ -102,10 +102,9 @@ impl<'a> Lexer<'a> {
     }
 
     fn bump(&mut self) -> u8 {
-        let c = self.peek(0);
-        if c == 0 {
-            return 0;
-        }
+        // 真实 EOF 才停：输入里的 NUL 字节是普通字符，必须推进
+        // （否则字符串/注释循环在 NUL 上死循环）
+        let Some(&c) = self.b.get(self.pos) else { return 0 };
         self.pos += 1;
         if c == b'\n' {
             self.line += 1;
