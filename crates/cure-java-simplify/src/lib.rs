@@ -444,6 +444,51 @@ fn unwrap_paren_cast(lang: &JavaAst, mut n: JavaId) -> JavaId {
     }
 }
 
+/// 从任意泛型 Ref（ArrayList<String> / List<T>）提取元素类型；裸类型 None。
+fn generic_elem_ty(ty: &JType) -> Option<JType> {
+    let name = match ty {
+        JType::Ref(n) => n.as_str(),
+        _ => return None,
+    };
+    let lt = name.find('<')?;
+    let gt = name.rfind('>')?;
+    if gt <= lt {
+        return None;
+    }
+    let inner = name[lt + 1..gt].trim();
+    if inner.is_empty() || inner.contains('<') {
+        return None; // 嵌套泛型/通配符 → Object 兜底
+    }
+    Some(JType::Ref(inner.to_string()))
+}
+
+/// 收集子树内 name 的全部 VarRef。
+fn collect_var_refs(lang: &JavaAst, root: JavaId, name: &str, out: &mut Vec<JavaId>) {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name) {
+            out.push(n);
+        }
+        for &c in lang.children(n) {
+            stack.push(c);
+        }
+    }
+}
+
+/// 在 root 子树内找 target 的直接父节点。
+fn parent_of_recv(lang: &JavaAst, root: JavaId, target: JavaId) -> JavaId {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        for &c in lang.children(n) {
+            if c == target {
+                return n;
+            }
+            stack.push(c);
+        }
+    }
+    root
+}
+
 fn subtree_has_var(lang: &JavaAst, id: JavaId, name: &str) -> bool {
     let mut stack = vec![id];
     while let Some(n) = stack.pop() {
@@ -516,63 +561,135 @@ impl Rule<JavaAst> for LoopHeadBreak {
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let lang = ctx.lang;
-        if lang.kind(id) != NodeKind::While {
-            return None;
-        }
-        let ch = lang.children(id).to_vec();
-        let (cond, body) = (ch[0], ch[1]);
-        if !matches!(lang.literal(cond), Some(LitRef::Bool(true))) {
-            return None;
-        }
+        let body = match lang.kind(id) {
+            NodeKind::While => {
+                let ch = lang.children(id).to_vec();
+                if !matches!(lang.literal(ch[0]), Some(LitRef::Bool(true))) {
+                    return None;
+                }
+                ch[1]
+            }
+            NodeKind::DoWhile => {
+                let ch = lang.children(id).to_vec();
+                if !matches!(lang.literal(ch[1]), Some(LitRef::Bool(true))) {
+                    return None;
+                }
+                ch[0]
+            }
+            _ => return None,
+        };
         if lang.kind(body) != NodeKind::Block {
             return None;
         }
         let bch = lang.children(body).to_vec();
+        let is_do = lang.kind(id) == NodeKind::DoWhile;
+        // do-while 形态：if 必须是体里唯一语句
+        if is_do && bch.len() != 1 {
+            return None;
+        }
         let first = *bch.first()?;
         if lang.kind(first) != NodeKind::If {
             return None;
         }
         let ich = lang.children(first).to_vec();
         let c = ich[0];
-        // then 分支必须是单个无标签 break
+
         let bare_break = |n: JavaId| matches!(lang.data(n), NodeData::Break { label: None });
-        let then_break = match lang.kind(ich[1]) {
-            NodeKind::Break => bare_break(ich[1]),
-            NodeKind::Block if lang.children(ich[1]).len() == 1 => {
-                bare_break(lang.children(ich[1])[0])
-            }
+        let is_break = |n: JavaId| match lang.kind(n) {
+            NodeKind::Break => bare_break(n),
+            NodeKind::Block if lang.children(n).len() == 1 => bare_break(lang.children(n)[0]),
             _ => false,
         };
-        if !then_break {
-            return None;
-        }
-        // REST = else 分支（若有）+ body 其余语句
-        let mut rest: Vec<JavaId> = Vec::new();
-        if ich.len() == 3 {
-            match lang.kind(ich[2]) {
-                NodeKind::Block => rest.extend(lang.children(ich[2]).iter().copied()),
-                _ => rest.push(ich[2]),
+        let bare_continue = |n: JavaId| matches!(lang.data(n), NodeData::Continue { label: None });
+        let ends_with_continue = |n: JavaId| -> bool {
+            match lang.kind(n) {
+                NodeKind::Continue => bare_continue(n),
+                NodeKind::Block => lang
+                    .children(n)
+                    .last()
+                    .is_some_and(|&l| lang.kind(l) == NodeKind::Continue && bare_continue(l)),
+                _ => false,
             }
+        };
+        let strip_tail_continue = |n: JavaId| -> Vec<JavaId> {
+            match lang.kind(n) {
+                NodeKind::Continue => vec![],
+                NodeKind::Block => {
+                    let ch = lang.children(n).to_vec();
+                    if ch
+                        .last()
+                        .is_some_and(|&l| lang.kind(l) == NodeKind::Continue && bare_continue(l))
+                    {
+                        ch[..ch.len() - 1].to_vec()
+                    } else {
+                        ch
+                    }
+                }
+                _ => vec![n],
+            }
+        };
+
+        match ich.len() {
+            2 => {
+                // while (true) { if (c) { break; } REST } → while (!c) { REST }
+                if is_do || !is_break(ich[1]) {
+                    return None;
+                }
+                let mut rest: Vec<JavaId> = bch[1..].to_vec();
+                if let Some(&last) = rest.last() {
+                    if lang.kind(last) == NodeKind::Continue && bare_continue(last) {
+                        rest.pop();
+                    }
+                }
+                let nc = lang.build_unary(UnOp::Not, c);
+                let inner = lang.build_block(rest);
+                let w = lang.while_(nc, inner);
+                Some(Edit::Replace {
+                    target: id,
+                    with: w,
+                })
+            }
+            3 => {
+                let (then, els) = (ich[1], ich[2]);
+                // 形态 B/C：then 以 continue 结尾、else 是 break → while (c) { then' }
+                if ends_with_continue(then) && is_break(els) {
+                    let rest = strip_tail_continue(then);
+                    let inner = lang.build_block(rest);
+                    let w = lang.while_(c, inner);
+                    return Some(Edit::Replace {
+                        target: id,
+                        with: w,
+                    });
+                }
+                // 形态 D：then 是 break、else 以 continue 结尾 → while (!c) { else' }
+                if is_break(then) && ends_with_continue(els) {
+                    let rest = strip_tail_continue(els);
+                    let inner = lang.build_block(rest);
+                    let nc = lang.build_unary(UnOp::Not, c);
+                    let w = lang.while_(nc, inner);
+                    return Some(Edit::Replace {
+                        target: id,
+                        with: w,
+                    });
+                }
+                // 既有形态：while (true) { if (c) break; else { REST } … }
+                if !is_do && is_break(then) {
+                    let mut all = strip_tail_continue(els);
+                    all.extend(bch[1..].iter().copied());
+                    let inner = lang.build_block(all);
+                    let nc = lang.build_unary(UnOp::Not, c);
+                    let w = lang.while_(nc, inner);
+                    return Some(Edit::Replace {
+                        target: id,
+                        with: w,
+                    });
+                }
+                None
+            }
+            _ => None,
         }
-        rest.extend(bch[1..].iter().copied());
-        let nc = lang.build_unary(UnOp::Not, c);
-        let new_body = lang.build_block(rest);
-        Some(Edit::Splice {
-            node: id,
-            index: 0,
-            remove: 2,
-            insert: vec![nc, new_body],
-        })
     }
 }
-
-// ---------------------------------------------------------------------------
-// while 形式迭代器还原（jadx 常见，jcdc/ddc 同样产出）：
-//   Iterator<E> it = c.iterator();
-//   while (it.hasNext()) { E e = it.next(); REST }
-//   →  for (E e : c) { REST }
-// 安全性：与 for-each 脱糖同构；守卫：`it` 在 REST 中不再被引用。
-// ---------------------------------------------------------------------------
 
 pub struct WhileIteratorToForEach;
 
@@ -641,6 +758,79 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         }
         let bch = lang.children(body).to_vec();
         let first = *bch.first()?;
+        if lang.kind(first) != NodeKind::VarDecl {
+            // ===== 内联形态：body 中恰好一次 it.next()（可能 Cast/Paren 包裹）=====
+            // it 在体内只能出现这一次（hasNext 已在 cond 消费）
+            let it_refs_in_body: Vec<JavaId> = {
+                let mut v = Vec::new();
+                collect_var_refs(&*lang, body, &it_name, &mut v);
+                v
+            };
+            if it_refs_in_body.len() != 1 {
+                return None;
+            }
+            let next_recv = it_refs_in_body[0];
+            // receiver 的父是 Member{next}，Member 的父才是 Call（无实参）
+            let member = parent_of_recv(lang, body, next_recv);
+            if lang.kind(member) != NodeKind::Member {
+                return None;
+            }
+            let NodeData::Member { name: mn } = lang.data(member) else {
+                return None;
+            };
+            if mn != "next" {
+                return None;
+            }
+            let next_call = parent_of_recv(lang, body, member);
+            if lang.kind(next_call) != NodeKind::Call {
+                return None;
+            }
+            if lang.children(next_call).len() != 1 {
+                return None;
+            }
+            // 包裹节点（要被替换的）：从 next_call 向上收集 Cast/Paren
+            let mut wrapped = next_call;
+            loop {
+                let par = parent_of_recv(lang, body, wrapped);
+                match lang.kind(par) {
+                    NodeKind::Cast | NodeKind::Paren => wrapped = par,
+                    _ => break,
+                }
+            }
+            // 循环变量类型：从可迭代对象的声明类型推导（ArrayList<String>→String，
+            // 裸类型→Object）。元素为 Object 时【保留 Cast】（裸集合上
+            // for (String e : raw) 非法，必须 for (Object e) + (String) e）
+            let elem = match lang.var_type(iterable) {
+                Some(t) => generic_elem_ty(t).unwrap_or(JType::Ref("Object".into())),
+                None => JType::Ref("Object".into()),
+            };
+            let is_object = matches!(&elem, JType::Ref(n) if n == "Object");
+            let (replace_target, e_ty) = match lang.data(wrapped) {
+                NodeData::Cast { .. } if is_object => (next_call, elem),
+                NodeData::Cast { ty } => (wrapped, if is_object { ty.clone() } else { elem }),
+                _ => (wrapped, elem),
+            };
+            // 新变量名（不与体内现有变量冲突）
+            let e_name = if subtree_has_var(&*lang, body, "e") {
+                "e2"
+            } else {
+                "e"
+            };
+            let e_ref = lang.var(e_name);
+            let foreach = lang.for_each(e_name, e_ty, iterable, body);
+            return Some(Edit::Multi(vec![
+                Edit::Replace {
+                    target: replace_target,
+                    with: e_ref,
+                },
+                Edit::Splice {
+                    node: parent,
+                    index: idx - 1,
+                    remove: 2,
+                    insert: vec![foreach],
+                },
+            ]));
+        }
         let NodeData::VarDecl { name: e_name, ty } = lang.data(first) else {
             return None;
         };
@@ -658,6 +848,14 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
             return None;
         }
         if lang.var_name(lang.children(nc[0])[0]) != Some(it_name.as_str()) {
+            return None;
+        }
+        // 裸集合（元素 Object）上 for (更窄类型 e : raw) 非法 → 保守拒绝
+        let elem_is_object = match lang.var_type(iterable) {
+            Some(it_t) => generic_elem_ty(it_t).is_none(),
+            None => true,
+        };
+        if elem_is_object && ty != JType::Ref("Object".into()) {
             return None;
         }
         let rest = bch[1..].to_vec();

@@ -670,3 +670,93 @@ public class NestC {
         "{cleaned}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// do-while/break-continue 形态 + 内联 next() 提取
+// ---------------------------------------------------------------------------
+
+#[test]
+fn loop_head_break_dowhile_forms() {
+    // ddc 形态：do { if (c) { REST; continue; } else { break; } } while (true)
+    let out = run_src(r#"
+class A {
+    int m(java.util.List<String> l) {
+        int n = 0;
+        java.util.Iterator<String> it = l.iterator();
+        do {
+            if (it.hasNext()) {
+                n += it.next().length();
+                continue;
+            } else {
+                break;
+            }
+        } while (true);
+        return n;
+    }
+}
+"#);
+    // 链式接力：do-while 还原 → while(hasNext) → 内联 next() 提取 → for-each
+    assert!(out.contains("for (String e : l)"), "{out}");
+    assert!(!out.contains("do"), "{out}");
+    assert!(!out.contains("Iterator"), "{out}");
+
+    // while 形态 B：then 以 continue 结尾、else 是 break
+    let out = run_src(r#"
+class A {
+    int m(java.util.List<String> l) {
+        int n = 0;
+        java.util.Iterator<String> it = l.iterator();
+        while (true) {
+            if (it.hasNext()) {
+                n += 1;
+                continue;
+            } else {
+                break;
+            }
+        }
+        return n;
+    }
+}
+"#);
+    assert!(out.contains("while (it.hasNext())"), "{out}");
+    assert!(!out.contains("continue"), "{out}");
+
+    // while 形态 D：then 是 break、else 以 continue 结尾
+    let out = run_src("class A{int m(int x){int s = 0; while (true) { if (x < 0) { break; } else { s += x; x--; continue; } } return s;}}");
+    assert!(out.contains("while (x >= 0)"), "{out}");
+    assert!(!out.contains("continue"), "{out}");
+}
+
+#[test]
+fn inline_next_extraction_to_for_each() {
+    // ddc 形态：next() 内联在表达式里（Cast 包裹）
+    let out = run_src(r#"
+class A {
+    void m(java.util.List<String> list) {
+        String acc = "";
+        java.util.Iterator it = list.iterator();
+        while (it.hasNext()) {
+            acc = acc + (String) it.next() + "-";
+        }
+        System.out.println(acc);
+    }
+}
+"#);
+    assert!(out.contains("for (String e : list)"), "{out}");
+    assert!(out.contains("acc = acc + e"), "{out}");
+    assert!(!out.contains("Iterator"), "{out}");
+    assert!(!out.contains("next()"), "{out}");
+
+    // it 在体内出现两次 → 不提取
+    let out = run_src(r#"
+class A {
+    void m(java.util.List<String> list) {
+        java.util.Iterator it = list.iterator();
+        while (it.hasNext()) {
+            System.out.println(it.next() + it.next().length());
+        }
+    }
+}
+"#);
+    assert!(out.contains("it.next()"), "{out}");
+}

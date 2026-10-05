@@ -96,7 +96,8 @@ dead_store + 选配 unreachable_after_terminal。
 
 Java 专属（15）：cast_simplify、self_compare、string_builder_fold、box_unbox_chain、
 iterator_to_for_each、while_iterator_to_for_each（支持 Cast/Paren 包裹的 next()）、
-new_string_fold、loop_head_break、concat_value_of_drop、
+new_string_fold、loop_head_break（`while(true){if(c)break;…}` + **do-while 形态**
+`do{if(c){REST;continue}else{break}}while(true)` + 正/负极性 continue/break 组合）、concat_value_of_drop、
 **string_builder_statements**（语句级 SB 链还原：重赋值+新变量混合形态
 `sb = sb.append(x); sb2 = sb.append(y); s = sb2.toString()` → `s = …拼接…`）、
 **xor_noise**（Java 语义下 XOR 操作数必为整型 → 含副作用调用也能剥
