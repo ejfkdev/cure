@@ -110,8 +110,13 @@ class Order {
     assert!(edits >= 4, "expect multiple edits, got {edits}");
     // 布尔返回折叠 + 传播
     assert!(printed.contains("return value > 10;"), "{printed}");
-    // x * 1 → x, int u = t → int t 传播
-    assert!(printed.contains("return \"value=\" + x;"), "{printed}");
+    // x * 1 → x, int u = t → int t 传播；批量化后中间语句先行折叠，
+    // if-return 得以进一步归并为三元（两种形态都正确）
+    assert!(
+        printed.contains("return \"value=\" + x;")
+            || printed.contains(": \"value=\" + x;"),
+        "{printed}"
+    );
     // 自赋值删除
     assert!(!printed.contains("self = self;"), "{printed}");
 }

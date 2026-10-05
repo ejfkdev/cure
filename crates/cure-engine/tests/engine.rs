@@ -618,20 +618,23 @@ fn propagation_pure_values() {
         run("(block (decl x 5) (expr y) (ret x))"),
         "(block (expr y) (ret 5))"
     );
-    // 区间内有对 value 读到的变量的写 → 放弃
+    // 区间内有对 value 读到的变量的写 → 放弃传播；
+    // 但根块内的死写（assign y 2 无后续读）先被零用途 DeadStore 删除，
+    // 删除后传播 y 健全（y 保持旧值，ret y ≡ ret x，行为等价）
     assert_eq!(
         run("(block (decl x y) (assign y 2) (ret x))"),
-        "(block (decl x y) (assign y 2) (ret x))"
+        "(block (ret y))"
     );
     // 多次使用 → 放弃
     assert_eq!(
         run("(block (decl x 5) (expr (+ x 1)) (ret x))"),
         "(block (decl x 5) (expr (+ x 1)) (ret x))"
     );
-    // 区间内重声明：旧声明被遮蔽不传播；新声明本身照常传播（符合语义）
+    // 区间内重声明：旧声明被遮蔽不传播；新声明本身照常传播；
+    // 内层传播后旧声明的读归零 → 零用途 DeadStore 删除（值从未流出，健全）
     assert_eq!(
         run("(block (decl x 5) (expr (call f)) (decl x 6) (ret x))"),
-        "(block (decl x 5) (expr (call f)) (ret 6))"
+        "(block (expr (call f)) (ret 6))"
     );
 }
 

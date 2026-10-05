@@ -1807,9 +1807,24 @@ impl Parser {
                         }
                     }
                     Tok::Punct("<") => {
-                        // 显式泛型方法调用 this.<T>foo() —— 罕见，跳过泛型原文
+                        // 显式泛型方法调用 x.<T>name(...)（GJF 常见形态）：
+                        // 类型实参原文丢弃（语义由方法决议决定），方法名照常接
                         if self.type_args_raw().is_none() {
                             break;
+                        }
+                        match &self.tok().tok {
+                            Tok::Ident(name) => {
+                                let n = name.clone();
+                                self.bump();
+                                if self.at_punct("(") {
+                                    let args = self.call_args()?;
+                                    let m = self.ast.member(e, &n);
+                                    e = self.ast.call(m, args);
+                                } else {
+                                    e = self.ast.member(e, &n);
+                                }
+                            }
+                            _ => break,
                         }
                     }
                     _ => break,

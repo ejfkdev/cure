@@ -509,6 +509,14 @@ impl<'a> Lexer<'a> {
         let content_start = self.pos;
         let mut closed = false;
         while self.pos < self.b.len() {
+            // 转义对优先于闭合判定（javac 语义，GJF StringWrapperTest 实证）：
+            // \" 中的引号不计入 """ 闭合 run——\""" 是 转义引号+两个内容引号，
+            // 不是闭合。否则提前闭合会把块剩余内容当代码再解析（错误风暴）。
+            if self.peek(0) == b'\\' {
+                self.bump(); // \
+                self.bump(); // 被转义字符（EOF 处 bump 自行无害）
+                continue;
+            }
             if self.peek(0) == b'"' && self.peek(1) == b'"' && self.peek(2) == b'"' {
                 closed = true;
                 break;

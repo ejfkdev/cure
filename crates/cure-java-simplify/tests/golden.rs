@@ -129,7 +129,8 @@ fn self_assign_removed() {
         let ks = a.expr_stmt(keep);
         a.block(vec![di, sa, ks])
     });
-    assert_eq!(out, "int i = 1;\nkeep();");
+    // 自赋值删除后 i 死声明一并清（零用途 DeadStore）
+    assert_eq!(out, "keep();");
 }
 
 #[test]
@@ -237,8 +238,9 @@ fn self_compare_ints() {
         let r = a.ret(Some(cmp));
         a.block(vec![di, r])
     });
-    // i == i → true 后 i 成为死声明；死存储删除不在范围内，声明保留
-    assert_eq!(out, "int i = 3;\nreturn true;");
+    // i == i → true 后 i 成为死声明；零用途 DeadStore 一并删除
+    // （批量化暴露的形态：值纯、后继零引用，删除健全）
+    assert_eq!(out, "return true;");
 }
 
 #[test]

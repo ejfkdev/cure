@@ -419,10 +419,16 @@ fn assign_propagation_rules() {
     assert!(out.contains("return z;"), "{out}");
     assert!(!out.contains("x = y;"), "{out}");
     assert!(!out.contains("return y;"), "{out}");
-    // value 读到的变量被写 → 不传播
-    let out = run_src("class A{int m(int y){int x = 0; x = y; y = 9; return x;}}");
-    assert!(out.contains("x = y;") || out.contains("return x;"), "{out}");
+    // value 读到的变量被写 → 不传播。
+    // 注意 y=9 必须是活写（println(y) 读取）：若为死写会先被零用途
+    // DeadStore 删除，届时传播 y 反而是健全的（差分 differential 覆盖）。
+    let out = run_src(
+        "class A{int m(int y){int x = 0; x = y; y = 9; System.out.println(y); return x;}}",
+    );
     assert!(!out.contains("return y;"), "{out}");
+    // 死写形态：y=9 无读取 → 删除后传播健全（return y 返回旧值，行为等价）
+    let out = run_src("class A{int m(int y){int x = 0; x = y; y = 9; return x;}}");
+    assert!(out.contains("return y;"), "{out}");
 }
 
 #[test]
@@ -477,10 +483,15 @@ fn multi_use_copy_propagation() {
     assert!(out.contains("if (y > 1)"), "{out}");
     assert!(out.contains("return y + z;"), "{out}");
     assert!(!out.contains("x = y;"), "{out}");
-    // y 被写 → 不传播
-    let out = run_src("class A{int m(int y, int w){int x = 0; x = y; y = w; return x;}}");
+    // y 被活写（有读取）→ 不传播
+    let out = run_src(
+        "class A{int m(int y, int w){int x = 0; x = y; y = w; System.out.println(y); return x;}}",
+    );
     assert!(out.contains("return x;"), "{out}");
     assert!(!out.contains("return y;"), "{out}");
+    // y 被死写（无读取）→ 写先被零用途 DeadStore 删除，传播 y 健全（返回旧值）
+    let out = run_src("class A{int m(int y, int w){int x = 0; x = y; y = w; return x;}}");
+    assert!(out.contains("return y;"), "{out}");
 }
 
 #[test]
@@ -597,9 +608,10 @@ fn store_kill_safety_cases() {
     // 击杀写在循环体内 → 不动（可能零次执行）
     let out = run_src("class A{int m(){int v = 0; while (v < 3) { v = 9; } return v;}}");
     assert!(out.contains("int v = 0;") || out.contains("int v = 0;\n"), "{out}");
-    // 中间语句的 init 里读 v → 不动（读事件阻断）
+    // 中间语句的 init 里读 v → 读事件阻断 init 剥除；
+    // v="y" 是死写（后续无读）→ 零用途 DeadStore 先删，整链合法坍缩（差分锁定）
     let out = run_src("class A{String m(){String v = \"\"; String w = v + \"x\"; v = \"y\"; return w;}}");
-    assert!(out.contains("v = \"y\";"), "{out}");
+    assert!(out.contains("return \"x\";"), "{out}");
 }
 
 // ---------------------------------------------------------------------------

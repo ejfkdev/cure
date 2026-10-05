@@ -53,6 +53,11 @@ pub trait Lang {
 
     /// 整棵子树的聚合效果（最坏情况）。语言侧应缓存（见 `prepare`）。
     fn effect(&self, id: Self::Id) -> Effect;
+    /// 使 `id` 的聚合效果缓存失效（若有）。引擎在同 pass 批量应用编辑后
+    /// 沿祖先链调用——祖先的聚合效果含被改子树，必须失效，
+    /// 后续 `effect()` 读取回退为按需重算（子缓存仍有效，代价 O(孩子数)）。
+    /// 默认空实现：无缓存的语言每次现算，天然正确。
+    fn invalidate_effect(&mut self, _id: Self::Id) {}
     /// 节点自身（不含 children）的效果贡献。
     fn own_effect(&self, id: Self::Id) -> Effect {
         match self.kind(id) {

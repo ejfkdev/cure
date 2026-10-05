@@ -801,6 +801,12 @@ impl Lang for JavaAst {
         e
     }
 
+    fn invalidate_effect(&mut self, id: JavaId) {
+        if let Some(slot) = self.effect_cache.get_mut(id.0 as usize) {
+            *slot = None;
+        }
+    }
+
     fn own_effect(&self, id: JavaId) -> Effect {
         match self.data(id) {
             NodeData::Literal(_)

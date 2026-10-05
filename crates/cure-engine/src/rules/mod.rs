@@ -510,12 +510,31 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         // 写冲突窗口 = [decl 后, 使用语句]：纯值移动到使用点，
         // 使用点之后的写不影响（值已被消费）
         let mut writes: HashSet<String> = HashSet::new();
-        for &s in &stmts[index + 1..] {
+        let mut use_stmt_idx = None;
+        for (off, &s) in stmts[index + 1..].iter().enumerate() {
             let mut w = HashSet::new();
             scan_region(&*lang, s, &name, &mut Vec::new(), &mut w, &mut false);
             writes.extend(w);
             if subtree_contains(&*lang, s, |n| n == use_id) {
+                use_stmt_idx = Some(index + 1 + off);
                 break; // 使用语句之后的写不参与冲突判定
+            }
+        }
+        // 声明删除前提：use 之后不得再出现对该名字的任何引用（读/写/遮蔽）。
+        // 值的传播只关心窗口内写，但**删声明**要求名字彻底无残留引用——
+        // 使用点之后的死写（如 v = "y"）同样引用声明，残留会让输出失去声明。
+        if let Some(ui) = use_stmt_idx {
+            for &s in &stmts[ui + 1..] {
+                let mut tail_uses = Vec::new();
+                let mut tail_writes = HashSet::new();
+                let mut tail_shadowed = false;
+                scan_region(&*lang, s, &name, &mut tail_uses, &mut tail_writes, &mut tail_shadowed);
+                if !tail_uses.is_empty()
+                    || tail_writes.contains(&name)
+                    || tail_shadowed
+                {
+                    return None;
+                }
             }
         }
         let ve = lang.effect(value);
@@ -1090,18 +1109,73 @@ impl<L: Lang> Rule<L> for DeadStore {
         let stmts = lang.children(parent).to_vec();
         let next_stmt = *stmts.get(idx + 1)?;
 
-        // 归一化第二条语句：Assign / ExprStmt{Assign}（简单赋值）
+        // 归一化第二条语句：Assign / ExprStmt{Assign}（简单赋值）；
+        // 不是赋值 → 落入「零用途死存储」形态（见下）
         let second = match lang.kind(next_stmt) {
-            NodeKind::Assign => next_stmt,
+            NodeKind::Assign => Some(next_stmt),
             NodeKind::ExprStmt => {
                 let ch = lang.children(next_stmt);
                 if ch.len() == 1 && lang.kind(ch[0]) == NodeKind::Assign {
-                    ch[0]
+                    Some(ch[0])
                 } else {
-                    return None;
+                    None
                 }
             }
-            _ => return None,
+            _ => None,
+        };
+        let Some(second) = second else {
+            // 零用途死存储：后继对该变量**无读且无写**（含遮蔽重声明），
+            // 存入的值永不流出 → 整条删除。值效果 ≤ MayRead 才可丢弃。
+            // （批量化后可达的形态：传播先消费了击杀写，init 残留为死值；
+            //   旧逐编辑时序下由相邻对形态逐步吸收，未暴露此缺口。）
+            // **作用域前提**：名字必须声明于本块（块级作用域，出块不可见）。
+            // 外层声明的名字可能在本块之后被外层代码读取（if/while 分支里
+            // 对外层变量的赋值就是典型）→ 扫描只覆盖本块尾部，必须拒绝。
+            // （property.rs seed=29 的随机程序抓获此漏洞。）
+            let (name_node, target_local) = if decl_form {
+                (id, true)
+            } else {
+                let t = *lang.children(first_assign?).first()?;
+                if lang.kind(t) != NodeKind::VarRef {
+                    return None;
+                }
+                (t, lang.is_local_var(t))
+            };
+            // 赋值形态：目标必须是本局部（声明形态天然是局部）
+            if !target_local {
+                return None;
+            }
+            let name = lang.var_name(name_node)?.to_string();
+            let declared_in_this_block = if decl_form {
+                true // 检查对象就是本块的声明
+            } else if parent == walk.root {
+                // 方法体根块：尾部扫描覆盖到方法末尾——参数/局部变量的
+                // 零后续事件即可判定为死（方法外不可见）
+                true
+            } else {
+                // 嵌套块：名字必须声明于本块（外层声明的名字可能被
+                // 本块之后的外层代码读取）
+                stmts[..idx].iter().any(|&s| {
+                    lang.kind(s) == NodeKind::VarDecl && lang.var_name(s) == Some(name.as_str())
+                })
+            };
+            if !declared_in_this_block {
+                return None;
+            }
+            let mut uses: Vec<L::Id> = Vec::new();
+            let mut writes = HashSet::new();
+            let mut shadowed = false;
+            for &s in &stmts[idx + 1..] {
+                scan_region(&*lang, s, &name, &mut uses, &mut writes, &mut shadowed);
+            }
+            // 只判**本名字**的读/写：writes 收集的是区域内全部写者
+            if !uses.is_empty() || writes.contains(&name) || shadowed {
+                return None;
+            }
+            if lang.effect(first_value) > Effect::MayRead {
+                return None;
+            }
+            return Some(Edit::Delete { node: id });
         };
         if lang.assign_op(second).is_some() {
             return None;

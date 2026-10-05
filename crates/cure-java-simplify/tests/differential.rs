@@ -731,3 +731,36 @@ public class DeadM {
     assert!(count >= 2, "撞名重载应保留:\n{out}");
     let _ = HashSet::<String>::new();
 }
+
+#[test]
+fn dead_write_then_propagate() {
+    // 零用途 DeadStore 删除死写后，此前被写冲突挡住的传播变为健全。
+    // 三种形态的行为等价性由 javac 差分锁定（死写删除不改变可观察行为）。
+    differential(
+        "DeadW",
+        r#"
+public class DeadW {
+    static int mark = 0;
+    static int bump() { mark++; return mark; }
+    public static void main(String[] args) {
+        // 死写 y=9 无后续读 → 删除后 return y 与原 return x 同值
+        int y0 = args.length;
+        int x = 0;
+        x = y0;
+        y0 = 9;
+        System.out.println(x);
+        // 死写 + 后续传播整链坍缩
+        String v = "";
+        String w = v + "x";
+        v = "y";
+        System.out.println(w);
+        // 副作用值不可丢：bump() 的调用次数必须保留
+        int p = bump();
+        p = 5;
+        System.out.println(p);
+        System.out.println(mark);
+    }
+}
+"#,
+    );
+}
