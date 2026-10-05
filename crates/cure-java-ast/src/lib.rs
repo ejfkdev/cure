@@ -668,6 +668,9 @@ impl Lang for JavaAst {
     fn build_str(&mut self, s: &str) -> JavaId {
         self.lit(Lit::Str(s.to_string()))
     }
+    fn build_char(&mut self, c: char) -> JavaId {
+        self.lit(Lit::Char(c))
+    }
     fn build_bin(&mut self, op: BinOp, l: JavaId, r: JavaId) -> JavaId {
         self.bin(op, l, r)
     }

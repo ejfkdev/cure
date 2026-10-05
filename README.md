@@ -98,7 +98,25 @@ new_string_fold、loop_head_break、concat_value_of_drop、
 `sb = sb.append(x); sb2 = sb.append(y); s = sb2.toString()` → `s = …拼接…`）、
 **xor_noise**（Java 语义下 XOR 操作数必为整型 → 含副作用调用也能剥
 `(mark(5) ^ 0x5A) ^ 0x5A → mark(5)`）、
-**str_len_fold**（`"abc".length() → 3`）。
+**str_len_fold**（`"abc".length() → 3`）、
+**literal_eval**（部分求值器/"虚拟执行"：纯 JDK 方法 + 全字面量实参 →
+编译期求值——`"HelloWorld".substring(0,5)`、`String.format("%s=%d",…)`、
+`Integer.parseInt("42")`、`Math.abs/max/min`、`Character.isXxx/toXxx/toString`、
+字面量数组下标 `{"a","b"}[1]`、cast 字面量 `(char)('a'+2) → 'c'`；
+**只在求值成功时折叠**——解析失败/越界/异常路径保持原样；
+不折 toUpperCase/toLowerCase（locale 敏感））、
+**base64_new_string_fold**（`new String(Base64.getDecoder().decode("aGVsbG8=")) → "hello"`，
+标准/URL 字母表，UTF-8 合法时折叠）。
+引擎侧 char 参与算术按 Java 语义提升为 int 折叠；Str+Char/Int/Long/Bool
+字面量拼接直接折成字符串（浮点除外——Double.toString 算法不保证逐位一致）。
+
+## 虚拟执行验证（tests/eval_obfuscation.rs）
+
+混淆器把常量藏进方法调用（substring/format/parseInt/Base64/字符算术/
+字面量表/字符串杂项/Math/Character）——40 次改写，非空行 44 → 20（-55%），
+javac 差分逐字节一致。模式来源：obfuscator.io / javascript-obfuscator
+的 string-array 与字符串编码家族的 Java 等价形态（跨方法解密器与
+控制流扁平化需要过程间分析，暂不覆盖）。
 
 ## 刁钻混淆验证（tests/hard_obfuscation.rs）
 

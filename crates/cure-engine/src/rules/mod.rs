@@ -855,18 +855,39 @@ impl<L: Lang> Rule<L> for ConstFoldBin {
         }
         let ch = lang.children(id);
         let (l, r) = (*ch.first()?, *ch.get(1)?);
-        // 字符串拼接
+        // 字符串拼接（Str 与 Str/Char/Int/Long/Bool 字面量——拼接的隐式
+        // valueOf 对这些基元是确定性的；浮点除外：Double.toString 算法与
+        // Rust Display 不保证逐位一致）
         if op == BinOp::Add {
-            if let (Some(LitRef::Str(a)), Some(LitRef::Str(b))) = (lang.literal(l), lang.literal(r)) {
-                let joined = format!("{a}{b}");
-                let with = lang.build_str(&joined);
-                return Some(Edit::Replace { target: id, with });
+            let lit_str_of = |n: L::Id| -> Option<String> {
+                match lang.literal(n)? {
+                    LitRef::Str(s) => Some(s.to_string()),
+                    LitRef::Char(c) => Some(c.to_string()),
+                    LitRef::Int(v) => Some(v.to_string()),
+                    LitRef::Long(v) => Some(v.to_string()),
+                    LitRef::Bool(b) => Some(b.to_string()),
+                    _ => None,
+                }
+            };
+            if let (Some(a), Some(b)) = (lit_str_of(l), lit_str_of(r)) {
+                if matches!(lang.literal(l), Some(LitRef::Str(_)))
+                    || matches!(lang.literal(r), Some(LitRef::Str(_)))
+                {
+                    let joined = format!("{a}{b}");
+                    let with = lang.build_str(&joined);
+                    return Some(Edit::Replace { target: id, with });
+                }
             }
         }
-        let (a, b) = (
-            lang.literal(l).and_then(|x| x.as_int())?,
-            lang.literal(r).and_then(|x| x.as_int())?,
-        );
+        let int_of = |x: Option<LitRef<'_>>| -> Option<i64> {
+            match x? {
+                // Java 中 char 参与算术时提升为 int
+                LitRef::Int(v) | LitRef::Long(v) => Some(v),
+                LitRef::Char(c) => Some(c as u32 as i64),
+                _ => None,
+            }
+        };
+        let (a, b) = (int_of(lang.literal(l))?, int_of(lang.literal(r))?);
         let is_long = matches!(lang.literal(l), Some(LitRef::Long(_)))
             || matches!(lang.literal(r), Some(LitRef::Long(_)));
         let folded: Option<i64> = if is_long {
@@ -1189,17 +1210,27 @@ impl<L: Lang> Rule<L> for CmpConstFold {
         }
         let ch = lang.children(id);
         let (l, r) = (*ch.first()?, *ch.get(1)?);
-        let (a, b) = (lang.literal(l)?, lang.literal(r)?);
-        use LitRef::*;
-        let result: Option<bool> = match (a, b) {
-            (Int(x), Int(y)) => cmp_i64(op, x, y),
-            (Long(x), Long(y)) => cmp_i64(op, x, y),
-            (Int(x), Long(y)) => cmp_i64(op, x, y),
-            (Long(x), Int(y)) => cmp_i64(op, x, y),
-            (Bool(x), Bool(y)) if matches!(op, BinOp::Eq | BinOp::Ne) => {
-                Some(if op == BinOp::Eq { x == y } else { x != y })
+        let int_of = |x: Option<LitRef<'_>>| -> Option<i64> {
+            match x? {
+                LitRef::Int(v) | LitRef::Long(v) => Some(v),
+                LitRef::Char(c) => Some(c as u32 as i64),
+                _ => None,
             }
-            _ => None,
+        };
+        use LitRef::*;
+        let result: Option<bool> = match (int_of(lang.literal(l)), int_of(lang.literal(r))) {
+            (Some(x), Some(y)) => cmp_i64(op, x, y),
+            _ => {
+                if let (Some(Bool(x)), Some(Bool(y))) = (lang.literal(l), lang.literal(r)) {
+                    if matches!(op, BinOp::Eq | BinOp::Ne) {
+                        Some(if op == BinOp::Eq { x == y } else { x != y })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
         };
         let v = result?;
         let with = lang.build_bool(v);

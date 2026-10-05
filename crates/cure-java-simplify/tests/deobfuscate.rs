@@ -224,9 +224,9 @@ fn deobfuscate_simulated_obfuscator() {
     assert!(!cleaned.contains("int p;"), "{cleaned}");
     assert!(!cleaned.contains("q = p;"), "{cleaned}");
 
-    // valueOf 剥离 + 拼接常量合并
+    // valueOf 剥离 + 拼接常量合并（Int+Str 字面量直接折成 "42x"）
     assert!(!cleaned.contains("String.valueOf"), "{cleaned}");
-    assert!(cleaned.contains("42 + \"x\""), "{cleaned}");
+    assert!(cleaned.contains(r#"String v = "42x";"#), "{cleaned}");
     assert!(cleaned.contains(r#""a" + v + "bc""#), "{cleaned}");
 
     // ---- 3. 统计 ----

@@ -19,6 +19,7 @@ enum Lit {
     Float(f64),
     Double(f64),
     Str(String),
+    Char(char),
     Null,
 }
 
@@ -109,6 +110,11 @@ impl Lang for Toy {
         self.nodes[id as usize].lit = Some(Lit::Str(s.to_string()));
         id
     }
+    fn build_char(&mut self, c: char) -> Id {
+        let id = self.push(NodeKind::Literal, vec![], None);
+        self.nodes[id as usize].lit = Some(Lit::Char(c));
+        id
+    }
     fn build_bin(&mut self, op: BinOp, l: Id, r: Id) -> Id {
         let id = self.push(NodeKind::Binary, vec![l, r], None);
         self.nodes[id as usize].bin = Some(op);
@@ -185,6 +191,7 @@ impl Lang for Toy {
             Some(Lit::Float(v)) => Some(LitRef::Float(*v)),
             Some(Lit::Double(v)) => Some(LitRef::Double(*v)),
             Some(Lit::Str(s)) => Some(LitRef::Str(s)),
+            Some(Lit::Char(c)) => Some(LitRef::Char(*c)),
             Some(Lit::Null) => Some(LitRef::Null),
             None => None,
         }
@@ -471,6 +478,7 @@ fn to_sexp(toy: &Toy, id: Id) -> String {
             Some(Lit::Float(v)) => format!("{}f", ensure_frac(*v)),
             Some(Lit::Double(v)) => ensure_frac(*v),
             Some(Lit::Str(s)) => format!("\"{s}\""),
+            Some(Lit::Char(c)) => format!("'{c}'"),
             Some(Lit::Null) => "null".into(),
             None => "?".into(),
         },

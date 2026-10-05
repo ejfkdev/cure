@@ -7,7 +7,7 @@
 
 use cure_engine::kind::{BinOp, UnOp};
 use cure_engine::{Config, Edit, Lang, LitRef, NodeKind, Report, RewriteCtx, Rule};
-use cure_java_ast::{CompilationUnit, JavaAst, JavaId, JType, Member, NodeData, TypeDecl};
+use cure_java_ast::{CompilationUnit, JavaAst, JavaId, JType, Lit, Member, NodeData, TypeDecl};
 
 // ---------------------------------------------------------------------------
 // Java 特有规则
@@ -1195,6 +1195,387 @@ impl Rule<JavaAst> for StrLenFold {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 部分求值器（"虚拟执行"）：纯 JDK 方法 + 全字面量实参 → 编译期求值。
+// 只在**求值成功**时折叠（失败/越界/异常路径保持原样交给运行时）。
+// 覆盖混淆器常用的字符串藏匿手段：
+//   "HelloWorld".substring(0,5) / .indexOf / .replace / .trim / .startsWith…
+//   Integer.parseInt("42") / String.format("%s=%d",…) / String.valueOf
+//   Math.abs/max/min / Character.isXxx / (char)('a'+2)
+//   {"a","b"}[1]（字面量数组下标） / Base64 解码链 new String(decoder.decode("…"))
+// 语义安全边界：不折 toUpperCase/toLowerCase（locale 敏感）、
+// parseInt 解析失败不折、substring 越界不折。
+// ---------------------------------------------------------------------------
+
+pub struct LiteralEval;
+
+impl Rule<JavaAst> for LiteralEval {
+    fn name(&self) -> &'static str {
+        "literal_eval"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        match lang.kind(id) {
+            NodeKind::Call => self.eval_call(lang, id),
+            NodeKind::Index => self.eval_index(lang, id),
+            NodeKind::Cast => eval_cast_literal(lang, id),
+            _ => None,
+        }
+    }
+}
+
+impl LiteralEval {
+    fn eval_call(&self, lang: &mut JavaAst, id: JavaId) -> Option<Edit<JavaAst>> {
+        let ch = lang.children(id).to_vec();
+        let callee = ch[0];
+        let NodeData::Member { name: method } = lang.data(callee) else {
+            return None;
+        };
+        let method = method.clone();
+        let recv = lang.children(callee)[0];
+        // 实参必须全部为字面量
+        let args: Vec<Lit> = ch[1..]
+            .iter()
+            .map(|&a| litref_to_lit(lang.literal(a)))
+            .collect::<Option<Vec<_>>>()?;
+
+        let result: Option<Lit> = if let Some(LitRef::Str(s)) = lang.literal(recv) {
+            eval_str_method(s, &method, &args)
+        } else if let Some(cls) = lang.var_name(recv) {
+            eval_static_method(cls, &method, &args)
+        } else {
+            None
+        };
+        let lit = result?;
+        let with = lit_to_node(lang, &lit);
+        Some(Edit::Replace {
+            target: id,
+            with,
+        })
+    }
+
+    fn eval_index(&self, lang: &mut JavaAst, id: JavaId) -> Option<Edit<JavaAst>> {
+        // {"a","b"}[1] → "b"（字面量数组 + 字面量下标，界内）
+        let ch = lang.children(id).to_vec();
+        if lang.kind(ch[0]) != NodeKind::ArrayLit {
+            return None;
+        }
+        let idx = lang.literal(ch[1])?.as_int()?;
+        let elems = lang.children(ch[0]).to_vec();
+        if idx < 0 || idx >= elems.len() as i64 {
+            return None;
+        }
+        Some(Edit::Replace {
+            target: id,
+            with: elems[idx as usize],
+        })
+    }
+}
+
+fn litref_to_lit(l: Option<LitRef<'_>>) -> Option<Lit> {
+    Some(match l? {
+        LitRef::Str(s) => Lit::Str(s.to_string()),
+        LitRef::Int(v) => Lit::Int(v),
+        LitRef::Long(v) => Lit::Long(v),
+        LitRef::Bool(b) => Lit::Bool(b),
+        LitRef::Char(c) => Lit::Char(c),
+        LitRef::Float(v) => Lit::Float(v),
+        LitRef::Double(v) => Lit::Double(v),
+        LitRef::Null => return None,
+    })
+}
+
+fn lit_to_node(lang: &mut JavaAst, lit: &Lit) -> JavaId {
+    match lit {
+        Lit::Str(s) => lang.build_str(s),
+        Lit::Int(v) => lang.build_int(*v, false),
+        Lit::Long(v) => lang.build_int(*v, true),
+        Lit::Bool(b) => lang.build_bool(*b),
+        Lit::Char(c) => lang.build_char(*c),
+        Lit::Float(v) => lang.lit(Lit::Float(*v)),
+        Lit::Double(v) => lang.lit(Lit::Double(*v)),
+        _ => lang.lit(Lit::Null),
+    }
+}
+
+/// 字面量 cast 折叠：(char)('a'+1) → 'b、(int)'a' → 97、窄化仅在值域内。
+fn eval_cast_literal(lang: &mut JavaAst, id: JavaId) -> Option<Edit<JavaAst>> {
+    let NodeData::Cast { ty } = lang.data(id) else {
+        return None;
+    };
+    let ty = ty.clone();
+    let inner = lang.children(id)[0];
+    let lit = litref_to_lit(lang.literal(inner))?;
+    let with = match (&ty, &lit) {
+        (JType::Char, Lit::Int(v)) if (0 as i64..=0xFFFF).contains(v) => {
+            lang.build_char(char::from_u32(*v as u32)?)
+        }
+        (JType::Char, Lit::Char(_)) => inner,
+        (JType::Int, Lit::Char(c)) => lang.build_int(*c as i64, false),
+        (JType::Long, Lit::Char(c)) => lang.build_int(*c as i64, true),
+        (JType::Long, Lit::Int(v)) => lang.build_int(*v, true),
+        (JType::Int, Lit::Long(v)) if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 => {
+            lang.build_int(*v, false)
+        }
+        (JType::Int, Lit::Int(_)) => inner,
+        _ => return None,
+    };
+    Some(Edit::Replace {
+        target: id,
+        with,
+    })
+}
+
+fn eval_str_method(s: &str, method: &str, args: &[Lit]) -> Option<Lit> {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+    Some(match (method, args) {
+        ("isEmpty", []) => Lit::Bool(s.is_empty()),
+        ("trim", []) => Lit::Str(s.trim_matches(|c: char| c <= ' ').to_string()),
+        ("concat", [Lit::Str(b)]) => Lit::Str(format!("{s}{b}")),
+        ("startsWith", [Lit::Str(p)]) => Lit::Bool(s.starts_with(p.as_str())),
+        ("endsWith", [Lit::Str(p)]) => Lit::Bool(s.ends_with(p.as_str())),
+        ("contains", [Lit::Str(p)]) => Lit::Bool(s.contains(p.as_str())),
+        ("equals", [Lit::Str(p)]) => Lit::Bool(s == p),
+        ("equalsIgnoreCase", [Lit::Str(p)]) => {
+            Lit::Bool(s.to_lowercase() == p.to_lowercase())
+        }
+        ("indexOf", [Lit::Char(c)]) => Lit::Int(
+            s.find(*c).map(|i| i as i64).unwrap_or(-1),
+        ),
+        ("indexOf", [Lit::Str(p)]) => Lit::Int(
+            s.find(p.as_str()).map(|i| i as i64).unwrap_or(-1),
+        ),
+        ("length", []) => Lit::Int(n),
+        ("charAt", [Lit::Int(i)]) if *i >= 0 && *i < n => {
+            Lit::Char(chars[*i as usize])
+        }
+        ("substring", [Lit::Int(b)]) if *b >= 0 && *b <= n => {
+            Lit::Str(s.chars().skip(*b as usize).collect())
+        }
+        ("substring", [Lit::Int(b), Lit::Int(e)]) if *b >= 0 && *b <= *e && *e <= n => {
+            Lit::Str(chars[*b as usize..*e as usize].iter().collect())
+        }
+        ("replace", [Lit::Char(a), Lit::Char(b)]) => {
+            Lit::Str(s.chars().map(|c| if c == *a { *b } else { c }).collect())
+        }
+        ("replace", [Lit::Str(a), Lit::Str(b)]) if !a.is_empty() => {
+            Lit::Str(s.replace(a.as_str(), b))
+        }
+        // String.hashCode 是 JLS 规定的确定性算法
+        ("hashCode", []) => Lit::Int(
+            s.chars()
+                .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32))
+                as i64,
+        ),
+        _ => return None,
+    })
+}
+
+fn eval_static_method(cls: &str, method: &str, args: &[Lit]) -> Option<Lit> {
+    let cls = cls.rsplit('.').next().unwrap_or(cls);
+    Some(match (cls, method, args) {
+        ("Integer", "parseInt", [Lit::Str(s)]) => {
+            Lit::Int(s.trim().parse::<i64>().ok()? as i64)
+        }
+        ("Integer", "toString", [Lit::Int(v)]) => Lit::Str(v.to_string()),
+        ("Integer", "toString", [Lit::Long(v)]) => Lit::Str(v.to_string()),
+        ("Long", "parseLong", [Lit::Str(s)]) => Lit::Long(s.trim().parse::<i64>().ok()?),
+        ("Long", "toString", [Lit::Int(v)]) => Lit::Str(v.to_string()),
+        ("Long", "toString", [Lit::Long(v)]) => Lit::Str(v.to_string()),
+        ("Boolean", "parseBoolean", [Lit::Str(s)]) => {
+            Lit::Bool(s.eq_ignore_ascii_case("true"))
+        }
+        ("Boolean", "toString", [Lit::Bool(b)]) => Lit::Str(b.to_string()),
+        ("String", "valueOf", [Lit::Str(s)]) => Lit::Str(s.clone()),
+        ("String", "valueOf", [Lit::Int(v)]) => Lit::Str(v.to_string()),
+        ("String", "valueOf", [Lit::Long(v)]) => Lit::Str(v.to_string()),
+        ("String", "valueOf", [Lit::Char(c)]) => Lit::Str(c.to_string()),
+        ("String", "valueOf", [Lit::Bool(b)]) => Lit::Str(b.to_string()),
+        ("String", "format", fmt_args @ [Lit::Str(_), ..]) => {
+            let fmt = match &fmt_args[0] {
+                Lit::Str(s) => s.clone(),
+                _ => return None,
+            };
+            let out = eval_string_format(&fmt, &fmt_args[1..])?;
+            Lit::Str(out)
+        }
+        ("Math", "abs", [Lit::Int(v)]) => Lit::Int(v.wrapping_abs()),
+        ("Math", "abs", [Lit::Long(v)]) => Lit::Long(v.wrapping_abs()),
+        ("Math", "max", [Lit::Int(a), Lit::Int(b)]) => Lit::Int(*a.max(b)),
+        ("Math", "min", [Lit::Int(a), Lit::Int(b)]) => Lit::Int(*a.min(b)),
+        ("Math", "max", [Lit::Long(a), Lit::Long(b)]) => Lit::Long(*a.max(b)),
+        ("Math", "min", [Lit::Long(a), Lit::Long(b)]) => Lit::Long(*a.min(b)),
+        ("Character", "isDigit", [Lit::Char(c)]) => Lit::Bool(c.is_ascii_digit()),
+        ("Character", "isLetter", [Lit::Char(c)]) => Lit::Bool(c.is_alphabetic()),
+        ("Character", "isWhitespace", [Lit::Char(c)]) => Lit::Bool(c.is_whitespace()),
+        ("Character", "isUpperCase", [Lit::Char(c)]) => Lit::Bool(c.is_uppercase()),
+        ("Character", "isLowerCase", [Lit::Char(c)]) => Lit::Bool(c.is_lowercase()),
+        ("Character", "toUpperCase", [Lit::Char(c)]) => Lit::Char(c.to_uppercase().next()?),
+        ("Character", "toLowerCase", [Lit::Char(c)]) => Lit::Char(c.to_lowercase().next()?),
+        ("Character", "toString", [Lit::Char(c)]) => Lit::Str(c.to_string()),
+        _ => return None,
+    })
+}
+
+/// String.format 最小子集：%s、%d、%%；其余转换（%f/%x/宽度/精度）不折。
+fn eval_string_format(fmt: &str, args: &[Lit]) -> Option<String> {
+    let mut out = String::new();
+    let mut it = fmt.chars().peekable();
+    let mut arg_i = 0usize;
+    while let Some(c) = it.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match it.next()? {
+            '%' => out.push('%'),
+            's' => {
+                let a = args.get(arg_i)?;
+                arg_i += 1;
+                match a {
+                    Lit::Str(s) => out.push_str(s),
+                    Lit::Char(ch) => out.push(*ch),
+                    Lit::Bool(b) => out.push_str(&b.to_string()),
+                    _ => out.push_str(&lit_debug_str(a)),
+                }
+            }
+            'd' => {
+                let a = args.get(arg_i)?;
+                arg_i += 1;
+                match a {
+                    Lit::Int(v) => out.push_str(&v.to_string()),
+                    Lit::Long(v) => out.push_str(&v.to_string()),
+                    Lit::Char(ch) => out.push_str(&(*ch as i64).to_string()),
+                    _ => return None,
+                }
+            }
+            // 未知/未支持转换：交给运行时
+            _ => return None,
+        }
+    }
+    if arg_i != args.len() {
+        return None; // 实参数量与转换符不匹配 → 运行时异常路径，不折
+    }
+    Some(out)
+}
+
+fn lit_debug_str(l: &Lit) -> String {
+    match l {
+        Lit::Int(v) => v.to_string(),
+        Lit::Long(v) => v.to_string(),
+        _ => "?".into(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Base64 字符串解码还原（混淆器标准藏匿手段）：
+//   new String(Base64.getDecoder().decode("aGVsbG8=")) → "hello"
+//   （URL 解码器同理；解码字节须为合法 UTF-8）
+// ---------------------------------------------------------------------------
+
+pub struct Base64NewStringFold;
+
+impl Rule<JavaAst> for Base64NewStringFold {
+    fn name(&self) -> &'static str {
+        "base64_new_string_fold"
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        let NodeData::New { ty, .. } = lang.data(id) else {
+            return None;
+        };
+        if !matches!(ty, JType::Ref(n) if n == "String" || n.ends_with(".String")) {
+            return None;
+        }
+        let args = lang.children(id).to_vec();
+        if args.len() != 1 {
+            return None;
+        }
+        // 参数：Base64.getXxxDecoder().decode("lit")
+        if lang.kind(args[0]) != NodeKind::Call {
+            return None;
+        }
+        let dc = lang.children(args[0]).to_vec();
+        if dc.len() != 2 {
+            return None;
+        }
+        let NodeData::Member { name: dn } = lang.data(dc[0]) else {
+            return None;
+        };
+        if dn != "decode" {
+            return None;
+        }
+        // recv = Base64.getXxxDecoder()（调用）
+        let recv = lang.children(dc[0])[0];
+        if lang.kind(recv) != NodeKind::Call {
+            return None;
+        }
+        let gc = lang.children(recv).to_vec();
+        let NodeData::Member { name: gn } = lang.data(*gc.first()?) else {
+            return None;
+        };
+        let url_safe = match gn.as_str() {
+            "getDecoder" => false,
+            "getUrlDecoder" => true,
+            _ => return None,
+        };
+        // owner = java.util.Base64（Member 链）或裸 Base64（VarRef）
+        let owner = lang.children(gc[0])[0];
+        let owner_ok = match lang.data(owner) {
+            NodeData::Member { name } => name == "Base64",
+            _ => matches!(lang.var_name(owner), Some(n) if n == "Base64" || n.ends_with(".Base64")),
+        };
+        if !owner_ok {
+            return None;
+        }
+        let LitRef::Str(b64) = lang.literal(dc[1])? else {
+            return None;
+        };
+        let bytes = base64_decode(b64, url_safe)?;
+        let text = String::from_utf8(bytes).ok()?;
+        let with = lang.build_str(&text);
+        Some(Edit::Replace {
+            target: id,
+            with,
+        })
+    }
+}
+
+/// 手写 base64 解码（标准/URL 字母表，允许缺省填充）。
+fn base64_decode(s: &str, url_safe: bool) -> Option<Vec<u8>> {
+    let val = |c: char| -> Option<u32> {
+        match c {
+            'A'..='Z' => Some(c as u32 - 'A' as u32),
+            'a'..='z' => Some(c as u32 - 'a' as u32 + 26),
+            '0'..='9' => Some(c as u32 - '0' as u32 + 52),
+            '+' if !url_safe => Some(62),
+            '/' if !url_safe => Some(63),
+            '-' if url_safe => Some(62),
+            '_' if url_safe => Some(63),
+            _ => None,
+        }
+    };
+    let clean: String = s.chars().filter(|&c| c != '=' && !c.is_whitespace()).collect();
+    if clean.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for c in clean.chars() {
+        buf = (buf << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
 // ---------------------------------------------------------------------------
 // 门面
 // ---------------------------------------------------------------------------
@@ -1215,6 +1596,8 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(TrailingContinueJava));
     rules.push(Box::new(XorNoise));
     rules.push(Box::new(StrLenFold));
+    rules.push(Box::new(LiteralEval));
+    rules.push(Box::new(Base64NewStringFold));
     rules
 }
 

@@ -163,8 +163,8 @@ fn hard_composed_obfuscation_deobfuscated() {
     }
 
     // ---- 2. 各层混淆被击穿 ----
-    // 多层常量链：整链塌缩成 20
-    assert!(cleaned.contains("k=\" + 20") || cleaned.contains("\"k=\" + 20"), "{cleaned}");
+    // 多层常量链：整链塌缩成 "k=20"（含 Str+Int 字面量拼接折叠）
+    assert!(cleaned.contains(r#"println("k=20")"#), "{cleaned}");
     assert!(!cleaned.contains("0x5A"), "{cleaned}");
     assert!(!cleaned.contains("k2"), "{cleaned}");
 
@@ -181,12 +181,11 @@ fn hard_composed_obfuscation_deobfuscated() {
     assert!(!cleaned.contains("v32"), "{cleaned}");
     assert!(!cleaned.contains("v33"), "{cleaned}");
 
-    // 多层字符串：SB 链 + new String + valueOf + length 全部折叠
-    //（5+"!" 的括号是结构性保真：("a"+5)+"!" 与 "a"+(5+"!") 求值序不同）
+    // 多层字符串：SB 链 + new String + valueOf + length + Int/Str 拼接全折叠
     assert!(!cleaned.contains("new StringBuilder"), "{cleaned}");
     assert!(!cleaned.contains("new String("), "{cleaned}");
     assert!(!cleaned.contains("String.valueOf"), "{cleaned}");
-    assert!(cleaned.contains(r#""a" + (5 + "!") + "bcd""#), "{cleaned}");
+    assert!(cleaned.contains(r#"println("a5!bcd")"#), "{cleaned}");
 
     // 布尔旗标三元嵌套 → 合取
     assert!(cleaned.contains("v25 > 3 && v25 > 5"), "{cleaned}");

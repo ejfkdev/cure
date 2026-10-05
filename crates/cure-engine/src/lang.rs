@@ -44,6 +44,8 @@ pub trait Lang {
     fn build_assign(&mut self, target: Self::Id, value: Self::Id) -> Self::Id;
     /// 构造字符串字面量（字符串常量折叠产物）。
     fn build_str(&mut self, s: &str) -> Self::Id;
+    /// 构造字符字面量（部分求值产物：`(char)('a'+1)` → 'b'）。
+    fn build_char(&mut self, c: char) -> Self::Id;
     /// 深拷贝子树（返回新 Id）。
     fn copy_subtree(&mut self, id: Self::Id) -> Self::Id;
 

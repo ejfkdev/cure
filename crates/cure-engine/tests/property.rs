@@ -22,6 +22,7 @@ enum Lit {
     Bool(bool),
     Int(i64),
     Str(String),
+    Char(char),
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +104,11 @@ impl Lang for Toy {
         self.nodes[id as usize].lit = Some(Lit::Str(s.to_string()));
         id
     }
+    fn build_char(&mut self, c: char) -> Id {
+        let id = self.push(NodeKind::Literal, vec![], None);
+        self.nodes[id as usize].lit = Some(Lit::Char(c));
+        id
+    }
     fn build_bin(&mut self, op: BinOp, l: Id, r: Id) -> Id {
         let id = self.push(NodeKind::Binary, vec![l, r], None);
         self.nodes[id as usize].bin = Some(op);
@@ -177,6 +183,7 @@ impl Lang for Toy {
             Some(Lit::Bool(b)) => Some(LitRef::Bool(*b)),
             Some(Lit::Int(v)) => Some(LitRef::Int(*v)),
             Some(Lit::Str(s)) => Some(LitRef::Str(s)),
+            Some(Lit::Char(c)) => Some(LitRef::Char(*c)),
             None => None,
         }
     }
@@ -832,6 +839,7 @@ fn to_sexp(t: &Toy, id: Id) -> String {
             Some(Lit::Bool(b)) => format!("{b}"),
             Some(Lit::Int(v)) => format!("{v}"),
             Some(Lit::Str(s)) => format!("\"{s}\""),
+            Some(Lit::Char(c)) => format!("'{c}'"),
             None => "?".into(),
         },
         k => format!("(:{k:?})"),
