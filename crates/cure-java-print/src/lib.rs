@@ -1090,6 +1090,13 @@ impl<'a> Printer<'a> {
                     self.out.push(')');
                 }
             }
+            NodeData::Group => {
+                // 合成分组：无作用域、无括号——子语句同层展开
+                let children = self.ast.children(id).to_vec();
+                for &s in &children {
+                    self.stmt(s);
+                }
+            }
             NodeData::ArrayLit => {
                 let elems = ast.children(id);
                 self.out.push('{');

@@ -92,6 +92,10 @@ pub enum Lit {
 pub enum NodeData {
     // ---- 语句 ----
     Block,
+    /// 合成分组（无花括号、**无作用域**）：多声明符等"一句多语句"的承载。
+    /// 语句列表处在解析期就地展开；若存活到打印，按同缩进无括号输出。
+    /// kind() 映射为 Block（引擎规则透明），但语义上不引入词法作用域。
+    Group,
     Empty,
     ExprStmt,
     VarDecl { name: String, ty: JType },
@@ -330,7 +334,7 @@ impl JavaAst {
     /// 固有方法（与 Lang trait 同名；供不依赖引擎的下游使用，如 printer）。
     pub fn kind(&self, id: JavaId) -> NodeKind {
         match &self.nodes[id.0 as usize].data {
-            NodeData::Block => NodeKind::Block,
+            NodeData::Block | NodeData::Group => NodeKind::Block,
             NodeData::Empty => NodeKind::Empty,
             NodeData::ExprStmt => NodeKind::ExprStmt,
             NodeData::VarDecl { .. } => NodeKind::VarDecl,
@@ -579,6 +583,10 @@ impl JavaAst {
         let mut ch = sizes;
         ch.extend(init);
         self.push(NodeData::NewArray { ty, dims, sized }, ch)
+    }
+    /// 合成分组（无作用域）。
+    pub fn group(&mut self, stmts: Vec<JavaId>) -> JavaId {
+        self.push(NodeData::Group, stmts)
     }
     pub fn array_lit(&mut self, elems: Vec<JavaId>) -> JavaId {
         self.push(NodeData::ArrayLit, elems)
@@ -854,6 +862,7 @@ impl Lang for JavaAst {
             | NodeData::Super
             | NodeData::Paren
             | NodeData::Block
+            | NodeData::Group
             | NodeData::Empty
             | NodeData::VarDecl { .. }
             | NodeData::Break { .. }

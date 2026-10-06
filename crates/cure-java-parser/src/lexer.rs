@@ -375,7 +375,12 @@ impl<'a> Lexer<'a> {
             }
         }
         let _ = &is_float;
-        if (self.peek(0) | 0x20) == b'e' && self.peek(1).is_ascii_digit() {
+        // 指数：e 后跟数字，或符号后跟数字（1.5e-3 / 1E+10）
+        if (self.peek(0) | 0x20) == b'e'
+            && (self.peek(1).is_ascii_digit()
+                || ((self.peek(1) == b'+' || self.peek(1) == b'-')
+                    && self.peek(2).is_ascii_digit()))
+        {
             is_float = true;
             self.bump();
             if self.peek(0) == b'+' || self.peek(0) == b'-' {

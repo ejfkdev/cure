@@ -952,7 +952,12 @@ impl Parser {
                 break;
             }
             let s = self.parse_stmt();
-            children.push(s);
+            // Group（多声明符等）就地展开为兄弟语句
+            if matches!(self.ast.data(s), &NodeData::Group) {
+                children.extend(self.ast.children(s).iter().copied());
+            } else {
+                children.push(s);
+            }
         }
         self.ast.block(children)
     }
@@ -1216,12 +1221,15 @@ impl Parser {
                 let (n, t, i) = &decls[0];
                 return self.ast.var_decl(n, t.clone(), i.clone());
             }
-            // 多声明符 → 兄弟语句，用无语义差 Block 承载（打印时同缩进展开）
+            // 多声明符 → 合成 Group（无作用域）：语句列表处就地展开；
+            // 逃逸到打印时按同缩进无括号输出。绝不能用 Block——那是词法
+            // 作用域，会把声明的作用域错误地圈进花括号（曾经因此被
+            // 零用途 DeadStore 误删逃逸变量，对抗差分抓获）。
             let stmts = decls
                 .iter()
                 .map(|(n, t, i)| self.ast.var_decl(n, t.clone(), i.clone()))
                 .collect();
-            return self.ast.block(stmts);
+            return self.ast.group(stmts);
         }
         self.pos = save;
         self.expr_stmt_fallback(start)
@@ -1610,7 +1618,11 @@ impl Parser {
                     stmts.push(self.parse_block_raw());
                 } else {
                     let s = self.parse_stmt();
-                    stmts.push(s);
+                    if matches!(self.ast.data(s), &NodeData::Group) {
+                        stmts.extend(self.ast.children(s).iter().copied());
+                    } else {
+                        stmts.push(s);
+                    }
                 }
             } else {
                 self.expect(":");
@@ -1623,7 +1635,12 @@ impl Parser {
                     if self.at_kw("case") || self.at_kw("default") || self.at_punct("}") {
                         break;
                     }
-                    stmts.push(self.parse_stmt());
+                    let s = self.parse_stmt();
+                    if matches!(self.ast.data(s), &NodeData::Group) {
+                        stmts.extend(self.ast.children(s).iter().copied());
+                    } else {
+                        stmts.push(s);
+                    }
                 }
             }
             cases.push(self.ast.case_(labels, is_default, arrow, stmts));

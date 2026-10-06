@@ -857,3 +857,127 @@ public class DNeg {
     let out = print_unit(&outcome.ast, &mut outcome.unit);
     assert!(out.contains("return 5;"), "{out}");
 }
+
+#[test]
+fn adversarial_precedence_and_literals() {
+    // 对抗性差分：运算符优先级全组合嵌套、全部字面量形态（十六进制/八进制/
+    // 二进制/下划线/带符号指数/前导点浮点/字符转义/\u 转义）、单目链、转型
+    // 优先级、instanceof、赋值表达式、三元嵌套、数组/foreach/标签/do-while/
+    // 经典与箭头 switch、副作用求值序。
+    // 曾抓到两个真 bug：1) 指数符号 e-/E+ 词法分支缺失（4M 错误风暴）；
+    // 2) 多声明符合成 Block 被当词法作用域 → 零用途 DeadStore 误删逃逸变量
+    //    （Google/ProGuard 风格一行一声明故从未触发；本样本经典写法引爆）。
+    differential(
+        "Adv",
+        r#"public class Adv {
+    static int side = 0;
+    static int bump() { side++; return side; }
+
+    public static void main(String[] args) {
+        int a = 13, b = 5, c = 3;
+        long l = 100L;
+        // 运算符优先级嵌套（printer 括号正确性）
+        System.out.println(a - (b - c));
+        System.out.println((a - b) - c);
+        System.out.println(a << (b << c));
+        System.out.println((a << b) << c);
+        System.out.println(a / (b / c));
+        System.out.println(a % (b % c));
+        System.out.println((a & b) | c);
+        System.out.println(a & (b | c));
+        System.out.println(a ^ (b ^ c));
+        System.out.println((a ^ b) ^ c);
+        System.out.println(a + (b * c));
+        System.out.println((a + b) * c);
+        System.out.println(a < (b < c ? 1 : 0));
+        System.out.println((a < b) ? (c < 5 ? 1 : 2) : 3);
+        System.out.println(a == (b == c ? 0 : 1));
+        System.out.println(!(a < b) && (c > 2));
+        // 字面量形态
+        System.out.println(0x7FFFFFFF);
+        System.out.println(0x80000000L);
+        System.out.println(010);
+        System.out.println(0b1010);
+        System.out.println(1_000_000);
+        System.out.println(1_000_000.5f);
+        System.out.println(1e10);
+        System.out.println(1.5e-3);
+        System.out.println(3.14f);
+        System.out.println(3.14d);
+        System.out.println(.5f);
+        System.out.println('a');
+        System.out.println('\\');
+        System.out.println('\'');
+        System.out.println('\n' == 10);
+        System.out.println('\u4e2d' == 20013);
+        System.out.println("\u4e2d\u6587");
+        System.out.println("tab\tnl\nq\"bs\\");
+        // 单目嵌套
+        System.out.println(-(-a));
+        System.out.println(~(~a));
+        System.out.println(-(~a));
+        System.out.println(~(-a));
+        System.out.println(!(!(a > b)));
+        // 转型与优先级
+        System.out.println((int) (a + b));
+        System.out.println((int) a + b);
+        System.out.println((long) (a * b) + c);
+        System.out.println((char) ('a' + 1));
+        System.out.println((byte) 200);
+        System.out.println((float) 3.14 + 1);
+        // instanceof / 赋值表达式 / 三元嵌套
+        Object o = "s";
+        System.out.println(o instanceof String);
+        int x;
+        System.out.println(x = a + b);
+        System.out.println(x += c);
+        System.out.println(x *= 2);
+        System.out.println(x /= 3);
+        System.out.println(x %= 4);
+        System.out.println(x ^= 1);
+        System.out.println(a > b ? b > c ? 10 : 20 : 30);
+        System.out.println((a > b) ? 1 : (b > c) ? 2 : 3);
+        // 数组/foreach/变参
+        int[] arr = {3, 1, 2};
+        int[][] mtx = {{1, 2}, {3, 4}};
+        for (int v : arr) { System.out.println(v); }
+        for (int[] row : mtx) { for (int v : row) { System.out.println(v); } }
+        // 标签 + continue
+        outer:
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                if (j == 1) { continue outer; }
+                System.out.println(i * 10 + j);
+            }
+        }
+        // do-while
+        int k = 0;
+        do { k++; } while (k < 3);
+        System.out.println(k);
+        // switch 经典与箭头
+        switch (a % 3) {
+            case 0: System.out.println("zero"); break;
+            case 1 + 1: System.out.println("two"); break;
+            default: System.out.println("other");
+        }
+        switch (b) {
+            case 1 -> System.out.println("one");
+            default -> System.out.println("many");
+        }
+        // 求值顺序（副作用）
+        System.out.println(bump() + bump() * 10);
+        System.out.println(a > b && bump() > 0);
+        System.out.println(a < b || bump() > 0);
+        System.out.println(side);
+    }
+}
+"#,
+    );
+    // 多声明符专项：变量逃逸合成分组后必须存活且可用
+    let src = "class A{int m(){int a = 1, b = 2, c = 3; return a + b * c;}}";
+    let mut outcome = parse(src);
+    simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
+    let out = print_unit(&outcome.ast, &outcome.unit);
+    assert!(out.contains("int a = 1;") || out.contains("int a = 1,") || out.contains("return 7;"), "{out}");
+    assert!(!out.contains("{\n            int a"), "{out}");
+}
