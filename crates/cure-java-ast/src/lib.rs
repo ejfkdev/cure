@@ -181,6 +181,11 @@ pub struct JavaAst {
     /// 可内联的单 return 方法：名字 → (参数名表, 返回表达式节点)。
     /// 由 simplify_unit 填充（解密 helper：d(0) → 方法体）。
     pub inline_methods: HashMap<String, (Vec<String>, JavaId)>,
+    /// 事件索引清洁标记（B3 惰性重建）：invalidate_effect 清零；prepare
+    /// 走完重建置位。true 时 prepare 直接跳过 build_region_index 全树
+    /// walk（无失效 = 无需重建；编辑必经失效路径——立即/延迟两路都覆盖）。
+    /// 默认 false（derive）= 首次 prepare 必建全量。
+    events_clean: bool,
     /// String 引用身份比较缓存：(root, 结果)。prepare() 清空（树已变），
     /// 首次查询时计算——供 new String(lit) 等折叠守卫复用（每轮至多一次全扫）。
     string_identity: std::cell::Cell<Option<(JavaId, bool)>>,
@@ -831,12 +836,34 @@ impl Lang for JavaAst {
     }
 
     fn invalidate_effect(&mut self, id: JavaId) {
+        self.events_clean = false;
         if let Some(slot) = self.effect_cache.get_mut(id.0 as usize) {
             *slot = None;
         }
         // 事件索引同步失效：本节点子树若被改，其预计算事件已陈旧
         if let Some(ev) = self.region_events.get_mut(id.0 as usize) {
             ev.clear();
+        }
+    }
+
+    fn debug_verify_events(&self, stmt: JavaId) {
+        if !verify_events_on() {
+            return;
+        }
+        if let Some(indexed) = self.region_events(stmt) {
+            let fresh = self.collect_region_events(stmt);
+            // 比较（键+种类+节点）三元组序列
+            let key = |e: &cure_engine::kind::RegionEvent<JavaId, u32>| {
+                (e.key, matches!(e.kind, cure_engine::kind::EventKind::Use), e.node.0)
+            };
+            let a: Vec<_> = indexed.iter().map(key).collect();
+            let b: Vec<_> = fresh.iter().map(key).collect();
+            if a != b {
+                eprintln!(
+                    "[EVENTS-STALE] stmt #{} kind={:?}: indexed {} events, fresh {} events",
+                    stmt.0, self.kind(stmt), a.len(), b.len()
+                );
+            }
         }
     }
 
@@ -1036,6 +1063,10 @@ impl Lang for JavaAst {
     /// 1) 效果表——arena 按升序扫描（child index < parent index 不变量）；
     /// 2) 变量类型表——从 root 做作用域栈遍历。
     fn prepare(&mut self, root: JavaId) {
+        if cnt_prepare_on() {
+            PREPARE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            PREPARE_NODES.fetch_add(self.nodes.len(), std::sync::atomic::Ordering::Relaxed);
+        }
         // 名字键增量扩展：新节点 intern（既有节点键不变——名字与位置无关）
         if self.node_key.len() < self.nodes.len() {
             let base = self.node_key.len();
@@ -1050,21 +1081,28 @@ impl Lang for JavaAst {
         }
         // 守卫缓存失效：树已变
         self.string_identity.set(None);
-        // 区域事件索引【脏式重建】：只重建空条目（被 invalidate_effect
-        // 失效的，或新语句）。未失效条目的事件是子树局部的——与位置无关，
-        // 搬移不改变内容；clear() 保留内层 Vec 容量（免每 pass 30k 次分配）。
-        // 队列编辑在应用后沿祖先失效（见 pass.rs），保证脏集完备。
-        // B1：逐条 clear 保容量（免每 pass 数万次 Vec 分配）；全量重建
+        // 区域事件索引【惰性重建】（B3）：只重建**空条目**——被
+        // invalidate_effect 失效的语句、或新语句。未失效条目的事件是
+        // 子树局部的（与位置无关）。关键不变量：**一切**改树路径都必须
+        // 失效受影响语句的条目：
+        //   - 立即 Replace：目标祖先链 + with 子树中既有节点的**旧容器**
+        //     祖先链（搬移——pass.rs 立即路径两处都做）
+        //   - 队列编辑应用：同上（pass.rs deferred 应用后统一失效）
+        // 违反不变量的后果：陈旧事件驱动错误决策（B2 教训：cff_diamond
+        // 差分当场抓获）。性能背景：Types.java 上 prepare 每 pass 全量重建
+        // = 726 倍冗余（37 万文件语料 prepare 占 57% 线程时间）。
         if self.region_events.len() < self.nodes.len() {
             self.region_events.resize(self.nodes.len(), Vec::new());
-        } else {
-            for v in &mut self.region_events {
-                v.clear();
-            }
         }
+        if self.events_clean {
+            return;
+        }
+        self.events_clean = true;
         for sr in self.build_region_index(root) {
-            let events = self.collect_region_events(sr);
-            self.region_events[sr.0 as usize] = events;
+            if self.region_events[sr.0 as usize].is_empty() {
+                let events = self.collect_region_events(sr);
+                self.region_events[sr.0 as usize] = events;
+            }
         }
         // ---- 效果表 ----
         // 正常情况一轮升序扫描即可（children index < parent index 的
@@ -1312,6 +1350,9 @@ impl JavaAst {
     /// Use 的顺序、Write/Shadow 的命中，跨键顺序无关），查询侧可二分
     /// 定位键区间、跳过全部非匹配事件。
     fn collect_region_events(&self, node: JavaId) -> Vec<RegionEvent<JavaId, u32>> {
+        if cnt_prepare_on() {
+            COLLECT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut out = Vec::new();
         let saw_raw = self.collect_events_into(node, &mut out);
         if saw_raw {
@@ -1403,3 +1444,20 @@ impl JavaAst {
         }
     }
 }
+
+static ENV_CACHED: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+fn env_flags() -> (bool, bool) {
+    *ENV_CACHED.get_or_init(|| {
+        (
+            std::env::var("CURE_CNT_PREPARE").is_ok(),
+            std::env::var("CURE_VERIFY_EVENTS").is_ok(),
+        )
+    })
+}
+fn cnt_prepare_on() -> bool { env_flags().0 }
+fn verify_events_on() -> bool { env_flags().1 }
+
+pub static PREPARE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static PREPARE_NODES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub static COLLECT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

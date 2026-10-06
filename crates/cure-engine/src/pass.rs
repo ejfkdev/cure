@@ -181,13 +181,34 @@ pub fn simplify<L: Lang>(
                         for n in fp {
                             bit_set(&mut touched, lang.node_index(n));
                         }
-                        // 祖先链效果失效：被换子树的祖先聚合效果已陈旧
-                        let mut cur = Some(id);
-                        while let Some(a) =
-                            cur.and_then(|c| snap.parents.get(&c).map(|p| p.0))
-                        {
-                            lang.invalidate_effect(a);
-                            cur = Some(a);
+                        // 祖先链效果失效：被换子树的祖先聚合效果已陈旧；
+                        // with 子树中既有节点被**搬移**——其旧容器（快照祖先）
+                        // 的事件条目同样陈旧（B2 教训：漏掉曾驱动 cff_diamond
+                        // 错误决策）。惰性重建（B3）下必须失效，否则旧条目
+                        // 永不重建。
+                        // 失效根：提案节点 + **全部**子编辑目标/with（Multi
+                        // [Replace A, Replace B] 的子目标各自需要失效——
+                        // 惰性重建下漏失效 = 陈旧事件驱动错误决策，deobfuscate
+                        // 差分当场抓获：q 声明被误删）；with 含既有节点 =
+                        // 搬移，旧容器条目同样陈旧（B2 教训）
+                        let roots = {
+                            let mut r = vec![id];
+                            r.extend(edit_invalidation_roots(&edit));
+                            r
+                        };
+                        for root in roots {
+                            // 根自身先失效：规则可能**原地修改**搬移节点
+                            //（decl_assign_merge 给既有 VarDecl 加 init——
+                            // 惰性重建下条目陈旧，deobfuscate 差分 + 事件
+                            // 自检抓获：indexed 2 vs fresh 3）
+                            lang.invalidate_effect(root);
+                            let mut cur = Some(root);
+                            while let Some(a) =
+                                cur.and_then(|c| snap.parents.get(&c).map(|p| p.0))
+                            {
+                                lang.invalidate_effect(a);
+                                cur = Some(a);
+                            }
                         }
                         continue 'scan;
                     }
@@ -248,7 +269,21 @@ pub fn simplify<L: Lang>(
                     );
                 }
                 if ok {
+                    // 失效集（应用**前**取——用旧快照定位祖先）：目标 +
+                    // 删除 + insert/with 中的既有节点（搬移旧容器——B2 教训；
+                    // 新节点无祖先链，循环自然为零）
+                    let roots = edit_invalidation_roots(&q.edit);
                     crate::rule::apply_deferred(&mut *lang, &snap, &q.edit);
+                    for root in roots {
+                        lang.invalidate_effect(root);
+                        let mut cur = Some(root);
+                        while let Some(a) =
+                            cur.and_then(|c| snap.parents.get(&c).map(|p| p.0))
+                        {
+                            lang.invalidate_effect(a);
+                            cur = Some(a);
+                        }
+                    }
                     *report.by_rule.entry(q.rule).or_insert(0) += 1;
                     report.edits += 1;
                     applied = true;
@@ -288,6 +323,37 @@ fn bit_get(bits: &[u64], idx: usize) -> bool {
 }
 
 /// 编辑全部 with 根（Replace / 全 Replace Multi）。
+/// 编辑的全部失效根（应用**前**用旧快照定位）：目标/删除节点 +
+/// insert/with 中**既有**节点（搬移——其旧容器条目陈旧，B2 教训）。
+/// 新建节点不在 snap.parents 中 → 祖先链循环自然为空，无需特判。
+/// 编辑的全部失效根（应用**前**用旧快照定位祖先链）：目标/删除节点 +
+/// insert/with 中的全部节点（既有节点 = 搬移，旧容器条目陈旧——B2 教训；
+/// 新节点不在快照中，祖先链循环自然为零次，无需特判）。
+fn edit_invalidation_roots<L: Lang>(edit: &Edit<L>) -> Vec<L::Id> {
+    let mut out = Vec::new();
+    collect_all(edit, &mut out);
+    out
+}
+
+fn collect_all<L: Lang>(edit: &Edit<L>, out: &mut Vec<L::Id>) {
+    match edit {
+        Edit::Replace { target, with } => {
+            out.push(*target);
+            out.push(*with);
+        }
+        Edit::Delete { node } => out.push(*node),
+        Edit::Splice { node, insert, .. } => {
+            out.push(*node);
+            out.extend(insert.iter().copied());
+        }
+        Edit::Multi(es) => {
+            for e in es {
+                collect_all(e, out);
+            }
+        }
+    }
+}
+
 fn with_roots_of<L: Lang>(edit: &Edit<L>) -> Vec<L::Id> {
     match edit {
         Edit::Replace { with, .. } => vec![*with],

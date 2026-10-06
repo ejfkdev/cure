@@ -693,9 +693,7 @@ impl<L: Lang> Watch<L> {
 
 /// 扫描一个语句子树：主名字的**读**、兴趣名字的**写命中**、同名声明遮蔽。
 fn scan_region<L: Lang>(lang: &L, node: L::Id, w: &mut Watch<L>) {
-    // 使用索引快路径：事件序列按 NameKey 稳定排序——二分定位键区间，
-    // 只遍历匹配键的事件（同键内序=遍历序，语义与全量过滤严格一致；
-    // 非匹配事件 90%+ 直接跳过）。
+    lang.debug_verify_events(node);
     if let Some(events) = lang.region_events(node) {
         // 主名字区间：Use 收集 + Shadow 命中 + Write 命中（name 可能在 watch 里）
         let lo = events.partition_point(|e| e.key < w.name);

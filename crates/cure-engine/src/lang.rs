@@ -68,6 +68,9 @@ pub trait Lang {
     /// 事件序必须等于 scan_region 原递归的遍历序；返回 None 表示该
     /// 节点无索引（未构建/已失效）——scan_region 回退为原递归遍历。
     /// 引擎在应用编辑后沿祖先链调用 invalidate_effect 使索引失效。
+    /// 事件索引一致性自检（惰性重建 B3 调试）：默认空实现。
+    fn debug_verify_events(&self, _stmt: Self::Id) {}
+
     fn region_events(
         &self,
         _id: Self::Id,
