@@ -831,10 +831,15 @@ impl Parser {
         // Adv6 差分抓获：javac 读作 int[][][]）
         let first_extra = {
             let mut extra_dims = 0u16;
-            while self.at_punct("[") && self.peek(1).is_punct("]") {
-                self.bump();
-                self.bump();
-                extra_dims += 1;
+            loop {
+                self.skip_mods_annotations();
+                if self.at_punct("[") && self.peek(1).is_punct("]") {
+                    self.bump();
+                    self.bump();
+                    extra_dims += 1;
+                } else {
+                    break;
+                }
             }
             extra_dims
         };
@@ -871,10 +876,16 @@ impl Parser {
                 break;
             }
             let mut d_dims = if declarators.is_empty() { first_extra } else { 0 };
-            while self.at_punct("[") && self.peek(1).is_punct("]") {
-                self.bump();
-                self.bump();
-                d_dims += 1;
+            loop {
+                // 维度间注解：String [] @B [] x（openjdk LocalVariables）
+                self.skip_mods_annotations();
+                if self.at_punct("[") && self.peek(1).is_punct("]") {
+                    self.bump();
+                    self.bump();
+                    d_dims += 1;
+                } else {
+                    break;
+                }
             }
             let init = if self.eat("=") {
                 match self.parse_expr(PREC_ASSIGN) {
@@ -1058,10 +1069,17 @@ impl Parser {
         }
         let base = self.parse_type_base()?;
         let mut ty = base;
-        while self.at_punct("[") && self.peek(1).is_punct("]") {
-            self.bump();
-            self.bump();
-            ty = JType::Array(Box::new(ty));
+        loop {
+            // 维度间注解：String [] @B [] x（openjdk LocalVariables——
+            // 注解位于 [] 对之间，丢弃维度注解并入数组类型）
+            self.skip_mods_annotations();
+            if self.at_punct("[") && self.peek(1).is_punct("]") {
+                self.bump();
+                self.bump();
+                ty = JType::Array(Box::new(ty));
+            } else {
+                break;
+            }
         }
         Some(ty)
     }
@@ -1099,10 +1117,21 @@ impl Parser {
                         }
                     }
                     if self.at_punct(".") {
-                        if let Tok::Ident(seg) = &self.peek(1).tok {
+                        if self.peek(1).is_punct("@") {
+                            // 段间注解：Map.@NonNull Entry（JSR 308 段级——
+                            // PMD FullTypeAnnotations 抓获；注解丢弃，段并入名）
+                            self.bump(); // .
+                            self.skip_mods_annotations();
+                            if let Tok::Ident(seg) = &self.tok().tok {
+                                let seg = seg.clone();
+                                self.bump();
+                                name.push('.');
+                                name.push_str(&seg);
+                            } else {
+                                break;
+                            }
+                        } else if let Tok::Ident(seg) = &self.peek(1).tok {
                             // .new/.this/.super/.class 是表达式后缀不是类型段
-                            //（内联产物 `disgust.new Section<>()` 曾被当声明头
-                            // → "expected ;"——CelebrationLunch 往返抓获）
                             if is_type_reserved(seg) {
                                 break;
                             }
@@ -1363,17 +1392,30 @@ impl Parser {
             self.errs.truncate(err_len);
         }
         if self.at_kw("assert") {
+            // assert 作方法名（PMD jdkversiontests：assert() 调用——1.4 前
+            // 旧代码兼容）：表达式解析失败即回退按语句重解（不消费 assert）
+            let save_assert = self.pos;
+            let err_len = self.errs.len();
             self.bump();
-            let cond = self
-                .parse_expr(PREC_TERNARY)
-                .unwrap_or_else(|| self.ast.raw("/*bad assert*/"));
-            let msg = if self.eat(":") {
-                self.parse_expr(PREC_ASSIGN)
-            } else {
-                None
+            let parsed = self.parse_expr(PREC_TERNARY);
+            let cond = match parsed {
+                None => {
+                    self.pos = save_assert;
+                    self.errs.truncate(err_len);
+                    None // 回退：落入下方语句解析（assert 按方法名）
+                }
+                Some(c) => Some(c),
             };
-            self.expect(";");
-            return self.ast.assert_(cond, msg);
+            if let Some(cond) = cond {
+                let cond = cond;
+                let msg = if self.eat(":") {
+                    self.parse_expr(PREC_ASSIGN)
+                } else {
+                    None
+                };
+                self.expect(";");
+                return self.ast.assert_(cond, msg);
+            }
         }
         {
             // 局部类/接口/枚举/record 声明：原文保真。可带 final/@Anno 修饰
@@ -1483,10 +1525,15 @@ impl Parser {
                     }
                 };
                 let mut d_extra = 0u32;
-                while self.at_punct("[") && self.peek(1).is_punct("]") {
-                    self.bump();
-                    self.bump();
-                    d_extra += 1;
+                loop {
+                    self.skip_mods_annotations();
+                    if self.at_punct("[") && self.peek(1).is_punct("]") {
+                        self.bump();
+                        self.bump();
+                        d_extra += 1;
+                    } else {
+                        break;
+                    }
                 }
                 let had_eq = self.eat("=");
                 let init = if had_eq {
@@ -1752,10 +1799,15 @@ impl Parser {
                         }
                     };
                     let mut d_extra = 0u32;
-                    while self.at_punct("[") && self.peek(1).is_punct("]") {
-                        self.bump();
-                        self.bump();
-                        d_extra += 1;
+                    loop {
+                        self.skip_mods_annotations();
+                        if self.at_punct("[") && self.peek(1).is_punct("]") {
+                            self.bump();
+                            self.bump();
+                            d_extra += 1;
+                        } else {
+                            break;
+                        }
                     }
                     let init2 = if self.eat("=") {
                         self.parse_expr(PREC_ASSIGN)
@@ -2304,6 +2356,15 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Option<JavaId> {
+        // 表达式位置的前导类型注解（@A int.class——JSR 308 拷问文件）：
+        // 跳过后继续（TYPE_USE 无运行时语义）
+        if self.at_punct("@") {
+            self.bump();
+            self.bump();
+            if self.at_punct("(") {
+                self.skip_balanced("(", ")");
+            }
+        }
         // 前缀一元
         let t = self.tok().clone();
         let prefix = match &t.tok {
@@ -2342,6 +2403,27 @@ impl Parser {
         };
         // 后缀循环
         loop {
+            // 顶层类型实参 + 方法引用：List<String>::size /
+            // List<@A String>::size（PMD FullTypeAnnotations——`<` 分支
+            // 曾只在 `.` 之后（x.<T>m() 形态），无点前缀永不进入）
+            if self.at_punct("<") {
+                let save_lt = self.pos;
+                if self.type_args_raw().is_some() && self.at_punct("::") {
+                    self.bump();
+                    let m = match &self.tok().tok {
+                        Tok::Ident(m) => m.clone(),
+                        _ => String::new(),
+                    };
+                    if !m.is_empty() {
+                        self.bump();
+                    }
+                    let name = format!("{m}");
+                    e = self.ast.method_ref(e, &name);
+                    continue;
+                }
+                self.pos = save_lt;
+                break;
+            }
             if self.at_punct(".") {
                 self.bump();
                 match &self.tok().tok {
@@ -2396,9 +2478,26 @@ impl Parser {
                     }
                     Tok::Punct("<") => {
                         // 显式泛型方法调用 x.<T>name(...)（GJF 常见形态）：
-                        // 类型实参原文丢弃（语义由方法决议决定），方法名照常接
+                        // 类型实参原文丢弃（语义由方法决议决定），方法名照常接；
+                        // 类型引用带类型实参后接 ::（List<@A String>::size——
+                        // PMD FullTypeAnnotations）：并入方法引用名原文
+                        if std::env::var("CURE_DBG_LT").is_ok() { eprintln!("[lt] enter, tok={:?}", self.tok().tok); }
                         if self.type_args_raw().is_none() {
                             break;
+                        }
+                        if std::env::var("CURE_DBG_LT").is_ok() { eprintln!("[lt] after ta, tok={:?}", self.tok().tok); }
+                        if self.at_punct("::") {
+                            self.bump();
+                            let m = match &self.tok().tok {
+                                Tok::Ident(m) => m.clone(),
+                                _ => String::new(),
+                            };
+                            if !m.is_empty() {
+                                self.bump();
+                            }
+                            let name = format!("{m}");
+                            e = self.ast.method_ref(e, &name);
+                            continue;
                         }
                         match &self.tok().tok {
                             Tok::Ident(name) => {
@@ -2424,12 +2523,55 @@ impl Parser {
             if self.at_punct("[") && self.peek(1).is_punct("]") {
                 // 越过全部 [] 维度后判定尾巴（一维时旧条件漏多维 .class →
                 // 风暴；CompilationUnitBuildersTest 抓获）
+                // 维度间的注解（int [] @A [] .class）：前瞻时跳过 @Anno(…)
                 let mut p = self.pos + 2;
-                while p + 1 < self.t.len()
-                    && matches!(&self.t[p].tok, Tok::Punct(b) if *b == "[")
-                    && matches!(&self.t[p + 1].tok, Tok::Punct(b) if *b == "]")
-                {
-                    p += 2;
+                loop {
+                    if p < self.t.len() && self.t[p].is_punct("@") {
+                        p += 2; // @ 名
+                        if p < self.t.len() && self.t[p].is_punct("(") {
+                            // 平衡越过（计数括号）
+                            let mut depth = 0i32;
+                            while p < self.t.len() {
+                                if self.t[p].is_punct("(") {
+                                    depth += 1;
+                                } else if self.t[p].is_punct(")") {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        p += 1;
+                                        break;
+                                    }
+                                }
+                                p += 1;
+                            }
+                        }
+                        continue;
+                    }
+                    if p + 1 < self.t.len() && self.t[p].is_punct("[") && self.t[p + 1].is_punct("]") {
+                        p += 2;
+                        continue;
+                    }
+                    break;
+                }
+                // 可选 <…>（int[]<String>::new——PMD GitHubBug309：数组类型
+                // 带类型实参再接 ::，负向拷问形态）——平衡越过（> 计 1/>>
+                // 计 2/>>> 计 3，同 type_args_raw 语义）
+                if p < self.t.len() && self.t[p].is_punct("<") {
+                    let mut depth = 0i32;
+                    while p < self.t.len() {
+                        if self.t[p].is_punct("<") {
+                            depth += 1;
+                        } else if self.t[p].is_punct(">") {
+                            depth -= 1;
+                        } else if self.t[p].is_punct(">>") {
+                            depth -= 2;
+                        } else if self.t[p].is_punct(">>>") {
+                            depth -= 3;
+                        }
+                        p += 1;
+                        if depth <= 0 {
+                            break;
+                        }
+                    }
                 }
                 let dims_tail = p < self.t.len()
                     && (matches!(&self.t[p].tok, Tok::Punct(c) if *c == "::")
@@ -2438,10 +2580,15 @@ impl Parser {
                             && matches!(&self.t[p + 1].tok, Tok::Ident(i) if i == "class")));
                 if dims_tail {
                     let mut dims = String::new();
-                    while self.at_punct("[") && self.peek(1).is_punct("]") {
-                        self.bump();
-                        self.bump();
-                        dims.push_str("[]");
+                    loop {
+                        self.skip_mods_annotations();
+                        if self.at_punct("[") && self.peek(1).is_punct("]") {
+                            self.bump();
+                            self.bump();
+                            dims.push_str("[]");
+                        } else {
+                            break;
+                        }
                     }
                     // T[].class：Member{recv=e, name=dims+"class"}（打印 recv[].class）
                     if self.at_punct(".")
@@ -2452,6 +2599,10 @@ impl Parser {
                         let mname = format!("{dims}class");
                         e = self.ast.member(e, &mname);
                         continue;
+                    }
+                    // 跳过可选类型实参原文（丢弃）
+                    if self.at_punct("<") {
+                        let _ = self.skip_balanced("<", ">");
                     }
                     let mut name = dims;
                     self.bump(); // ::
@@ -2521,6 +2672,20 @@ impl Parser {
     }
 
     fn parse_paren_prefixed(&mut self) -> Option<JavaId> {
+        // 0) 注解-only 括号：(@A) x（JSR 308 负向拷问——无类型的注解 cast）：
+        // token 级判定（( 后仅注解直接收尾 ）→ 透明丢弃，解析操作数
+        {
+            let save_ac = self.pos;
+            if self.at_punct("(") && self.peek(1).is_punct("@") {
+                self.bump(); // (
+                self.skip_mods_annotations();
+                if self.at_punct(")") {
+                    self.bump();
+                    return self.parse_unary();
+                }
+                self.pos = save_ac;
+            }
+        }
         // 1) lambda: ( ... ) ->
         // case 标签内禁判：when 守卫 `case R(...) x when (expr) -> body`
         // 的 (expr) -> 恰与 lambda 形态同形（checkstyle GuardsWithExtra
@@ -2571,7 +2736,26 @@ impl Parser {
                 self.skip_balanced("(", ")");
             }
         }
-        let ty = self.parse_type();
+        let mut ty = self.parse_type();
+        // cast 数组维度与注解交错：(int @A []) a——注解位于维度间
+        //（openjdk LintCast/DotClass 拷问）；维度并入类型
+        if let Some(mut t) = ty.clone() {
+            let mut dims = 0u32;
+            loop {
+                self.skip_mods_annotations();
+                if self.at_punct("[") && self.peek(1).is_punct("]") {
+                    self.bump();
+                    self.bump();
+                    dims += 1;
+                } else {
+                    break;
+                }
+            }
+            if dims > 0 {
+                t = wrap_dims(t, dims);
+                ty = Some(t);
+            }
+        }
         // 交叉类型 cast：(Runnable & Serializable) lambda——按 JLS 15.16 可多类型
         // 并列；Ref 名内保真原文（打印为原文形态）
         let ty = match ty {
@@ -2743,8 +2927,26 @@ impl Parser {
                 self.bump();
                 break;
             }
+            // 试性/罕见形态容忍：
+            // - 展开实参 expr...（Java 24 灵活实参草案——openjdk T6967002）
+            // - 裸 `?` 通配符实参（同文件负向测试）
+            if self.at_punct("?") {
+                self.bump();
+                args.push(self.ast.raw("?"));
+                if !self.eat(",") {
+                    self.expect(")");
+                    break;
+                }
+                continue;
+            }
             match self.parse_expr(PREC_ASSIGN) {
-                Some(a) => args.push(a),
+                Some(a) => {
+                    // 展开标记：…（丢弃——草案语法，产出按普通实参）
+                    if self.at_punct("...") {
+                        self.bump();
+                    }
+                    args.push(a)
+                }
                 None => {
                     self.err_at("bad argument");
                     self.sync_call_end();
