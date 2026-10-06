@@ -1392,3 +1392,93 @@ public class Adv4 {
     let out = print_unit(&outcome.ast, &outcome.unit);
     assert!(out.contains("int y = 7"), "匿名类捕获变量被误删:\n{out}");
 }
+
+#[test]
+fn adversarial_expression_edge_cases() {
+    // 对抗波 5（全干净，零 bug——固化防回归）：三元右结合链、赋值链
+    //（x=y=z=9）、复合移位赋值（<<= >>= >>>=）、for(;;) + break、空语句
+    // 串、自增在数组下标（arr[++i]/arr[i++]/arr[j]+=5）、do-while+continue
+    //（continue 跳条件求值）、短路求值副作用保序、位运算优先级链
+    //（a|b&c^d）、锯齿/立方数组、catch 内再抛 + finally 副作用。
+    // 附带容错压力：空文件/仅注释/乱码/未闭合/字符串未闭合均不 panic
+    // 且错误数有界；1+1+...×2000 常量链折叠结果精确。
+    differential(
+        "Adv5",
+        r#"public class Adv5 {
+    static int[] arr = {10, 20, 30};
+    static int s = 0;
+    static int side() { s++; return s; }
+
+    public static void main(String[] args) {
+        int a = 1, b = 2, c = 3, d = 4;
+        int t1 = a < b ? b : c < d ? d : 5;
+        int t2 = (a < b ? b : c < d ? d : 5) + (a > b ? 100 : 200);
+        System.out.println("t=" + t1 + "," + t2);
+        int x, y, z;
+        x = y = z = 9;
+        System.out.println("chain=" + x + y + z);
+        int sh = 1;
+        sh <<= 4;
+        sh >>= 2;
+        sh >>>= 1;
+        System.out.println("sh=" + sh);
+        int neg = -16;
+        neg >>>= 2;
+        System.out.println("neg=" + neg);
+        int cnt = 0;
+        for (;;) {
+            cnt++;
+            if (cnt >= 3) { break; }
+        }
+        System.out.println("cnt=" + cnt);
+        ;;;
+        System.out.println("semi");
+        int i = 0;
+        System.out.println("pre=" + arr[++i] + " i=" + i);
+        System.out.println("post=" + arr[i++] + " i=" + i);
+        int j = 0;
+        arr[j] += 5;
+        System.out.println("aa=" + arr[0]);
+        int k = 0, sum = 0;
+        do {
+            k++;
+            if (k % 2 == 0) { continue; }
+            sum += k;
+        } while (k < 6);
+        System.out.println("dw=" + k + "," + sum);
+        System.out.println("sc=" + (a < b && side() > 0) + "," + (a > b || side() > 0));
+        System.out.println("s=" + s);
+        System.out.println("cc=" + "" + 'a' + 1 + 'b' + 2);
+        boolean cmp = a < b == c < d;
+        System.out.println("cmp=" + cmp);
+        int bits = a | b & c ^ d;
+        System.out.println("bits=" + bits);
+        int[][] jag2 = new int[2][];
+        jag2[0] = new int[1];
+        jag2[1] = new int[2];
+        System.out.println("jag=" + jag2.length + jag2[1].length);
+        int[][][] cube = new int[2][3][4];
+        System.out.println("cube=" + cube[1][2].length);
+        int total = 0;
+        for (int v : arr) { total += v; }
+        System.out.println("fe=" + total);
+        System.out.println("ce=" + nested());
+    }
+
+    static String nested() {
+        try {
+            try {
+                throw new RuntimeException("in");
+            } catch (RuntimeException e) {
+                throw new IllegalStateException("re");
+            }
+        } catch (IllegalStateException | IllegalArgumentException e) {
+            return "caught:" + e.getMessage();
+        } finally {
+            side();
+        }
+    }
+}
+"#,
+    );
+}
