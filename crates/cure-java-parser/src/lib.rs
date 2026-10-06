@@ -272,11 +272,30 @@ impl Parser {
             }
             if self.at_punct(open) {
                 depth += 1;
-            } else if self.at_punct(close) {
-                depth -= 1;
-                if depth == 0 {
-                    self.bump();
-                    return Some(self.text_of(start, self.t[self.pos - 1].end));
+            } else {
+                // close 方的分裂计数：泛型嵌套的收尾被词法器并成单 token
+                // （Comparable<T>> 的 ">>"）——按 2/3 个 close 计，否则永不
+                // 配平 → 静默吞到文件尾（对抗波 2 抓获：泛型方法整体消失）。
+                // type_args_raw 同此语义。
+                let n = if self.at_punct(close) {
+                    1
+                } else if close == ">" {
+                    if self.at_punct(">>") {
+                        2
+                    } else if self.at_punct(">>>") {
+                        3
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                if n > 0 {
+                    depth -= n;
+                    if depth <= 0 {
+                        self.bump();
+                        return Some(self.text_of(start, self.t[self.pos - 1].end));
+                    }
                 }
             }
             self.bump();
@@ -1812,6 +1831,31 @@ impl Parser {
             if self.at_punct(".") {
                 self.bump();
                 match &self.tok().tok {
+                    Tok::Ident(name) if name == "new" => {
+                        // 限定内部类创建 outer.new Inner(...)：表示为
+                        // Call{Member{recv, "new Inner"}, args}——打印精确还原
+                        // `recv.new Inner(args)`；效果=Call（保守 Unknown）；
+                        // 成员名带空格不会与真实标识符冲突，规则不误匹配。
+                        self.bump();
+                        let Tok::Ident(cls) = &self.tok().tok else {
+                            break;
+                        };
+                        let mut mname = format!("new {cls}");
+                        self.bump();
+                        if self.at_punct("<") {
+                            if let Some(ta) = self.type_args_raw() {
+                                mname.push_str(&ta);
+                            }
+                        }
+                        if self.at_punct("(") {
+                            let args = self.call_args()?;
+                            let m = self.ast.member(e, &mname);
+                            e = self.ast.call(m, args);
+                        } else {
+                            e = self.ast.member(e, &mname);
+                        }
+                        continue;
+                    }
                     Tok::Ident(name) => {
                         let n = name.clone();
                         self.bump();
@@ -2088,6 +2132,12 @@ impl Parser {
                 }
             }
             if !self.eat(",") {
+                if !self.at_punct(")") {
+                    // 参数后既非 , 也非 )（如 outer.new Inner 残尾）：
+                    // 干净失败 → 上层回退整句 RAW 保真，而非带错继续
+                    // （对抗波 2 抓获：残缺参数曾产出可打印但非法的输出）
+                    return None;
+                }
                 self.expect(")");
                 break;
             }

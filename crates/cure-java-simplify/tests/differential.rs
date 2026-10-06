@@ -981,3 +981,146 @@ fn adversarial_precedence_and_literals() {
     assert!(out.contains("int a = 1;") || out.contains("int a = 1,") || out.contains("return 7;"), "{out}");
     assert!(!out.contains("{\n            int a"), "{out}");
 }
+
+#[test]
+fn adversarial_modern_java_forms() {
+    // 对抗波 2：枚举带成员、泛型方法（<T extends …>）、内部/嵌套/匿名类、
+    // lambda 全形态（含 Runnable 赋值）、方法引用、try-with-resources（多资源
+    // + var）、multi-catch、instanceof 模式、switch 表达式（yield）、逗号 for、
+    // 标签、静态/实例初始化块、synchronized、assert。
+    // 曾抓到三个真 bug：1) >>/>>> 单 token 使 skip_balanced 永不配平 →
+    // 泛型方法起整块静默丢失（0 错误！）；2) outer.new Inner() 限定内部类
+    // 创建无节点表示 → 4M 错误风暴；3) lambda/方法引用被传播进 receiver 位
+    // → (() -> {}).run() / String::length.apply() 非法输出。
+    differential(
+        "Adv2",
+        r#"import java.util.*;
+import java.util.function.*;
+
+public class Adv2 {
+    // 枚举
+    enum Color { RED, GREEN, BLUE;
+        static final Color[] ALL = values();
+    }
+    // 泛型边界
+    static <T extends Comparable<? super T>> T max(List<? extends T> xs) {
+        T r = xs.get(0);
+        for (T x : xs) { if (x.compareTo(r) > 0) { r = x; } }
+        return r;
+    }
+    // 静态块 / 实例块 / 内部类
+    static int COUNTER;
+    static { COUNTER = 5; }
+    { COUNTER += 1; }
+    static class Nested {
+        int f(int x) { return x * COUNTER; }
+    }
+    class Inner {
+        int g() { return COUNTER; }
+    }
+    interface Op { int apply(int a, int b); default int twice(int a, int b) { return apply(a, b) * 2; } }
+
+    // try-with-resources（多资源 + var）+ multi-catch
+    static String io(boolean a, boolean b) {
+        StringBuilder sb = new StringBuilder();
+        try (var in = new java.io.ByteArrayInputStream(new byte[]{65, 66});
+             var out = new java.io.ByteArrayOutputStream()) {
+            int c;
+            while ((c = in.read()) >= 0) { out.write(c); }
+            sb.append(out.toString());
+        } catch (java.io.IOException | RuntimeException e) {
+            sb.append("err");
+        } finally {
+            sb.append("!");
+        }
+        try {
+            if (a) { throw new IllegalStateException("a"); }
+            if (b) { throw new IllegalArgumentException("b"); }
+        } catch (IllegalStateException | IllegalArgumentException e) {
+            sb.append(e.getMessage());
+        }
+        return sb.toString();
+    }
+
+    public static void main(String[] args) {
+        // lambda 全形态 + 方法引用
+        Predicate<String> p = s -> s.isEmpty();
+        Function<Integer, Integer> f = x -> x + 1;
+        Supplier<String> sup = () -> "v";
+        BiFunction<Integer, Integer, Integer> add = (a, b) -> a + b;
+        Runnable r = () -> {
+            int t = 0;
+            for (int i = 0; i < 3; i++) { t += i; }
+            System.out.println(t);
+        };
+        r.run();
+        Function<String, Integer> len = String::length;
+        Function<Integer, List<Integer>> mk = ArrayList::new;
+        System.out.println(p.test("") + "," + f.apply(1) + "," + sup.get() + "," + add.apply(2, 3) + "," + len.apply("ab") + "," + mk.apply(3).size());
+        // var + instanceof 模式
+        Object o = "str";
+        if (o instanceof String s) { System.out.println(s.length()); }
+        var list = List.of(1, 2, 3);
+        System.out.println(list.size());
+        // switch 表达式 + yield + 箭头
+        int day = 3;
+        String kind = switch (day) {
+            case 1, 7 -> "weekend";
+            case 2, 3, 4, 5, 6 -> "weekday";
+            default -> throw new IllegalArgumentException();
+        };
+        System.out.println(kind);
+        int code = switch (day) {
+            case 1 -> { yield 100; }
+            default -> { yield 200; }
+        };
+        System.out.println(code);
+        // 逗号 for + 标签
+        outer2:
+        for (int i = 0, j = 9; i < j; i++, j--) {
+            if (i == 3) { continue outer2; }
+            System.out.println(i + ":" + j);
+        }
+        // 泛型调用（通配 + 菱形）
+        List<Integer> ints = new ArrayList<>();
+        ints.add(3);
+        List<? extends Number> nums = ints;
+        Map<String, List<Integer>> m = new HashMap<>();
+        m.put("k", ints);
+        System.out.println(max(ints) + "," + nums.size() + "," + m.get("k").size());
+        // 匿名类
+        Op op = new Op() {
+            @Override public int apply(int a, int b) { return a * 10 + b; }
+        };
+        System.out.println(op.apply(4, 2) + "," + op.twice(1, 2));
+        // 枚举
+        System.out.println(Color.ALL.length + "," + Color.GREEN.name());
+        // assert
+        assert list.size() > 0 : "empty";
+        // synchronized
+        Object lock = new Object();
+        synchronized (lock) { System.out.println("sync"); }
+        // 数组：锯齿 + new int[2][3]
+        int[][] jag = new int[2][];
+        jag[0] = new int[]{1};
+        jag[1] = new int[]{2, 3};
+        int[][] grid = new int[2][3];
+        System.out.println(jag[1][1] + "," + grid.length + "," + grid[0].length);
+        // 字符算术 + +=
+        char ch = 'a';
+        ch += 2;
+        System.out.println(ch);
+        String s2 = "x";
+        s2 += "y";
+        s2 += 1;
+        System.out.println(s2);
+        // 内部/嵌套类
+        System.out.println(new Nested().f(2) + "," + new Adv2().new Inner().g());
+        // io
+        System.out.println(io(false, false));
+        System.out.println(COUNTER);
+    }
+}
+"#,
+    );
+}

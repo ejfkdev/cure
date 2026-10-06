@@ -510,6 +510,12 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         if lang.kind(value) == NodeKind::ArrayLit {
             return None;
         }
+        // lambda / 方法引用值：内联进 receiver 位产出非法 Java
+        //（(() -> {}).run() / String::length.apply()——对抗波 2 抓获）。
+        // 参数位合法但罕见——统一保守拒绝。
+        if matches!(lang.kind(value), NodeKind::Lambda | NodeKind::MethodRef) {
+            return None;
+        }
         // 自引用 init（int x = x + 1 之类）直接放弃
         if subtree_contains(&*lang, value, |n| {
             lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name.as_str())
@@ -2008,6 +2014,10 @@ impl<L: Lang> Rule<L> for AssignPropagation {
         if lang.kind(value) == NodeKind::ArrayLit {
             return None;
         }
+        // lambda / 方法引用值同 ArrayLit：receiver 位非法 → 保守拒绝
+        if matches!(lang.kind(value), NodeKind::Lambda | NodeKind::MethodRef) {
+            return None;
+        }
         let name = lang.var_name(target)?.to_string();
 
         let parent = walk.parent(stmt_node)?;
@@ -2242,6 +2252,10 @@ impl<L: Lang> Rule<L> for MultiUseCopyPropagation {
         let ach = lang.children(assign).to_vec();
         let (target, value) = (ach[0], ach[1]);
         if lang.kind(target) != NodeKind::VarRef || lang.kind(value) != NodeKind::VarRef {
+            return None;
+        }
+        // lambda / 方法引用值：内联进 receiver 位非法（对抗波 2）→ 保守拒绝
+        if matches!(lang.kind(value), NodeKind::Lambda | NodeKind::MethodRef) {
             return None;
         }
         if !lang.is_local_var(target) {
