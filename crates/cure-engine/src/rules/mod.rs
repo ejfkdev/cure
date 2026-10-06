@@ -719,6 +719,11 @@ fn scan_region<L: Lang>(lang: &L, node: L::Id, w: &mut Watch<L>) {
         }
         return;
     }
+    // 递归路径也查不透明（索引被失效后落到此处的防御）
+    if lang.is_opaque(node) {
+        w.opaque = true;
+        return;
+    }
     // 无索引语言：原递归遍历（事件序一致；键比较同上）
     match lang.kind(node) {
         NodeKind::Assign => {

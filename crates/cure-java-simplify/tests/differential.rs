@@ -1288,3 +1288,107 @@ fn raw_statement_opacity_protects_variables() {
     assert!(out.contains("v =: 3"), "RAW 丢失:\n{out}");
     assert!(out.contains("println(v)"), "值被提前传播越过 RAW 赋值:\n{out}");
 }
+
+#[test]
+fn adversarial_captures_and_exotic_forms() {
+    // 对抗波 4：匿名类捕获外部局部变量、局部类捕获、接口私有/static/
+    // default 方法、枚举常量专属方法体、泛型方法调用 Adv4.<T>box()、
+    // C 风格数组声明（int a[] = {..}, b[], c; int[] d[]）、this 引用、
+    // 标签块 break、char/byte/short 复合赋值隐式收窄（ch += 2; bb += 100;
+    // sh *= 100）、装箱三元 + null、深嵌套泛型、静态导入。
+    // 抓获 bug 9：匿名类体是原文（anon_raw）→ 捕获的外部局部变量对用量
+    // 分析不可见 → 仅被匿名类捕获的变量被零用途规则误删（输出无法编译）。
+    // 修复=Lang::is_opaque 钩子（Raw 节点 + 匿名类 New）贯通事件与递归
+    // 两条扫描路径。
+    differential(
+        "Adv4",
+        r#"import static java.lang.Math.max;
+
+public class Adv4 {
+    int field = 10;
+    static int sfield = 20;
+
+    interface P {
+        default int d() { return p() * 2; }
+        static int s() { return 5; }
+        private int p() { return 3; }
+    }
+
+    enum Op {
+        ADD { int ap(int a, int b) { return a + b; } },
+        MUL { int ap(int a, int b) { return a * b; } };
+        abstract int ap(int a, int b);
+    }
+
+    static class Holder {
+        int v;
+        Holder(int v) { this.v = v; }
+        int get() { return v; }
+    }
+
+    public static void main(String[] args) {
+        int x = 5;
+        Runnable r = new Runnable() {
+            @Override public void run() { System.out.println("x=" + x); }
+        };
+        r.run();
+        int y = 7;
+        Runnable r2 = new Runnable() {
+            @Override public void run() { System.out.println("y=" + y); }
+        };
+        r2.run();
+        System.out.println("y2=" + y);
+        int z = 9;
+        class Local {
+            int zap() { return z + 1; }
+        }
+        System.out.println("z=" + new Local().zap());
+        Adv4 outer = new Adv4();
+        System.out.println("f=" + outer.field);
+        System.out.println("g=" + Adv4.<Integer>box(42));
+        int a[] = {1, 2};
+        int b[] = {3}, c = 4;
+        int[] d[] = {{5}, {6}};
+        System.out.println(a[1] + "," + b[0] + "," + c + "," + d[1][0]);
+        System.out.println("op=" + Op.ADD.ap(3, 4) + "," + Op.MUL.ap(3, 4));
+        System.out.println("p=" + new P() {}.d() + "," + P.s());
+        Integer boxed = args.length == 0 ? null : 1;
+        System.out.println("bx=" + boxed);
+        java.util.Map<String, java.util.List<int[]>> deep = new java.util.HashMap<>();
+        deep.put("k", java.util.List.of(new int[]{7, 8}));
+        System.out.println("deep=" + deep.get("k").get(0)[1]);
+        System.out.println("max=" + max(3, 9));
+        System.out.println("h=" + new Holder(11).get() + "," + new Holder(12).v);
+        for (var s : java.util.List.of("a", "b")) { System.out.println("v=" + s); }
+        java.util.function.IntSupplier sup = () -> max(sfield, 25);
+        System.out.println("sup=" + sup.getAsInt());
+        blk:
+        {
+            for (int i = 0; i < 3; i++) {
+                if (i == 1) { break blk; }
+                System.out.println("blk" + i);
+            }
+            System.out.println("unreachable");
+        }
+        char ch = 'a';
+        ch += 2;
+        System.out.println("ch=" + ch);
+        byte bb = 100;
+        bb += 100;
+        System.out.println("bb=" + bb);
+        short sh = 1000;
+        sh *= 100;
+        System.out.println("sh=" + sh);
+    }
+
+    static <T> T box(T v) { return v; }
+}
+"#,
+    );
+    // 捕获保护专项：仅被匿名类引用的变量必须存活
+    let src = "class A{void m(){int y = 7; Runnable r = new Runnable(){public void run(){System.out.println(y);}}; r.run();}}";
+    let mut outcome = parse(src);
+    simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
+    let out = print_unit(&outcome.ast, &outcome.unit);
+    assert!(out.contains("int y = 7"), "匿名类捕获变量被误删:\n{out}");
+}

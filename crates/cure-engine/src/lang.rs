@@ -79,6 +79,12 @@ pub trait Lang {
     fn var_key(&self, _id: Self::Id) -> Option<Self::NameKey> {
         None
     }
+    /// 节点是否不透明（内部含不可解析原文，读/写集不可证明）：
+    /// Java 的 Raw 节点与匿名类体（anon_raw）。区域用量分析的可靠性
+    /// 前提——漏判会导致捕获变量被误删（对抗波 4 抓获）。
+    fn is_opaque(&self, _id: Self::Id) -> bool {
+        false
+    }
     /// 节点自身（不含 children）的效果贡献。
     fn own_effect(&self, id: Self::Id) -> Effect {
         match self.kind(id) {

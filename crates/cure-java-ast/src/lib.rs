@@ -857,6 +857,17 @@ impl Lang for JavaAst {
         id.0 as usize
     }
 
+    fn is_opaque(&self, id: JavaId) -> bool {
+        match self.data(id) {
+            // 不可解析原文
+            NodeData::Raw { .. } => true,
+            // 匿名类体是原文（捕获的外部局部变量不可见）——
+            // 对抗波 4：仅被匿名类捕获的变量曾被零用途规则误删
+            NodeData::New { anon_raw: Some(_), .. } => true,
+            _ => false,
+        }
+    }
+
     fn own_effect(&self, id: JavaId) -> Effect {
         match self.data(id) {
             NodeData::Literal(_)
@@ -1315,6 +1326,11 @@ impl JavaAst {
     fn collect_events_into(&self, node: JavaId, out: &mut Vec<RegionEvent<JavaId, u32>>) -> bool {
         match self.data(node) {
             NodeData::Raw { .. } => {
+                out.push(RegionEvent { kind: EventKind::Opaque, node, key: KEY_NONE });
+                return true;
+            }
+            NodeData::New { anon_raw: Some(_), .. } => {
+                // 匿名类体原文：捕获变量读写不可见 → 整节点不透明
                 out.push(RegionEvent { kind: EventKind::Opaque, node, key: KEY_NONE });
                 return true;
             }
