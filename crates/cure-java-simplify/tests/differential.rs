@@ -824,3 +824,36 @@ public class CapW2 {
     assert!(!out.contains("finally"), "{out}");
     assert!(out.contains(r#"return "a";"#), "{out}");
 }
+
+#[test]
+fn double_neg_and_printer_legality() {
+    // -(-x) → x（补码回绕恒等）；-(-lit) → |lit|；
+    // printer 二义修复：-(-x)/-(-5) 曾输出 --x/--5（词法=前置自减，非法）
+    differential(
+        "DNeg",
+        r#"
+public class DNeg {
+    public static void main(String[] args) {
+        int x = -7;
+        System.out.println(-(-x));
+        System.out.println(-(-5));
+        System.out.println(-(-5L));
+        // MIN 边界：-(-MIN) ≡ MIN（回绕）
+        System.out.println(-(-Integer.MIN_VALUE));
+        long l = -9L;
+        System.out.println(-(-l));
+        // 嵌套两层（定点收敛）
+        System.out.println(-(-(-(-x))));
+    }
+}
+"#,
+    );
+    let mut outcome = parse("class A{int m(int x){return -(-x);}}");
+    simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
+    let out = print_unit(&outcome.ast, &outcome.unit);
+    assert!(out.contains("return x;"), "{out}");
+    let mut outcome = parse("class A{int m(){return -(-5);}}");
+    simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
+    let out = print_unit(&outcome.ast, &mut outcome.unit);
+    assert!(out.contains("return 5;"), "{out}");
+}

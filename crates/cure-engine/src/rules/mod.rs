@@ -1414,6 +1414,52 @@ impl<L: Lang> Rule<L> for BlockFlatten {
     }
 }
 
+/// 数值双重取负：-(-x) → x（补码回绕下恒等：-(-MIN) ≡ MIN ≡ x）；
+/// -(-lit) → |lit|（解析器不折负字面量的外层负）。
+pub struct DoubleNegFold;
+
+impl<L: Lang> Rule<L> for DoubleNegFold {
+    fn name(&self) -> &'static str {
+        "double_neg_fold"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Unary]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, .. } = ctx;
+        if lang.un_op(id) != Some(UnOp::Neg) {
+            return None;
+        }
+        let inner = *lang.children(id).first()?;
+        if lang.un_op(inner) == Some(UnOp::Neg) {
+            let x = *lang.children(inner).first()?;
+            return Some(Edit::Replace {
+                target: id,
+                with: x,
+            });
+        }
+        // -(-lit)：负数值字面量取外层负 → 正字面量
+        if let Some(v) = lang.literal(inner).and_then(|l| match l {
+            LitRef::Int(v) => Some((v, false)),
+            LitRef::Long(v) => Some((v, true)),
+            _ => None,
+        }) {
+            if v.0 < 0 {
+                let with = if v.1 {
+                    lang.build_int(-v.0, true)
+                } else {
+                    lang.build_int(-v.0, false)
+                };
+                return Some(Edit::Replace {
+                    target: id,
+                    with,
+                });
+            }
+        }
+        None
+    }
+}
+
 pub struct UnreachableAfterTerminal;
 
 impl<L: Lang> Rule<L> for UnreachableAfterTerminal {
@@ -2606,6 +2652,7 @@ fn is_literal<L: Lang>(lang: &L, n: L::Id) -> bool {
 /// 默认规则（保守集：不做 DCE 类清理）。
 pub fn default_rules<L: Lang>() -> Vec<Box<dyn Rule<L>>> {
     vec![
+        Box::new(DoubleNegFold),
         Box::new(BlockFlatten),
         Box::new(ParenRemoval),
         Box::new(ConstCondition),

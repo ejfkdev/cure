@@ -912,7 +912,27 @@ impl<'a> Printer<'a> {
                     self.out.push_str(un_symbol(*op));
                 } else {
                     self.out.push_str(un_symbol(*op));
+                    // `-(-x)` 必须括号：裸拼会输出 `--x`，词法层变为前置自减
+                    // （负字面量同理：`--5`）。`~(~x)`/`-(-x)` 中只有 Neg 有此
+                    // 二义（`~~x` 合法、`-++x`/`-​--x` 词法可分）。
+                    // 负字面量同样二义（解析器把 -5 折成字面量节点：Int/NumRaw）
+                    let neg_lit = match ast.data(ch[0]) {
+                        NodeData::Literal(Lit::Int(v)) => *v < 0,
+                        NodeData::Literal(Lit::Long(v)) => *v < 0,
+                        NodeData::Literal(Lit::Float(v)) => *v < 0.0,
+                        NodeData::Literal(Lit::Double(v)) => *v < 0.0,
+                        NodeData::Literal(Lit::NumRaw { text, .. }) => text.starts_with('-'),
+                        _ => false,
+                    };
+                    let amb_neg = *op == UnOp::Neg
+                        && (matches!(ast.data(ch[0]), NodeData::Unary { op: UnOp::Neg }) || neg_lit);
+                    if amb_neg {
+                        self.out.push('(');
+                    }
                     self.expr(ch[0], prec::UNARY);
+                    if amb_neg {
+                        self.out.push(')');
+                    }
                 }
                 if need {
                     self.out.push(')');
