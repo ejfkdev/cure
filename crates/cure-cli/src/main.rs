@@ -425,9 +425,19 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                         } else {
                             display
                         };
+                        // 非 UTF-8（ISO-8859-1/Cp1252 等编码测试文件）或读失败：
+                        // 告警跳过而非中止整个目录运行（spoon/javaparser 语料
+                        // 各含一个编码测试文件——曾让 5000+ 文件的运行整体失败）
                         let src = match fs::read_to_string(&path) {
                             Ok(s) => s,
-                            Err(e) => return Err(format!("读取 {} 失败: {e}", path.display())),
+                            Err(e) => {
+                                eprintln!(
+                                    "cure: 读取 {} 失败（跳过）: {}",
+                                    path.display(),
+                                    e
+                                );
+                                continue;
+                            }
                         };
                         let r = process_source(&src, &opts, out_path, &display)?;
                         out.push(r);
