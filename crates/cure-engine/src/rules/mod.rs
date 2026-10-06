@@ -538,7 +538,7 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         for &s in &stmts[index + 1..] {
             scan_region(&*lang, s, &mut wa);
         }
-        if wa.shadowed || wa.uses.len() != 1 {
+        if wa.opaque || wa.shadowed || wa.uses.len() != 1 {
             return None;
         }
         let use_id = wa.uses[0];
@@ -566,7 +566,7 @@ impl<L: Lang> Rule<L> for LocalPropagation {
             let mut wc = Watch::<L>::new(name_key, &[name_key]);
             for &s in &stmts[ui + 1..] {
                 scan_region(&*lang, s, &mut wc);
-                if !wc.uses.is_empty() || wc.wrote(name_key) || wc.shadowed {
+                if wc.opaque || !wc.uses.is_empty() || wc.wrote(name_key) || wc.shadowed {
                     return None;
                 }
             }
@@ -581,7 +581,7 @@ impl<L: Lang> Rule<L> for LocalPropagation {
             {
                 wb.clear_wrote(target_key);
             }
-            if wb.any_write() {
+            if wb.opaque || wb.any_write() {
                 return None;
             }
             return Some(Edit::Multi(vec![
@@ -633,6 +633,8 @@ impl<L: Lang> Rule<L> for LocalPropagation {
 /// 收集期直接判中——零哈希、零集合重建。对比旧版：每次检查重建
 /// `HashSet<&str>`（分配/重哈希/释放）曾占 release 运行时间 ~50%。
 pub(crate) struct Watch<L: Lang> {
+    /// 区域含不透明（Raw）内容：读/写集不可证明——所有守卫保守拒绝
+    opaque: bool,
     /// 主名字键：读收集 + 遮蔽判定（整数等值比较）
     name: L::NameKey,
     /// 写冲突兴趣名字键（典型 2~4 个）
@@ -647,6 +649,7 @@ pub(crate) struct Watch<L: Lang> {
 impl<L: Lang> Watch<L> {
     pub(crate) fn new(name: L::NameKey, watch: &[L::NameKey]) -> Self {
         Watch {
+            opaque: false,
             name,
             watch: watch.to_vec(),
             writes_hit: vec![false; watch.len()],
@@ -695,6 +698,9 @@ fn scan_region<L: Lang>(lang: &L, node: L::Id, w: &mut Watch<L>) {
                         }
                     }
                 }
+                // 防御：索引层保证含 Raw 的语句不建索引（键排序分区看不见
+                // Opaque 键），此处理论上不可达
+                crate::kind::EventKind::Opaque => w.opaque = true,
             }
         }
         // 其余 watch 键区间：只找 Write
@@ -784,6 +790,10 @@ fn scan_region<L: Lang>(lang: &L, node: L::Id, w: &mut Watch<L>) {
             if lang.var_key(node) == Some(w.name) {
                 w.uses.push(node);
             }
+        }
+        NodeKind::Raw => {
+            // 不可解析原文：读/写集未知
+            w.opaque = true;
         }
         _ => {
             for &c in lang.children(node) {
@@ -1312,8 +1322,8 @@ impl<L: Lang> Rule<L> for DeadStore {
             for &s in &stmts[idx + 1..] {
                 scan_region(&*lang, s, &mut w0);
             }
-            // 只判**本名字**的读/写（watch 集即本名字）
-            if !w0.uses.is_empty() || w0.wrote(name_key0) || w0.shadowed {
+            // 只判**本名字**的读/写（watch 集即本名字）；Raw 区域不可证明
+            if w0.opaque || !w0.uses.is_empty() || w0.wrote(name_key0) || w0.shadowed {
                 return None;
             }
             if lang.effect(first_value) > Effect::MayRead {
@@ -2048,7 +2058,7 @@ impl<L: Lang> Rule<L> for AssignPropagation {
         for &s in &stmts[idx + 1..] {
             scan_region(&*lang, s, &mut wa);
         }
-        if wa.shadowed || wa.uses.len() != 1 {
+        if wa.opaque || wa.shadowed || wa.uses.len() != 1 {
             return None;
         }
         let use_id = wa.uses[0];
@@ -2289,7 +2299,7 @@ impl<L: Lang> Rule<L> for MultiUseCopyPropagation {
         for &s in &stmts[idx + 1..] {
             scan_region(&*lang, s, &mut w1);
         }
-        if w1.shadowed || w1.uses.is_empty() {
+        if w1.opaque || w1.shadowed || w1.uses.is_empty() {
             return None;
         }
         if w1.wrote(name_key) || w1.wrote(src_key) {

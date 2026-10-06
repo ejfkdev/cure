@@ -1124,3 +1124,167 @@ public class Adv2 {
 "#,
     );
 }
+
+#[test]
+fn adversarial_annotations_records_sealed() {
+    // 对抗波 3：注解全形态（标记/单值/数组/嵌套/@interface 成员带 default）、
+    // record（泛型+紧凑构造器+辅助构造器）、sealed/non-sealed/permits、
+    // 窄类型复合赋值（隐式收窄 b += 1）、数值提升（byte+byte→int 等）、
+    // 十六进制 long 负值域、>>> 无符号移位、字符串/枚举 switch 落穿、
+    // 嵌套 switch、finally+continue/break 组合、拼接 null。
+    // 曾抓到四个真 bug：1) @interface 成员 `T name() default v;` 无方法体
+    // 形态解析失败（已 RAW 保真）；2) non-sealed 三 token 序列被拆（non
+    // 单独消费留 `-sealed` 残体）；3) permits 子句被丢弃（TypeDecl 无字段）；
+    // 4) 词法器 THREE 表缺裸 `>>>`（只有 >>>=）——`n >>> 1` 切成 `>>` + `>`。
+    differential(
+        "Adv3",
+        r#"import java.lang.annotation.*;
+import java.util.*;
+
+@SuppressWarnings("all")
+@Deprecated
+public class Adv3 {
+    // 注解全形态：标记、单值、数组、嵌套
+    @Retention(RetentionPolicy.RUNTIME)
+    @interface Fr { String name() default "x"; int[] vals() default {1, 2}; }
+    @interface Outer { Fr inner() default @Fr(name = "d"); Class<?>[] types() default {}; }
+
+    @Fr(name = "n", vals = {3, 4})
+    @Outer(inner = @Fr(name = "e"), types = {String.class, List.class})
+    static int annotatedField = 1;
+
+    // record + 泛型 + 紧凑构造器
+    record Point(int x, int y) {
+        Point {
+            if (x < 0) { throw new IllegalArgumentException(); }
+        }
+        Point(int x) { this(x, 0); }
+        int sum() { return x + y; }
+    }
+    record Pair<T extends Comparable<T>>(T a, T b) {}
+
+    // sealed（Java 17）
+    sealed interface Shape permits Circle, Square, Big {}
+    record Circle(double r) implements Shape {}
+    record Square(double s) implements Shape {}
+    non-sealed class Big implements Shape {}
+
+    // 窄类型复合赋值（隐式收窄：b += 1 合法、b = b + 1 编译错误）
+    static byte bump(byte b) {
+        b += 1;
+        b *= 2;
+        b -= 1;
+        return b;
+    }
+    static short shr(short s) {
+        s += 1000;
+        return s;
+    }
+
+    public static void main(String[] args) {
+        // 数值提升：byte+byte→int、int+long→long、char+int→int
+        byte b1 = 10, b2 = 20;
+        int i1 = b1 + b2;
+        long l1 = i1 + 1L;
+        double d1 = l1 + 0.5;
+        char c1 = 'a';
+        int i2 = c1 + 1;
+        System.out.println(i1 + "," + l1 + "," + d1 + "," + (char) i2);
+        // 窄类型复合赋值链
+        System.out.println(bump((byte) 100));
+        System.out.println(shr((short) 20000));
+        // 十六进制/八进制 long 边角（负值域）
+        long h1 = 0x7FFFFFFFFFFFFFFFL;
+        long h2 = 0x8000000000000000L;
+        long h3 = 0xFFFFFFFFFFFFFFFFL;
+        System.out.println(h1 + "," + h2 + "," + h3);
+        int h4 = 0x80000000; // 无符号 32 位域内合法
+        System.out.println(h4);
+        // 移位：>>> 无符号
+        int neg = -8;
+        System.out.println(neg >> 1);
+        System.out.println(neg >>> 1);
+        System.out.println(neg >>> 60);
+        long ln = -8L;
+        System.out.println(ln >>> 63);
+        // 字符串 switch + 落穿
+        String op = "mul";
+        int r = 0;
+        switch (op) {
+            case "add":
+                r += 1;
+            case "mul":
+                r += 2;
+                // 落穿到 sub
+            case "sub":
+                r += 4;
+                break;
+            default:
+                r = -1;
+        }
+        System.out.println(r);
+        // 枚举 switch
+        enum Day { MON, TUE }
+        Day d = Day.TUE;
+        switch (d) {
+            case MON: System.out.println("m"); break;
+            case TUE: System.out.println("t"); break;
+        }
+        // record 使用
+        Point p = new Point(3, 4);
+        System.out.println(p.x() + p.y() + p.sum());
+        Pair<String> pr = new Pair<>("a", "b");
+        System.out.println(pr.a() + pr.b());
+        Shape s = new Circle(2.0);
+        System.out.println(s instanceof Circle ci ? ci.r() : -1);
+        // 三元混合类型（int/long 提升路径）
+        boolean cond = args.length == 0;
+        long mix = cond ? 1 : 2L;
+        System.out.println(mix);
+        // 字符串拼接 null
+        String nil = null;
+        System.out.println("v=" + nil);
+        System.out.println('a' + "b" + 'c');
+        System.out.println("x" + 'y' + 1);
+        // 嵌套 try + 循环
+        for (int i = 0; i < 3; i++) {
+            try {
+                if (i == 1) { continue; }
+                if (i == 2) { break; }
+                System.out.println("iter" + i);
+            } finally {
+                System.out.println("fin" + i);
+            }
+        }
+        // 嵌套 switch
+        switch (1) {
+            case 1:
+                switch (2) {
+                    case 2: System.out.println("nested"); break;
+                }
+                System.out.println("outer");
+                break;
+        }
+        System.out.println(annotatedField);
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn raw_statement_opacity_protects_variables() {
+    // 深层 bug（对抗波 3 抓获）：RAW（不可解析原文）语句对用量分析不可见
+    // → 仅被 RAW 引用的变量被零用途规则误删，且值被提前传播越过 RAW 中的
+    // 赋值（语义损坏）。修复=Opaque 语义贯通：含 Raw 的语句不建事件索引
+    // → 递归扫描设 opaque → 四条传播/删除规则 + StoreKill 全部保守拒绝。
+    // 注：原文件含非 Java 语法（:=），javac 差分不适用（原版也不可编译）；
+    // 验证 = 形态断言：RAW 保真、变量存活、传播不越过 RAW。
+    let src = "class A{void m(){int v = 7; v =: 3; System.out.println(v);}}";
+    let mut outcome = parse(src);
+    simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
+    let out = print_unit(&outcome.ast, &outcome.unit);
+    assert!(out.contains("int v"), "RAW 引用的变量被误删:\n{out}");
+    assert!(out.contains("v =: 3"), "RAW 丢失:\n{out}");
+    assert!(out.contains("println(v)"), "值被提前传播越过 RAW 赋值:\n{out}");
+}

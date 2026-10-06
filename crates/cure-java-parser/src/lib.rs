@@ -383,14 +383,26 @@ impl Parser {
         let start = self.cur_start();
         let mut last_end = start;
         let mut guard = 0usize;
-        loop {
+        'mods: loop {
             guard += 1;
             if guard > 10_000 {
                 break;
             }
             if self.at_annotation_decl() {
                 // `@interface` 是注解类型声明关键字，不是注解——留给 type_decl_body
-                break;
+                break 'mods;
+            }
+            // non-sealed：三 token 序列合并（对抗波 3：单独消费 non 会留下
+            // `-sealed` 残体产出非法输出）
+            if matches!(&self.tok().tok, Tok::Ident(n) if n == "non")
+                && matches!(&self.peek(1).tok, Tok::Punct("-"))
+                && matches!(&self.peek(2).tok, Tok::Ident(s) if s == "sealed")
+            {
+                self.bump();
+                self.bump();
+                self.bump();
+                last_end = self.t[self.pos - 1].end;
+                continue;
             }
             if self.at_punct("@") {
                 self.bump();
@@ -465,6 +477,7 @@ impl Parser {
         }
         let mut extends = Vec::new();
         let mut implements = Vec::new();
+        let mut permits: Vec<String> = Vec::new();
         loop {
             if self.at_kw("extends") {
                 self.bump();
@@ -478,7 +491,7 @@ impl Parser {
             }
             if self.at_kw("permits") {
                 self.bump();
-                let _ = self.type_list();
+                permits = self.type_list();
                 continue;
             }
             break;
@@ -492,6 +505,7 @@ impl Parser {
                 name,
                 ty_params,
                 header,
+                permits: permits.clone(),
                 extends,
                 implements,
                 enum_constants: Vec::new(),
@@ -537,6 +551,19 @@ impl Parser {
                 self.bump();
                 break;
             }
+            // @interface 成员：`Type name() [default expr];` 无方法体 + 默认值
+            // 形态无专用节点——整段 RAW 保真（可编译、逐字往返；对抗波 3 抓获
+            // "expected method body" 错误流）
+            if kind == TypeKind::Annotation {
+                let mstart0 = self.cur_start();
+                let text = self.sync_member();
+                if text.is_empty() {
+                    break;
+                }
+                members.push(Member::Raw(text.trim().to_string()));
+                let _ = mstart0;
+                continue;
+            }
             if self.at_punct(";") {
                 self.bump();
                 continue;
@@ -579,6 +606,7 @@ impl Parser {
             name,
             ty_params,
             header,
+            permits,
             extends,
             implements,
             enum_constants,
@@ -2322,7 +2350,6 @@ fn is_modifier_kw(s: &str) -> bool {
         s,
         "public" | "private" | "protected" | "static" | "final" | "abstract" | "native"
             | "synchronized" | "strictfp" | "transient" | "volatile" | "default" | "sealed"
-            | "non" | "non-sealed"
     )
 }
 

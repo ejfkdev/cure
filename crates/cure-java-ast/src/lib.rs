@@ -278,6 +278,8 @@ pub struct TypeDecl {
     pub header: String,
     pub extends: Vec<String>,
     pub implements: Vec<String>,
+    /// sealed 类型的 permits 子句原文列表（打印 `permits A, B`）。
+    pub permits: Vec<String>,
     /// 枚举常量原文（解析失败时兜底保真）。
     pub enum_constants: Vec<String>,
     pub members: Vec<Member>,
@@ -1295,7 +1297,12 @@ impl JavaAst {
     /// 定位键区间、跳过全部非匹配事件。
     fn collect_region_events(&self, node: JavaId) -> Vec<RegionEvent<JavaId, u32>> {
         let mut out = Vec::new();
-        self.collect_events_into(node, &mut out);
+        let saw_raw = self.collect_events_into(node, &mut out);
+        if saw_raw {
+            // 含 Raw：不建索引（键排序分区看不见 Opaque 键）——置空走
+            // scan_region 递归路径，其 Raw 分支设 opaque → 规则保守拒绝
+            return Vec::new();
+        }
         out.sort_by_key(|e| e.key);
         out
     }
@@ -1304,8 +1311,13 @@ impl JavaAst {
         self.node_key.get(node.0 as usize).copied().unwrap_or(KEY_NONE)
     }
 
-    fn collect_events_into(&self, node: JavaId, out: &mut Vec<RegionEvent<JavaId, u32>>) {
+    /// 返回值：子树是否含 Raw（不可解析原文——读/写集不可证明）。
+    fn collect_events_into(&self, node: JavaId, out: &mut Vec<RegionEvent<JavaId, u32>>) -> bool {
         match self.data(node) {
+            NodeData::Raw { .. } => {
+                out.push(RegionEvent { kind: EventKind::Opaque, node, key: KEY_NONE });
+                return true;
+            }
             NodeData::Assign { .. } => {
                 let ch = self.children(node);
                 if let Some(&t) = ch.first() {
@@ -1314,8 +1326,9 @@ impl JavaAst {
                     }
                 }
                 if let Some(&v) = ch.get(1) {
-                    self.collect_events_into(v, out);
+                    return self.collect_events_into(v, out);
                 }
+                false
             }
             NodeData::Unary { op } if op.is_incdec() => {
                 let ch = self.children(node);
@@ -1324,37 +1337,47 @@ impl JavaAst {
                         out.push(RegionEvent { kind: EventKind::Write, node: t, key: self.key_of(t) });
                     }
                 }
+                false
             }
             NodeData::VarDecl { .. } => {
                 let k = self.key_of(node);
                 out.push(RegionEvent { kind: EventKind::Write, node, key: k });
                 out.push(RegionEvent { kind: EventKind::Shadow, node, key: k });
+                let mut raw = false;
                 for &c in self.children(node) {
-                    self.collect_events_into(c, out);
+                    raw |= self.collect_events_into(c, out);
                 }
+                raw
             }
             NodeData::ForEach { .. } => {
                 let k = self.key_of(node);
                 out.push(RegionEvent { kind: EventKind::Write, node, key: k });
                 out.push(RegionEvent { kind: EventKind::Shadow, node, key: k });
+                let mut raw = false;
                 for &c in self.children(node) {
-                    self.collect_events_into(c, out);
+                    raw |= self.collect_events_into(c, out);
                 }
+                raw
             }
             NodeData::Catch { .. } => {
                 let k = self.key_of(node);
                 out.push(RegionEvent { kind: EventKind::Shadow, node, key: k });
+                let mut raw = false;
                 for &c in self.children(node) {
-                    self.collect_events_into(c, out);
+                    raw |= self.collect_events_into(c, out);
                 }
+                raw
             }
             NodeData::VarRef { .. } => {
                 out.push(RegionEvent { kind: EventKind::Use, node, key: self.key_of(node) });
+                false
             }
             _ => {
+                let mut raw = false;
                 for &c in self.children(node) {
-                    self.collect_events_into(c, out);
+                    raw |= self.collect_events_into(c, out);
                 }
+                raw
             }
         }
     }

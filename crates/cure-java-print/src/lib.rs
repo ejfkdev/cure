@@ -287,6 +287,9 @@ impl<'a> Printer<'a> {
         self.out.push_str(&t.name);
         self.out.push_str(&t.ty_params);
         self.out.push_str(&t.header);
+        if !t.permits.is_empty() {
+            self.out.push_str(&format!(" permits {}", t.permits.join(", ")));
+        }
         if !t.extends.is_empty() {
             self.out.push_str(&format!(" extends {}", t.extends.join(", ")));
         }

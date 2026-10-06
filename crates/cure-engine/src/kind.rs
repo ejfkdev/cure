@@ -290,4 +290,8 @@ pub enum EventKind {
     Write,
     /// 同名遮蔽（VarDecl / ForEach / Catch 声明）
     Shadow,
+    /// 不透明区域（Raw 不可解析原文）：读写集未知——一切"零用途/
+    /// 单用途/无写"的证明失效，规则必须保守拒绝（对抗波 3 抓获：
+    /// 仅被 RAW 引用的变量被误删 + 值被提前传播越过 RAW 赋值）。
+    Opaque,
 }
