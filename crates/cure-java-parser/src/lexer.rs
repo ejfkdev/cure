@@ -171,9 +171,11 @@ impl<'a> Lexer<'a> {
                 });
                 continue;
             }
-            // 数字（含 .5 形式：仅当 '.' 后是数字且前一个 token 不是可接成员访问的东西）
+            // 数字（含 .5 形式：'.' 后是数字即浮点字面量开头——x.5 本就
+            // 非法，无需 prev_ends_primary 守卫；return .5f——jdk-sources
+            // GroupLayout 抓获：return 是 Ident 曾误判成员访问）
             if c.is_ascii_digit()
-                || (c == b'.' && self.peek(1).is_ascii_digit() && !self.prev_ends_primary())
+                || (c == b'.' && self.peek(1).is_ascii_digit())
             {
                 self.number(start, line, col);
                 continue;
@@ -222,16 +224,6 @@ impl<'a> Lexer<'a> {
             line,
             col,
         });
-    }
-
-    /// 前一个 token 是否以 primary 结尾（决定 `.` 后接数字的归类）。
-    fn prev_ends_primary(&self) -> bool {
-        match self.toks.last().map(|t| &t.tok) {
-            Some(Tok::Ident(_)) | Some(Tok::Str(_)) | Some(Tok::Char(_)) => true,
-            Some(Tok::Num(_)) => true,
-            Some(Tok::Punct(p)) => matches!(*p, ")" | "]" | "}"),
-            _ => false,
-        }
     }
 
     fn punct(&mut self) -> Option<&'static str> {
@@ -373,6 +365,16 @@ impl<'a> Lexer<'a> {
                     break;
                 }
             }
+        } else if self.peek(0) == b'.'
+            && matches!(
+                self.peek(1),
+                0 | b'f' | b'F' | b'd' | b'D' | b';' | b',' | b')' | b']' | b' ' | b'\n' | b'\t'
+            )
+        {
+            // 尾点浮点（1. / 2.f——JLS 一个 double 字面量 token；后面是
+            // 终结符/后缀，不是成员访问——jdk-sources StackMoveTest）
+            is_float = true;
+            self.bump();
         }
         let _ = &is_float;
         // 指数：e 后跟数字，或符号后跟数字（1.5e-3 / 1E+10）

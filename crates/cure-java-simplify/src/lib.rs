@@ -493,6 +493,16 @@ fn generic_elem_ty(ty: &JType) -> Option<JType> {
     Some(JType::Ref(inner.to_string()))
 }
 
+/// for-each 元素类型合法性：`?`/`? extends …`/`? super …`（通配符）不是
+/// 合法变量类型 → Object（jdk-sources Subject 抓获：`Iterator<?> ce =
+/// c.iterator()` 还原成 `for (? e2 : c)` 非法 Java）
+fn for_each_elem_ok(ty: &JType) -> bool {
+    match ty {
+        JType::Ref(n) => !n.trim_start().starts_with('?'),
+        _ => true,
+    }
+}
+
 /// 收集子树内 name 的全部 VarRef。
 fn collect_var_refs(lang: &JavaAst, root: JavaId, name: &str, out: &mut Vec<JavaId>) {
     let mut stack = vec![root];
@@ -1040,6 +1050,11 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
                 Some(t) => generic_elem_ty(t).unwrap_or(JType::Ref("Object".into())),
                 None => JType::Ref("Object".into()),
             };
+            let elem = if for_each_elem_ok(&elem) {
+                elem
+            } else {
+                JType::Ref("Object".into())
+            };
             let is_object = matches!(&elem, JType::Ref(n) if n == "Object");
             let (replace_target, e_ty) = match lang.data(wrapped) {
                 NodeData::Cast { .. } if is_object => (next_call, elem),
@@ -1095,6 +1110,8 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         if elem_is_object && ty != JType::Ref("Object".into()) {
             return None;
         }
+        // 通配符元素（Iterator<?> → for (? e : …) 非法）→ Object 兜底
+        let ty = if for_each_elem_ok(&ty) { ty } else { JType::Ref("Object".into()) };
         let rest = bch[1..].to_vec();
         for &r in &rest {
             if subtree_has_var(&*lang, r, &it_name) {
@@ -2926,6 +2943,15 @@ fn subtree_calls_self(ast: &JavaAst, root: JavaId, name: &str) -> bool {
             let callee = ast.children(n)[0];
             if ast.var_name(callee) == Some(name) {
                 return true;
+            }
+            // 成员调用名也算（Boolean.getBoolean——jdk-sources TCPEndpoint
+            // 抓获：库方法与本地方法恰好同名时，匹配器按
+            // "大写接收方.方法名" 也会命中 → 自我乒乓无限克隆 → 爆栈；
+            // 保守拒绝（误拒仅损失一次内联机会）
+            if let NodeData::Member { name: m } = ast.data(callee) {
+                if m == name {
+                    return true;
+                }
             }
         }
         for &c in ast.children(n) {

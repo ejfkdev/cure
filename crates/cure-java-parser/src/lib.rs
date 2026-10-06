@@ -14,7 +14,7 @@
 //! 完整表达式（赋值、三元、短路、instanceof、lambda、方法引用、数组创建、
 //! 泛型钻石、匿名类体原文保真）。签名泛型/注解/throws 以原文保真。
 
-mod lexer;
+pub mod lexer;
 
 use cure_java_ast::*;
 
@@ -196,6 +196,13 @@ impl Parser {
             if self.at_punct("@") {
                 self.bump();
                 self.bump();
+                // 限定名（@a.b.C）
+                while self.at_punct(".")
+                    && matches!(self.peek(1).tok, Tok::Ident(_))
+                {
+                    self.bump();
+                    self.bump();
+                }
                 if self.at_punct("(") {
                     self.skip_balanced("(", ")");
                 }
@@ -213,6 +220,13 @@ impl Parser {
             self.bump();
             let _ = self.parse_expr(PREC_TERNARY);
         }
+    }
+
+    /// 值类（JDK 28 预览 JEP draft：`value class` / 内部亦可能 `value` + 其他
+    /// 声明）。两 token 前瞻判定——不进 is_modifier_kw（value 是常见标识符，
+    /// 会误吃变量名/字段名）
+    fn at_value_decl(&self) -> bool {
+        self.at_kw("value") && matches!(&self.peek(1).tok, Tok::Ident(c) if c == "class")
     }
 
     fn at_kw(&self, s: &str) -> bool {
@@ -491,6 +505,27 @@ impl Parser {
             // 类型声明（带注解/修饰符）
             let mods_start = self.cur_start();
             let mods = self.modifiers();
+            // package-info：注解（如 @SuppressWarnings("doclint:…")）后跟
+            // package——修饰符吞掉注解后落回循环顶由 package 分支处理
+            //（jdk-sources java/net/package-info.java 抓获）
+            if self.at_kw("package") {
+                continue;
+            }
+            // 值类（JDK 28 预览）：public final value class X —— value 并入
+            // mods 文本，class 照常解析
+            if self.at_value_decl() {
+                self.bump();
+            }
+            // module-info（Java 9）：[open] module name { requires/exports/
+            // opens/provides/uses…; }——无专用节点，整文件 RAW 保真
+            //（jdk-sources 每模块一个 module-info.java，87 失败中占 70）
+            if self.at_kw("module")
+                || (self.at_kw("open") && matches!(&self.peek(1).tok, Tok::Ident(m) if m == "module"))
+            {
+                let text = self.text_of(mods_start, self.src.len());
+                unit.raws.push(text.trim().to_string());
+                return unit;
+            }
             if self.at_kw("class")
                 || self.at_kw("interface")
                 || self.at_kw("enum")
@@ -547,6 +582,14 @@ impl Parser {
             if self.at_punct("@") {
                 self.bump();
                 self.bump(); // 注解名
+                // 限定名注解（@jdk.internal.ValueBased——JDK 现代源码
+                // 2119 文件主簇：类级注解大量限定名）
+                while self.at_punct(".")
+                    && matches!(self.peek(1).tok, Tok::Ident(_))
+                {
+                    self.bump();
+                    self.bump();
+                }
                 // 注解参数（可能多层嵌套）
                 if self.at_punct("(") {
                     self.skip_balanced("(", ")");
@@ -567,6 +610,9 @@ impl Parser {
     // ---- 类型声明 ----
 
     fn type_decl_body(&mut self, mods: &str, mods_start: usize) -> Option<TypeDecl> {
+        if self.at_value_decl() {
+            self.bump();
+        }
         let kind = if self.at_kw("class") {
             TypeKind::Class
         } else if self.at_kw("interface") {
@@ -718,6 +764,10 @@ impl Parser {
             }
             let mstart = self.cur_start();
             let mmods = self.modifiers();
+            // 嵌套值类（value class——JDK 28 预览）
+            if self.at_value_decl() {
+                self.bump();
+            }
             // 嵌套类型
             if self.at_kw("class")
                 || self.at_kw("interface")
@@ -1397,7 +1447,7 @@ impl Parser {
             let save_assert = self.pos;
             let err_len = self.errs.len();
             self.bump();
-            let parsed = self.parse_expr(PREC_TERNARY);
+            let parsed = self.parse_expr(PREC_ASSIGN);
             let cond = match parsed {
                 None => {
                     self.pos = save_assert;
@@ -1425,6 +1475,9 @@ impl Parser {
             // 修饰全形态（strictfp enum E{…};——checkstyle Java16LocalEnum：
             // 修饰集含 strictfp/public/static 等，非仅 final/@Anno）
             while matches!(&self.tok().tok, Tok::Ident(i) if is_modifier_kw(i)) {
+                self.bump();
+            }
+            if self.at_value_decl() {
                 self.bump();
             }
             self.skip_mods_annotations();
@@ -1611,7 +1664,10 @@ impl Parser {
         }
         let ty = ty.unwrap();
         match &self.tok().tok {
-            Tok::Ident(_) => Some(ty),
+            // instanceof is by no means a valid declaration name (k instanceof String was once judged
+            // as the declaration "type k, name instanceof" — jdk-sources SignatureUtil:
+            // case EDDSA -> k instanceof EdECPrivateKey ? … storm root cause)
+            Tok::Ident(i) if i != "instanceof" => Some(ty),
             _ => {
                 self.pos = save;
                 None
@@ -2019,10 +2075,27 @@ impl Parser {
                     // 原文保真
                     self.skip_mods_annotations();
                     let handled = 'label: {
-                        // 1. 括号化模式：case (String s) when … ->
-                        //（openjdk Parenthesized）
+                        // 1. 括号化形态：先试 cast 表达式标签（case (int) X /
+                        // case (char) 0xFFFF——jdk-sources P11*/Switch02 拷问），
+                        // 收尾合法（->/:/,/when）即用；否则括号化模式
+                        //（case (String s) when … ->）整段 raw
                         if self.at_punct("(") {
                             let start = self.cur_start();
+                            let save_tok = self.pos;
+                            let err_len = self.errs.len();
+                            if let Some(e2) = self.parse_expr(PREC_TERNARY) {
+                                if self.at_punct("->")
+                                    || self.at_punct(":")
+                                    || self.at_punct(",")
+                                    || self.at_kw("when")
+                                {
+                                    labels.push(e2);
+                                    break 'label true;
+                                }
+                            }
+                            // 试探失败回退（位置 + 泄漏诊断）
+                            self.pos = save_tok;
+                            self.errs.truncate(err_len);
                             self.skip_balanced("(", ")");
                             self.consume_when_guard();
                             let text = self.text_of(start, self.t[self.pos - 1].end);
@@ -2408,18 +2481,34 @@ impl Parser {
             // 曾只在 `.` 之后（x.<T>m() 形态），无点前缀永不进入）
             if self.at_punct("<") {
                 let save_lt = self.pos;
-                if self.type_args_raw().is_some() && self.at_punct("::") {
-                    self.bump();
-                    let m = match &self.tok().tok {
-                        Tok::Ident(m) => m.clone(),
-                        _ => String::new(),
-                    };
-                    if !m.is_empty() {
+                if self.type_args_raw().is_some() {
+                    // 可选数组维度（Class<?>[]::new——jdk-sources 拷问）：
+                    // 维度并入方法引用名（打印机维度在 :: 前）
+                    let mut dims = String::new();
+                    while self.at_punct("[") && self.peek(1).is_punct("]") {
                         self.bump();
+                        self.bump();
+                        dims.push_str("[]");
                     }
-                    let name = format!("{m}");
-                    e = self.ast.method_ref(e, &name);
-                    continue;
+                    if self.at_punct("::") {
+                        self.bump();
+                        let m = match &self.tok().tok {
+                            Tok::Ident(m) => m.clone(),
+                            _ => String::new(),
+                        };
+                        if !m.is_empty() {
+                            self.bump();
+                        }
+                        // 打印约定：无维度时纯方法名（打印机自打 ::）；带维度
+                        // 时 "[]::m"（维度在 :: 前——打印机按 find("::") 切分）
+                        let name = if dims.is_empty() {
+                            format!("{m}")
+                        } else {
+                            format!("{dims}::{m}")
+                        };
+                        e = self.ast.method_ref(e, &name);
+                        continue;
+                    }
                 }
                 self.pos = save_lt;
                 break;
@@ -3111,7 +3200,7 @@ fn starts_unary_operand(t: &Token) -> bool {
         //（openjdk PrimitiveInstanceOfNumericValueTests 抓获）
         Tok::Ident(i) if i != "instanceof" => true,
         Tok::Num(_) | Tok::Str(_) | Tok::Char(_) | Tok::TextBlock(_) => true,
-        Tok::Punct(p) => matches!(*p, "(" | "!" | "~"),
+        Tok::Punct(p) => matches!(*p, "(" | "!" | "~" | "++" | "--"),
         _ => false,
     }
 }

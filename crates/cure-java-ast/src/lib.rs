@@ -378,6 +378,11 @@ impl JavaAst {
             NodeData::MethodRef { .. } => NodeKind::MethodRef,
         }
     }
+    /// arena 节点总数（诊断/深度测量用）。
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub fn children(&self, id: JavaId) -> &[JavaId] {
         &self.nodes[id.0 as usize].children
     }
