@@ -205,6 +205,16 @@ impl Parser {
         }
     }
 
+    /// case 标签的 when 守卫（case … when cond ->，Java 21）——消费并入
+    /// 原文（标签区间由调用方闭合）。`when cond ->` 中 when 后是箭头时
+    /// 不是守卫（是名为 when 的标签？保守不消费）。
+    fn consume_when_guard(&mut self) {
+        if self.at_kw("when") && !self.peek(1).is_punct("->") {
+            self.bump();
+            let _ = self.parse_expr(PREC_TERNARY);
+        }
+    }
+
     fn at_kw(&self, s: &str) -> bool {
         matches!(self.tok().tok, Tok::Ident(ref i) if i == s)
     }
@@ -1336,19 +1346,21 @@ impl Parser {
             };
         }
         if self.at_kw("yield") {
-            // switch 表达式块内的 yield：原文保真（语义不触碰）
+            // switch 表达式块内的 yield：原文保真（语义不触碰）。
+            // yield 也可作方法名（openjdk T8326204：yield((Map) null, 2) 是
+            // 调用）——解析出非 `;` 收尾即回退按表达式语句重解
             let start = self.cur_start();
+            let save = self.pos;
+            let err_len = self.errs.len();
             self.bump();
-            if self.parse_expr(PREC_ASSIGN).is_none() {
-                self.err_at("bad yield");
+            if self.parse_expr(PREC_ASSIGN).is_some() && self.eat(";") {
+                let end = self.t[self.pos - 1].end;
+                let text = self.text_of(start, end).trim().to_string();
+                return self.ast.raw(&text);
             }
-            let end = if self.eat(";") {
-                self.t[self.pos - 1].end
-            } else {
-                self.tok().start
-            };
-            let text = self.text_of(start, end).trim().to_string();
-            return self.ast.raw(&text);
+            // 回退：试探期间的诊断一并回滚（T8326204 曾泄漏 1 错误）
+            self.pos = save;
+            self.errs.truncate(err_len);
         }
         if self.at_kw("assert") {
             self.bump();
@@ -1363,14 +1375,33 @@ impl Parser {
             self.expect(";");
             return self.ast.assert_(cond, msg);
         }
-        if self.at_kw("class")
-            || self.at_kw("interface")
-            || self.at_kw("enum")
-            || self.at_kw("record")
         {
-            // 局部类声明：原文保真
-            let text = self.sync_member();
-            return self.ast.raw(&text);
+            // 局部类/接口/枚举/record 声明：原文保真。可带 final/@Anno 修饰
+            //（final record X(…) {}——checkstyle Java15FinalLocalRecord 抓获：
+            // 修饰前缀曾使局部 record 走变量声明路径 → 风暴）
+            let save = self.pos;
+            // 修饰全形态（strictfp enum E{…};——checkstyle Java16LocalEnum：
+            // 修饰集含 strictfp/public/static 等，非仅 final/@Anno）
+            while matches!(&self.tok().tok, Tok::Ident(i) if is_modifier_kw(i)) {
+                self.bump();
+            }
+            self.skip_mods_annotations();
+            if self.at_kw("class")
+                || self.at_kw("interface")
+                || self.at_kw("enum")
+                || self.at_kw("record")
+            {
+                let text = self.sync_member();
+                // 尾分号（enum E{…}; 容错形态）一并并入
+                let text = if self.at_punct(";") {
+                    self.bump();
+                    format!("{text};")
+                } else {
+                    text
+                };
+                return self.ast.raw(&text.trim());
+            }
+            self.pos = save;
         }
         // 标签语句： Ident ':'
         if let Tok::Ident(_) = &self.tok().tok {
@@ -1642,6 +1673,15 @@ impl Parser {
             if let Tok::Ident(n) = &self.tok().tok {
                 let name = n.clone();
                 self.bump();
+                // C 风格维度变量：for (int _[] : …) / for (int x[] : arr)
+                //（openjdk UnnamedErrors 抓获——曾残留 [ 触发经典 for 路径风暴）
+                let mut dims = 0u32;
+                while self.at_punct("[") && self.peek(1).is_punct("]") {
+                    self.bump();
+                    self.bump();
+                    dims += 1;
+                }
+                let ty = if dims > 0 { wrap_dims(ty, dims) } else { ty };
                 if self.at_punct(":") {
                     self.bump();
                     let iterable = self.parse_expr(PREC_ASSIGN);
@@ -1865,6 +1905,15 @@ impl Parser {
                     break;
                 }
             }
+            // 裸无名参数：catch (_)（Java 21+ 匿名 catch——openjdk
+            // UnnamedErrors 抓获：`_` 先被 parse_type 当类型名吃掉 →
+            // ty_parts==["_"] 且无名位收尾即匿名形态）
+            if ty_parts.len() == 1 && ty_parts[0] == "_" && self.at_punct(")") {
+                self.bump();
+                let block = self.parse_block_raw();
+                catches.push(self.ast.catch_("_", "_", block));
+                continue;
+            }
             let name = match &self.tok().tok {
                 Tok::Ident(i) => {
                     let n = i.clone();
@@ -1913,89 +1962,113 @@ impl Parser {
                 self.bump();
                 self.in_case_label = true;
                 loop {
-                    // 标签头修饰：case final Pair<I>(final C c, @A I i) ->
-                    //（checkstyle BindingWithModifiers：final/注解可修饰整个
-                    // 模式标签——跳过后并入原文保真）
+                    // 标签头修饰：final/注解可修饰整个模式标签（case final
+                    // Pair<I>(…)——checkstyle BindingWithModifiers）——跳过并入
+                    // 原文保真
                     self.skip_mods_annotations();
-                    // record 模式解构：case MyRecord(String _) / case R(a, b) /
-                    // case Pair<String, Integer>(var x, var y) / case W.X(_, _)
-                    // →（Java 21+，可限定名/段级泛型）——括号内是类型模式/嵌套
-                    // 模式而非实参，误入调用解析会风暴；整体原文保真。
-                    // 判定：[Ident | .Ident | <T>…]* 后跟 ( （回溯试探）
-                    let record_pattern = {
-                        let save = self.pos;
-                        let mut ok = false;
-                        if matches!(self.tok().tok, Tok::Ident(_)) {
-                            self.bump();
-                            if self.at_punct("<") {
-                                let _ = self.skip_balanced("<", ">");
-                            }
-                            while self.at_punct(".")
-                                && matches!(self.peek(1).tok, Tok::Ident(_))
-                            {
-                                self.bump(); // .
-                                self.bump(); // 段名
+                    let handled = 'label: {
+                        // 1. 括号化模式：case (String s) when … ->
+                        //（openjdk Parenthesized）
+                        if self.at_punct("(") {
+                            let start = self.cur_start();
+                            self.skip_balanced("(", ")");
+                            self.consume_when_guard();
+                            let text = self.text_of(start, self.t[self.pos - 1].end);
+                            labels.push(self.ast.raw(text.trim()));
+                            break 'label true;
+                        }
+                        // 2. record 模式：[Name|.Name|<T>…]*( ——判定后整体原文
+                        // 括号内是类型模式/嵌套模式而非实参，误入调用解析会
+                        // 风暴；含泛型/限定名/模式绑定名/when 守卫全形态
+                        {
+                            let save = self.pos;
+                            let mut ok = false;
+                            if matches!(self.tok().tok, Tok::Ident(_)) {
+                                self.bump();
                                 if self.at_punct("<") {
                                     let _ = self.skip_balanced("<", ">");
                                 }
+                                while self.at_punct(".")
+                                    && matches!(self.peek(1).tok, Tok::Ident(_))
+                                {
+                                    self.bump();
+                                    self.bump();
+                                    if self.at_punct("<") {
+                                        let _ = self.skip_balanced("<", ">");
+                                    }
+                                }
+                                ok = self.at_punct("(");
                             }
-                            ok = self.at_punct("(");
+                            self.pos = save;
+                            if ok {
+                                let start = self.cur_start();
+                                self.bump(); // record 名
+                                if self.at_punct("<") {
+                                    self.skip_balanced("<", ">");
+                                }
+                                while self.at_punct(".")
+                                    && matches!(self.peek(1).tok, Tok::Ident(_))
+                                {
+                                    self.bump();
+                                    self.bump();
+                                    if self.at_punct("<") {
+                                        self.skip_balanced("<", ">");
+                                    }
+                                }
+                                self.skip_balanced("(", ")");
+                                // 模式绑定名：case Box<String>(String s) box
+                                if matches!(&self.tok().tok, Tok::Ident(i) if i != "when") {
+                                    self.bump();
+                                }
+                                self.consume_when_guard();
+                                let text = self.text_of(start, self.t[self.pos - 1].end);
+                                labels.push(self.ast.raw(text.trim()));
+                                break 'label true;
+                            }
                         }
-                        self.pos = save;
-                        ok
-                    };
-                    if record_pattern {
-                        let start = self.cur_start();
-                        self.bump(); // record 名
-                        if self.at_punct("<") {
-                            self.skip_balanced("<", ">");
-                        }
-                        while self.at_punct(".")
-                            && matches!(self.peek(1).tok, Tok::Ident(_))
+                        // 3. 类型模式（含数组维度与 C 风格后缀）：case Foo f /
+                        // case int[] arr / case Long a[]（openjdk Switches、
+                        // T8309054）——parse_type 全形 + 绑定名 + []*，须以
+                        // ->/: 收尾（防常量表达式误判），否则回退
                         {
-                            self.bump();
-                            self.bump();
-                            if self.at_punct("<") {
-                                self.skip_balanced("<", ">");
+                            let save = self.pos;
+                            let start = self.cur_start();
+                            if self.parse_type().is_some() {
+                                if let Tok::Ident(bind) = &self.tok().tok {
+                                    if !is_reserved_after_type(bind) && bind != "when" {
+                                        self.bump();
+                                        while self.at_punct("[")
+                                            && self.peek(1).is_punct("]")
+                                        {
+                                            self.bump();
+                                            self.bump();
+                                        }
+                                        self.consume_when_guard();
+                                        // 收尾：->/: 或 ,（多标签 case Integer
+                                        // _, String _ ->——UnnamedErrors 抓获：
+                                        // 曾只认 ->/: → 首标签拒绝风暴）
+                                        if self.at_punct("->")
+                                            || self.at_punct(":")
+                                            || self.at_punct(",")
+                                        {
+                                            let text =
+                                                self.text_of(start, self.t[self.pos - 1].end);
+                                            labels.push(self.ast.raw(text.trim()));
+                                            break 'label true;
+                                        }
+                                    }
+                                }
                             }
+                            self.pos = save;
                         }
-                        self.skip_balanced("(", ")");
-                        // 可选模式绑定名：case Box<String>(String s) box（Java 21
-                        // record 模式+绑定——checkstyle GuardsWithExtraParenthesis
-                        // 抓获：漏消费会让标签后残留 Ident → 风暴）
-                        if matches!(&self.tok().tok, Tok::Ident(i) if i != "when") {
-                            self.bump();
+                        // 4. 常量表达式标签
+                        if let Some(e) = self.parse_expr(PREC_TERNARY) {
+                            labels.push(e);
+                            break 'label true;
                         }
-                        if self.at_kw("when") && !self.peek(1).is_punct("->") {
-                            self.bump();
-                            let _ = self.parse_expr(PREC_TERNARY);
-                        }
-                        let text = self.text_of(start, self.t[self.pos - 1].end);
-                        labels.push(self.ast.raw(text.trim()));
-                    }
-                    // 类型模式：case Foo f [when cond] -> …（Ident + Ident 形态）
-                    else if matches!(self.tok().tok, Tok::Ident(_))
-                        && matches!(&self.peek(1).tok, Tok::Ident(_))
-                    {
-                        let start = self.cur_start();
-                        if self.parse_type().is_some() {
-                            if let Tok::Ident(_) = &self.tok().tok {
-                                self.bump();
-                            }
-                            // when 守卫（Java 21）：一并并入保真文本
-                            if self.at_kw("when") && !self.peek(1).is_punct("->") {
-                                self.bump();
-                                let _ = self.parse_expr(PREC_TERNARY);
-                            }
-                            let text = self.text_of(start, self.t[self.pos - 1].end);
-                            labels.push(self.ast.raw(text.trim()));
-                        } else {
-                            self.err_at("bad case label");
-                            break;
-                        }
-                    } else if let Some(e) = self.parse_expr(PREC_TERNARY) {
-                        labels.push(e);
-                    } else {
+                        false
+                    };
+                    if !handled {
                         self.err_at("bad case label");
                         break;
                     }
@@ -2060,9 +2133,29 @@ impl Parser {
             if self.at_kw("instanceof") && PREC_RELATIONAL >= min_prec {
                 self.bump();
                 // 模式修饰：final 与注解交错（x instanceof @A final @B C
-                // pattern——GJF I588 / checkstyle BindingWithModifiers）
+                // pattern——GJF I588 / checkstyle BindingWithModifiers）；
+                // static 为 javac 拒绝的垃圾修饰（openjdk NoModifiersOnBinding
+                // 负向测试）——容忍跳过（容错优先，输出仍合法）
+                while self.at_kw("static") {
+                    self.bump();
+                }
                 self.skip_mods_annotations();
                 let pat_start = self.cur_start();
+                // 括号化模式：o instanceof (String s)（openjdk Parenthesized）——
+                // 整体并入 Ref 原文（含可选绑定/when）
+                if self.at_punct("(") {
+                    self.skip_balanced("(", ")");
+                    if matches!(&self.tok().tok, Tok::Ident(i) if i != "when" && !is_reserved_after_type(i)) {
+                        self.bump();
+                    }
+                    self.consume_when_guard();
+                    let text = self
+                        .text_of(pat_start, self.t[self.pos - 1].end)
+                        .trim()
+                        .to_string();
+                    lhs = self.ast.instance_of(lhs, JType::Ref(text), None);
+                    continue;
+                }
                 let ty = self.parse_type()?;
                 if self.at_punct("(") {
                     // instanceof record 模式：x instanceof ColoredPoint(int a,
@@ -2089,13 +2182,22 @@ impl Parser {
                     continue;
                 }
                 let bind = match &self.tok().tok {
-                    Tok::Ident(i) if !is_reserved_after_type(i) => {
+                    Tok::Ident(i) if !is_reserved_after_type(i) && i != "when" => {
                         let b = i.clone();
                         self.bump();
                         Some(b)
                     }
                     _ => None,
                 };
+                // C 风格绑定维度：instanceof Float a[][]（T8309054）——
+                // 维度并入类型（打印 Float[][] a，语义同形）
+                let mut dims = 0u32;
+                while self.at_punct("[") && self.peek(1).is_punct("]") {
+                    self.bump();
+                    self.bump();
+                    dims += 1;
+                }
+                let ty = if dims > 0 { wrap_dims(ty, dims) } else { ty };
                 lhs = self.ast.instance_of(lhs, ty, bind.as_deref());
                 continue;
             }
@@ -2802,7 +2904,10 @@ impl Parser {
 
 fn starts_unary_operand(t: &Token) -> bool {
     match &t.tok {
-        Tok::Ident(_) => true,
+        // instanceof 不是合法一元操作数——(Integer.MAX_VALUE) instanceof byte
+        // 的限定名可解析为类型，instanceof 形似变量 → 误判 cast 吞掉关键字
+        //（openjdk PrimitiveInstanceOfNumericValueTests 抓获）
+        Tok::Ident(i) if i != "instanceof" => true,
         Tok::Num(_) | Tok::Str(_) | Tok::Char(_) | Tok::TextBlock(_) => true,
         Tok::Punct(p) => matches!(*p, "(" | "!" | "~"),
         _ => false,

@@ -1713,14 +1713,46 @@ impl<L: Lang> Rule<L> for ArithReassoc {
         let x = ich[0];
 
         // 字符串拼接重结合：(x + "K1") + "K2" → x + "K1K2"
-        // （拼接满足结合律且各操作数恰按序求值一次；x 任意类型）
+        // （拼接满足结合律且各操作数恰按序求值一次；x 任意类型）。
+        // **整链折叠**：左倾链 (((x+"a")+"a")+"a")… 一刀折成 x+"aaa…"——
+        // 逐层折每 pass 一层是 O(n²)（openjdk DeepStringConcat 32001 项
+        // 78s/32k passes 抓获；整链后 1 编辑收敛）
         if op1 == BinOp::Add && op2 == BinOp::Add {
             if let (Some(LitRef::Str(k1)), Some(LitRef::Str(k2))) =
                 (lang.literal(ich[1]), lang.literal(och[1]))
             {
-                let joined = format!("{k1}{k2}");
+                // 收集左倾链（外→内），要求每层 (child + "str") 同构
+                let mut chain: Vec<L::Id> = vec![id];
+                let mut cur = id;
+                loop {
+                    let cch = lang.children(cur).to_vec();
+                    let next = cch[0];
+                    let deeper = lang.kind(next) == NodeKind::Binary
+                        && lang.bin_op(next) == Some(BinOp::Add)
+                        && matches!(lang.literal(lang.children(next).to_vec()[1]),
+                            Some(LitRef::Str(_)));
+                    if deeper {
+                        chain.push(next);
+                        cur = next;
+                    } else {
+                        break;
+                    }
+                }
+                // base = 最内层的左操作数；parts 内→外 = 源顺序
+                let innermost = *chain.last().unwrap();
+                let ich2 = lang.children(innermost).to_vec();
+                let base = ich2[0];
+                let mut joined = String::new();
+                for &n in chain.iter().rev() {
+                    if let Some(LitRef::Str(k)) =
+                        lang.literal(lang.children(n).to_vec()[1])
+                    {
+                        joined.push_str(k);
+                    }
+                }
+                let _ = (k1, k2); // 已并入 joined
                 let lit = lang.build_str(&joined);
-                let with = lang.build_bin(BinOp::Add, x, lit);
+                let with = lang.build_bin(BinOp::Add, base, lit);
                 return Some(Edit::Replace {
                     target: id,
                     with,

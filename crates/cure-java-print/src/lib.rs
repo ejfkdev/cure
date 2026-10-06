@@ -10,8 +10,8 @@
 //! 签名里的泛型、注解、throws 按原文输出；不可解析区域（Raw）原样保留。
 
 use cure_java_ast::{
-    BinOp, CompilationUnit, Declarator, JType, JavaAst, JavaId, Lit, Member, NodeData, Param,
-    TypeDecl, TypeKind, UnOp,
+    BinOp, CompilationUnit, Declarator, JType, JavaAst, JavaId, Lit, Member, NodeData, NodeKind,
+    Param, TypeDecl, TypeKind, UnOp,
 };
 
 // ---- 优先级表（数值越大绑定越紧）----
@@ -1028,7 +1028,14 @@ impl<'a> Printer<'a> {
                     self.out.push(' ');
                     self.out.push_str(body);
                 } else {
+                    let sw_recv = !ch.is_empty() && ast.kind(ch[0]) == NodeKind::Switch;
+                    if sw_recv {
+                        self.out.push('(');
+                    }
                     self.expr(ch[0], prec::POSTFIX);
+                    if sw_recv {
+                        self.out.push(')');
+                    }
                     self.out.push('(');
                     for (i, &a) in ch[1..].iter().enumerate() {
                         if i > 0 {
@@ -1045,10 +1052,16 @@ impl<'a> Printer<'a> {
             NodeData::Member { name } => {
                 let obj = ast.children(id)[0];
                 let need = prec::POSTFIX < min_prec;
-                if need {
+                // Switch 表达式作接收方必须带括号：switch (s) {…}.x 非法
+                //（openjdk ConditionalWithVoid 往返抓获——打印丢括号 → 重解析失败）
+                let switch_recv = ast.kind(obj) == NodeKind::Switch;
+                if need || switch_recv {
                     self.out.push('(');
                 }
                 self.expr(obj, prec::POSTFIX);
+                if need || switch_recv {
+                    self.out.push(')');
+                }
                 // 数组类型前缀（"[]class"）：维度在点号前——int[].class
                 let (dims, rest) = if name.starts_with("[]") {
                     let d = name[..name.find("class").unwrap_or(name.len())].to_string();
@@ -1059,9 +1072,6 @@ impl<'a> Printer<'a> {
                 self.out.push_str(&dims);
                 self.out.push('.');
                 self.out.push_str(rest);
-                if need {
-                    self.out.push(')');
-                }
             }
             NodeData::MethodRef { name } => {
                 let recv = ast.children(id)[0];

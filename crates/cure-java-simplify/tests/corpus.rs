@@ -33,6 +33,13 @@ const GJF_TESTDATA_ROOT: &str =
 /// 我们的容错解析器干净解析（语义非法但语法合法），走全三检
 const CHECKSTYLE_ROOT: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus_data/checkstyle_noncompilable");
+/// openjdk langtools patterns/switch：JDK 参考语法测试（Java 16-25 模式
+/// 匹配/record 模式/switch 全家——新 JDK 版本语料主源）
+const OPENJDK_ROOT: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus_data/openjdk_langtools");
+/// checkstyle grammar：按 JDK 版本组织的语法回归（java8-25 等）
+const CHECKSTYLE_GRAMMAR_ROOT: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus_data/checkstyle_grammar");
 
 fn collect_java_files(root: &Path, out: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(root) {
@@ -71,6 +78,16 @@ fn gjf_testdata_corpus_robust_consistent_idempotent() {
 #[test]
 fn checkstyle_noncompilable_corpus_robust_consistent_idempotent() {
     run_corpus(CHECKSTYLE_ROOT, "checkstyle-noncompilable");
+}
+
+#[test]
+fn openjdk_langtools_corpus_robust_consistent_idempotent() {
+    run_corpus(OPENJDK_ROOT, "openjdk-langtools");
+}
+
+#[test]
+fn checkstyle_grammar_corpus_robust_consistent_idempotent() {
+    run_corpus(CHECKSTYLE_GRAMMAR_ROOT, "checkstyle-grammar");
 }
 
 fn run_corpus(root: &str, label: &str) {
