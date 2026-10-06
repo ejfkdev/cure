@@ -22,6 +22,17 @@ use cure_java_simplify::simplify_unit;
 /// - fernflower_obf/：fernflower 测试集 66 个真实 ProGuard 混淆输出（目标域）
 const CORPUS_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus_data/gjf");
 const OBF_CORPUS_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus_data/fernflower_obf");
+/// GJF testdata：google-java-format 格式化前后配对样例的 .input 侧
+///（core/src/test/resources/…/testdata/*.input，209 个）——完整编译单元、
+/// 语法面最全的格式化输入集（.output 侧语法同形，不重复入库）
+const GJF_TESTDATA_ROOT: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus_data/gjf_testdata");
+/// checkstyle noncompilable：checkstyle 仓库 src/test/resources-noncompilable
+///（426 个，2026-10 克隆）——**故意不可编译**的容错压测集：合法语法边界 +
+/// 语义非法形态。容错承诺：错误有界（无风暴）、无 panic；其中约 236 个被
+/// 我们的容错解析器干净解析（语义非法但语法合法），走全三检
+const CHECKSTYLE_ROOT: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/corpus_data/checkstyle_noncompilable");
 
 fn collect_java_files(root: &Path, out: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(root) {
@@ -50,6 +61,16 @@ fn corpus_robust_consistent_idempotent() {
 #[test]
 fn obfuscated_corpus_robust_consistent_idempotent() {
     run_corpus(OBF_CORPUS_ROOT, "fernflower-obfuscated");
+}
+
+#[test]
+fn gjf_testdata_corpus_robust_consistent_idempotent() {
+    run_corpus(GJF_TESTDATA_ROOT, "gjf-testdata");
+}
+
+#[test]
+fn checkstyle_noncompilable_corpus_robust_consistent_idempotent() {
+    run_corpus(CHECKSTYLE_ROOT, "checkstyle-noncompilable");
 }
 
 fn run_corpus(root: &str, label: &str) {

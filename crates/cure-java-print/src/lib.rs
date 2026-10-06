@@ -681,7 +681,15 @@ impl<'a> Printer<'a> {
                 }
             }
             _ => {
-                self.expr(id, prec::ASSIGN);
+                // 表达式资源（try (stream)——JEP 提案形态/GJF testdata i155）：
+                // 解析侧包了 ExprStmt，解包后打印（曾打 /* ExprStmt */ 占位
+                // 符 → 重解析形态漂移 → 幂等失败）
+                let target = if ast.data(id) == &NodeData::ExprStmt {
+                    ast.children(id).first().copied().unwrap_or(id)
+                } else {
+                    id
+                };
+                self.expr(target, prec::ASSIGN);
             }
         }
     }
