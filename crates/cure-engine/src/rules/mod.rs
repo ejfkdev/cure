@@ -528,25 +528,28 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         }
 
         // 扫描 decl 之后的区域（用途/遮蔽全区间；写冲突窗口见下）
-        let mut uses: Vec<L::Id> = Vec::new();
-        let mut shadowed = false;
+        let mut wa = Watch::<L>::new(&name, &[]);
         for &s in &stmts[index + 1..] {
-            let mut w = StrSet::default();
-            scan_region(&*lang, s, &name, &mut uses, &mut w, &mut shadowed);
+            scan_region(&*lang, s, &mut wa);
         }
-        if shadowed || uses.len() != 1 {
+        if wa.shadowed || wa.uses.len() != 1 {
             return None;
         }
-        let use_id = uses[0];
+        let use_id = wa.uses[0];
+        // value 读到的名字（写冲突兴趣集；reads 含 name 自身——一票否决）
+        let mut reads = StrSet::default();
+        reads_vars(&*lang, value, &mut reads);
+        reads.insert(name.as_str());
+        let watch_names: Vec<&str> = reads.iter().copied().collect();
         // 写冲突窗口 = [decl 后, 使用语句]：纯值移动到使用点，
-        // 使用点之后的写不影响（值已被消费）
-        let mut writes = StrSet::default();
+        // 使用点之后的写不影响（值已被消费）。首个含 use 的语句即使用语句
+        //（uses[0] 是遍历序首个读，与 subtree_contains 等价）
+        let mut wb = Watch::<L>::new(&name, &watch_names);
         let mut use_stmt_idx = None;
         for (off, &s) in stmts[index + 1..].iter().enumerate() {
-            let mut w = StrSet::default();
-            scan_region(&*lang, s, &name, &mut Vec::new(), &mut w, &mut false);
-            writes.extend(w);
-            if subtree_contains(&*lang, s, |n| n == use_id) {
+            let uses_before = wb.uses.len();
+            scan_region(&*lang, s, &mut wb);
+            if wb.uses.len() > uses_before {
                 use_stmt_idx = Some(index + 1 + off);
                 break; // 使用语句之后的写不参与冲突判定
             }
@@ -555,15 +558,10 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         // 值的传播只关心窗口内写，但**删声明**要求名字彻底无残留引用——
         // 使用点之后的死写（如 v = "y"）同样引用声明，残留会让输出失去声明。
         if let Some(ui) = use_stmt_idx {
+            let mut wc = Watch::<L>::new(&name, &[name.as_str()]);
             for &s in &stmts[ui + 1..] {
-                let mut tail_uses = Vec::new();
-                let mut tail_writes = StrSet::default();
-                let mut tail_shadowed = false;
-                scan_region(&*lang, s, &name, &mut tail_uses, &mut tail_writes, &mut tail_shadowed);
-                if !tail_uses.is_empty()
-                    || tail_writes.contains(&name.as_str())
-                    || tail_shadowed
-                {
+                scan_region(&*lang, s, &mut wc);
+                if !wc.uses.is_empty() || wc.wrote(name.as_str()) || wc.shadowed {
                     return None;
                 }
             }
@@ -573,19 +571,13 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         if ve <= Effect::MayRead {
             // 自由移动：区间内的显式局部写不得触碰 V 读到的变量
             // （对声明变量自身的写也包含在 writes 里，一票否决）
-            let mut reads = StrSet::default();
-            reads_vars(&*lang, value, &mut reads);
-            reads.insert(name.as_str());
-            let mut effective_writes = writes.clone();
             if let Some(target) =
                 use_stmt_target_write(&*lang, &stmts[index + 1..], use_id, name.as_str())
             {
-                effective_writes.remove(target.as_str());
+                wb.clear_wrote(target.as_str());
             }
-            for w in &effective_writes {
-                if reads.contains(w) {
-                    return None;
-                }
+            if wb.any_write() {
+                return None;
             }
             return Some(Edit::Multi(vec![
                 Edit::Replace {
@@ -630,51 +622,101 @@ impl<L: Lang> Rule<L> for LocalPropagation {
     }
 }
 
-/// 扫描一个语句子树：收集对 `name` 的**读**、所有显式局部写、同名声明遮蔽。
-fn scan_region<'a, L: Lang>(
-    lang: &'a L,
-    node: L::Id,
-    name: &str,
-    uses: &mut Vec<L::Id>,
-    writes: &mut StrSet<'a>,
-    shadowed: &mut bool,
-) {
+/// 区域扫描观察：主名字的读 + 小兴趣集的写命中 + 同名遮蔽。
+///
+/// 规则预先声明感兴趣的**写名字**（通常 ≤4：主名字 + value 读到的变量），
+/// 收集期直接判中——零哈希、零集合重建。对比旧版：每次检查重建
+/// `HashSet<&str>`（分配/重哈希/释放）曾占 release 运行时间 ~50%。
+pub(crate) struct Watch<'a, L: Lang> {
+    /// 主名字：读收集 + 遮蔽判定
+    name: &'a str,
+    /// 写冲突兴趣名字（写事件按名字线性比对，典型 2~4 个）
+    watch: Vec<&'a str>,
+    /// 与 watch 一一对应：窗口内是否出现过该名字的写
+    writes_hit: Vec<bool>,
+    shadowed: bool,
+    /// 主名字的读（遍历序）
+    uses: Vec<L::Id>,
+}
+
+impl<'a, L: Lang> Watch<'a, L> {
+    pub(crate) fn new(name: &'a str, watch: &[&'a str]) -> Self {
+        Watch {
+            name,
+            watch: watch.to_vec(),
+            writes_hit: vec![false; watch.len()],
+            shadowed: false,
+            uses: Vec::new(),
+        }
+    }
+    /// 名字 `n` 在窗口内是否被写（聚合判断）
+    pub(crate) fn wrote(&self, n: &str) -> bool {
+        self.watch
+            .iter()
+            .zip(&self.writes_hit)
+            .any(|(w, h)| *h && *w == n)
+    }
+    /// 任一兴趣名字被写
+    pub(crate) fn any_write(&self) -> bool {
+        self.writes_hit.iter().any(|h| *h)
+    }
+    /// 清除对 `n` 的写命中（use 语句自身对目标的写不参与冲突判定）
+    pub(crate) fn clear_wrote(&mut self, n: &str) {
+        for (w, h) in self.watch.iter().zip(self.writes_hit.iter_mut()) {
+            if *w == n {
+                *h = false;
+            }
+        }
+    }
+}
+
+/// 扫描一个语句子树：主名字的**读**、兴趣名字的**写命中**、同名声明遮蔽。
+fn scan_region<L: Lang>(lang: &L, node: L::Id, w: &mut Watch<L>) {
     // 使用索引快路径：prepare 预计算的子树事件序列（遍历序与下方递归
-    // 完全一致），过滤即可——O(事件数) 而非 O(节点数)，且不重派发 kind。
+    // 完全一致），按 Watch 过滤——O(事件数)、零分配。
     if let Some(events) = lang.region_events(node) {
         for e in events {
             match e.kind {
                 crate::kind::EventKind::Use => {
-                    if lang.var_name(e.node) == Some(name) {
-                        uses.push(e.node);
+                    if lang.var_name(e.node) == Some(w.name) {
+                        w.uses.push(e.node);
                     }
                 }
                 crate::kind::EventKind::Write => {
                     if let Some(n) = lang.var_name(e.node) {
-                        writes.insert(n);
+                        for (wn, hit) in w.watch.iter().zip(w.writes_hit.iter_mut()) {
+                            if wn == &n {
+                                *hit = true;
+                            }
+                        }
                     }
                 }
                 crate::kind::EventKind::Shadow => {
-                    if lang.var_name(e.node) == Some(name) {
-                        *shadowed = true;
+                    if lang.var_name(e.node) == Some(w.name) {
+                        w.shadowed = true;
                     }
                 }
             }
         }
         return;
     }
+    // 无索引语言：原递归遍历（事件序一致）
     match lang.kind(node) {
         NodeKind::Assign => {
             let ch = lang.children(node);
             if let Some(&t) = ch.first() {
                 if lang.kind(t) == NodeKind::VarRef {
                     if let Some(n) = lang.var_name(t) {
-                        writes.insert(n);
+                        for (wn, hit) in w.watch.iter().zip(w.writes_hit.iter_mut()) {
+                            if wn == &n {
+                                *hit = true;
+                            }
+                        }
                     }
                 }
             }
             if let Some(&v) = ch.get(1) {
-                scan_region(lang, v, name, uses, writes, shadowed);
+                scan_region(lang, v, w);
             }
         }
         NodeKind::Unary if lang.un_op(node).is_some_and(|o| o.is_incdec()) => {
@@ -682,45 +724,57 @@ fn scan_region<'a, L: Lang>(
             if let Some(&t) = ch.first() {
                 if lang.kind(t) == NodeKind::VarRef {
                     if let Some(n) = lang.var_name(t) {
-                        writes.insert(n);
+                        for (wn, hit) in w.watch.iter().zip(w.writes_hit.iter_mut()) {
+                            if wn == &n {
+                                *hit = true;
+                            }
+                        }
                     }
                 }
             }
         }
         NodeKind::VarDecl => {
             if let Some(n) = lang.var_name(node) {
-                if n == name {
-                    *shadowed = true;
+                if n == w.name {
+                    w.shadowed = true;
                 }
-                writes.insert(n);
+                for (wn, hit) in w.watch.iter().zip(w.writes_hit.iter_mut()) {
+                    if wn == &n {
+                        *hit = true;
+                    }
+                }
             }
             for &c in lang.children(node) {
-                scan_region(lang, c, name, uses, writes, shadowed);
+                scan_region(lang, c, w);
             }
         }
         // ForEach 循环变量 / Catch 绑定：在子作用域声明了同名变量 → 视为遮蔽；
         // ForEach 每轮给循环变量赋值 → 也算显式写。
         NodeKind::ForEach | NodeKind::Catch => {
             if let Some(n) = lang.var_name(node) {
-                if n == name {
-                    *shadowed = true;
+                if n == w.name {
+                    w.shadowed = true;
                 }
                 if lang.kind(node) == NodeKind::ForEach {
-                    writes.insert(n);
+                    for (wn, hit) in w.watch.iter().zip(w.writes_hit.iter_mut()) {
+                        if wn == &n {
+                            *hit = true;
+                        }
+                    }
                 }
             }
             for &c in lang.children(node) {
-                scan_region(lang, c, name, uses, writes, shadowed);
+                scan_region(lang, c, w);
             }
         }
         NodeKind::VarRef => {
-            if lang.var_name(node) == Some(name) {
-                uses.push(node);
+            if lang.var_name(node) == Some(w.name) {
+                w.uses.push(node);
             }
         }
         _ => {
             for &c in lang.children(node) {
-                scan_region(lang, c, name, uses, writes, shadowed);
+                scan_region(lang, c, w);
             }
         }
     }
@@ -1240,14 +1294,12 @@ impl<L: Lang> Rule<L> for DeadStore {
             if !declared_in_this_block {
                 return None;
             }
-            let mut uses: Vec<L::Id> = Vec::new();
-            let mut writes = StrSet::default();
-            let mut shadowed = false;
+            let mut w0 = Watch::<L>::new(&name, &[name.as_str()]);
             for &s in &stmts[idx + 1..] {
-                scan_region(&*lang, s, &name, &mut uses, &mut writes, &mut shadowed);
+                scan_region(&*lang, s, &mut w0);
             }
-            // 只判**本名字**的读/写：writes 收集的是区域内全部写者
-            if !uses.is_empty() || writes.contains(&name.as_str()) || shadowed {
+            // 只判**本名字**的读/写（watch 集即本名字）
+            if !w0.uses.is_empty() || w0.wrote(name.as_str()) || w0.shadowed {
                 return None;
             }
             if lang.effect(first_value) > Effect::MayRead {
@@ -1888,42 +1940,39 @@ impl<L: Lang> Rule<L> for AssignPropagation {
         }
 
         // 扫描赋值之后的区域（用途/遮蔽全区间；写冲突窗口见下）
-        let mut uses: Vec<L::Id> = Vec::new();
-        let mut shadowed = false;
+        let mut wa = Watch::<L>::new(&name, &[]);
         for &s in &stmts[idx + 1..] {
-            let mut w = StrSet::default();
-            scan_region(&*lang, s, &name, &mut uses, &mut w, &mut shadowed);
+            scan_region(&*lang, s, &mut wa);
         }
-        if shadowed || uses.len() != 1 {
+        if wa.shadowed || wa.uses.len() != 1 {
             return None;
         }
-        // x 自身在窗口内被写 → 赋值会被覆盖，拒绝
-        let use_id = uses[0];
-        let mut writes = StrSet::default();
+        let use_id = wa.uses[0];
+        // 写冲突兴趣集：value 读到的名字 + x 自身（自身被写 → 覆盖，拒绝）
+        let mut reads = StrSet::default();
+        reads_vars(&*lang, value, &mut reads);
+        reads.insert(name.as_str());
+        let watch_names: Vec<&str> = reads.iter().copied().collect();
+        let mut wb = Watch::<L>::new(&name, &watch_names);
         for &s in &stmts[idx + 1..] {
-            let mut w = StrSet::default();
-            scan_region(&*lang, s, &name, &mut Vec::new(), &mut w, &mut false);
-            if w.contains(&name.as_str()) {
-                return None;
-            }
-            writes.extend(w);
-            if subtree_contains(&*lang, s, |n| n == use_id) {
+            let uses_before = wb.uses.len();
+            scan_region(&*lang, s, &mut wb);
+            if uses_before < wb.uses.len() {
                 break; // 使用语句之后的写不参与冲突判定
             }
+        }
+        // x 自身在窗口内被写 → 赋值会被覆盖，拒绝（先于目标写排除）
+        if wb.wrote(name.as_str()) {
+            return None;
         }
         let ve = lang.effect(value);
 
         if ve <= Effect::MayRead {
-            let mut reads = StrSet::default();
-            reads_vars(&*lang, value, &mut reads);
-            let mut effective_writes = writes.clone();
             if let Some(target) = use_stmt_target_write(&*lang, &stmts[idx + 1..], use_id, name.as_str()) {
-                effective_writes.remove(target.as_str());
+                wb.clear_wrote(target.as_str());
             }
-            for w in &effective_writes {
-                if reads.contains(w) {
-                    return None;
-                }
+            if wb.any_write() {
+                return None;
             }
             return Some(Edit::Multi(vec![
                 Edit::Replace {
@@ -2114,24 +2163,20 @@ impl<L: Lang> Rule<L> for MultiUseCopyPropagation {
         }
 
         // 扫描后续：收集 x 的全部读；对 x 的任何写 / 对 y 的任何写 / 遮蔽 → 拒绝
-        let mut uses: Vec<L::Id> = Vec::new();
-        let mut writes = StrSet::default();
-        let mut shadowed = false;
+        let mut w1 = Watch::<L>::new(&name, &[name.as_str(), src.as_str()]);
         for &s in &stmts[idx + 1..] {
-            scan_region(&*lang, s, &name, &mut uses, &mut writes, &mut shadowed);
+            scan_region(&*lang, s, &mut w1);
         }
-        if shadowed || uses.is_empty() {
+        if w1.shadowed || w1.uses.is_empty() {
             return None;
         }
-        for w in &writes {
-            if *w == name || *w == src {
-                return None;
-            }
+        if w1.wrote(name.as_str()) || w1.wrote(src.as_str()) {
+            return None;
         }
         // y 也不得在【赋值前】与 x 指向不同值（x=y 之前 y 已是其所值，无需检查）；
         // 但 x=y 之间不能有对 y 的写（相邻语句，天然无中间）——赋值本身就是当前值 ✓
 
-        let mut edits: Vec<Edit<L>> = uses
+        let mut edits: Vec<Edit<L>> = w1.uses
             .iter()
             .map(|&u| Edit::Replace {
                 target: u,
