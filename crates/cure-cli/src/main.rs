@@ -462,7 +462,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         all.extend(r?);
     }
     all.sort_by_key(|(i, _)| *i);
-    let mut all: Vec<FileResult> = all.into_iter().map(|(_, r)| r).collect();
+    let all: Vec<FileResult> = all.into_iter().map(|(_, r)| r).collect();
 
     // --copy-other：非源文件原样拷贝
     for (src, dst) in copy_jobs {

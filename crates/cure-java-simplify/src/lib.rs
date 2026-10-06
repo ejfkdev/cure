@@ -3076,6 +3076,925 @@ fn copy_subst(
     lang.clone_node(node, new_children)
 }
 
+
+// ---------------------------------------------------------------------------
+// try-with-resources 还原（twr_recover）：两种反编译器直出形态。
+//
+// family B（ddc：javac→d8 字节码的紧凑渲染）：
+//   R r = new R(...);            // 资源（new——无卫语句形态下唯一非空证明）
+//   try { B }
+//   catch (Throwable t) {
+//       try { r.close(); }
+//       catch (Throwable sup) { t.addSuppressed(sup); }
+//       throw t;
+//   }
+//   r.close();                   // 正常路径尾部直调
+//   → try (R r = new R(...)) { B }
+//
+// family A（javac 源级翻译；CFR/ProGuard 常见）：
+//   R r = init; Throwable primary = null;
+//   try { B }
+//   catch (Throwable t) { primary = t; throw t; }
+//   finally {
+//       if (r != null) {
+//           if (primary != null) {
+//               try { r.close(); } catch (Throwable sup) { primary.addSuppressed(sup); }
+//           } else { r.close(); }
+//       }
+//   }
+//   → try (R r = init) { B }      // 含 null 资源跳过 close 的路径（卫语句保证）
+//
+// 多资源：嵌套形态由不动点逐层还原（内层先→外层 try 体含 try(res)——
+// JLS 上嵌套 TWR ≡ 多资源 TWR，无需合并）。守卫：r/primary/t/sup 的全部
+// 引用必须落在模式消费的子树内（否则不还原）；同名遮蔽一律拒绝。
+// ---------------------------------------------------------------------------
+
+pub struct TwrRecover;
+
+fn twr_is_throwable(ty_raw: &str) -> bool {
+    ty_raw == "Throwable" || ty_raw == "java.lang.Throwable"
+}
+
+/// 表达式语句解包：ExprStmt{e} → e（赋值/调用等语句位置）。
+fn unwrap_expr_stmt(lang: &JavaAst, n: JavaId) -> JavaId {
+    if lang.kind(n) == NodeKind::ExprStmt {
+        if let Some(&e) = lang.children(n).first() {
+            return e;
+        }
+    }
+    n
+}
+
+/// 语句序列（Block 展开；单语句原样）。
+fn twr_stmts(lang: &JavaAst, n: JavaId) -> Vec<JavaId> {
+    if lang.kind(n) == NodeKind::Block {
+        lang.children(n).to_vec()
+    } else {
+        vec![n]
+    }
+}
+
+/// `r.close()` 调用表达式（ExprStmt 解包后）。
+fn twr_is_close_call(lang: &JavaAst, e: JavaId, r: &str) -> bool {
+    if lang.kind(e) != NodeKind::Call {
+        return false;
+    }
+    let ch = lang.children(e);
+    if ch.len() != 1 {
+        return false;
+    }
+    match lang.data(ch[0]) {
+        NodeData::Member { name } if name == "close" => {
+            let Some(&recv) = lang.children(ch[0]).first() else {
+                return false;
+            };
+            lang.kind(recv) == NodeKind::VarRef && lang.var_name(recv) == Some(r)
+        }
+        _ => false,
+    }
+}
+
+fn twr_is_close_stmt(lang: &JavaAst, n: JavaId, r: &str) -> bool {
+    if lang.kind(n) != NodeKind::ExprStmt {
+        return false;
+    }
+    lang.children(n)
+        .first()
+        .is_some_and(|&e| twr_is_close_call(lang, e, r))
+}
+
+/// `primary.addSuppressed(sup)` 语句。
+fn twr_is_add_suppressed(lang: &JavaAst, n: JavaId, primary: &str, sup: &str) -> bool {
+    if lang.kind(n) != NodeKind::ExprStmt {
+        return false;
+    }
+    let Some(&e) = lang.children(n).first() else {
+        return false;
+    };
+    if lang.kind(e) != NodeKind::Call {
+        return false;
+    }
+    let ch = lang.children(e);
+    if ch.len() != 2 {
+        return false;
+    }
+    match lang.data(ch[0]) {
+        NodeData::Member { name } if name == "addSuppressed" => {
+            let Some(&recv) = lang.children(ch[0]).first() else {
+                return false;
+            };
+            lang.kind(recv) == NodeKind::VarRef
+                && lang.var_name(recv) == Some(primary)
+                && lang.kind(ch[1]) == NodeKind::VarRef
+                && lang.var_name(ch[1]) == Some(sup)
+        }
+        _ => false,
+    }
+}
+
+fn node_contains(lang: &JavaAst, root: JavaId, target: JavaId) -> bool {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if n == target {
+            return true;
+        }
+        stack.extend(lang.children(n).iter().copied());
+    }
+    false
+}
+
+/// root 内存在 name 的引用且不在任何 allowed 子树内（模式外的逃逸引用）。
+fn refs_escape(lang: &JavaAst, root: JavaId, name: &str, allowed: &[JavaId]) -> bool {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name) {
+            let ok = allowed
+                .iter()
+                .any(|&a| a == n || node_contains(lang, a, n));
+            if !ok {
+                return true;
+            }
+        }
+        if lang.kind(n) == NodeKind::VarDecl {
+            if let Some(nm) = lang.var_name(n) {
+                if nm == name && !allowed.contains(&n) {
+                    // 同名再声明（遮蔽风险）→ 拒绝
+                    return true;
+                }
+            }
+        }
+        stack.extend(lang.children(n).iter().copied());
+    }
+    false
+}
+
+/// Try{try 块, 单 catch(Throwable, sup), 无 finally} 且 catch 体 =
+/// [addSuppressed(primary, sup)]、try 体 = [r.close()]。
+/// 返回 (r 名, sup 名)。primary 传闭包外确定。
+fn twr_close_with_suppressed(
+    lang: &JavaAst,
+    try_node: JavaId,
+    primary: &str,
+) -> Option<(String, String)> {
+    let ch = lang.children(try_node).to_vec();
+    if ch.len() != 2 || lang.kind(ch[0]) != NodeKind::Block {
+        return None;
+    }
+    let NodeData::Catch { ty_raw, name: sup } = lang.data(ch[1]) else {
+        return None;
+    };
+    if !twr_is_throwable(ty_raw) {
+        return None;
+    }
+    let sup = sup.clone();
+    let catch_stmts = twr_stmts(lang, *lang.children(ch[1]).first()?);
+    if catch_stmts.len() != 1 || !twr_is_add_suppressed(lang, catch_stmts[0], primary, &sup) {
+        return None;
+    }
+    let close_stmts = twr_stmts(lang, ch[0]);
+    if close_stmts.len() != 1 {
+        return None;
+    }
+    if lang.kind(close_stmts[0]) != NodeKind::ExprStmt {
+        return None;
+    }
+    let e = *lang.children(close_stmts[0]).first()?;
+    let cc = lang.children(e);
+    if cc.len() != 1 {
+        return None;
+    }
+    let NodeData::Member { name } = lang.data(cc[0]) else {
+        return None;
+    };
+    if name != "close" {
+        return None;
+    }
+    let recv = *lang.children(cc[0]).first()?;
+    if lang.kind(recv) != NodeKind::VarRef {
+        return None;
+    }
+    Some((lang.var_name(recv)?.to_string(), sup))
+}
+
+impl Rule<JavaAst> for TwrRecover {
+    fn name(&self) -> &'static str {
+        "twr_recover"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Try]
+    }
+    fn structural(&self) -> bool {
+        true
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        // 先取 ctx 查询（lang 的 &mut 移出后 ctx 不可再用）
+        let (parent, idx, walk_root) = (ctx.parent(id)?, ctx.index(id)?, ctx.root());
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::Try {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        // 资源已存在的（嵌套已还原）不再匹配
+        let try_idx = ch
+            .iter()
+            .position(|&c| lang.kind(c) == NodeKind::Block)?;
+        if try_idx != 0 {
+            return None;
+        }
+        let try_block = ch[0];
+        if lang.kind(parent) != NodeKind::Block {
+            return None;
+        }
+        let pch = lang.children(parent).to_vec();
+
+        // ===== family B：[decl_r, try{B}catch, close] =====
+        if ch.len() == 2 {
+            if let NodeData::Catch { ty_raw, name: t } = lang.data(ch[1]) {
+                if twr_is_throwable(ty_raw) {
+                    let t = t.clone();
+                    let catch_stmts = twr_stmts(lang, *lang.children(ch[1]).first()?);
+                    if catch_stmts.len() == 2 {
+                        // [Try{close,sup}, throw t]
+                        let (inner_try, throw_stmt) = (catch_stmts[0], catch_stmts[1]);
+                        let throw_ok = lang.kind(throw_stmt) == NodeKind::Throw
+                            && lang
+                                .children(throw_stmt)
+                                .first()
+                                .is_some_and(|&x| {
+                                    lang.kind(x) == NodeKind::VarRef
+                                        && lang.var_name(x) == Some(t.as_str())
+                                });
+                        if throw_ok && lang.kind(inner_try) == NodeKind::Try {
+                            if let Some((r, sup)) =
+                                twr_close_with_suppressed(lang, inner_try, t.as_str())
+                            {
+                                if idx >= 1 && idx + 1 < pch.len() {
+                                    let decl_r = pch[idx - 1];
+                                    let trailing = pch[idx + 1];
+                                    if let NodeData::VarDecl { name, ty } = lang.data(decl_r) {
+                                        if name == &r {
+                                            let (name, ty) = (name.clone(), ty.clone());
+                                            let init =
+                                                lang.children(decl_r).first().copied();
+                                            if let Some(init) = init {
+                                                // 无卫语句形态：init 须为 new（非空证明）
+                                                let provably_new = lang.kind(init)
+                                                    == NodeKind::New;
+                                                let close_ok =
+                                                    twr_is_close_stmt(lang, trailing, &r);
+                                                if provably_new && close_ok {
+                                                    // 引用逃逸扫描
+                                                    let root = walk_root;
+                                                    let r_ok = !refs_escape(
+                                                        lang,
+                                                        root,
+                                                        &r,
+                                                        &[
+                                                            decl_r,
+                                                            init,
+                                                            *lang
+                                                                .children(inner_try)
+                                                                .first()
+                                                                .unwrap_or(&inner_try),
+                                                            trailing,
+                                                            try_block,
+                                                        ],
+                                                    );
+                                                    let t_ok = !refs_escape(
+                                                        lang, root, &t,
+                                                        &[throw_stmt, ch[1]],
+                                                    );
+                                                    let sup_ok = !refs_escape(
+                                                        lang, root, &sup,
+                                                        &[ch[1]],
+                                                    );
+                                                    if r_ok && t_ok && sup_ok {
+                                                        let init_copy =
+                                                            lang.copy_subtree(init);
+                                                        let res = lang.var_decl(
+                                                            &name, ty,
+                                                            Some(init_copy),
+                                                        );
+                                                        let new_try = lang.try_(
+                                                            vec![res],
+                                                            try_block,
+                                                            Vec::new(),
+                                                            None,
+                                                        );
+                                                        return Some(Edit::Splice {
+                                                            node: parent,
+                                                            index: idx - 1,
+                                                            remove: 3,
+                                                            insert: vec![new_try],
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===== family A：[decl_r, decl_primary, try{B}catch{primary=t;throw}finally{卫语句}] =====
+        if ch.len() == 3 {
+            let NodeData::Catch { ty_raw, name: t } = lang.data(ch[1]) else {
+                return None;
+            };
+            if !twr_is_throwable(ty_raw) {
+                return None;
+            }
+            let t = t.clone();
+            // finally 块
+            if lang.kind(ch[2]) != NodeKind::Block {
+                return None;
+            }
+            let fin_stmts = twr_stmts(lang, ch[2]);
+            if fin_stmts.len() != 1 || lang.kind(fin_stmts[0]) != NodeKind::If {
+                return None;
+            }
+            // catch 体 = [primary = t, throw t]
+            let catch_stmts = twr_stmts(lang, *lang.children(ch[1]).first()?);
+            if catch_stmts.len() != 2 {
+                return None;
+            }
+            let (assign_stmt, throw_stmt) = (catch_stmts[0], catch_stmts[1]);
+            let assign_expr = unwrap_expr_stmt(lang, assign_stmt);
+            let NodeData::Assign { op: None } = lang.data(assign_expr) else {
+                return None;
+            };
+            let as_ch = lang.children(assign_expr);
+            if as_ch.len() != 2 {
+                return None;
+            }
+            let primary = match lang.data(as_ch[0]) {
+                NodeData::VarRef { name } => name.clone(),
+                _ => return None,
+            };
+            let assign_ok = lang.kind(as_ch[1]) == NodeKind::VarRef
+                && lang.var_name(as_ch[1]) == Some(t.as_str())
+                && lang.kind(as_ch[0]) == NodeKind::VarRef
+                && lang.var_name(as_ch[0]) == Some(primary.as_str());
+            let throw_ok = lang.kind(throw_stmt) == NodeKind::Throw
+                && lang.children(throw_stmt)
+                    .first()
+                    .is_some_and(|&x| {
+                        lang.kind(x) == NodeKind::VarRef
+                            && lang.var_name(x) == Some(t.as_str())
+                    });
+            if !assign_ok || !throw_ok {
+                return None;
+            }
+            // 卫语句：if (r != null) { if (primary != null) { try{r.close()}catch{sup} } else { r.close() } }
+            let if1 = fin_stmts[0];
+            let i1 = lang.children(if1).to_vec();
+            if i1.len() < 2 {
+                return None;
+            }
+            let cond1 = i1[0];
+            let NodeData::Binary { op: BinOp::Ne } = lang.data(cond1) else {
+                return None;
+            };
+            let c1 = lang.children(cond1);
+            let r = match lang.data(c1[0]) {
+                NodeData::VarRef { name } if lang.literal(c1[1]) == Some(LitRef::Null) => {
+                    name.clone()
+                }
+                _ => {
+                    return None;
+                }
+            };
+            let then1 = i1[1];
+            let inner_stmts = twr_stmts(lang, then1);
+            if inner_stmts.len() != 1 || lang.kind(inner_stmts[0]) != NodeKind::If {
+                return None;
+            }
+            let if2 = inner_stmts[0];
+            let i2 = lang.children(if2).to_vec();
+            if i2.len() != 3 {
+                return None;
+            }
+            let NodeData::Binary { op: BinOp::Ne } = lang.data(i2[0]) else {
+                return None;
+            };
+            let c2 = lang.children(i2[0]);
+            let primary_ok = lang.kind(c2[0]) == NodeKind::VarRef
+                && lang.var_name(c2[0]) == Some(primary.as_str())
+                && lang.literal(c2[1]) == Some(LitRef::Null);
+            if !primary_ok {
+                return None;
+            }
+            let (then2, els2) = (i2[1], i2[2]);
+            // then2: Try{[r.close()], catch{primary.addSuppressed(sup)}}
+            let t2_stmts = twr_stmts(lang, then2);
+            if t2_stmts.len() != 1 || lang.kind(t2_stmts[0]) != NodeKind::Try {
+                return None;
+            }
+            let Some((r2, sup)) =
+                twr_close_with_suppressed(lang, t2_stmts[0], primary.as_str())
+            else {
+                return None;
+            };
+            if r2 != r {
+                return None;
+            }
+            // els2: [r.close()]
+            let e2_stmts = twr_stmts(lang, els2);
+            if e2_stmts.len() != 1 || !twr_is_close_stmt(lang, e2_stmts[0], &r) {
+                return None;
+            }
+            // 父块三连：decl_r, decl_primary, try
+            if idx < 2 {
+                return None;
+            }
+            let decl_r = pch[idx - 2];
+            let decl_primary = pch[idx - 1];
+            let (r_decl, primary_decl) = match (lang.data(decl_r), lang.data(decl_primary)) {
+                (
+                    NodeData::VarDecl { name: rn, .. },
+                    NodeData::VarDecl { name: pn, .. },
+                ) => (rn.clone(), pn.clone()),
+                _ => return None,
+            };
+            if r_decl != r || primary_decl != primary {
+                return None;
+            }
+            // primary 初始化为 null
+            let pinit_null = lang
+                .children(decl_primary)
+                .first()
+                .is_some_and(|&n| lang.literal(n) == Some(LitRef::Null));
+            if !pinit_null {
+                return None;
+            }
+            let r_init = lang.children(decl_r).first().copied()?;
+            let ty = match lang.data(decl_r) {
+                NodeData::VarDecl { ty, .. } => ty.clone(),
+                _ => return None,
+            };
+            // 引用逃逸扫描
+            let root = walk_root;
+            // finally 整体被消费：卫语句内的 r/primary 引用均合法
+            let r_allowed = [decl_r, r_init, ch[2], try_block];
+            let t_allowed = [throw_stmt, assign_stmt, ch[1], ch[2]];
+            let p_allowed = [decl_primary, assign_stmt, ch[2]];
+            if refs_escape(lang, root, &r, &r_allowed)
+                || refs_escape(lang, root, &primary, &p_allowed)
+                || refs_escape(lang, root, &t, &t_allowed)
+                || refs_escape(lang, root, &sup, &[ch[2]])
+            {
+                return None;
+            }
+            let init_copy = lang.copy_subtree(r_init);
+            let res = lang.var_decl(&r, ty, Some(init_copy));
+            let new_try = lang.try_(vec![res], try_block, Vec::new(), None);
+            return Some(Edit::Splice {
+                node: parent,
+                index: idx - 2,
+                remove: 3,
+                insert: vec![new_try],
+            });
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 字符串 switch 还原（string_switch_recover）：javac v7 索引二级 switch
+// 形态（ddc 直出；javac 字节码本相——hashCode 定位 + equals 守卫 + 索引
+// switch 分发）：
+//   int v7 = 0;
+//   switch (s.hashCode()) {
+//       case H_i: {
+//           boolean e = s.equals("L_i");
+//           if (!e) { break; } else {
+//               v7 = K_i;
+//               switch (v7) { case K_1: BODY_1; ... default: BODY_DEF; }
+//           }
+//       } ...
+//   }
+//   v7 = -1;
+//   switch (v7) { case K_1: BODY_1; ... default: BODY_DEF; }   // 无匹配路径
+//   → switch (s) { case "L_1": BODY_1; ... default: BODY_DEF; }
+//
+// 守卫：选择器与 equals 接收方同为纯 VarRef（一次求值语义）；
+// 各索引 switch（含尾部）签名全同；每个 BODY 以终止语句收尾（无落穿，
+// 标签序无关）；v/e 引用全部落在被消费子树内；H_i ≡ "L_i".hashCode()。
+// 哈希碰撞（同 case 双守卫）形态更复杂 → 整体不还原（负控锁定）。
+// ---------------------------------------------------------------------------
+
+pub struct StringSwitchRecover;
+
+fn subtree_sig(lang: &JavaAst, n: JavaId, out: &mut String) {
+    out.push_str(&format!("{:?} ", lang.data(n)));
+    for &c in lang.children(n) {
+        subtree_sig(lang, c, out);
+    }
+}
+
+/// 从 v7 索引 switch 提取 case K → 语句、default → 语句。
+fn ssw_bodies(lang: &JavaAst, sw: JavaId) -> Option<Vec<(Option<i64>, Vec<JavaId>)>> {
+    let ch = lang.children(sw).to_vec();
+    let mut out = Vec::new();
+    for &c in &ch[1..] {
+        let NodeData::Case { labels, is_default, .. } = lang.data(c) else {
+            return None;
+        };
+        let is_default = *is_default;
+        let cc = lang.children(c);
+        let label = if is_default {
+            None
+        } else {
+            if *labels != 1 {
+                return None; // 多标签 → 复杂形态，不还原
+            }
+            let lab = cc[0];
+            let lit = lang.literal(lab)?;
+            let v = match lit {
+                LitRef::Int(v) | LitRef::Long(v) => v,
+                _ => return None, // 非整型标签（字符串 case 是还原产物/负控）
+            };
+            Some(v)
+        };
+        out.push((label, cc[*labels as usize..].to_vec()));
+    }
+    Some(out)
+}
+
+fn ssw_body_terminal(lang: &JavaAst, stmts: &[JavaId]) -> bool {
+    let Some(&last) = stmts.last() else {
+        return false; // 空体无终止
+    };
+    let last = if lang.kind(last) == NodeKind::Block {
+        match lang.children(last).last() {
+            Some(&l) => l,
+            None => return false,
+        }
+    } else {
+        last
+    };
+    matches!(
+        lang.kind(last),
+        NodeKind::Return | NodeKind::Break | NodeKind::Throw | NodeKind::Continue
+    )
+}
+
+impl Rule<JavaAst> for StringSwitchRecover {
+    fn name(&self) -> &'static str {
+        "string_switch_recover"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Switch]
+    }
+    fn structural(&self) -> bool {
+        true
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let (parent, idx, ctx_root) = (ctx.parent(id)?, ctx.index(id)?, ctx.root());
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::Switch {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        if ch.len() < 2 {
+            return None;
+        }
+        // 选择器 x.hashCode()
+        let x = match lang.data(ch[0]) {
+            NodeData::Call { .. } => {
+                let cc = lang.children(ch[0]);
+                if cc.len() != 1 {
+                    return None;
+                }
+                match lang.data(cc[0]) {
+                    NodeData::Member { name } if name == "hashCode" => {
+                        let recv = *lang.children(cc[0]).first()?;
+                        if lang.kind(recv) != NodeKind::VarRef {
+                            return None;
+                        }
+                        lang.var_name(recv)?.to_string()
+                    }
+                    _ => return None,
+                }
+            }
+            _ => {
+                return None;
+            }
+        };
+        // 各 hash case：单整型标签 + [decl_e?, if(!guard) break else {v=K, switch(v)}]
+        struct CaseInfo {
+            lit: String,
+            k: i64,
+            inner_switch: JavaId,
+        }
+        let mut infos: Vec<CaseInfo> = Vec::new();
+        let mut v_name: Option<String> = None;
+        let mut v_nodes: Vec<JavaId> = Vec::new(); // v 的全部合法出现（供逃逸扫描）
+        let mut guard_nodes: Vec<JavaId> = Vec::new();
+        for &c in &ch[1..] {
+            let NodeData::Case { labels, is_default, .. } = lang.data(c) else {
+                return None;
+            };
+            let is_default = *is_default;
+            if is_default {
+                return None; // hash switch 不应有 default（无匹配由尾部处理）
+            }
+            if *labels != 1 {
+                return None;
+            }
+            let cc = lang.children(c);
+            let h = match lang.literal(cc[0])? {
+                LitRef::Int(v) | LitRef::Long(v) => v as i32,
+                _ => return None,
+            };
+            let body = cc[1..].to_vec();
+            // 单 Block 解包
+            let body = if body.len() == 1 && lang.kind(body[0]) == NodeKind::Block {
+                lang.children(body[0]).to_vec()
+            } else {
+                body
+            };
+            let mut rest = body;
+            // 可选物化 boolean
+            let mut _e_decl: Option<(String, JavaId)> = None;
+            if let Some(&first) = rest.first() {
+                if let NodeData::VarDecl { name, .. } = lang.data(first) {
+                    if let Some(&init) = lang.children(first).first() {
+                        if is_x_equals(lang, init, &x) {
+                            _e_decl = Some((name.clone(), first));
+                            rest = rest[1..].to_vec();
+                        }
+                    }
+                }
+            }
+            if rest.len() != 1 || lang.kind(rest[0]) != NodeKind::If {
+                return None;
+            }
+            let ifn = rest[0];
+            let ic = lang.children(ifn).to_vec();
+            if ic.len() != 3 {
+                return None;
+            }
+            // cond = !guard（guard = e 或 x.equals(L)）
+            let NodeData::Unary { op: UnOp::Not } = lang.data(ic[0]) else {
+                return None;
+            };
+            let guard = *lang.children(ic[0]).first()?;
+            let lit = match lang.data(guard) {
+                NodeData::VarRef { name } => {
+                    // 物化 boolean：其唯一定义须是 x.equals("L")
+                    let Some((en, decl)) = &_e_decl else {
+                        return None;
+                    };
+                    if name != en {
+                        return None;
+                    }
+                    let init = *lang.children(*decl).first()?;
+                    equals_lit(lang, init, &x)?
+                }
+                NodeData::Call { .. } => equals_lit(lang, guard, &x)?,
+                _ => return None,
+            };
+            guard_nodes.push(guard);
+            if let Some((_, decl)) = &_e_decl {
+                guard_nodes.push(*decl);
+            }
+            // then = break（无标签）
+            let then_ok = twr_stmts(lang, ic[1]).len() == 1
+                && matches!(lang.data(twr_stmts(lang, ic[1])[0]),
+                    NodeData::Break { label: None });
+            if !then_ok {
+                return None;
+            }
+            // els = [v = K, switch(v)] 或 [switch(K)]
+            let els = twr_stmts(lang, ic[2]);
+            let (k, inner_switch, assign_node) = match els.len() {
+                2 => {
+                    let assign_expr = unwrap_expr_stmt(lang, els[0]);
+                    let NodeData::Assign { op: None } = lang.data(assign_expr) else {
+                        return None;
+                    };
+                    let a_ch = lang.children(assign_expr);
+                    let vn = match lang.data(a_ch[0]) {
+                        NodeData::VarRef { name } => name.clone(),
+                        _ => return None,
+                    };
+                    let k = match lang.literal(a_ch[1])? {
+                        LitRef::Int(v) | LitRef::Long(v) => v,
+                        _ => return None,
+                    };
+                    if lang.kind(els[1]) != NodeKind::Switch {
+                        return None;
+                    }
+                    // switch 选择器须为 v
+                    let sel = *lang.children(els[1]).first()?;
+                    if lang.kind(sel) != NodeKind::VarRef
+                        || lang.var_name(sel) != Some(vn.as_str())
+                    {
+                        return None;
+                    }
+                    match &v_name {
+                        Some(v) if *v != vn => return None,
+                        _ => v_name = Some(vn),
+                    }
+                    (k, els[1], Some(els[0]))
+                }
+                1 => {
+                    if lang.kind(els[0]) != NodeKind::Switch {
+                        return None;
+                    }
+                    // 常量折叠后的形态：switch(K)
+                    let sel = *lang.children(els[0]).first()?;
+                    let k = match lang.literal(sel)? {
+                        LitRef::Int(v) | LitRef::Long(v) => v,
+                        _ => return None,
+                    };
+                    (k, els[0], None)
+                }
+                _ => return None,
+            };
+            if let Some(a) = assign_node {
+                v_nodes.push(a);
+            }
+            v_nodes.push(*lang.children(inner_switch).first()?);
+            // H ≡ hash(L)
+            let hlit: i32 = lit
+                .chars()
+                .fold(0i32, |acc, ch| acc.wrapping_mul(31).wrapping_add(ch as i32));
+            if hlit != h {
+                return None;
+            }
+            let _ = assign_node;
+            infos.push(CaseInfo {
+                lit,
+                k,
+                inner_switch,
+            });
+        }
+        if infos.is_empty() {
+            return None;
+        }
+        // 父块 + 尾部
+        if lang.kind(parent) != NodeKind::Block {
+            return None;
+        }
+        let pch = lang.children(parent).to_vec();
+        let mut k = idx + 1;
+        // 可选 v = -1
+        if k < pch.len() {
+            let texpr = unwrap_expr_stmt(lang, pch[k]);
+            if let NodeData::Assign { op: None } = lang.data(texpr) {
+                let a_ch = lang.children(texpr);
+                if a_ch.len() == 2
+                    && lang.kind(a_ch[0]) == NodeKind::VarRef
+                    && lang.var_name(a_ch[0]) == v_name.as_deref()
+                    && lang.literal(a_ch[1]) == Some(LitRef::Int(-1))
+                {
+                    v_nodes.push(pch[k]);
+                    k += 1;
+                }
+            }
+        }
+        if k >= pch.len() || lang.kind(pch[k]) != NodeKind::Switch {
+            return None;
+        }
+        let trailing = pch[k];
+        // 尾部选择器：VarRef v 或常量
+        let tsel = *lang.children(trailing).first()?;
+        match lang.data(tsel) {
+            NodeData::VarRef { name } if Some(name.as_str()) == v_name.as_deref() => {
+                v_nodes.push(tsel);
+            }
+            NodeData::Literal(Lit::Int(_)) | NodeData::Literal(Lit::Long(_)) => {}
+            _ => {
+                if lang.literal(tsel).is_none() {
+                    return None;
+                }
+            }
+        }
+        // 签名一致性：所有 inner switch + trailing 的**case 体**全同
+        //（选择器除外——尾部的 v 常被赋值传播折叠成字面量）
+        fn switch_cases_sig(lang: &JavaAst, sw: JavaId, out: &mut String) {
+            for &c in &lang.children(sw)[1..] {
+                subtree_sig(lang, c, out);
+            }
+        }
+        let mut sig0 = String::new();
+        switch_cases_sig(lang, infos[0].inner_switch, &mut sig0);
+        for info in &infos[1..] {
+            let mut sig = String::new();
+            switch_cases_sig(lang, info.inner_switch, &mut sig);
+            if sig != sig0 {
+                return None;
+            }
+        }
+        {
+            let mut sig = String::new();
+            switch_cases_sig(lang, trailing, &mut sig);
+            if sig != sig0 {
+                return None;
+            }
+        }
+        // 提取 body（用第一个 inner switch）
+        let bodies = ssw_bodies(lang, infos[0].inner_switch)?;
+        let mut body_map: std::collections::HashMap<i64, Vec<JavaId>> =
+            std::collections::HashMap::new();
+        let mut default_body: Option<Vec<JavaId>> = None;
+        for (lab, stmts) in &bodies {
+            match lab {
+                Some(v) => {
+                    body_map.insert(*v, stmts.clone());
+                }
+                None => default_body = Some(stmts.clone()),
+            }
+        }
+        let Some(default_body) = default_body else {
+            return None;
+        };
+        // 终止性
+        for stmts in body_map.values().chain(std::iter::once(&default_body)) {
+            if !ssw_body_terminal(lang, stmts) {
+                return None;
+            }
+        }
+        // v/e 逃逸扫描（v 的声明本身合法——索引变量；其引用全在消费子树内）
+        let root = ctx_root;
+        if let Some(vn) = &v_name {
+            let mut allowed: Vec<JavaId> = v_nodes.clone();
+            allowed.push(trailing);
+            if idx >= 1 {
+                let cand = pch[idx - 1];
+                if let NodeData::VarDecl { name, .. } = lang.data(cand) {
+                    if name == vn {
+                        allowed.push(cand);
+                        // 声明位置紧邻（ddc 形态）；隔开的声明仍拒绝
+                        if idx != 1 {
+                            allowed.pop();
+                        }
+                    }
+                }
+            }
+            if refs_escape(lang, root, vn, &allowed) {
+                return None;
+            }
+        }
+        // 构建 switch (x) { case "L": BODY_K; ... default: BODY_DEF }
+        let mut new_cases: Vec<JavaId> = Vec::new();
+        for info in &infos {
+            let Some(body) = body_map.get(&info.k) else {
+                return None;
+            };
+            let lab = lang.lit(Lit::Str(info.lit.clone()));
+            let case = lang.case_(vec![lab], false, false, body.clone());
+            new_cases.push(case);
+        }
+        let def_case = lang.case_(Vec::new(), true, false, default_body);
+        new_cases.push(def_case);
+        let sel = lang.var(&x);
+        let new_switch = lang.switch_(sel, new_cases);
+        // 消费 [hash switch, (v=-1)?, trailing switch]
+        let remove = k - idx + 1;
+        Some(Edit::Splice {
+            node: parent,
+            index: idx,
+            remove,
+            insert: vec![new_switch],
+        })
+    }
+}
+
+/// Call{x.equals("L")} → L
+fn equals_lit(lang: &JavaAst, e: JavaId, x: &str) -> Option<String> {
+    if lang.kind(e) != NodeKind::Call {
+        return None;
+    }
+    let cc = lang.children(e);
+    if cc.len() != 2 {
+        return None;
+    }
+    match lang.data(cc[0]) {
+        NodeData::Member { name } if name == "equals" => {
+            let recv = *lang.children(cc[0]).first()?;
+            if lang.kind(recv) != NodeKind::VarRef || lang.var_name(recv) != Some(x) {
+                return None;
+            }
+            match lang.literal(cc[1])? {
+                LitRef::Str(s) => Some(s.to_string()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_x_equals(lang: &JavaAst, e: JavaId, x: &str) -> bool {
+    lang.kind(e) == NodeKind::Call && equals_lit(lang, e, x).is_some()
+}
+
 // ---------------------------------------------------------------------------
 // 门面
 // ---------------------------------------------------------------------------
@@ -3104,6 +4023,8 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(CffRecover));
     rules.push(Box::new(StaticArrayIndexFold));
     rules.push(Box::new(ConstMethodInline));
+    rules.push(Box::new(TwrRecover));
+    rules.push(Box::new(StringSwitchRecover));
     rules
 }
 

@@ -2232,7 +2232,6 @@ impl Parser {
                         }
                         _ => break,
                     }
-                    break;
                 }
             }
             if self.at_punct("[") {

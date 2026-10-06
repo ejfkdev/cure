@@ -1639,3 +1639,330 @@ public class Adv6 {
 "#,
     );
 }
+
+#[test]
+fn twr_and_string_switch_recover_wave() {
+    // 还原能力波：TWR（ddc catch 内 close+尾部直调形态 / javac 源级
+    // primary+finally 卫语句形态 / 嵌套多资源）与字符串 switch（javac
+    // v7 索引二级 switch 形态——ddc 直出）。行为差分 + 形态断言。
+    // 边沿覆盖：body 异常+close 异常（addSuppressed 可观测）、close 单独
+    // 异常、null 资源（跳过 close——family A 卫语句形态）、hashCode 碰撞
+    // （"Aa"/"BB"——不还原的负控）、普通 int switch（不还原负控）。
+    differential(
+        "TwrSsw",
+        r#"import java.util.*;
+
+public class TwrSsw {
+    static class Res implements AutoCloseable {
+        final String name;
+        final List<String> log;
+        Res(String n, List<String> l) { name = n; log = l; }
+        public void close() {
+            log.add("close:" + name);
+            if (name.startsWith("C")) throw new IllegalStateException("close-fail:" + name);
+        }
+        void use() {
+            log.add("use:" + name);
+            if (name.startsWith("U")) throw new IllegalArgumentException("use-fail:" + name);
+        }
+    }
+
+    // ddc 形态（family B）：close 在 catch 内 + 尾部直调（资源为 new，可省卫语句）
+    static void one(String s, List<String> log) {
+        Res r = new Res(s, log);
+        try {
+            r.use();
+        } catch (Throwable t) {
+            try {
+                r.close();
+            } catch (Throwable sup) {
+                t.addSuppressed(sup);
+            }
+            throw t;
+        }
+        r.close();
+    }
+
+    // javac 源级形态（family A）：primary 局部 + finally 卫语句（含 null 资源路径）
+    static void oneA(String s, List<String> log) {
+        Res r = new Res(s, log);
+        Throwable primary = null;
+        try {
+            r.use();
+        } catch (Throwable t) {
+            primary = t;
+            throw t;
+        } finally {
+            if (r != null) {
+                if (primary != null) {
+                    try {
+                        r.close();
+                    } catch (Throwable sup) {
+                        primary.addSuppressed(sup);
+                    }
+                } else {
+                    r.close();
+                }
+            }
+        }
+    }
+
+    // family A 卫语句形态 + null 资源（close 必须被跳过）
+    static void nullRes(List<String> log) {
+        Res r = null;
+        Throwable primary = null;
+        try {
+            log.add("body-null-res");
+        } catch (Throwable t) {
+            primary = t;
+            throw t;
+        } finally {
+            if (r != null) {
+                if (primary != null) {
+                    try {
+                        r.close();
+                    } catch (Throwable sup) {
+                        primary.addSuppressed(sup);
+                    }
+                } else {
+                    r.close();
+                }
+            }
+        }
+        log.add("after-null-res");
+    }
+
+    // family A 嵌套双资源
+    static void twoA(String a, String b, List<String> log) {
+        Res ra = new Res(a, log);
+        Throwable pa = null;
+        try {
+            Res rb = new Res(b, log);
+            Throwable pb = null;
+            try {
+                ra.use();
+                rb.use();
+            } catch (Throwable t) {
+                pb = t;
+                throw t;
+            } finally {
+                if (rb != null) {
+                    if (pb != null) {
+                        try {
+                            rb.close();
+                        } catch (Throwable sup) {
+                            pb.addSuppressed(sup);
+                        }
+                    } else {
+                        rb.close();
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            pa = t;
+            throw t;
+        } finally {
+            if (ra != null) {
+                if (pa != null) {
+                    try {
+                        ra.close();
+                    } catch (Throwable sup) {
+                        pa.addSuppressed(sup);
+                    }
+                } else {
+                    ra.close();
+                }
+            }
+        }
+    }
+
+    // 字符串 switch：javac v7 索引形态（ddc 直出；物化 boolean + else 分支）
+    static String pick(List<String> log, String s) {
+        int v7 = 0;
+        switch (s.hashCode()) {
+            case 97: {
+                boolean equals = s.equals("a");
+                if (!equals) {
+                    break;
+                } else {
+                    v7 = 0;
+                    switch (v7) {
+                        case 0: log.add("hit-a"); return "alpha";
+                        case 1: return "tail";
+                        case 2: return "zzz";
+                        default: return "def";
+                    }
+                }
+            }
+            case 3088: {
+                boolean equals2 = s.equals("b2");
+                if (!equals2) {
+                    break;
+                } else {
+                    v7 = 1;
+                    switch (v7) {
+                        case 0: log.add("hit-a"); return "alpha";
+                        case 1: return "tail";
+                        case 2: return "zzz";
+                        default: return "def";
+                    }
+                }
+            }
+            case 2912: {
+                boolean equals3 = s.equals("Zz");
+                if (!equals3) {
+                    break;
+                } else {
+                    v7 = 2;
+                    switch (v7) {
+                        case 0: log.add("hit-a"); return "alpha";
+                        case 1: return "tail";
+                        case 2: return "zzz";
+                        default: return "def";
+                    }
+                }
+            }
+        }
+        v7 = -1;
+        switch (v7) {
+            case 0: log.add("hit-a"); return "alpha";
+            case 1: return "tail";
+            case 2: return "zzz";
+            default: return "def";
+        }
+    }
+
+    // 负控 1：普通 int switch 不动
+    static int plain(int x) {
+        switch (x) {
+            case 1: return 10;
+            case 2: return 20;
+            default: return -1;
+        }
+    }
+
+    // 负控 2：hashCode 碰撞对（"Aa"/"BB" 同 2112）——原源码本有双守卫，
+    // 单守卫形态还原不安全 → 整体不还原
+    static String collide(String s) {
+        int v7 = 0;
+        switch (s.hashCode()) {
+            case 2112: {
+                boolean eq1 = s.equals("Aa");
+                if (!eq1) {
+                    break;
+                } else {
+                    v7 = 0;
+                    switch (v7) {
+                        case 0: return "AA";
+                        default: return "def";
+                    }
+                }
+            }
+        }
+        v7 = -1;
+        switch (v7) {
+            case 0: return "AA";
+            default: return "def";
+        }
+    }
+
+    public static void main(String[] args) {
+        List<String> log = new ArrayList<>();
+        one("a", log);
+        try { one("Ub", log); } catch (Throwable e) { log.add("caught:" + e.getMessage() + " sup=" + e.getSuppressed().length); }
+        try { one("Ca", log); } catch (Throwable e) { log.add("caught:" + e.getMessage()); }
+        oneA("b", log);
+        try { oneA("Uc", log); } catch (Throwable e) { log.add("caughtA:" + e.getMessage() + " sup=" + e.getSuppressed().length); }
+        nullRes(log);
+        twoA("x", "y", log);
+        try { twoA("z", "Uw", log); } catch (Throwable e) { log.add("caught2:" + e.getMessage() + " sup=" + e.getSuppressed().length); }
+        System.out.println(String.join("|", log));
+        log.clear();
+        System.out.println(pick(log, "a") + "," + pick(log, "b2") + "," + pick(log, "Zz") + "," + pick(log, "q"));
+        System.out.println(String.join("|", log));
+        System.out.println(plain(1) + "," + plain(2) + "," + plain(9));
+        System.out.println(collide("Aa") + "," + collide("BB") + "," + collide("x"));
+    }
+}
+"#,
+    );
+
+    // 形态断言：还原后的惯用形态
+    let mut outcome = parse(r#"import java.util.*;
+class T2 {
+    static class Res implements AutoCloseable {
+        public void close() { }
+        void use() { }
+    }
+    // family B → try(res)
+    static void b(Res r0) {
+        Res r = new Res();
+        try {
+            r.use();
+        } catch (Throwable t) {
+            try {
+                r.close();
+            } catch (Throwable sup) {
+                t.addSuppressed(sup);
+            }
+            throw t;
+        }
+        r.close();
+    }
+    // family A → try(res)
+    static void a() {
+        Res r = new Res();
+        Throwable primary = null;
+        try {
+            r.use();
+        } catch (Throwable t) {
+            primary = t;
+            throw t;
+        } finally {
+            if (r != null) {
+                if (primary != null) {
+                    try {
+                        r.close();
+                    } catch (Throwable sup) {
+                        primary.addSuppressed(sup);
+                    }
+                } else {
+                    r.close();
+                }
+            }
+        }
+    }
+    // 字符串 switch → switch(s) 字符串标签
+    static String p(String s) {
+        int v7 = 0;
+        switch (s.hashCode()) {
+            case 97: {
+                boolean e = s.equals("a");
+                if (!e) {
+                    break;
+                } else {
+                    v7 = 5;
+                    switch (v7) {
+                        case 5: return "A";
+                        default: return "D";
+                    }
+                }
+            }
+        }
+        v7 = -1;
+        switch (v7) {
+            case 5: return "A";
+            default: return "D";
+        }
+    }
+}
+"#);
+    simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
+    let out = print_unit(&outcome.ast, &outcome.unit);
+    assert!(out.contains("try (Res r = new Res())"), "family B 未还原:\n{out}");
+    assert!(out.matches("try (Res").count() >= 2, "family A 未还原:\n{out}");
+    assert!(out.contains(r#"case "a":"#), "字符串 switch 未还原:\n{out}");
+    assert!(!out.contains("hashCode()"), "hashCode 选择器残留:\n{out}");
+    assert!(!out.contains("v7"), "v7 索引残留:\n{out}");
+    assert!(!out.contains("addSuppressed"), "抑制异常样板残留:\n{out}");
+}
