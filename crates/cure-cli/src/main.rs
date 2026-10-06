@@ -402,47 +402,52 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         return Ok(final_code_opts(r.changed, r.errored, &opts));
     }
 
-    // 多文件：多核并行（文件间完全独立；stderr 诊断按行原子性可接受）
+    // 多文件：多核并行（文件间完全独立；stderr 诊断按行原子性可接受）。
+    // 动态工作队列（AtomicUsize 取号）而非静态连续切片：真实目录里大文件
+    // 常聚集（fernflower bd.java 0.3s vs 小文件 1ms），连续切片会把多个
+    // 大文件堆进同一线程成为关键路径——3000 文件混合负载实测并行度仅
+    // 7.3×/18 核，改队列后取号即做、天然均衡。
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
         .min(jobs.len())
         .max(1);
-    let chunk = jobs.len().div_ceil(n_threads);
-    let owned: Vec<Vec<(PathBuf, Option<PathBuf>, String)>> =
-        jobs.chunks(chunk).map(|c| c.to_vec()).collect();
     let opts2 = opts.clone();
-    let results: Vec<Result<Vec<FileResult>, String>> = std::thread::scope(|s| {
-        let handles: Vec<_> = owned
-            .into_iter()
-            .map(|c| {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let shared: Vec<(&PathBuf, &Option<PathBuf>, &str)> =
+        jobs.iter().map(|(p, o, d)| (p, o, d.as_str())).collect();
+    let results: Vec<Result<Vec<(usize, FileResult)>, String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..n_threads)
+            .map(|_| {
                 let opts = opts2.clone();
+                let next = &next;
+                let shared = &shared;
                 s.spawn(move || {
-                    let mut out = Vec::new();
-                    for (path, out_path, display) in c {
+                    let mut my: Vec<(usize, FileResult)> = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&(path, out_path, display)) = shared.get(i) else {
+                            break;
+                        };
                         let display = if display.is_empty() {
                             path.display().to_string()
                         } else {
-                            display
+                            display.to_string()
                         };
                         // 非 UTF-8（ISO-8859-1/Cp1252 等编码测试文件）或读失败：
                         // 告警跳过而非中止整个目录运行（spoon/javaparser 语料
                         // 各含一个编码测试文件——曾让 5000+ 文件的运行整体失败）
-                        let src = match fs::read_to_string(&path) {
+                        let src = match fs::read_to_string(path) {
                             Ok(s) => s,
                             Err(e) => {
-                                eprintln!(
-                                    "cure: 读取 {} 失败（跳过）: {}",
-                                    path.display(),
-                                    e
-                                );
+                                eprintln!("cure: 读取 {} 失败（跳过）: {}", path.display(), e);
                                 continue;
                             }
                         };
-                        let r = process_source(&src, &opts, out_path, &display)?;
-                        out.push(r);
+                        let r = process_source(&src, &opts, out_path.clone(), &display)?;
+                        my.push((i, r));
                     }
-                    Ok(out)
+                    Ok(my)
                 })
             })
             .collect();
@@ -451,10 +456,13 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             .map(|h| h.join().expect("cure 线程 panic"))
             .collect()
     });
-    let mut all: Vec<FileResult> = Vec::new();
+    // 结果按文件原始顺序稳定输出（诊断/统计确定性）
+    let mut all: Vec<(usize, FileResult)> = Vec::new();
     for r in results {
         all.extend(r?);
     }
+    all.sort_by_key(|(i, _)| *i);
+    let mut all: Vec<FileResult> = all.into_iter().map(|(_, r)| r).collect();
 
     // --copy-other：非源文件原样拷贝
     for (src, dst) in copy_jobs {

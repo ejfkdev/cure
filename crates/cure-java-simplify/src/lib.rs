@@ -3139,9 +3139,14 @@ pub fn simplify_unit(ast: &mut JavaAst, unit: &mut CompilationUnit, cfg: &Config
         }
         total.edits += round.edits;
         total.iterations += round.iterations;
+        total.discarded += round.discarded;
         for (k, v) in round.by_rule {
             *total.by_rule.entry(k).or_insert(0) += v;
         }
+        // 注：确认轮不可省——mega 实测驳回过"零丢弃即不动点"短路：跨轮
+        // 编辑的主来源是 collect 表过期（内联/折叠后新常量/新单 return 方法
+        // 涌现，重建表后才可见），非引擎丢弃提案的复活。RSS +2-3MB 是
+        // 收敛正确性的价格。
         if round.edits == 0 {
             break;
         }

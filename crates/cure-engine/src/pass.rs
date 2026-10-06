@@ -41,6 +41,9 @@ pub struct Report {
     pub edits: usize,
     /// fixed-point 扫描轮数。
     pub iterations: usize,
+    /// 被校验拒绝丢弃的结构提案数（这些提案需新鲜 walk 复活——外层
+    /// 收敛循环据此判断是否还有下一轮的必要）。
+    pub discarded: usize,
     /// 按规则名统计的编辑数。
     pub by_rule: BTreeMap<&'static str, usize>,
 }
@@ -249,6 +252,8 @@ pub fn simplify<L: Lang>(
                     *report.by_rule.entry(q.rule).or_insert(0) += 1;
                     report.edits += 1;
                     applied = true;
+                } else {
+                    report.discarded += 1;
                 }
             }
         }

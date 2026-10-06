@@ -32,64 +32,94 @@ pub struct ParseOutcome {
 /// 偶数个反斜杠才合法）。必须发生在词法**之前**——`'\u005c''` 只有先解码
 /// 成 `'\''` 才能正确切词（javaparser EscapeSequences 抓获：逐 token 处理
 /// 会把尾随 `'` 切进垃圾字符字面量 → 风暴）。解码语义与 javac 一致。
-fn preprocess_unicode_escapes(src: &str) -> String {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
+/// 字节级扫描（`\`/`u`/hex 均 ASCII，UTF-8 多字节 ≥0x80 永不误匹配）；
+/// 无合法逃逸时零拷贝借用（绝大多数文件）——曾每文件 Vec<char>(4B/char)
+/// + String 双分配，语料 5596 文件全量多付出 ~GB 级瞬时流量。
+fn preprocess_unicode_escapes(src: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let b = src.as_bytes();
     let mut i = 0usize;
-    while i < chars.len() {
-        let c = chars[i];
-        if c != '\\' {
-            out.push(c);
+    // 阶段 1：是否存在合法逃逸（快路径扫描，无分配）
+    while i < b.len() {
+        if b[i] != b'\\' {
             i += 1;
             continue;
         }
-        // 反斜杠连串
         let run_start = i;
         let mut j = i;
-        while j < chars.len() && chars[j] == '\\' {
+        while j < b.len() && b[j] == b'\\' {
             j += 1;
         }
         let run = j - run_start;
-        // 合法性：run 为奇数（最后的 \ 前有偶数个 \）且后随 u+ 4 hex
         let mut k = j;
-        let mut u_count = 0usize;
-        while k < chars.len() && chars[k] == 'u' {
-            u_count += 1;
+        while k < b.len() && b[k] == b'u' {
             k += 1;
         }
+        let u_count = k - j;
         let eligible = run % 2 == 1
             && u_count >= 1
-            && k + 4 <= chars.len()
-            && chars[k..k + 4]
-                .iter()
-                .all(|c| c.is_ascii_hexdigit());
+            && k + 4 <= b.len()
+            && b[k..k + 4].iter().all(|c| c.is_ascii_hexdigit());
         if eligible {
-            let hex: String = chars[k..k + 4].iter().collect();
-            let decoded = u32::from_str_radix(&hex, 16)
-                .map(|n| char::from_u32(n).unwrap_or('\u{fffd}'))
+            return Cow::Owned(build_decoded(src, b, run_start));
+        }
+        if u_count > 0 && run % 2 == 1 {
+            i = k;
+        } else {
+            i = j;
+        }
+    }
+    Cow::Borrowed(src)
+}
+
+/// 从首个逃逸位置重建解码文本（逃逸均为 ASCII 边界，区间切片合法 UTF-8）。
+/// 拷贝游标 copy：逃逸之间的普通文本靠 push_str(src[copy..逃逸起点]) 补
+/// ——曾漏掉该区段（只有逃逸自身进 out → 尾部全丢，formfeed 回归测试
+/// 抓获：`" \u000C"` 解码后连收尾引号都消失 → unterminated string）。
+fn build_decoded(src: &str, b: &[u8], first: usize) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut copy = 0usize;
+    let mut i = first;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        let mut j = i;
+        while j < b.len() && b[j] == b'\\' {
+            j += 1;
+        }
+        let run = j - run_start;
+        let mut k = j;
+        while k < b.len() && b[k] == b'u' {
+            k += 1;
+        }
+        let u_count = k - j;
+        let eligible = run % 2 == 1
+            && u_count >= 1
+            && k + 4 <= b.len()
+            && b[k..k + 4].iter().all(|c| c.is_ascii_hexdigit());
+        if eligible {
+            let hex = &src[k..k + 4];
+            let decoded = u32::from_str_radix(hex, 16)
+                .ok()
+                .and_then(char::from_u32)
                 .unwrap_or('\u{fffd}');
+            out.push_str(&src[copy..run_start]); // 逃逸前的原文
             // 前 run-1 个 \ 原样保留（\ 对 = 转义反斜杠），\uXXXX → 解码字符
             for _ in 0..run - 1 {
                 out.push('\\');
             }
             out.push(decoded);
+            copy = k + 4;
             i = k + 4;
         } else {
-            // 不合法（或非 \u 形态）：整段原样
-            for idx in run_start..j {
-                out.push(chars[idx]);
-            }
-            if u_count > 0 && run % 2 == 1 {
-                // 奇数 \ + u 但 hex 不全：保留 \u 原文，从 u 处继续
-                for _ in 0..u_count {
-                    out.push('u');
-                }
-                i = k;
-            } else {
-                i = j;
-            }
+            // 不合法（或非 \u 形态）：原样区段（由下一逃逸或尾部 push 补）
+            i = if u_count > 0 && run % 2 == 1 { k } else { j };
         }
     }
+    out.push_str(&src[copy..]);
     out
 }
 
@@ -98,12 +128,12 @@ pub fn parse(src: &str) -> ParseOutcome {
     // JLS 3.3：\uXXXX 预解码（词法之前）——token 偏移与 text_of 均基于
     // 解码后的文本
     let decoded = preprocess_unicode_escapes(src);
-    let src: &str = &decoded;
-    let (tokens, lex_errs) = lex(src);
+    let (tokens, lex_errs) = lex(decoded.as_ref());
+    // Borrowed→一次拷贝（与无预处理时代相同）；Owned→直接移入（解码即终值）
     let mut p = Parser {
         t: tokens,
         pos: 0,
-        src: src.to_string(),
+        src: decoded.into_owned(),
         errs: Vec::new(),
         ast: JavaAst::new(),
         in_case_label: false,
@@ -393,20 +423,23 @@ impl Parser {
                     }
                     self.bump();
                 }
-                self.eat(";");
-                let text = self.text_of(
-                    self.t[1.min(self.t.len() - 1)].start,
-                    self.tok().start,
-                );
-                // 重新截取：从 package 关键字之后到 ;
-                let after = self.text_of(start, self.tok().start);
+                // 包名文本区间终点：**在吃 ; 之前**取（曾吃过再取下一 token
+                // 起点 → ';' 落进区间并入包名 → 输出双分号，基线 diff 抓获）
+                let after_end = if self.at_punct(";") {
+                    let e = self.tok().start;
+                    self.bump();
+                    e
+                } else {
+                    self.t[self.pos - 1].end
+                };
+                let after = self.text_of(start, after_end);
                 let pkg = after
                     .trim()
                     .trim_start_matches("package")
                     .trim()
                     .to_string();
                 unit.package = Some(pkg);
-                let _ = text;
+                // 换行退出后仍可能跟悬空分号
                 self.eat(";");
                 continue;
             }
