@@ -1375,6 +1375,45 @@ impl<L: Lang> Rule<L> for DeadStore {
 // 语义安全（永不执行），但属于 DCE 范畴——**默认不启用**，经 all_rules() 选配。
 // ---------------------------------------------------------------------------
 
+/// 块展平：Block 的直接孩子是 Block 且**内层无任何声明**（VarDecl/
+/// ForEach/Catch 绑定引入作用域）→ 内层语句上提。典型形态：try 剥壳、
+/// CFF 还原后的裸嵌套块。无声明 ⇒ 无遮蔽 ⇒ 语义等价。
+pub struct BlockFlatten;
+
+impl<L: Lang> Rule<L> for BlockFlatten {
+    fn name(&self) -> &'static str {
+        "block_flatten"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Block]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk } = ctx;
+        let parent = walk.parent(id)?;
+        if lang.kind(parent) != NodeKind::Block {
+            return None;
+        }
+        // 内层不得有任何声明（作用域引入）
+        let inner = lang.children(id).to_vec();
+        let declares = |n: L::Id| -> bool {
+            matches!(
+                lang.kind(n),
+                NodeKind::VarDecl | NodeKind::ForEach | NodeKind::Catch
+            )
+        };
+        if inner.iter().any(|&s| declares(s)) {
+            return None;
+        }
+        let idx = walk.index(id)?;
+        Some(Edit::Splice {
+            node: parent,
+            index: idx,
+            remove: 1,
+            insert: inner,
+        })
+    }
+}
+
 pub struct UnreachableAfterTerminal;
 
 impl<L: Lang> Rule<L> for UnreachableAfterTerminal {
@@ -2567,6 +2606,7 @@ fn is_literal<L: Lang>(lang: &L, n: L::Id) -> bool {
 /// 默认规则（保守集：不做 DCE 类清理）。
 pub fn default_rules<L: Lang>() -> Vec<Box<dyn Rule<L>>> {
     vec![
+        Box::new(BlockFlatten),
         Box::new(ParenRemoval),
         Box::new(ConstCondition),
         Box::new(BooleanReturn),

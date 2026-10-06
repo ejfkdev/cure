@@ -764,3 +764,63 @@ public class DeadW {
 "#,
     );
 }
+
+#[test]
+fn deobfuscation_capability_wave() {
+    // 本轮新增的还原形态：ZKM/Allatori char 数组藏匿、intern 恒等、
+    // dex2jar 空 finally、StringBuilder 容量构造解锁——行为差分 + 形态断言。
+    differential(
+        "CapW",
+        r#"
+public class CapW {
+    static int mark = 0;
+    static int bump() { mark++; return mark; }
+    public static void main(String[] args) {
+        // ZKM/Allatori：new String(char 字面量数组)
+        System.out.println(new String(new char[]{'h', 'e', 'l', 'l', 'o'}));
+        // intern 恒等（JLS：字面量编译期驻留）
+        System.out.println("abc".intern());
+        System.out.println("abc".intern() == "abc");
+        // dex2jar：空 finally 剥壳 + try 解包 + 块展平
+        try {
+            System.out.println(bump());
+        } finally {
+        }
+        // 有 catch：只剥空 finally，try/catch 保留（异常必须仍被吞/处理）
+        try {
+            System.out.println(bump());
+        } catch (RuntimeException e) {
+            System.out.println("caught");
+        } finally {
+        }
+        // StringBuilder 容量字面量构造（容量只是分配提示）
+        System.out.println(new StringBuilder(16).append("cap").append(42).toString());
+        // 作用域安全：内层块有声明（遮蔽）→ 不展平
+        int x = 1;
+        {
+            int x2 = x + 1;
+            System.out.println(x2);
+        }
+        System.out.println(x);
+        System.out.println(mark);
+    }
+}
+"#,
+    );
+    // 形态断言
+    let mut outcome = parse(r#"
+public class CapW2 {
+    String s() { return new String(new char[]{'h', 'i'}); }
+    String i() { return "x".intern(); }
+    void t() { try { foo(); } finally { } }
+    String c() { return new StringBuilder(32).append("a").toString(); }
+}
+"#);
+    simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
+    let out = print_unit(&outcome.ast, &outcome.unit);
+    assert!(out.contains(r#"return "hi";"#), "{out}");
+    assert!(out.contains(r#"return "x";"#), "{out}");
+    assert!(out.contains("foo();"), "{out}");
+    assert!(!out.contains("finally"), "{out}");
+    assert!(out.contains(r#"return "a";"#), "{out}");
+}

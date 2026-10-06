@@ -153,16 +153,23 @@ impl Rule<JavaAst> for StringBuilderFold {
                     match args.len() {
                         0 => {} // new StringBuilder()
                         1 => {
-                            // 仅 String 内容构造可折叠；int 字面量是容量构造
+                            // String 内容构造参与拼接；int/long 字面量必为
+                            // 容量构造（无接收 int 的内容重载）——容量只是
+                            // 分配提示，无语义差异，按无参处理；变量实参
+                            // 类型不可证，保守拒绝
                             let a = args[0];
                             let stringy = matches!(lang.literal(a), Some(LitRef::Str(_)))
                                 || lang
                                     .var_type(a)
                                     .is_some_and(|t| matches!(t, JType::Ref(n) if n == "String"));
-                            if !stringy {
+                            if stringy {
+                                parts.push(a);
+                            } else if !matches!(
+                                lang.literal(a),
+                                Some(LitRef::Int(_) | LitRef::Long(_))
+                            ) {
                                 return None;
                             }
-                            parts.push(a);
                         }
                         _ => return None,
                     }
@@ -577,6 +584,168 @@ impl Rule<JavaAst> for NewStringFold {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// new String(char 字面量数组) → 字符串字面量（ZKM/Allatori 的字符串藏匿形态）。
+// 守卫与 new String(lit) 相同：产出池化字面量改变 == 引用语义。
+// ---------------------------------------------------------------------------
+
+pub struct NewStringCharArrayFold;
+
+impl Rule<JavaAst> for NewStringCharArrayFold {
+    fn name(&self) -> &'static str {
+        "new_string_char_array_fold"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::New]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let root = ctx.root();
+        let lang = ctx.lang;
+        let NodeData::New { ty, .. } = lang.data(id) else {
+            return None;
+        };
+        if !matches!(ty, JType::Ref(n) if n == "String" || n.ends_with(".String")) {
+            return None;
+        }
+        if lang.has_string_identity_compare(root) {
+            return None;
+        }
+        // 唯一实参：new char[]{...}（NewArray sized=0，唯一孩子 ArrayLit）
+        let args = lang.children(id).to_vec();
+        if args.len() != 1 {
+            return None;
+        }
+        let NodeData::NewArray { sized, .. } = lang.data(args[0]) else {
+            return None;
+        };
+        if *sized != 0 {
+            return None;
+        }
+        let arr_children = lang.children(args[0]).to_vec();
+        let lit = *arr_children.first()?;
+        if lang.kind(lit) != NodeKind::ArrayLit {
+            return None;
+        }
+        let mut text = String::new();
+        for &c in lang.children(lit) {
+            match lang.literal(c) {
+                Some(LitRef::Char(ch)) => text.push(ch),
+                _ => return None, // 非字符字面量（变量/表达式）不折
+            }
+        }
+        let with = lang.build_str(&text);
+        Some(Edit::Replace {
+            target: id,
+            with,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 空 finally 剥除（dex2jar/ProGuard 产物）：
+//   try { B } finally {}（无 catch、无资源）→ B
+//   try { B } catch… finally {} → try { B } catch…（空 finally 删除）
+// 语义：空 finally 无可观察行为；有 catch 时保留 try/catch 结构。
+// ---------------------------------------------------------------------------
+
+pub struct EmptyFinallyStrip;
+
+impl Rule<JavaAst> for EmptyFinallyStrip {
+    fn name(&self) -> &'static str {
+        "empty_finally_strip"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Try]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::Try {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        // children: [resource…, try_block, catch…, (finally)?]
+        // 结构：resource 数由遍历确定（Try 的资源是语句节点）——保守取
+        // 确定性布局：找 finally（最后一个孩子若是空 Block 且孩子数≥2）。
+        if ch.len() < 2 {
+            return None;
+        }
+        let finally = *ch.last()?;
+        // 资源存在时最后一个孩子不一定是 finally——只有它为空 Block 才动它，
+        // 而空 Block 作为 try_block/catch 的概率也有 → 用孩子数区分：
+        // [resources…, try_block, (catch…)?, (finally)?] —— 无 catch 时
+        // ch = [res…, try, finally?]；有 catch 时 finally 仍是最后。
+        // 空资源本身也是空 Block —— 通过"倒数第二也存在"与语义组合判定。
+        let is_empty_block = |n: JavaId| -> bool {
+            lang.kind(n) == NodeKind::Block && lang.children(n).is_empty()
+        };
+        if !is_empty_block(finally) {
+            return None;
+        }
+        // try_block = finally 之前的最近一个非 catch…：布局里 finally 前是
+        // 最后一个 catch 或 try_block。保守：剥除空 finally（保留其余结构）。
+        // Splice 删最后一个孩子。
+        Some(Edit::Splice {
+            node: id,
+            index: ch.len() - 1,
+            remove: 1,
+            insert: Vec::new(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 无 catch + 无资源 + 空/无 finally → 完全解包 try：
+//   try { B } finally {} / try { B } → B
+// ---------------------------------------------------------------------------
+
+pub struct TryUnwrapNoCatch;
+
+impl Rule<JavaAst> for TryUnwrapNoCatch {
+    fn name(&self) -> &'static str {
+        "try_unwrap_no_catch"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Try]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::Try {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        if ch.is_empty() {
+            return None;
+        }
+        // 布局 [resource…, try_block, catch…, (finally)?]：
+        // catch 节点识别（NodeData::Catch）；资源是语句节点（VarDecl/ExprStmt）。
+        let has_catch = ch.iter().any(|&c| lang.kind(c) == NodeKind::Catch);
+        if has_catch {
+            return None;
+        }
+        // 资源识别：try 块之前、非 try-block 的孩子数 —— 保守做法：
+        // try_block = 第一个 Block 孩子（资源不会是 Block）；其后的孩子
+        // 只能是 finally（无 catch）。
+        let try_block = *ch.iter().find(|&&c| lang.kind(c) == NodeKind::Block)?;
+        let rest: Vec<JavaId> = ch
+            .iter()
+            .copied()
+            .filter(|&c| c != try_block)
+            .collect();
+        // 其余（资源 + finally）必须全部为空 Block（即无 finally 或空 finally）
+        // 且无资源语句。
+        for &r in &rest {
+            let is_empty_block = lang.kind(r) == NodeKind::Block && lang.children(r).is_empty();
+            if !is_empty_block {
+                return None; // 有资源或非空 finally
+            }
+        }
+        Some(Edit::Replace {
+            target: id,
+            with: try_block,
+        })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 循环头断路还原（jadx/反编译器高频形态）：
@@ -1133,10 +1302,17 @@ impl Rule<JavaAst> for StringBuilderStatements {
                             || lang
                                 .var_type(a)
                                 .is_some_and(|t| matches!(t, JType::Ref(n) if n == "String"));
-                        if !stringy {
-                            return None; // 容量构造
+                        if stringy {
+                            (Some(a), ic[1])
+                        } else if matches!(
+                            lang.literal(a),
+                            Some(LitRef::Int(_) | LitRef::Long(_))
+                        ) {
+                            // int/long 字面量必为容量构造——无语义差异
+                            (None, ic[1])
+                        } else {
+                            return None; // 变量实参类型不可证
                         }
-                        (Some(a), ic[1])
                     }
                     _ => return None,
                 }
@@ -1665,6 +1841,8 @@ fn eval_str_method(s: &str, method: &str, args: &[Lit]) -> Option<Lit> {
     let n = chars.len() as i64;
     Some(match (method, args) {
         ("isEmpty", []) => Lit::Bool(s.is_empty()),
+        // JLS：字面量编译期即驻留池——"lit".intern() ≡ "lit"（同引用）
+        ("intern", []) => Lit::Str(s.to_string()),
         ("trim", []) => Lit::Str(s.trim_matches(|c: char| c <= ' ').to_string()),
         ("concat", [Lit::Str(b)]) => Lit::Str(format!("{s}{b}")),
         ("startsWith", [Lit::Str(p)]) => Lit::Bool(s.starts_with(p.as_str())),
@@ -2884,6 +3062,9 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(BoxUnboxChain));
     rules.push(Box::new(IteratorToForEach));
     rules.push(Box::new(NewStringFold));
+    rules.push(Box::new(NewStringCharArrayFold));
+    rules.push(Box::new(EmptyFinallyStrip));
+    rules.push(Box::new(TryUnwrapNoCatch));
     rules.push(Box::new(LoopHeadBreak));
     rules.push(Box::new(WhileIteratorToForEach));
     rules.push(Box::new(ConcatValueOfDrop));
