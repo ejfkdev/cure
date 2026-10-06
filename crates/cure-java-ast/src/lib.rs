@@ -1023,10 +1023,22 @@ impl Lang for JavaAst {
         }
         // 守卫缓存失效：树已变
         self.string_identity.set(None);
-        // 区域事件索引重建：语句级节点（Block 的孩子）各得一份子树事件序列
-        self.region_events.clear();
-        self.region_events.resize(self.nodes.len(), Vec::new());
-        self.build_region_index(root);
+        // 区域事件索引【脏式重建】：只重建空条目（被 invalidate_effect
+        // 失效的，或新语句）。未失效条目的事件是子树局部的——与位置无关，
+        // 搬移不改变内容；clear() 保留内层 Vec 容量（免每 pass 30k 次分配）。
+        // 队列编辑在应用后沿祖先失效（见 pass.rs），保证脏集完备。
+        // B1：逐条 clear 保容量（免每 pass 数万次 Vec 分配）；全量重建
+        if self.region_events.len() < self.nodes.len() {
+            self.region_events.resize(self.nodes.len(), Vec::new());
+        } else {
+            for v in &mut self.region_events {
+                v.clear();
+            }
+        }
+        for sr in self.build_region_index(root) {
+            let events = self.collect_region_events(sr);
+            self.region_events[sr.0 as usize] = events;
+        }
         // ---- 效果表 ----
         // 正常情况一轮升序扫描即可（children index < parent index 的
         // 解析器不变量）。但 Edit::Replace 注入的新节点 append 在 arena
@@ -1250,7 +1262,7 @@ impl JavaAst {
         k
     }
 
-    fn build_region_index(&mut self, root: JavaId) {
+    fn build_region_index(&mut self, root: JavaId) -> Vec<JavaId> {
         // 语句级节点 = Block 的直接孩子（规则只对这些调用 scan_region）。
         // 遍历整树，遇到 Block 就为其每个孩子收集事件。
         let mut stack = vec![root];
@@ -1265,16 +1277,17 @@ impl JavaAst {
                 stack.push(c);
             }
         }
-        for sr in stmt_roots {
-            let events = self.collect_region_events(sr);
-            self.region_events[sr.0 as usize] = events;
-        }
+        stmt_roots
     }
 
-    /// 收集 `node` 子树的事件序列（顺序语义见模块注释；键取 node_key 预存）。
+    /// 收集 `node` 子树的事件序列（顺序语义见模块注释；键取 node_key 预存），
+    /// **按键稳定排序**：同键内保持遍历序（scan_region 只消费键内序——
+    /// Use 的顺序、Write/Shadow 的命中，跨键顺序无关），查询侧可二分
+    /// 定位键区间、跳过全部非匹配事件。
     fn collect_region_events(&self, node: JavaId) -> Vec<RegionEvent<JavaId, u32>> {
         let mut out = Vec::new();
         self.collect_events_into(node, &mut out);
+        out.sort_by_key(|e| e.key);
         out
     }
 

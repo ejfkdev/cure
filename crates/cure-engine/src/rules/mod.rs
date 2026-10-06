@@ -671,27 +671,37 @@ impl<L: Lang> Watch<L> {
 
 /// 扫描一个语句子树：主名字的**读**、兴趣名字的**写命中**、同名声明遮蔽。
 fn scan_region<L: Lang>(lang: &L, node: L::Id, w: &mut Watch<L>) {
-    // 使用索引快路径：prepare 预计算的子树事件序列（遍历序与下方递归
-    // 完全一致），按 Watch 过滤——O(事件数)、键为整数等值比较、零分配。
+    // 使用索引快路径：事件序列按 NameKey 稳定排序——二分定位键区间，
+    // 只遍历匹配键的事件（同键内序=遍历序，语义与全量过滤严格一致；
+    // 非匹配事件 90%+ 直接跳过）。
     if let Some(events) = lang.region_events(node) {
-        for e in events {
+        // 主名字区间：Use 收集 + Shadow 命中 + Write 命中（name 可能在 watch 里）
+        let lo = events.partition_point(|e| e.key < w.name);
+        let hi = events.partition_point(|e| e.key <= w.name);
+        for e in &events[lo..hi] {
             match e.kind {
-                crate::kind::EventKind::Use => {
-                    if e.key == w.name {
-                        w.uses.push(e.node);
-                    }
-                }
+                crate::kind::EventKind::Use => w.uses.push(e.node),
+                crate::kind::EventKind::Shadow => w.shadowed = true,
                 crate::kind::EventKind::Write => {
                     for (wn, hit) in w.watch.iter().zip(w.writes_hit.iter_mut()) {
-                        if *wn == e.key {
+                        if *wn == w.name {
                             *hit = true;
                         }
                     }
                 }
-                crate::kind::EventKind::Shadow => {
-                    if e.key == w.name {
-                        w.shadowed = true;
-                    }
+            }
+        }
+        // 其余 watch 键区间：只找 Write
+        for (i, wk) in w.watch.iter().enumerate() {
+            if *wk == w.name {
+                continue; // 已随主名字区间处理
+            }
+            let lo = events.partition_point(|e| e.key < *wk);
+            let hi = events.partition_point(|e| e.key <= *wk);
+            for e in &events[lo..hi] {
+                if e.kind == crate::kind::EventKind::Write {
+                    w.writes_hit[i] = true;
+                    break; // 区间内任一 Write 即命中
                 }
             }
         }

@@ -17,7 +17,7 @@ pub trait Lang {
     type Id: Copy + Eq + Hash + Ord + Debug;
     /// 名字等价类句柄（Java：u32 intern id）。区域扫描的全部名字比较
     /// 走它——语言侧应保证同名字同键、比较为整数等值（无字符串 memcmp）。
-    type NameKey: Copy + Eq + Debug;
+    type NameKey: Copy + Eq + Ord + Debug;
     /// 节点在语言 arena 中的稠密下标（供引擎位图/数组索引）。
     fn node_index(&self, id: Self::Id) -> usize;
 
