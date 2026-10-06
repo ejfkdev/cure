@@ -665,26 +665,28 @@ impl Rule<JavaAst> for EmptyFinallyStrip {
         }
         let ch = lang.children(id).to_vec();
         // children: [resource…, try_block, catch…, (finally)?]
-        // 结构：resource 数由遍历确定（Try 的资源是语句节点）——保守取
-        // 确定性布局：找 finally（最后一个孩子若是空 Block 且孩子数≥2）。
-        if ch.len() < 2 {
-            return None;
-        }
-        let finally = *ch.last()?;
-        // 资源存在时最后一个孩子不一定是 finally——只有它为空 Block 才动它，
-        // 而空 Block 作为 try_block/catch 的概率也有 → 用孩子数区分：
-        // [resources…, try_block, (catch…)?, (finally)?] —— 无 catch 时
-        // ch = [res…, try, finally?]；有 catch 时 finally 仍是最后。
-        // 空资源本身也是空 Block —— 通过"倒数第二也存在"与语义组合判定。
+        // 【关键】try_block = 第一个 Block 孩子；finally 只能是 try_block 与
+        // catch 之后的最后孩子。**try_block 本身绝不在此删**（空 try 块交给
+        // TryUnwrapNoCatch 整体解包）——曾经"last 为空块就删"会把空 try_block
+        // 误当 finally 剥掉，try-with-resources 的资源直接暴露在 try 头外
+        //（spoon sniperPrinter 真实语料抓获）。
         let is_empty_block = |n: JavaId| -> bool {
             lang.kind(n) == NodeKind::Block && lang.children(n).is_empty()
         };
-        if !is_empty_block(finally) {
+        let try_idx = ch.iter().position(|&c| lang.kind(c) == NodeKind::Block)?;
+        if ch.len() < try_idx + 2 {
+            return None; // try_block 后没有孩子（无 finally）
+        }
+        // finally 存在性：最后孩子在 try_idx 之后且不是 catch
+        let last = *ch.last()?;
+        if lang.kind(last) == NodeKind::Catch {
             return None;
         }
-        // try_block = finally 之前的最近一个非 catch…：布局里 finally 前是
-        // 最后一个 catch 或 try_block。保守：剥除空 finally（保留其余结构）。
-        // Splice 删最后一个孩子。
+        if !is_empty_block(last) {
+            return None;
+        }
+        // last 距 try_idx 至少隔 1（try_idx 本身不可是 last——上面已保证
+        // ch.len() ≥ try_idx+2，但 last 也可能是紧随 try_block 的 catch 后的 finally）
         Some(Edit::Splice {
             node: id,
             index: ch.len() - 1,
@@ -2862,7 +2864,15 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
                 let ch = ast.children(*b).to_vec();
                 if ch.len() == 1 && ast.kind(ch[0]) == NodeKind::Return {
                     if let Some(&expr) = ast.children(ch[0]).first() {
-                        if params.len() <= 3 && !subtree_calls_self(&ast, expr, name) {
+                        if params.len() <= 3
+                            && !subtree_calls_self(&ast, expr, name)
+                            // 类型敏感守卫：字面量替换会改变形参位置的静态类型
+                            // （switch 模式选择器 / instanceof 被测式 / Raw 不
+                            // 可见构造）——`match(42)` 内联成 switch(42) 遭
+                            // javac 拒绝（Adv6 差分抓获）。混淆 helper（纯算
+                            // 术/字符串体）不受影响。
+                            && !subtree_has_type_sensitive(&ast, expr)
+                        {
                             let ps: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
                             if ast.inline_methods.contains_key(name) {
                                 ast.inline_methods.remove(name);
@@ -2890,6 +2900,23 @@ fn is_const_init(ast: &JavaAst, init: JavaId) -> bool {
         }
         _ => false,
     }
+}
+
+/// 子树含类型敏感构造（switch / instanceof / Raw）：字面量替换形参
+/// 会改变这些位置的静态类型 → 编译器拒绝（`match(42)` → `switch(42)`
+/// 遭 javac 否决，Adv6 差分抓获）。这类方法不进内联候选。
+fn subtree_has_type_sensitive(ast: &JavaAst, root: JavaId) -> bool {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        match ast.kind(n) {
+            NodeKind::Switch | NodeKind::InstanceOf | NodeKind::Raw => return true,
+            _ => {}
+        }
+        for &c in ast.children(n) {
+            stack.push(c);
+        }
+    }
+    false
 }
 
 fn subtree_calls_self(ast: &JavaAst, root: JavaId, name: &str) -> bool {
@@ -3096,13 +3123,28 @@ pub fn simplify(ast: &mut JavaAst, root: JavaId, cfg: &Config) -> Report {
 
 /// 整个编译单元：逐个方法体/初始化块/字段初始化器优化，签名不动。
 pub fn simplify_unit(ast: &mut JavaAst, unit: &mut CompilationUnit, cfg: &Config) -> Report {
-    collect_unit_consts(ast, unit);
     let mut total = Report::default();
-    for ty in &mut unit.types {
-        simplify_type(ast, ty, cfg, &mut total);
-    }
-    if cfg.remove_dead_methods {
-        total.edits += remove_dead_private_methods(ast, unit);
+    // 收敛外循环：引擎单次调用跑至"本轮无应用"即停，但末轮被丢弃的结构
+    // 提案（目标父在搬移后过期，需新鲜 walk 复活）会漏到下一次调用——
+    // 外层重跑到不动点（上限防乒乓；真实语料 1-2 轮清零，javaparser 6 个
+    // 幂等失败文件抓获：const_method_inline/if_else_empty 二轮仍有编辑）
+    for _cycle in 0..6 {
+        let mut round = Report::default();
+        collect_unit_consts(ast, unit);
+        for ty in &mut unit.types {
+            simplify_type(ast, ty, cfg, &mut round);
+        }
+        if cfg.remove_dead_methods {
+            round.edits += remove_dead_private_methods(ast, unit);
+        }
+        total.edits += round.edits;
+        total.iterations += round.iterations;
+        for (k, v) in round.by_rule {
+            *total.by_rule.entry(k).or_insert(0) += v;
+        }
+        if round.edits == 0 {
+            break;
+        }
     }
     total
 }

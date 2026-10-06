@@ -217,7 +217,7 @@ impl<L: Lang> Rule<L> for IfElseEmpty {
         &[NodeKind::If]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
-        let RewriteCtx { lang, walk: _ } = ctx;
+        let RewriteCtx { lang, walk } = ctx;
         if lang.kind(id) != NodeKind::If {
             return None;
         }
@@ -260,7 +260,20 @@ impl<L: Lang> Rule<L> for IfElseEmpty {
             }
             2 => {
                 let then = ch[1];
-                if is_empty_block(then) && lang.effect(cond) <= Effect::MayRead {
+                // 【位置守卫】Delete 只在语句位置（父为 Block）合法：
+                // if 处于分支位置（if(c){ if(c2){} }——else-if 链化后的
+                // 常见形态）时，抽走分支会给父 If 留下"只有条件没有体"的
+                // 残骸（1-child If，打印机越界 panic——真实大语料抓获）。
+                // 分支位置的空体 if 由父 If 的规则吸收（塌缩后自身再走
+                // len==2/len==3 变换）。
+                let parent_is_block = walk
+                    .parent(id)
+                    .map(|p| lang.kind(p) == NodeKind::Block)
+                    .unwrap_or(false);
+                if is_empty_block(then)
+                    && lang.effect(cond) <= Effect::MayRead
+                    && parent_is_block
+                {
                     // 删除整个 if 会丢掉 cond 的求值，仅当 cond 无副作用时安全
                     return Some(Edit::Delete { node: id });
                 }

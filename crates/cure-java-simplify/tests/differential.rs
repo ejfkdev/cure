@@ -1482,3 +1482,160 @@ fn adversarial_expression_edge_cases() {
 "#,
     );
 }
+
+#[test]
+fn adversarial_real_corpus_wave() {
+    // 对抗波 6（真实语料批量抓获的 13 处修复固化）：
+    //  1) record 模式解构 case R(String s)/嵌套/泛型/when 守卫/多标签（spoon
+    //     UnnamedVar 6M 错误风暴）——RAW 保真；
+    //  2) 交叉 cast (Runnable & Serializable) lambda（Ref 名保真原文）；
+    //  3) 多维数组类字面量 int[][][].class（CompilationUnitBuildersTest 风暴：
+    //     postfix 数组前缀曾只判一维）；
+    //  4) catch (final X e)（JavaConceptsMethods 风暴）；
+    //  5) 枚举常量间注解 enum E{A, @Deprecated B}（JavaConcepts 风暴）；
+    //  6) 字段多声明符名字 `int a, b` 曾丢名打成 `int a, a`——**语义破坏**，
+    //     往返自检抓不到（本波 javac 行为对拍抓获）；
+    //  7) C 风格 ()[] 数组返回后缀；
+    //  8) JLS 3.3 \uXXXX 预处理（EscapeSequences 2M 风暴：'\u005c'' 必须先
+    //     预解码才能正确切词）；
+    //  9) 块内空语句不进树（if (c) { ; } else 级联断链——ASTParser 幂等
+    //     残留 22 处）；
+    // 10) 泛型实参内类型注解 List<@TA String>（Pozole 风暴）；
+    // 11) instanceof 前类型注解（Pozole 风暴）；
+    // 12) qualified-new 匿名体序 recv.new X(args) {body}（ProblemReferenceBinding
+    //     往返失败：曾打成 {body}(args)）+ TWR 匿名资源；
+    // 13) record 泛型模式 G<Integer>(var n)。
+    differential(
+        "Adv6",
+        r#"import java.lang.annotation.*;
+import java.util.*;
+
+@Retention(RetentionPolicy.SOURCE)
+@Target(ElementType.TYPE_USE)
+@interface TA {}
+
+public class Adv6 {
+    // ---- record 模式解构 ----
+    record R(String s) {}
+    record P(int x, int y) {}
+    record Line(P a, P b) {}
+    record G<T>(T v) {}
+
+    static String match(Object o) {
+        return switch (o) {
+            case R(String str) when str.length() > 1 -> "R:" + str;
+            case R(String str) -> "short:" + str;
+            default -> "other";
+        };
+    }
+
+    static int lineSum(Object o) {
+        return switch (o) {
+            case Line(P(var x1, var y1), P(var x2, var y2)) -> x1 + y1 + x2 + y2;
+            default -> -1;
+        };
+    }
+
+    static String genericMatch(Object o) {
+        return switch (o) {
+            case G(var n) -> "G" + n;
+            default -> "miss";
+        };
+    }
+
+    // ---- 枚举常量间注解 ----
+    enum E { A, @Deprecated B, C }
+
+    // ---- 字段多声明符（6：名字不得丢失）+ C 风格维度 ----
+    static int a, b = 2, c;
+    static int f[], g[][];
+
+    // ---- C 风格 ()[] 数组返回 ----
+    static int[] mk()[] { return new int[][]{{7, 8}}; }
+
+    // ---- TWR 匿名资源 + qualified new ----
+    static class Res implements AutoCloseable {
+        public void close() { System.out.println("closed"); }
+    }
+    static class GO<T> {
+        class RU<U> implements AutoCloseable {
+            U u;
+            RU(U u) { this.u = u; }
+            public void close() { System.out.println("ru-closed"); }
+        }
+    }
+
+    public static void main(String[] args) {
+        // record 模式
+        System.out.println(match(new R("hi")));
+        System.out.println(match(new R("x")));
+        System.out.println(match(42));
+        System.out.println("sum=" + lineSum(new Line(new P(1, 2), new P(3, 4))));
+        System.out.println(genericMatch(new G<>(5)));
+        System.out.println(genericMatch("s"));
+
+        // 交叉 cast
+        Runnable r = (Runnable & java.io.Serializable) () -> System.out.println("cross");
+        r.run();
+
+        // 多维数组类字面量
+        System.out.println(int[][][].class.getName());
+        System.out.println(String[][][].class.getName());
+        System.out.println(Adv6[][].class.getName());
+
+        // catch (final …)
+        try {
+            throw new IllegalStateException("boom");
+        } catch (final IllegalStateException e) {
+            System.out.println("caught:" + e.getMessage());
+        }
+
+        // 枚举常量间注解
+        StringBuilder sb = new StringBuilder();
+        for (E v : E.values()) { sb.append(v).append(' '); }
+        System.out.println(sb.toString().trim());
+
+        // 字段多声明符（丢名 bug 会在此现形）
+        a = 11;
+        c = a + b;
+        f = new int[]{31};
+        g = new int[][]{{32}, {33}};
+        System.out.println("decl=" + a + "," + b + "," + c + "," + f[0] + "," + g[1][0]);
+
+        // ()[] 返回
+        System.out.println("mk=" + mk()[0][1]);
+
+        // JLS 3.3 unicode 逃逸预处理
+        String u = "\u00e4\u00f6";
+        char ch = '\u0041';
+        char q = '\'';
+        System.out.println("u=" + u + " ch=" + ch + " q=" + q);
+
+        // 块内空语句 + 空分支级联
+        int x = 0;
+        if (x > 0) { ; } else { x = 5; }
+        System.out.println("x=" + x);
+
+        // 泛型实参/instanceof 前类型注解（语义等价丢弃）
+        List<@TA String> ls = new ArrayList<>();
+        ls.add("z");
+        System.out.println("ls=" + ls.get(0));
+        Object o = "str";
+        if (o instanceof @TA String s) { System.out.println("inst=" + s.length()); }
+
+        // TWR 匿名资源
+        try (Res res = new Res() { public String toString() { return "anon-res"; } }) {
+            System.out.println("twr-body");
+        }
+
+        // qualified-new 泛型（含 TWR + 匿名体形态）
+        GO<String>.RU<Integer> ru = new GO<String>().new RU<Integer>(9);
+        System.out.println("ru=" + ru.u);
+        try (GO<String>.RU<Integer> r2 = new GO<String>().new RU<Integer>(5) {}) {
+            System.out.println("twr-ru=" + r2.u);
+        }
+    }
+}
+"#,
+    );
+}

@@ -28,8 +28,77 @@ pub struct ParseOutcome {
     pub errors: Vec<ParseError>,
 }
 
+/// JLS 3.3 预处理：解码合法的 `\uXXXX`（含 `\uu+` 多 u 形态；`\` 前有
+/// 偶数个反斜杠才合法）。必须发生在词法**之前**——`'\u005c''` 只有先解码
+/// 成 `'\''` 才能正确切词（javaparser EscapeSequences 抓获：逐 token 处理
+/// 会把尾随 `'` 切进垃圾字符字面量 → 风暴）。解码语义与 javac 一致。
+fn preprocess_unicode_escapes(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c != '\\' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // 反斜杠连串
+        let run_start = i;
+        let mut j = i;
+        while j < chars.len() && chars[j] == '\\' {
+            j += 1;
+        }
+        let run = j - run_start;
+        // 合法性：run 为奇数（最后的 \ 前有偶数个 \）且后随 u+ 4 hex
+        let mut k = j;
+        let mut u_count = 0usize;
+        while k < chars.len() && chars[k] == 'u' {
+            u_count += 1;
+            k += 1;
+        }
+        let eligible = run % 2 == 1
+            && u_count >= 1
+            && k + 4 <= chars.len()
+            && chars[k..k + 4]
+                .iter()
+                .all(|c| c.is_ascii_hexdigit());
+        if eligible {
+            let hex: String = chars[k..k + 4].iter().collect();
+            let decoded = u32::from_str_radix(&hex, 16)
+                .map(|n| char::from_u32(n).unwrap_or('\u{fffd}'))
+                .unwrap_or('\u{fffd}');
+            // 前 run-1 个 \ 原样保留（\ 对 = 转义反斜杠），\uXXXX → 解码字符
+            for _ in 0..run - 1 {
+                out.push('\\');
+            }
+            out.push(decoded);
+            i = k + 4;
+        } else {
+            // 不合法（或非 \u 形态）：整段原样
+            for idx in run_start..j {
+                out.push(chars[idx]);
+            }
+            if u_count > 0 && run % 2 == 1 {
+                // 奇数 \ + u 但 hex 不全：保留 \u 原文，从 u 处继续
+                for _ in 0..u_count {
+                    out.push('u');
+                }
+                i = k;
+            } else {
+                i = j;
+            }
+        }
+    }
+    out
+}
+
 /// 解析 Java 源码（容错，永不失败）。
 pub fn parse(src: &str) -> ParseOutcome {
+    // JLS 3.3：\uXXXX 预解码（词法之前）——token 偏移与 text_of 均基于
+    // 解码后的文本
+    let decoded = preprocess_unicode_escapes(src);
+    let src: &str = &decoded;
     let (tokens, lex_errs) = lex(src);
     let mut p = Parser {
         t: tokens,
@@ -314,9 +383,17 @@ impl Parser {
             }
             if self.at_kw("package") {
                 let start = self.cur_start();
+                // 容错：package 语句缺分号（Bar.java 形态）——扫到分号或
+                // 行尾即止（token 有 line 信息；不设界会吞掉整个 class 体
+                // → 4M 错误风暴）
+                let pkg_line = self.tok().line;
                 while !self.at_eof() && !self.at_punct(";") {
+                    if self.tok().line != pkg_line && !self.at_punct(".") {
+                        break; // 换行且非点连接（限定名 a.b.c 可跨行）
+                    }
                     self.bump();
                 }
+                self.eat(";");
                 let text = self.text_of(
                     self.t[1.min(self.t.len() - 1)].start,
                     self.tok().start,
@@ -515,9 +592,17 @@ impl Parser {
         let mut enum_constants = Vec::new();
         let mut members = Vec::new();
         if kind == TypeKind::Enum {
-            // 枚举常量（原文保真）
+            // 枚举常量（原文保真；常量可带前注解 enum E{m, @Deprecated f;}
+            // ——JavaConcepts 抓获：曾断在 @ 上 → 常量流落进成员解析风暴）
             while !self.at_eof() && !self.at_punct(";") && !self.at_punct("}") {
                 let cstart = self.cur_start();
+                while self.at_punct("@") {
+                    self.bump();
+                    self.bump();
+                    if self.at_punct("(") {
+                        self.skip_balanced("(", ")");
+                    }
+                }
                 if !matches!(self.tok().tok, Tok::Ident(_)) {
                     break;
                 }
@@ -666,7 +751,7 @@ impl Parser {
 
         // 字段或方法：Type name
         let ty = self.parse_type()?;
-        let name = match &self.tok().tok {
+        let mut name = match &self.tok().tok {
             Tok::Ident(i) => {
                 let n = i.clone();
                 self.bump();
@@ -677,17 +762,31 @@ impl Parser {
                 return None;
             }
         };
-        // C 风格维度 int a[]
-        let mut extra_dims = 0u16;
-        while self.at_punct("[") && self.peek(1).is_punct("]") {
-            self.bump();
-            self.bump();
-            extra_dims += 1;
-        }
-        let ty = wrap_dims(ty, extra_dims as u32);
+        // C 风格维度 int a[]：**不并入 ty**——ty 保持基类型，首个声明符
+        // 的维度记入 first_extra 由声明符自带（曾 wrap 进 ty 又打印各声明符
+        // 原始后缀 → `int f[], g[][]` 打成 `int[] f, g[][]` = g 三维，
+        // Adv6 差分抓获：javac 读作 int[][][]）
+        let first_extra = {
+            let mut extra_dims = 0u16;
+            while self.at_punct("[") && self.peek(1).is_punct("]") {
+                self.bump();
+                self.bump();
+                extra_dims += 1;
+            }
+            extra_dims
+        };
         if self.at_punct("(") {
             // 方法
             let params = self.param_list();
+            // C 风格数组返回后缀 int doSomething()[]（JavaConcepts 抓获：
+            // 曾直接进 body 期待 → "expected method body"）
+            let mut ret_dims = 0u16;
+            while self.at_punct("[") && self.peek(1).is_punct("]") {
+                self.bump();
+                self.bump();
+                ret_dims += 1;
+            }
+            let ty = wrap_dims(ty, ret_dims as u32);
             let throws = self.throws_clause();
             let body = self.member_body();
             return Some(Member::Method {
@@ -708,7 +807,7 @@ impl Parser {
             if guard > 10_000 {
                 break;
             }
-            let mut d_dims = 0u16;
+            let mut d_dims = if declarators.is_empty() { first_extra } else { 0 };
             while self.at_punct("[") && self.peek(1).is_punct("]") {
                 self.bump();
                 self.bump();
@@ -735,11 +834,23 @@ impl Parser {
             if !self.eat(",") {
                 break;
             }
-            // 后续声明符需要新名字
-            if !matches!(self.tok().tok, Tok::Ident(_)) {
-                break;
+            // 后续声明符：跳过注解（@Deprecated f——JavaConcepts 抓获），
+            // 取**新名字**（曾丢弃名字 → `int a, b;` 打成 `int a, a;`——
+            // 语义破坏，往返自检抓不到，本轮探针抓获）
+            while self.at_punct("@") {
+                self.bump();
+                self.bump();
+                if self.at_punct("(") {
+                    self.skip_balanced("(", ")");
+                }
             }
-            let _ = self.bump();
+            match &self.tok().tok {
+                Tok::Ident(n) => {
+                    name = n.clone();
+                    self.bump();
+                }
+                _ => break,
+            }
             continue;
         }
         self.expect(";");
@@ -872,6 +983,16 @@ impl Parser {
 
     /// 解析类型（含数组后缀）；失败返回 None（调用方自行保存 pos 回滚）。
     fn parse_type(&mut self) -> Option<JType> {
+        // 类型注解前缀（JSR 308：instanceof/new/泛型等类型位置的 @Anno(…)）——
+        // 跳过不进类型名（语义等价；spoon Pozole 的 instanceof 前注解抓获：
+        // 曾使 parse_type 直接失败 → 表达式风暴）
+        while self.at_punct("@") {
+            self.bump(); // @
+            self.bump(); // 注解名
+            if self.at_punct("(") {
+                self.skip_balanced("(", ")");
+            }
+        }
         let base = self.parse_type_base()?;
         let mut ty = base;
         while self.at_punct("[") && self.peek(1).is_punct("]") {
@@ -903,25 +1024,35 @@ impl Parser {
             Tok::Ident(i) if !is_type_reserved(i) => {
                 let mut name = i.clone();
                 self.bump();
-                // 点分名
-                while self.at_punct(".") {
-                    if let Tok::Ident(_) = &self.peek(1).tok {
-                        self.bump();
-                        let seg = match &self.tok().tok {
-                            Tok::Ident(s) => s.clone(),
-                            _ => break,
-                        };
-                        self.bump();
-                        name.push('.');
-                        name.push_str(&seg);
+                // 点分名 + 段级泛型（GO<String>.RU<Integer>——内部类型限定，
+                // TWR/声明里出现；ProblemReferenceBinding 形态）：循环吞
+                // （<…> | .seg）直到耗尽
+                loop {
+                    if self.at_punct("<") {
+                        if let Some(text) = self.type_args_raw() {
+                            name.push_str(&text);
+                        } else {
+                            break;
+                        }
+                    }
+                    if self.at_punct(".") {
+                        if let Tok::Ident(seg) = &self.peek(1).tok {
+                            // .new/.this/.super/.class 是表达式后缀不是类型段
+                            //（内联产物 `disgust.new Section<>()` 曾被当声明头
+                            // → "expected ;"——CelebrationLunch 往返抓获）
+                            if is_type_reserved(seg) {
+                                break;
+                            }
+                            let seg = seg.clone();
+                            self.bump();
+                            self.bump();
+                            name.push('.');
+                            name.push_str(&seg);
+                        } else {
+                            break;
+                        }
                     } else {
                         break;
-                    }
-                }
-                // 泛型参数（原文并入类型名）
-                if self.at_punct("<") {
-                    if let Some(text) = self.type_args_raw() {
-                        name.push_str(&text);
                     }
                 }
                 JType::Ref(name)
@@ -963,8 +1094,23 @@ impl Parser {
                 }
                 continue;
             }
+            // 注解元素值可含 = @ {} 字面量（@Anno(clazz=X.class, arr={Y.class})——
+            // JSR 308 类型注解可出现在泛型实参内；spoon Pozole 抓获：曾按"非法
+            // 字符"整体拒绝 → new 表达式解析失败风暴）
             if matches!(self.tok().tok, Tok::Ident(_))
-                || matches!(&self.tok().tok, Tok::Punct(p) if matches!(*p, "." | "," | "?" | "&" | "|" | "[" | "]" | "(" | ")"))
+                || matches!(
+                    &self.tok().tok,
+                    Tok::Num(_) | Tok::Str(_) | Tok::Char(_) | Tok::TextBlock(_)
+                )
+                || matches!(
+                    &self.tok().tok,
+                    Tok::Punct(p)
+                        if matches!(
+                            *p,
+                            "." | "," | "?" | "&" | "|" | "[" | "]" | "(" | ")" | "@" | "="
+                                | "{" | "}" | "::"
+                        )
+                )
             {
                 self.bump();
                 continue;
@@ -1002,6 +1148,11 @@ impl Parser {
             // Group（多声明符等）就地展开为兄弟语句
             if matches!(self.ast.data(s), &NodeData::Group) {
                 children.extend(self.ast.children(s).iter().copied());
+            } else if matches!(self.ast.data(s), &NodeData::Empty) {
+                // 块内空语句（;）不进树：打印端本就不输出，留着会让
+                // is_empty_block 判否 → if_else_empty 级联断链（ASTParser
+                // 幂等失败 22 处抓获：`if (c) { ; } else {B}` 永不简化）。
+                // 语句体位置的 Empty（while(x);）不经过此路径，不受影响。
             } else {
                 children.push(s);
             }
@@ -1228,6 +1379,14 @@ impl Parser {
                 if !self.eat(",") {
                     break;
                 }
+                // 声明符间注解（int a, @Deprecated b;）：跳过
+                while self.at_punct("@") {
+                    self.bump();
+                    self.bump();
+                    if self.at_punct("(") {
+                        self.skip_balanced("(", ")");
+                    }
+                }
                 let name = match &self.tok().tok {
                     Tok::Ident(i) => {
                         let n = i.clone();
@@ -1354,9 +1513,18 @@ impl Parser {
             let text = self.sync_stmt();
             return self.ast.raw(&text);
         }
-        // for-each 判定
+        // for-each 判定（先跳过 final 与**注解**——for (@Anno int i : a)
+        // 是合法形态；注解原文丢弃（容错优先），否则解析风暴）
         let save = self.pos;
-        while self.at_kw("final") {
+        while self.at_kw("final") || self.at_punct("@") {
+            if self.at_punct("@") {
+                self.bump(); // @
+                self.bump(); // 注解名
+                if self.at_punct("(") {
+                    self.skip_balanced("(", ")");
+                }
+                continue;
+            }
             self.bump();
         }
         if let Some(ty) = self.parse_type() {
@@ -1381,6 +1549,14 @@ impl Parser {
         let mut inits: Vec<JavaId> = Vec::new();
         if !self.at_punct(";") {
             let save2 = self.pos;
+            // init 前置注解（for (@Anno int i = 0; …)）：跳过（原文丢弃）
+            while self.at_punct("@") {
+                self.bump();
+                self.bump();
+                if self.at_punct("(") {
+                    self.skip_balanced("(", ")");
+                }
+            }
             if let Some(ty) = self.try_decl_prefix() {
                 // 声明式 init：`int i = 0, j = 1`（后续声明符无类型 token）
                 let name = match &self.tok().tok {
@@ -1551,13 +1727,17 @@ impl Parser {
             if !self.expect("(") {
                 break;
             }
-            // 多类型 catch：A | B | C
+            // 多类型 catch：A | B | C（可带 final：catch (final IOException e)——
+            // JavaConceptsMethods 抓获：曾使 parse_type 失败 → 风暴）
             let mut ty_parts: Vec<String> = Vec::new();
             let mut guard = 0usize;
             loop {
                 guard += 1;
                 if guard > 10_000 {
                     break;
+                }
+                while self.at_kw("final") {
+                    self.bump();
                 }
                 let start = self.cur_start();
                 if self.parse_type().is_none() {
@@ -1617,9 +1797,42 @@ impl Parser {
                 self.bump();
                 self.in_case_label = true;
                 loop {
+                    // record 模式解构：case MyRecord(String _) / case R(a, b) /
+                    // case Pair<String, Integer>(var x, var y) ->（Java 21）——括号内是
+                    // 类型模式/嵌套模式而非实参，误入调用解析会风暴；整体原文保真
+                    let record_pattern = matches!(self.tok().tok, Tok::Ident(_))
+                        && (self.peek(1).is_punct("(") || self.peek(1).is_punct("<"))
+                        && {
+                            let save = self.pos;
+                            self.bump();
+                            if self.peek(0).is_punct("<") {
+                                // 泛型后必须紧跟 ( 才是 record 模式（否则是普通表达式）
+                                let ok = self.skip_balanced("<", ">").is_some()
+                                    && self.peek(0).is_punct("(");
+                                self.pos = save;
+                                ok
+                            } else {
+                                self.pos = save;
+                                true
+                            }
+                        };
+                    if record_pattern {
+                        let start = self.cur_start();
+                        self.bump(); // record 名
+                        if self.peek(0).is_punct("<") {
+                            self.skip_balanced("<", ">");
+                        }
+                        self.skip_balanced("(", ")");
+                        if self.at_kw("when") && !self.peek(1).is_punct("->") {
+                            self.bump();
+                            let _ = self.parse_expr(PREC_TERNARY);
+                        }
+                        let text = self.text_of(start, self.t[self.pos - 1].end);
+                        labels.push(self.ast.raw(text.trim()));
+                    }
                     // 类型模式：case Foo f [when cond] -> …（Ident + Ident 形态）
-                    if matches!(self.tok().tok, Tok::Ident(_))
-                        && matches!(self.peek(1).tok, Tok::Ident(_))
+                    else if matches!(self.tok().tok, Tok::Ident(_))
+                        && matches!(&self.peek(1).tok, Tok::Ident(_))
                     {
                         let start = self.cur_start();
                         if self.parse_type().is_some() {
@@ -1875,8 +2088,21 @@ impl Parser {
                                 mname.push_str(&ta);
                             }
                         }
+                        // 先参数后匿名体（.new Inner(args) { body } 的固定序）
+                        let mut args = Vec::new();
+                        let mut had_parens = false;
                         if self.at_punct("(") {
-                            let args = self.call_args()?;
+                            had_parens = true;
+                            args = self.call_args()?;
+                        }
+                        // 匿名类体 {…}：原文附加（与普通 new 相同）
+                        if self.at_punct("{") {
+                            if let Some(anon) = self.skip_balanced_braces() {
+                                mname.push(' ');
+                                mname.push_str(&anon);
+                            }
+                        }
+                        if had_parens {
                             let m = self.ast.member(e, &mname);
                             e = self.ast.call(m, args);
                         } else {
@@ -1919,6 +2145,62 @@ impl Parser {
                     _ => break,
                 }
                 continue;
+            }
+            // 数组类型前缀通用形态：T[]（可多维）后跟 ::new（方法引用）或 .class
+            //（int[].class / CompilationUnit[][][].class）——维度串吞掉后按后续形态分支。
+            if self.at_punct("[") && self.peek(1).is_punct("]") {
+                // 越过全部 [] 维度后判定尾巴（一维时旧条件漏多维 .class →
+                // 风暴；CompilationUnitBuildersTest 抓获）
+                let mut p = self.pos + 2;
+                while p + 1 < self.t.len()
+                    && matches!(&self.t[p].tok, Tok::Punct(b) if *b == "[")
+                    && matches!(&self.t[p + 1].tok, Tok::Punct(b) if *b == "]")
+                {
+                    p += 2;
+                }
+                let dims_tail = p < self.t.len()
+                    && (matches!(&self.t[p].tok, Tok::Punct(c) if *c == "::")
+                        || (matches!(&self.t[p].tok, Tok::Punct(c) if *c == ".")
+                            && p + 1 < self.t.len()
+                            && matches!(&self.t[p + 1].tok, Tok::Ident(i) if i == "class")));
+                if dims_tail {
+                    let mut dims = String::new();
+                    while self.at_punct("[") && self.peek(1).is_punct("]") {
+                        self.bump();
+                        self.bump();
+                        dims.push_str("[]");
+                    }
+                    // T[].class：Member{recv=e, name=dims+"class"}（打印 recv[].class）
+                    if self.at_punct(".")
+                        && matches!(&self.peek(1).tok, Tok::Ident(i) if i == "class")
+                    {
+                        self.bump(); // .
+                        self.bump(); // class
+                        let mname = format!("{dims}class");
+                        e = self.ast.member(e, &mname);
+                        continue;
+                    }
+                    let mut name = dims;
+                    self.bump(); // ::
+                    // 可选显式类型实参（罕见）：T[]::<X>name
+                    if self.at_punct("<") {
+                        if let Some(ta) = self.type_args_raw() {
+                            name.push_str(&ta);
+                        }
+                    }
+                    match &self.tok().tok {
+                        Tok::Ident(m) => {
+                            let n = m.clone();
+                            self.bump();
+                            name.push_str("::");
+                            name.push_str(&n);
+                            e = self.ast.method_ref(e, &name);
+                            continue;
+                        }
+                        _ => break,
+                    }
+                    break;
+                }
             }
             if self.at_punct("[") {
                 self.bump();
@@ -2005,7 +2287,42 @@ impl Parser {
     fn try_cast_type(&mut self) -> Option<JType> {
         let save = self.pos;
         self.bump(); // (
+        // 类型注解前缀（(@Anno String) x——JSR 308）：跳过注解原文
+        //（spoon Castings.java 高频；不跳会导致 cast 判定失败 → 风暴）
+        while self.at_punct("@") {
+            self.bump(); // @
+            self.bump(); // 注解名
+            if self.at_punct("(") {
+                self.skip_balanced("(", ")");
+            }
+        }
         let ty = self.parse_type();
+        // 交叉类型 cast：(Runnable & Serializable) lambda——按 JLS 15.16 可多类型
+        // 并列；Ref 名内保真原文（打印为原文形态）
+        let ty = match ty {
+            Some(mut t) => {
+                if self.at_punct("&") {
+                    let mut names = Vec::new();
+                    if let JType::Ref(n) = &t {
+                        names.push(n.clone());
+                    }
+                    while self.eat("&") {
+                        if let Some(extra) = self.parse_type() {
+                            if let JType::Ref(n) = extra {
+                                names.push(n);
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    if !names.is_empty() {
+                        t = JType::Ref(names.join(" & "));
+                    }
+                }
+                Some(t)
+            }
+            None => None,
+        };
         let ok = match ty {
             Some(ty) => {
                 if self.at_punct(")") {

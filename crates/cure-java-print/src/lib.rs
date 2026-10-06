@@ -635,9 +635,15 @@ impl<'a> Printer<'a> {
                 self.indent();
                 self.out.push_str(name);
                 self.out.push(':');
+                let body = ast.children(id)[0];
+                if self.ast.data(body) == &NodeData::Empty {
+                    // label:;（指向空分号）——直接同行输出分号
+                    self.out.push_str(";");
+                    return;
+                }
                 self.level += 1;
                 self.newline();
-                self.stmt(ast.children(id)[0]);
+                self.stmt(body);
                 self.level -= 1;
             }
             NodeData::Assert => {
@@ -814,17 +820,26 @@ impl<'a> Printer<'a> {
                 let init = decl_init_expr(ast, ty, init);
                 self.expr(init, prec::ASSIGN);
             }
-        } else if with_type {
-            self.expr(id, prec::ASSIGN);
-        } else {
-            self.out.push_str("/* bad init */");
+            return;
         }
+        // 表达式 init：for (i = 0; …)——解析侧包着 ExprStmt（或裸表达式）
+        let expr = match ast.data(id) {
+            NodeData::ExprStmt => *ast.children(id).first().unwrap_or(&id),
+            _ => id,
+        };
+        self.expr(expr, prec::ASSIGN);
+        // 非 VarDecl 非 ExprStmt 的罕见形态：交给 expr 输出（不再打占位注释——
+        // `/* bad init */` 会污染合法 for 头并使输出无法重解析）
     }
 
     /// 控制流体：Block 直接展开，单语句换行缩进。
     fn body_stmt(&mut self, id: JavaId) {
         if self.ast.data(id) == &NodeData::Block {
             self.block_body(id);
+        } else if self.ast.data(id) == &NodeData::Empty {
+            // 控制流裸分号体（while(x); / label: while(x);）——必须输出 `;`，
+            // 否则 while 无体也无关联语句（FooLabel 真实语料：输出不可重解析）
+            self.out.push(';');
         } else {
             self.level += 1;
             self.newline();
@@ -977,15 +992,44 @@ impl<'a> Printer<'a> {
                 if need {
                     self.out.push('(');
                 }
-                self.expr(ch[0], prec::POSTFIX);
-                self.out.push('(');
-                for (i, &a) in ch[1..].iter().enumerate() {
-                    if i > 0 {
-                        self.out.push_str(", ");
+                // 限定 new + 匿名类体：callee 名形如 "new X<…> {body…}"，合法
+                // 顺序是 recv.new X(args) {body}（JLS 15.9.1——体在实参之后；
+                // 曾打成 recv.new X {body}(args)，往返失败，spoon
+                // ProblemReferenceBinding 抓获）
+                let mut qual_new_anon = None;
+                if let NodeData::Member { name } = ast.data(ch[0]) {
+                    if name.starts_with("new ") {
+                        if let Some(i) = name.find(" {") {
+                            qual_new_anon = Some((i, name));
+                        }
                     }
-                    self.expr(a, prec::ASSIGN);
                 }
-                self.out.push(')');
+                if let Some((i, name)) = qual_new_anon {
+                    let (head, body) = (&name[..i], &name[i + 1..]);
+                    self.expr(ast.children(ch[0])[0], prec::POSTFIX);
+                    self.out.push('.');
+                    self.out.push_str(head);
+                    self.out.push('(');
+                    for (j, &a) in ch[1..].iter().enumerate() {
+                        if j > 0 {
+                            self.out.push_str(", ");
+                        }
+                        self.expr(a, prec::ASSIGN);
+                    }
+                    self.out.push(')');
+                    self.out.push(' ');
+                    self.out.push_str(body);
+                } else {
+                    self.expr(ch[0], prec::POSTFIX);
+                    self.out.push('(');
+                    for (i, &a) in ch[1..].iter().enumerate() {
+                        if i > 0 {
+                            self.out.push_str(", ");
+                        }
+                        self.expr(a, prec::ASSIGN);
+                    }
+                    self.out.push(')');
+                }
                 if need {
                     self.out.push(')');
                 }
@@ -997,8 +1041,16 @@ impl<'a> Printer<'a> {
                     self.out.push('(');
                 }
                 self.expr(obj, prec::POSTFIX);
+                // 数组类型前缀（"[]class"）：维度在点号前——int[].class
+                let (dims, rest) = if name.starts_with("[]") {
+                    let d = name[..name.find("class").unwrap_or(name.len())].to_string();
+                    (d, &name[name.find("class").unwrap_or(0)..])
+                } else {
+                    (String::new(), name.as_str())
+                };
+                self.out.push_str(&dims);
                 self.out.push('.');
-                self.out.push_str(name);
+                self.out.push_str(rest);
                 if need {
                     self.out.push(')');
                 }
@@ -1010,8 +1062,15 @@ impl<'a> Printer<'a> {
                     self.out.push('(');
                 }
                 self.expr(recv, prec::POSTFIX);
+                // 数组类型方法引用：name 形如 "[]::new"/"[][]::m"——
+                // 维度属接收方类型（T[]::new），须在 :: 之前输出
+                let (dims, rest) = match name.find("::") {
+                    Some(i) if name.starts_with("[]") => (&name[..i], &name[i + 2..]),
+                    _ => ("", name.as_str()),
+                };
+                self.out.push_str(dims);
                 self.out.push_str("::");
-                self.out.push_str(name);
+                self.out.push_str(rest);
                 if need {
                     self.out.push(')');
                 }
