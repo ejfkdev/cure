@@ -274,9 +274,12 @@ impl<'a> LitRef<'a> {
 /// 声明节点；Shadow→VarDecl/ForEach/Catch 绑定节点），名字由
 /// `Lang::var_name(node)` 读取——与 scan_region 原递归的判定一致。
 #[derive(Clone, Copy, Debug)]
-pub struct RegionEvent<Id> {
+pub struct RegionEvent<Id, Key> {
     pub kind: EventKind,
     pub node: Id,
+    /// 事件承载者的名字键（语言侧等价类：Java=u32 intern id）——
+    /// 事件构建时预存，查询侧比较为整数等值，免 var_name/memcmp。
+    pub key: Key,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -183,8 +183,16 @@ pub struct JavaAst {
     /// 区域事件索引（使用索引）：语句级节点 → 子树事件序列（prepare 构建，
     /// 编辑沿祖先失效）。供引擎 scan_region 快路径——遍历序与
     /// scan_region 原递归严格一致（见 collect_region_events）。
-    region_events: Vec<Vec<cure_engine::kind::RegionEvent<JavaId>>>,
+    region_events: Vec<Vec<cure_engine::kind::RegionEvent<JavaId, u32>>>,
+    /// 名字实化（intern）：名字 → u32 键。单元级持久、只增。
+    name_intern: HashMap<String, u32>,
+    /// 节点的名字键（槽位=节点 id；KEY_NONE=无名）。prepare 增量扩展
+    /// （新节点 intern），既有节点键与其名字恒同——无需失效。
+    node_key: Vec<u32>,
 }
+
+/// 无名节点的键。
+const KEY_NONE: u32 = u32::MAX;
 
 // ---------------------------------------------------------------------------
 // 编译单元 / 成员（签名层：签名保真、方法体进 arena）
@@ -733,6 +741,7 @@ impl JavaAst {
 
 impl Lang for JavaAst {
     type Id = JavaId;
+    type NameKey = u32;
 
     fn kind(&self, id: JavaId) -> NodeKind {
         JavaAst::kind(self, id)
@@ -816,12 +825,26 @@ impl Lang for JavaAst {
         }
     }
 
-    fn region_events(&self, id: JavaId) -> Option<&[cure_engine::kind::RegionEvent<JavaId>]> {
+    fn region_events(
+        &self,
+        id: JavaId,
+    ) -> Option<&[cure_engine::kind::RegionEvent<JavaId, u32>]> {
         match self.region_events.get(id.0 as usize) {
             // 空序列 = 未索引（非语句节点或已失效）→ None 走原递归
             Some(v) if !v.is_empty() => Some(v),
             _ => None,
         }
+    }
+
+    fn var_key(&self, id: JavaId) -> Option<u32> {
+        match self.node_key.get(id.0 as usize) {
+            Some(&k) if k != KEY_NONE => Some(k),
+            _ => None,
+        }
+    }
+
+    fn node_index(&self, id: JavaId) -> usize {
+        id.0 as usize
     }
 
     fn own_effect(&self, id: JavaId) -> Effect {
@@ -986,6 +1009,18 @@ impl Lang for JavaAst {
     /// 1) 效果表——arena 按升序扫描（child index < parent index 不变量）；
     /// 2) 变量类型表——从 root 做作用域栈遍历。
     fn prepare(&mut self, root: JavaId) {
+        // 名字键增量扩展：新节点 intern（既有节点键不变——名字与位置无关）
+        if self.node_key.len() < self.nodes.len() {
+            let base = self.node_key.len();
+            self.node_key.resize(self.nodes.len(), KEY_NONE);
+            for i in base..self.nodes.len() {
+                let id = JavaId(i as u32);
+                if let Some(name) = self.var_name(id).map(|n| n.to_string()) {
+                    let k = self.intern_name(&name);
+                    self.node_key[i] = k;
+                }
+            }
+        }
         // 守卫缓存失效：树已变
         self.string_identity.set(None);
         // 区域事件索引重建：语句级节点（Block 的孩子）各得一份子树事件序列
@@ -1205,6 +1240,16 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 impl JavaAst {
+    /// 名字 → 实化键（持久表，只增；同名字恒同键）。
+    fn intern_name(&mut self, name: &str) -> u32 {
+        if let Some(&k) = self.name_intern.get(name) {
+            return k;
+        }
+        let k = self.name_intern.len() as u32;
+        self.name_intern.insert(name.to_string(), k);
+        k
+    }
+
     fn build_region_index(&mut self, root: JavaId) {
         // 语句级节点 = Block 的直接孩子（规则只对这些调用 scan_region）。
         // 遍历整树，遇到 Block 就为其每个孩子收集事件。
@@ -1226,20 +1271,24 @@ impl JavaAst {
         }
     }
 
-    /// 收集 `node` 子树的事件序列（顺序语义见模块注释）。
-    fn collect_region_events(&self, node: JavaId) -> Vec<RegionEvent<JavaId>> {
+    /// 收集 `node` 子树的事件序列（顺序语义见模块注释；键取 node_key 预存）。
+    fn collect_region_events(&self, node: JavaId) -> Vec<RegionEvent<JavaId, u32>> {
         let mut out = Vec::new();
         self.collect_events_into(node, &mut out);
         out
     }
 
-    fn collect_events_into(&self, node: JavaId, out: &mut Vec<RegionEvent<JavaId>>) {
+    fn key_of(&self, node: JavaId) -> u32 {
+        self.node_key.get(node.0 as usize).copied().unwrap_or(KEY_NONE)
+    }
+
+    fn collect_events_into(&self, node: JavaId, out: &mut Vec<RegionEvent<JavaId, u32>>) {
         match self.data(node) {
             NodeData::Assign { .. } => {
                 let ch = self.children(node);
                 if let Some(&t) = ch.first() {
                     if self.kind(t) == NodeKind::VarRef {
-                        out.push(RegionEvent { kind: EventKind::Write, node: t });
+                        out.push(RegionEvent { kind: EventKind::Write, node: t, key: self.key_of(t) });
                     }
                 }
                 if let Some(&v) = ch.get(1) {
@@ -1250,32 +1299,35 @@ impl JavaAst {
                 let ch = self.children(node);
                 if let Some(&t) = ch.first() {
                     if self.kind(t) == NodeKind::VarRef {
-                        out.push(RegionEvent { kind: EventKind::Write, node: t });
+                        out.push(RegionEvent { kind: EventKind::Write, node: t, key: self.key_of(t) });
                     }
                 }
             }
             NodeData::VarDecl { .. } => {
-                out.push(RegionEvent { kind: EventKind::Write, node });
-                out.push(RegionEvent { kind: EventKind::Shadow, node });
+                let k = self.key_of(node);
+                out.push(RegionEvent { kind: EventKind::Write, node, key: k });
+                out.push(RegionEvent { kind: EventKind::Shadow, node, key: k });
                 for &c in self.children(node) {
                     self.collect_events_into(c, out);
                 }
             }
             NodeData::ForEach { .. } => {
-                out.push(RegionEvent { kind: EventKind::Write, node });
-                out.push(RegionEvent { kind: EventKind::Shadow, node });
+                let k = self.key_of(node);
+                out.push(RegionEvent { kind: EventKind::Write, node, key: k });
+                out.push(RegionEvent { kind: EventKind::Shadow, node, key: k });
                 for &c in self.children(node) {
                     self.collect_events_into(c, out);
                 }
             }
             NodeData::Catch { .. } => {
-                out.push(RegionEvent { kind: EventKind::Shadow, node });
+                let k = self.key_of(node);
+                out.push(RegionEvent { kind: EventKind::Shadow, node, key: k });
                 for &c in self.children(node) {
                     self.collect_events_into(c, out);
                 }
             }
             NodeData::VarRef { .. } => {
-                out.push(RegionEvent { kind: EventKind::Use, node });
+                out.push(RegionEvent { kind: EventKind::Use, node, key: self.key_of(node) });
             }
             _ => {
                 for &c in self.children(node) {

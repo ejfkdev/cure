@@ -15,6 +15,11 @@ use crate::kind::{BinOp, LitRef, NodeKind, UnOp};
 pub trait Lang {
     /// 稳定节点句柄（通常是 `Copy` 的索引 newtype）。
     type Id: Copy + Eq + Hash + Ord + Debug;
+    /// 名字等价类句柄（Java：u32 intern id）。区域扫描的全部名字比较
+    /// 走它——语言侧应保证同名字同键、比较为整数等值（无字符串 memcmp）。
+    type NameKey: Copy + Eq + Debug;
+    /// 节点在语言 arena 中的稠密下标（供引擎位图/数组索引）。
+    fn node_index(&self, id: Self::Id) -> usize;
 
     // ---- 结构 ----
 
@@ -63,7 +68,15 @@ pub trait Lang {
     /// 事件序必须等于 scan_region 原递归的遍历序；返回 None 表示该
     /// 节点无索引（未构建/已失效）——scan_region 回退为原递归遍历。
     /// 引擎在应用编辑后沿祖先链调用 invalidate_effect 使索引失效。
-    fn region_events(&self, _id: Self::Id) -> Option<&[crate::kind::RegionEvent<Self::Id>]> {
+    fn region_events(
+        &self,
+        _id: Self::Id,
+    ) -> Option<&[crate::kind::RegionEvent<Self::Id, Self::NameKey>]> {
+        None
+    }
+    /// 节点的名字键（VarRef/VarDecl/ForEach/Catch 等命名节点）；
+    /// 无名节点返回 None。
+    fn var_key(&self, _id: Self::Id) -> Option<Self::NameKey> {
         None
     }
     /// 节点自身（不含 children）的效果贡献。

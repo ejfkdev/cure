@@ -71,14 +71,14 @@ pub fn simplify<L: Lang>(
     let mut dispatch: Vec<Option<Box<[u32]>>> = vec![None; NodeKind::SLOT_COUNT];
     loop {
         let mut snap = walk(lang, root);
-        // touched = 立即应用的编辑足迹（真已脱离树）。已排队（未应用）的
-        // 编辑不改树 → 其足迹不进 touched：后续提案照常扫描/照常排队，
-        // 靠应用时的重跑检查消化（见 pass 末级联）。
-        let mut touched: crate::walk::IdMap<L::Id, ()> = std::collections::HashMap::default();
+        // touched = 立即应用的编辑足迹（真已脱离树）。位图索引=node_index
+        // （旧版 IdMap 哈希集：扫描循环每节点一次哈希查找 × 30k×136 轮）。
+        // 已排队（未应用）的编辑不改树 → 其足迹不进 touched。
+        let mut touched: Vec<u64> = Vec::new();
         // 搬移集：立即 Replace 把既有节点挪进新位置（with 复用旧节点）。
         // 这些节点的快照 parent 已过期——后续提案不得以其为目标（应用会
         // 写进幽灵父=半应用）。下一 pass 新鲜 walk 后自然解除。
-        let mut moved: crate::walk::IdMap<L::Id, ()> = std::collections::HashMap::default();
+        let mut moved: Vec<u64> = Vec::new();
         struct Queued<L: Lang> {
             /// 规则下标/提案节点：级联重查模式遗留（现按提案直接校验应用），
             /// 保留字段供 CURE_DEBUG_PASS 追踪与未来级联复用
@@ -96,7 +96,7 @@ pub fn simplify<L: Lang>(
         let applied_immediate = false;
 
         'scan: for &id in &snap.ids {
-            if touched.contains_key(&id) {
+            if bit_get(&touched, lang.node_index(id)) {
                 continue;
             }
             let kind = lang.kind(id);
@@ -148,7 +148,10 @@ pub fn simplify<L: Lang>(
                     // 放弃本轮（下一 pass 新鲜快照重提）
                     let mut fp = Vec::new();
                     crate::rule::collect_footprint(&*lang, &edit, &mut fp);
-                    if fp.iter().any(|n| touched.contains_key(n) || moved.contains_key(n)) {
+                    if fp
+                        .iter()
+                        .any(|n| bit_get(&touched, lang.node_index(*n)) || bit_get(&moved, lang.node_index(*n)))
+                    {
                         continue;
                     }
                     if apply_edit(lang, &snap, &edit).is_ok() {
@@ -156,7 +159,7 @@ pub fn simplify<L: Lang>(
                         let mut stack = with_roots_of(&edit);
                         while let Some(n) = stack.pop() {
                             if n != snap.root && !snap.parents.contains_key(&n) {
-                                moved.insert(n, ());
+                                bit_set(&mut moved, lang.node_index(n));
                             }
                             for &c in lang.children(n) {
                                 stack.push(c);
@@ -173,7 +176,7 @@ pub fn simplify<L: Lang>(
                         report.edits += 1;
                         applied = true;
                         for n in fp {
-                            touched.insert(n, ());
+                            bit_set(&mut touched, lang.node_index(n));
                         }
                         // 祖先链效果失效：被换子树的祖先聚合效果已陈旧
                         let mut cur = Some(id);
@@ -190,7 +193,10 @@ pub fn simplify<L: Lang>(
                     // 应用时不再重验——无重叠 + 单次新鲜重建保证一致性）
                     let mut fp = Vec::new();
                     crate::rule::collect_footprint(&*lang, &edit, &mut fp);
-                    if fp.iter().any(|n| touched.contains_key(n) || moved.contains_key(n)) {
+                    if fp
+                        .iter()
+                        .any(|n| bit_get(&touched, lang.node_index(*n)) || bit_get(&moved, lang.node_index(*n)))
+                    {
                         continue;
                     }
                     let mut expects = Vec::new();
@@ -203,7 +209,7 @@ pub fn simplify<L: Lang>(
                         expects,
                     });
                     for n in fp {
-                        touched.insert(n, ());
+                        bit_set(&mut touched, lang.node_index(n));
                     }
                     continue 'scan;
                 }
@@ -254,6 +260,20 @@ pub fn simplify<L: Lang>(
         lang.prepare(root);
     }
     report
+}
+
+/// 位图置位（按需扩容）。
+fn bit_set(bits: &mut Vec<u64>, idx: usize) {
+    if idx >= bits.len() * 64 {
+        bits.resize(idx / 64 + 1, 0);
+    }
+    bits[idx / 64] |= 1u64 << (idx % 64);
+}
+
+/// 位图读位（越界 = false）。
+fn bit_get(bits: &[u64], idx: usize) -> bool {
+    bits.get(idx / 64)
+        .map_or(false, |w| (w >> (idx % 64)) & 1 == 1)
 }
 
 /// 编辑全部 with 根（Replace / 全 Replace Multi）。

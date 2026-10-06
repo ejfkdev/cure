@@ -35,6 +35,7 @@ struct ToyNode {
 
 #[derive(Clone, Debug)]
 struct Toy {
+    toy_names: std::cell::RefCell<Vec<String>>,
     nodes: Vec<ToyNode>,
     root: Id,
 }
@@ -66,6 +67,8 @@ impl Toy {
 
 impl Lang for Toy {
     type Id = Id;
+    /// 名字键：&'static str 不可（运行时字符串）——用 u32 索引到 names 表。
+    type NameKey = u32;
 
     fn kind(&self, id: Id) -> NodeKind {
         self.nodes[id as usize].kind
@@ -199,6 +202,20 @@ impl Lang for Toy {
     fn var_name(&self, id: Id) -> Option<&str> {
         self.nodes[id as usize].name.as_deref()
     }
+    fn var_key(&self, id: Id) -> Option<u32> {
+        let name = self.nodes[id as usize].name.as_deref()?;
+        let mut names = self.toy_names.borrow_mut();
+        Some(match names.iter().position(|n| n == name) {
+            Some(i) => i as u32,
+            None => {
+                names.push(name.to_string());
+                (names.len() - 1) as u32
+            }
+        })
+    }
+    fn node_index(&self, id: Id) -> usize {
+        id as usize
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +293,7 @@ fn parse(src: &str) -> Toy {
     let mut pos = 0;
     let v = parse_tokens(&toks, &mut pos);
     let mut toy = Toy {
+        toy_names: std::cell::RefCell::new(Vec::new()),
         nodes: Vec::new(),
         root: 0,
     };
