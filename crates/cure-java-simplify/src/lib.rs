@@ -122,7 +122,7 @@ impl Rule<JavaAst> for StringBuilderFold {
         }
         let callee = lang.children(id)[0];
         if let NodeData::Member { name } = lang.data(callee) {
-            if name != "toString" || !lang.children(id)[1..].is_empty() {
+            if lang.sn(*name) != "toString" || !lang.children(id)[1..].is_empty() {
                 return None;
             }
         } else {
@@ -136,7 +136,7 @@ impl Rule<JavaAst> for StringBuilderFold {
                 NodeData::Call => {
                     let c = lang.children(node);
                     if let NodeData::Member { name } = lang.data(c[0]) {
-                        if name == "append" && c.len() == 2 {
+                        if lang.sn(*name) == "append" && c.len() == 2 {
                             parts.push(c[1]);
                             node = lang.children(c[0])[0];
                             continue;
@@ -287,7 +287,7 @@ impl Rule<JavaAst> for BoxUnboxChain {
             if let NodeData::Member { name } = lang.data(icallee) {
                 // Integer.valueOf：recv 是 VarRef(Integer)
                 let recv = lang.children(icallee)[0];
-                if name != "valueOf" {
+                if lang.sn(*name) != "valueOf" {
                     return None;
                 }
                 match lang.var_name(recv) {
@@ -308,7 +308,7 @@ impl Rule<JavaAst> for BoxUnboxChain {
             .iter()
             .find(|(b, _)| *b == box_name.as_str())
             .map(|(_, u)| *u)?;
-        if expected != unbox_name {
+        if expected != lang.sn(unbox_name) {
             return None;
         }
         // 类型守卫：实参必须是该包装类型对应的原始类型表达式
@@ -393,7 +393,7 @@ impl Rule<JavaAst> for IteratorToForEach {
         let NodeData::Member { name: m0 } = lang.data(icallee) else {
             return None;
         };
-        if m0 != "iterator" || ic.len() != 1 {
+        if lang.sn(*m0) != "iterator" || ic.len() != 1 {
             return None;
         }
         let iterable = lang.children(icallee)[0];
@@ -411,7 +411,7 @@ impl Rule<JavaAst> for IteratorToForEach {
         let NodeData::Member { name: m1 } = lang.data(ccallee) else {
             return None;
         };
-        if m1 != "hasNext" || cc.len() != 1 {
+        if lang.sn(*m1) != "hasNext" || cc.len() != 1 {
             return None;
         }
         if lang.var_name(lang.children(ccallee)[0]) != Some(it_name.as_str()) {
@@ -437,7 +437,7 @@ impl Rule<JavaAst> for IteratorToForEach {
         let NodeData::Member { name: m2 } = lang.data(ncallee) else {
             return None;
         };
-        if m2 != "next" || nc.len() != 1 {
+        if lang.sn(*m2) != "next" || nc.len() != 1 {
             return None;
         }
         if lang.var_name(lang.children(ncallee)[0]) != Some(it_name.as_str()) {
@@ -941,7 +941,7 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
             NodeKind::Call => {
                 let cc0 = lang.children(cond).to_vec();
                 match lang.data(*cc0.first()?) {
-                    NodeData::Member { name } if name == "hasNext" => {
+                    NodeData::Member { name } if lang.sn(*name) == "hasNext" => {
                         lang.var_name(lang.children(cc0[0])[0]).map(|x| x.to_string())
                     }
                     _ => None,
@@ -977,7 +977,7 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         let NodeData::Member { name: m0 } = lang.data(*ic.first()?) else {
             return None;
         };
-        if m0 != "iterator" || ic.len() != 1 {
+        if lang.sn(*m0) != "iterator" || ic.len() != 1 {
             return None;
         }
         let iterable = lang.children(ic[0])[0];
@@ -992,7 +992,7 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         let NodeData::Member { name: m1 } = lang.data(*cc.first()?) else {
             return None;
         };
-        if m1 != "hasNext" || cc.len() != 1 {
+        if lang.sn(*m1) != "hasNext" || cc.len() != 1 {
             return None;
         }
         if lang.var_name(lang.children(cc[0])[0]) != Some(it_name.as_str()) {
@@ -1024,7 +1024,7 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
             let NodeData::Member { name: mn } = lang.data(member) else {
                 return None;
             };
-            if mn != "next" {
+            if lang.sn(*mn) != "next" {
                 return None;
             }
             let next_call = parent_of_recv(lang, body, member);
@@ -1096,7 +1096,7 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         let NodeData::Member { name: m2 } = lang.data(*nc.first()?) else {
             return None;
         };
-        if m2 != "next" || nc.len() != 1 {
+        if lang.sn(*m2) != "next" || nc.len() != 1 {
             return None;
         }
         if lang.var_name(lang.children(nc[0])[0]) != Some(it_name.as_str()) {
@@ -1177,12 +1177,12 @@ impl Rule<JavaAst> for ConcatValueOfDrop {
             }
             let callee = c[0];
             if let NodeData::Member { name } = lang.data(callee) {
-                if name == "valueOf" && lang.var_name(lang.children(callee)[0]) == Some("String") {
+                if lang.sn(*name) == "valueOf" && lang.var_name(lang.children(callee)[0]) == Some("String") {
                     return Some(c[1]);
                 }
             }
             if let NodeData::VarRef { name } = lang.data(callee) {
-                if name == "valueOf" {
+                if lang.sn(*name) == "valueOf" {
                     return Some(c[1]);
                 }
             }
@@ -1302,7 +1302,7 @@ impl Rule<JavaAst> for StringBuilderStatements {
         let NodeData::Member { name: m0 } = lang.data(ic[0]) else {
             return None;
         };
-        if m0 != "append" {
+        if lang.sn(*m0) != "append" {
             return None;
         }
         let sb_new = lang.children(ic[0])[0];
@@ -1369,7 +1369,7 @@ impl Rule<JavaAst> for StringBuilderStatements {
                     let NodeData::Member { name: mn } = lang.data(vc[0]) else {
                         break;
                     };
-                    if mn != "append" {
+                    if lang.sn(*mn) != "append" {
                         break;
                     }
                     let recv = lang.children(vc[0])[0];
@@ -1402,7 +1402,7 @@ impl Rule<JavaAst> for StringBuilderStatements {
                     let NodeData::Member { name: mn } = lang.data(vc[0]) else {
                         break;
                     };
-                    if mn != "append" {
+                    if lang.sn(*mn) != "append" {
                         break;
                     }
                     let recv = lang.children(vc[0])[0];
@@ -1424,7 +1424,7 @@ impl Rule<JavaAst> for StringBuilderStatements {
                     let NodeData::Member { name: mn } = lang.data(vc[0]) else {
                         break;
                     };
-                    if mn != "append" {
+                    if lang.sn(*mn) != "append" {
                         break;
                     }
                     let recv = lang.children(vc[0])[0];
@@ -1464,7 +1464,7 @@ impl Rule<JavaAst> for StringBuilderStatements {
         let NodeData::Member { name: mn } = lang.data(sc[0]) else {
             return None;
         };
-        if mn != "toString" {
+        if lang.sn(*mn) != "toString" {
             return None;
         }
         if lang.var_name(lang.children(sc[0])[0]) != Some(cur.as_str()) {
@@ -1678,7 +1678,7 @@ impl Rule<JavaAst> for StrLenFold {
         let NodeData::Member { name } = lang.data(ch[0]) else {
             return None;
         };
-        if name != "length" {
+        if lang.sn(*name) != "length" {
             return None;
         }
         let recv = lang.children(ch[0])[0];
@@ -1757,9 +1757,9 @@ impl LiteralEval {
             .collect::<Option<Vec<_>>>()?;
 
         let result: Option<Lit> = if let Some(LitRef::Str(s)) = lang.literal(recv) {
-            eval_str_method(s, &method, &args)
+            eval_str_method(s, lang.sn(method), &args)
         } else if let Some(cls) = lang.var_name(recv) {
-            eval_static_method(cls, &method, &args)
+            eval_static_method(cls, lang.sn(method), &args)
         } else {
             None
         };
@@ -2042,7 +2042,7 @@ impl Rule<JavaAst> for Base64NewStringFold {
         let NodeData::Member { name: dn } = lang.data(dc[0]) else {
             return None;
         };
-        if dn != "decode" {
+        if lang.sn(*dn) != "decode" {
             return None;
         }
         // recv = Base64.getXxxDecoder()（调用）
@@ -2054,7 +2054,7 @@ impl Rule<JavaAst> for Base64NewStringFold {
         let NodeData::Member { name: gn } = lang.data(*gc.first()?) else {
             return None;
         };
-        let url_safe = match gn.as_str() {
+        let url_safe = match lang.sn(*gn) {
             "getDecoder" => false,
             "getUrlDecoder" => true,
             _ => return None,
@@ -2062,7 +2062,7 @@ impl Rule<JavaAst> for Base64NewStringFold {
         // owner = java.util.Base64（Member 链）或裸 Base64（VarRef）
         let owner = lang.children(gc[0])[0];
         let owner_ok = match lang.data(owner) {
-            NodeData::Member { name } => name == "Base64",
+            NodeData::Member { name } => lang.sn(*name) == "Base64",
             _ => matches!(lang.var_name(owner), Some(n) if n == "Base64" || n.ends_with(".Base64")),
         };
         if !owner_ok {
@@ -2949,7 +2949,7 @@ fn subtree_calls_self(ast: &JavaAst, root: JavaId, name: &str) -> bool {
             // "大写接收方.方法名" 也会命中 → 自我乒乓无限克隆 → 爆栈；
             // 保守拒绝（误拒仅损失一次内联机会）
             if let NodeData::Member { name: m } = ast.data(callee) {
-                if m == name {
+                if ast.sn(*m) == name {
                     return true;
                 }
             }
@@ -3050,7 +3050,7 @@ impl Rule<JavaAst> for ConstMethodInline {
             }
             _ => return None,
         };
-        let entry = lang.inline_methods.get(&method_name).cloned()?;
+        let entry = lang.inline_methods.get(lang.sn(method_name)).cloned()?;
         let (params, body_expr) = entry;
         // 终止守卫：方法体内不得含任何【内联名】的裸调用
         {
@@ -3090,7 +3090,7 @@ fn copy_subst(
     map: &std::collections::HashMap<String, JavaId>,
 ) -> JavaId {
     if let NodeData::VarRef { name } = lang.data(node) {
-        if let Some(&repl) = map.get(name) {
+        if let Some(&repl) = map.get(lang.sn(*name)) {
             return lang.copy_subtree(repl);
         }
     }
@@ -3170,7 +3170,7 @@ fn twr_is_close_call(lang: &JavaAst, e: JavaId, r: &str) -> bool {
         return false;
     }
     match lang.data(ch[0]) {
-        NodeData::Member { name } if name == "close" => {
+        NodeData::Member { name } if lang.sn(*name) == "close" => {
             let Some(&recv) = lang.children(ch[0]).first() else {
                 return false;
             };
@@ -3205,7 +3205,7 @@ fn twr_is_add_suppressed(lang: &JavaAst, n: JavaId, primary: &str, sup: &str) ->
         return false;
     }
     match lang.data(ch[0]) {
-        NodeData::Member { name } if name == "addSuppressed" => {
+        NodeData::Member { name } if lang.sn(*name) == "addSuppressed" => {
             let Some(&recv) = lang.children(ch[0]).first() else {
                 return false;
             };
@@ -3292,7 +3292,7 @@ fn twr_close_with_suppressed(
     let NodeData::Member { name } = lang.data(cc[0]) else {
         return None;
     };
-    if name != "close" {
+    if lang.sn(*name) != "close" {
         return None;
     }
     let recv = *lang.children(cc[0]).first()?;
@@ -3458,7 +3458,7 @@ impl Rule<JavaAst> for TwrRecover {
                 return None;
             }
             let primary = match lang.data(as_ch[0]) {
-                NodeData::VarRef { name } => name.clone(),
+                NodeData::VarRef { name } => lang.sn(*name).to_string(),
                 _ => return None,
             };
             let assign_ok = lang.kind(as_ch[1]) == NodeKind::VarRef
@@ -3488,7 +3488,7 @@ impl Rule<JavaAst> for TwrRecover {
             let c1 = lang.children(cond1);
             let r = match lang.data(c1[0]) {
                 NodeData::VarRef { name } if lang.literal(c1[1]) == Some(LitRef::Null) => {
-                    name.clone()
+                    lang.sn(*name).to_string()
                 }
                 _ => {
                     return None;
@@ -3697,7 +3697,7 @@ impl Rule<JavaAst> for StringSwitchRecover {
                     return None;
                 }
                 match lang.data(cc[0]) {
-                    NodeData::Member { name } if name == "hashCode" => {
+                    NodeData::Member { name } if lang.sn(*name) == "hashCode" => {
                         let recv = *lang.children(cc[0]).first()?;
                         if lang.kind(recv) != NodeKind::VarRef {
                             return None;
@@ -3776,7 +3776,7 @@ impl Rule<JavaAst> for StringSwitchRecover {
                     let Some((en, decl)) = &_e_decl else {
                         return None;
                     };
-                    if name != en {
+                    if lang.sn(*name) != en {
                         return None;
                     }
                     let init = *lang.children(*decl).first()?;
@@ -3806,7 +3806,7 @@ impl Rule<JavaAst> for StringSwitchRecover {
                     };
                     let a_ch = lang.children(assign_expr);
                     let vn = match lang.data(a_ch[0]) {
-                        NodeData::VarRef { name } => name.clone(),
+                        NodeData::VarRef { name } => lang.sn(*name).to_string(),
                         _ => return None,
                     };
                     let k = match lang.literal(a_ch[1])? {
@@ -3892,7 +3892,7 @@ impl Rule<JavaAst> for StringSwitchRecover {
         // 尾部选择器：VarRef v 或常量
         let tsel = *lang.children(trailing).first()?;
         match lang.data(tsel) {
-            NodeData::VarRef { name } if Some(name.as_str()) == v_name.as_deref() => {
+            NodeData::VarRef { name } if Some(lang.sn(*name)) == v_name.as_deref() => {
                 v_nodes.push(tsel);
             }
             NodeData::Literal(Lit::Int(_)) | NodeData::Literal(Lit::Long(_)) => {}
@@ -4003,7 +4003,7 @@ fn equals_lit(lang: &JavaAst, e: JavaId, x: &str) -> Option<String> {
         return None;
     }
     match lang.data(cc[0]) {
-        NodeData::Member { name } if name == "equals" => {
+        NodeData::Member { name } if lang.sn(*name) == "equals" => {
             let recv = *lang.children(cc[0]).first()?;
             if lang.kind(recv) != NodeKind::VarRef || lang.var_name(recv) != Some(x) {
                 return None;
@@ -4234,10 +4234,10 @@ fn collect_call_names(ast: &JavaAst, root: JavaId, out: &mut std::collections::H
                 if let Some(&callee) = ast.children(id).first() {
                     match ast.data(callee) {
                         NodeData::Member { name } => {
-                            out.insert(name.clone());
+                            out.insert(ast.sn(*name).to_string());
                         }
                         NodeData::VarRef { name } => {
-                            out.insert(name.clone());
+                            out.insert(ast.sn(*name).to_string());
                         }
                         _ => {}
                     }
@@ -4245,7 +4245,7 @@ fn collect_call_names(ast: &JavaAst, root: JavaId, out: &mut std::collections::H
             }
             NodeData::MethodRef { name } => {
                 // `recv::name` / `recv::new`
-                if let Some(short) = name.rsplit("::").next() {
+                if let Some(short) = ast.sn(*name).rsplit("::").next() {
                     out.insert(short.to_string());
                 }
             }

@@ -9,7 +9,7 @@
 //!
 //! 签名里的泛型、注解、throws 按原文输出；不可解析区域（Raw）原样保留。
 
-use cure_java_ast::{
+use cure_java_ast::{Sym, 
     BinOp, CompilationUnit, Declarator, JType, JavaAst, JavaId, Lit, Member, NodeData, NodeKind,
     Param, TypeDecl, TypeKind, UnOp,
 };
@@ -1006,13 +1006,21 @@ impl<'a> Printer<'a> {
                 // ProblemReferenceBinding 抓获）
                 let mut qual_new_anon = None;
                 if let NodeData::Member { name } = ast.data(ch[0]) {
+                    let name = ast.sn(*name);
                     if name.starts_with("new ") {
                         if let Some(i) = name.find(" {") {
-                            qual_new_anon = Some((i, name));
+                            qual_new_anon = Some(i);
                         }
                     }
                 }
-                if let Some((i, name)) = qual_new_anon {
+                if let Some(i) = qual_new_anon {
+                    let name = ast
+                        .sn(match ast.data(ch[0]) {
+                            NodeData::Member { name } => *name,
+                            _ => Sym::default(),
+                        })
+                        .to_string();
+                    let name = name.as_str();
                     let (head, body) = (&name[..i], &name[i + 1..]);
                     self.expr(ast.children(ch[0])[0], prec::POSTFIX);
                     self.out.push('.');
@@ -1050,6 +1058,8 @@ impl<'a> Printer<'a> {
                 }
             }
             NodeData::Member { name } => {
+                let name = ast.sn(*name);
+                let name = name;
                 let obj = ast.children(id)[0];
                 let need = prec::POSTFIX < min_prec;
                 // Switch 表达式作接收方必须带括号：switch (s) {…}.x 非法
@@ -1067,13 +1077,14 @@ impl<'a> Printer<'a> {
                     let d = name[..name.find("class").unwrap_or(name.len())].to_string();
                     (d, &name[name.find("class").unwrap_or(0)..])
                 } else {
-                    (String::new(), name.as_str())
+                    (String::new(), name)
                 };
                 self.out.push_str(&dims);
                 self.out.push('.');
                 self.out.push_str(rest);
             }
             NodeData::MethodRef { name } => {
+                let name = ast.sn(*name);
                 let recv = ast.children(id)[0];
                 let need = prec::POSTFIX < min_prec;
                 if need {
@@ -1084,7 +1095,7 @@ impl<'a> Printer<'a> {
                 // 维度属接收方类型（T[]::new），须在 :: 之前输出
                 let (dims, rest) = match name.find("::") {
                     Some(i) if name.starts_with("[]") => (&name[..i], &name[i + 2..]),
-                    _ => ("", name.as_str()),
+                    _ => ("", name),
                 };
                 self.out.push_str(dims);
                 self.out.push_str("::");
@@ -1190,7 +1201,7 @@ impl<'a> Printer<'a> {
             }
             NodeData::Switch => self.switch_print(id),
             NodeData::Raw { text } => self.out.push_str(text),
-            NodeData::VarRef { name } => self.out.push_str(name),
+            NodeData::VarRef { name } => self.out.push_str(ast.sn(*name)),
             NodeData::This => self.out.push_str("this"),
             NodeData::Super => self.out.push_str("super"),
             NodeData::Literal(l) => self.out.push_str(&lit_str(l)),

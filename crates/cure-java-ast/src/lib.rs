@@ -137,7 +137,7 @@ pub enum NodeData {
     /// children: `[callee, arg…]`
     Call,
     /// children: `[object]`；`name` 为成员名。
-    Member { name: String },
+    Member { name: Sym },
     /// children: `[array, index]`
     Index,
     Cast { ty: JType },
@@ -149,7 +149,7 @@ pub enum NodeData {
     /// children: `[size…, (ArrayLit)?]`
     NewArray { ty: JType, dims: u16, sized: u16 },
     ArrayLit,
-    VarRef { name: String },
+    VarRef { name: Sym },
     Literal(Lit),
     This,
     /// `super`（super.foo() / super(args) 的 callee）
@@ -159,7 +159,7 @@ pub enum NodeData {
     /// children: `[body]`（body 为 Block 或表达式）
     Lambda { params_raw: String },
     /// children: `[receiver]`；`recv::name`（name 含 `new`）
-    MethodRef { name: String },
+    MethodRef { name: Sym },
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -167,6 +167,13 @@ pub struct Node {
     pub data: NodeData,
     pub children: ChildList,
 }
+
+/// 符号（intern 名字 id）。VarRef/Member/MethodRef 的名字字段——
+/// 87% 重复率（实测 jdk-sources：4754 个名字节点仅 669 个唯一），
+/// String→Sym 后：构造去重、比较 u32、clone 零分配（copy_subtree/
+/// clone_node 全线受益）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Sym(pub u32);
 
 /// 子节点容器（内联优化）：≤3 个孩子零堆分配（AST 绝大多数节点——
 /// Binary/Assign=2、Member/MethodRef=1、VarDecl≤1、Literal=0……
@@ -304,6 +311,8 @@ pub struct JavaAst {
     region_events: Vec<Vec<cure_engine::kind::RegionEvent<JavaId, u32>>>,
     /// 名字实化（intern）：名字 → u32 键。单元级持久、只增。
     name_intern: HashMap<String, u32>,
+    /// Sym → 名字原文（符号表向量——sn() 翻译用）
+    sym_names: Vec<String>,
     /// 节点的名字键（槽位=节点 id；KEY_NONE=无名）。prepare 增量扩展
     /// （新节点 intern），既有节点键与其名字恒同——无需失效。
     node_key: Vec<u32>,
@@ -667,7 +676,8 @@ impl JavaAst {
         self.push(NodeData::Call, ch)
     }
     pub fn member(&mut self, obj: JavaId, name: &str) -> JavaId {
-        self.push(NodeData::Member { name: name.into() }, vec![obj])
+        let sym = self.intern_sym(name);
+        self.push(NodeData::Member { name: sym }, vec![obj])
     }
     pub fn index(&mut self, arr: JavaId, idx: JavaId) -> JavaId {
         self.push(NodeData::Index, vec![arr, idx])
@@ -713,7 +723,8 @@ impl JavaAst {
         self.push(NodeData::ArrayLit, elems)
     }
     pub fn var(&mut self, name: &str) -> JavaId {
-        self.push(NodeData::VarRef { name: name.into() }, vec![])
+        let sym = self.intern_sym(name);
+        self.push(NodeData::VarRef { name: sym }, vec![])
     }
     pub fn lit(&mut self, l: Lit) -> JavaId {
         self.push(NodeData::Literal(l), vec![])
@@ -749,10 +760,8 @@ impl JavaAst {
         )
     }
     pub fn method_ref(&mut self, receiver: JavaId, name: &str) -> JavaId {
-        self.push(
-            NodeData::MethodRef { name: name.into() },
-            vec![receiver],
-        )
+        let sym = self.intern_sym(name);
+        self.push(NodeData::MethodRef { name: sym }, vec![receiver])
     }
 
     // ---- 便捷 ----
@@ -1154,7 +1163,8 @@ impl Lang for JavaAst {
     }
     fn var_name(&self, id: JavaId) -> Option<&str> {
         match self.data(id) {
-            NodeData::VarRef { name } | NodeData::VarDecl { name, .. } => Some(name),
+            NodeData::VarRef { name } => Some(self.sn(*name)),
+            NodeData::VarDecl { name, .. } => Some(name),
             NodeData::ForEach { name, .. } | NodeData::Catch { name, .. } => Some(name),
             _ => None,
         }
@@ -1274,8 +1284,11 @@ impl Lang for JavaAst {
                             Action::None
                         }
                         NodeData::VarRef { name } => {
-                            if let Some(t) =
-                                scopes.iter().rev().find_map(|s| s.get(name)).cloned()
+                            if let Some(t) = scopes
+                                .iter()
+                                .rev()
+                                .find_map(|s| s.get(self.sn(*name)))
+                                .cloned()
                             {
                                 self.var_types[id.0 as usize] = Some(t);
                             }
@@ -1425,6 +1438,24 @@ mod tests {
 
 impl JavaAst {
     /// 名字 → 实化键（持久表，只增；同名字恒同键）。
+    /// intern 名字 → Sym（复用 name_intern 表 + sym_names 向量）。
+    pub fn intern_sym(&mut self, name: &str) -> Sym {
+        let k = self.intern_name(name);
+        if self.sym_names.len() <= k as usize {
+            self.sym_names.resize(k as usize + 1, String::new());
+            self.sym_names[k as usize] = name.to_string();
+        }
+        Sym(k)
+    }
+
+    /// Sym → 名字原文。
+    pub fn sn(&self, sym: Sym) -> &str {
+        self.sym_names
+            .get(sym.0 as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("")
+    }
+
     fn intern_name(&mut self, name: &str) -> u32 {
         if let Some(&k) = self.name_intern.get(name) {
             return k;
