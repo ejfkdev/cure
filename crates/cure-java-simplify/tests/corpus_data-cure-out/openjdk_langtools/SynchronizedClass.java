@@ -1,0 +1,2 @@
+public synchronized class SynchronizedClass {
+}

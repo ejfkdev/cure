@@ -1,0 +1,27 @@
+package com.puppycrawl.tools.checkstyle.checks.coding.illegaltype;
+
+import java.util.HashMap;
+import java.util.TreeSet;
+
+public class InputIllegalType implements InputIllegalTypeSuper {
+    public abstract class AbstractClass {
+    }
+    static class SomeStaticClass {
+    }
+    @Override
+    public void foo(HashMap<?, ?> buffer) {}
+    @Override
+    public HashMap<?, ?> foo() {
+        return null;
+    }
+    @Override
+    public HashMap<?, ?> bar() {
+        return null;
+    }
+}
+
+interface InputIllegalTypeSuper {
+    void foo(HashMap<?, ?> buffer);
+    HashMap<?, ?> foo();
+    Object bar();
+}

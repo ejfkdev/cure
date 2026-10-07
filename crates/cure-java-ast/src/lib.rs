@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 
+use cure_engine::analysis::{subtree_metrics, TreeMetrics};
 use cure_engine::lang::ReassocOutcome;
 use cure_engine::Lang;
 pub use cure_tree::ChildList;
@@ -1507,6 +1508,37 @@ impl JavaAst {
 
 
 
+}
+
+
+// ---------------------------------------------------------------------------
+// 结构化指标：编译单元级聚合（供 --stats 等评估简化效果——节点数 /
+// 判定点 / 嵌套深度不受格式化影响，只被语义简化改变）
+// ---------------------------------------------------------------------------
+
+/// 编译单元全部可执行体（方法/构造器/初始化块，含嵌套类型）的
+/// 结构指标总和。
+pub fn unit_metrics(ast: &JavaAst, unit: &CompilationUnit) -> TreeMetrics {
+    let mut total = TreeMetrics::default();
+    for ty in &unit.types {
+        metrics_of_type(ast, ty, &mut total);
+    }
+    total
+}
+
+fn metrics_of_type(ast: &JavaAst, ty: &TypeDecl, total: &mut TreeMetrics) {
+    for m in &ty.members {
+        match m {
+            Member::Method { body: Some(b), .. } | Member::Constructor { body: Some(b), .. } => {
+                total.add(subtree_metrics(ast, *b));
+            }
+            Member::Initializer { body, .. } => {
+                total.add(subtree_metrics(ast, *body));
+            }
+            Member::Type(t) => metrics_of_type(ast, t, total),
+            _ => {}
+        }
+    }
 }
 
 static ENV_CACHED: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();

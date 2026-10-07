@@ -1,0 +1,182 @@
+package com.google.googlejavaformat.java.javadoc;
+
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkState;
+import static com.google.googlejavaformat.java.javadoc.JavadocLexer.lex;
+import static java.util.regex.Pattern.CASE_INSENSITIVE;
+import static java.util.regex.Pattern.compile;
+import static java.util.stream.Collectors.joining;
+import com.google.common.base.CharMatcher;
+import com.google.common.collect.ImmutableList;
+import com.google.googlejavaformat.java.javadoc.JavadocLexer.LexException;
+import com.google.googlejavaformat.java.javadoc.Token.BeginJavadoc;
+import com.google.googlejavaformat.java.javadoc.Token.BlockQuoteCloseTag;
+import com.google.googlejavaformat.java.javadoc.Token.BlockQuoteMarker;
+import com.google.googlejavaformat.java.javadoc.Token.BlockQuoteOpenTag;
+import com.google.googlejavaformat.java.javadoc.Token.BrTag;
+import com.google.googlejavaformat.java.javadoc.Token.CodeCloseTag;
+import com.google.googlejavaformat.java.javadoc.Token.CodeOpenTag;
+import com.google.googlejavaformat.java.javadoc.Token.EndJavadoc;
+import com.google.googlejavaformat.java.javadoc.Token.FooterJavadocTagStart;
+import com.google.googlejavaformat.java.javadoc.Token.ForcedNewline;
+import com.google.googlejavaformat.java.javadoc.Token.HeaderCloseTag;
+import com.google.googlejavaformat.java.javadoc.Token.HeaderOpenTag;
+import com.google.googlejavaformat.java.javadoc.Token.HtmlComment;
+import com.google.googlejavaformat.java.javadoc.Token.ListCloseTag;
+import com.google.googlejavaformat.java.javadoc.Token.ListItemCloseTag;
+import com.google.googlejavaformat.java.javadoc.Token.ListItemOpenTag;
+import com.google.googlejavaformat.java.javadoc.Token.ListOpenTag;
+import com.google.googlejavaformat.java.javadoc.Token.Literal;
+import com.google.googlejavaformat.java.javadoc.Token.MarkdownBlockQuoteClose;
+import com.google.googlejavaformat.java.javadoc.Token.MarkdownBlockQuoteOpen;
+import com.google.googlejavaformat.java.javadoc.Token.MarkdownCodeSpanEnd;
+import com.google.googlejavaformat.java.javadoc.Token.MarkdownCodeSpanStart;
+import com.google.googlejavaformat.java.javadoc.Token.MarkdownFencedCodeBlock;
+import com.google.googlejavaformat.java.javadoc.Token.MarkdownHardLineBreak;
+import com.google.googlejavaformat.java.javadoc.Token.MarkdownTable;
+import com.google.googlejavaformat.java.javadoc.Token.MoeBeginStripComment;
+import com.google.googlejavaformat.java.javadoc.Token.MoeEndStripComment;
+import com.google.googlejavaformat.java.javadoc.Token.OptionalLineBreak;
+import com.google.googlejavaformat.java.javadoc.Token.ParagraphCloseTag;
+import com.google.googlejavaformat.java.javadoc.Token.ParagraphOpenTag;
+import com.google.googlejavaformat.java.javadoc.Token.PreCloseTag;
+import com.google.googlejavaformat.java.javadoc.Token.PreOpenTag;
+import com.google.googlejavaformat.java.javadoc.Token.SnippetBegin;
+import com.google.googlejavaformat.java.javadoc.Token.SnippetEnd;
+import com.google.googlejavaformat.java.javadoc.Token.TableCloseTag;
+import com.google.googlejavaformat.java.javadoc.Token.TableOpenTag;
+import com.google.googlejavaformat.java.javadoc.Token.Whitespace;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public final class JavadocFormatter {
+    public static String formatJavadoc(String input, int blockIndent, int maxLineLength) {
+        boolean classicJavadoc = switch (input) {
+            case String s when s.startsWith("/**") -> true;
+            case String s when s.startsWith("///") -> false;
+            default -> throw new IllegalArgumentException("Input does not start with /** or ///: " + input);
+        };
+        String inputForLexer = classicJavadoc ? classicCommentText(input) : markdownCommentText(input);
+        ImmutableList<Token> tokens;
+        try {
+            tokens = lex(inputForLexer, classicJavadoc);
+        } catch (LexException e) {
+            return input;
+        }
+        String result = render(tokens, blockIndent, classicJavadoc, maxLineLength);
+        if (classicJavadoc) {
+            result = makeSingleLineIfPossible(blockIndent, result, maxLineLength);
+        }
+        return result;
+    }
+    private static String render(List<Token> input, int blockIndent, boolean classicJavadoc, int maxLineLength) {
+        JavadocWriter output = new JavadocWriter(blockIndent, classicJavadoc, maxLineLength);
+        for (Token token : input) {
+            switch (token) {
+                case BeginJavadoc unused -> output.writeBeginJavadoc();
+                case EndJavadoc unused -> {
+                    output.writeEndJavadoc();
+                    return output.toString();
+                }
+                case FooterJavadocTagStart t -> output.writeFooterJavadocTagStart(t);
+                case SnippetBegin t -> output.writeSnippetBegin(t);
+                case SnippetEnd t -> output.writeSnippetEnd(t);
+                case ListOpenTag t -> output.writeListOpen(t);
+                case ListCloseTag t -> output.writeListClose(t);
+                case ListItemOpenTag t -> output.writeListItemOpen(t);
+                case HeaderOpenTag t -> output.writeHeaderOpen(t);
+                case HeaderCloseTag t -> output.writeHeaderClose(t);
+                case ParagraphOpenTag t -> output.writeParagraphOpen(standardizePToken(t));
+                case BlockQuoteOpenTag t -> output.writeBlockQuoteOpen(t);
+                case BlockQuoteCloseTag t -> output.writeBlockQuoteClose(t);
+                case MarkdownBlockQuoteOpen t -> output.writeMarkdownBlockQuoteOpen(t);
+                case MarkdownBlockQuoteClose t -> output.writeMarkdownBlockQuoteClose();
+                case PreOpenTag t -> output.writePreOpen(t);
+                case PreCloseTag t -> output.writePreClose(t);
+                case CodeOpenTag t -> output.writeCodeOpen(t);
+                case CodeCloseTag t -> output.writeCodeClose(t);
+                case TableOpenTag t -> output.writeTableOpen(t);
+                case TableCloseTag t -> output.writeTableClose(t);
+                case MoeBeginStripComment t -> output.requestMoeBeginStripComment(t);
+                case MoeEndStripComment t -> output.writeMoeEndStripComment(t);
+                case HtmlComment t -> output.writeHtmlComment(t);
+                case BrTag t -> output.writeBr(standardizeBrToken(t));
+                case Whitespace t -> output.requestWhitespaceOrBlankLine(t);
+                case ForcedNewline unused -> output.writeLineBreakNoAutoIndent();
+                case MarkdownHardLineBreak unused -> output.writeMarkdownHardLineBreak();
+                case Literal t -> output.writeLiteral(t);
+                case MarkdownFencedCodeBlock t -> output.writeMarkdownFencedCodeBlock(t);
+                case MarkdownTable t -> output.writeMarkdownTable(t);
+                case ListItemCloseTag unused -> {}
+                case OptionalLineBreak unused -> {}
+                case ParagraphCloseTag unused -> {}
+                case MarkdownCodeSpanStart unused -> {}
+                case MarkdownCodeSpanEnd unused -> {}
+                case BlockQuoteMarker unused -> {}
+            }
+        }
+        throw new AssertionError();
+    }
+    private static BrTag standardizeBrToken(BrTag token) {
+        return standardize(token, STANDARD_BR_TOKEN);
+    }
+    private static ParagraphOpenTag standardizePToken(ParagraphOpenTag token) {
+        return standardize(token, STANDARD_P_TOKEN);
+    }
+    private static <T extends Token> T standardize(T token, T standardToken) {
+        return SIMPLE_TAG_PATTERN.matcher(token.value()).matches() ? standardToken : token;
+    }
+    private static final BrTag STANDARD_BR_TOKEN = new BrTag("<br>");
+    private static final ParagraphOpenTag STANDARD_P_TOKEN = new ParagraphOpenTag("<p>");
+    private static final Pattern SIMPLE_TAG_PATTERN = compile("^<\\w+\\s*/?\\s*>", CASE_INSENSITIVE);
+    private static final Pattern ONE_CONTENT_LINE_PATTERN = compile(" */[*][*]\n *[*] (.*)\n *[*]/");
+    private static String makeSingleLineIfPossible(int blockIndent, String input, int maxLineLength) {
+        Matcher matcher = ONE_CONTENT_LINE_PATTERN.matcher(input);
+        if (matcher.matches()) {
+            String line = matcher.group(1);
+            if (line.isEmpty()) {
+                return "/** */";
+            } else if (oneLineJavadoc(line, blockIndent, maxLineLength)) {
+                return "/** " + line + " */";
+            }
+        }
+        return input;
+    }
+    private static boolean oneLineJavadoc(String line, int blockIndent, int maxLineLength) {
+        return line.length() > maxLineLength - 7 - blockIndent ? false : !(line.startsWith("@") && !line.equals("@hide"));
+    }
+    private static final CharMatcher NOT_SPACE_OR_TAB = CharMatcher.noneOf(" \t");
+    private static final Pattern CLASSIC_PREFIX_PATTERN = Pattern.compile("^[ \\t]*[*][ \\t]?");
+    private static String stripJavadocBeginAndEnd(String input) {
+        checkArgument(input.startsWith("/**"), "Missing /**: %s", input);
+        checkArgument(input.endsWith("*/") && input.length() > 4, "Missing */: %s", input);
+        return input.substring(3, input.length() - 2);
+    }
+    private static String classicCommentText(String input) {
+        List<String> lines = stripJavadocBeginAndEnd(input).lines().toList();
+        if (lines.isEmpty()) {
+            return "";
+        }
+        List<String> processedLines = new ArrayList<>();
+        processedLines.add(lines.get(0));
+        for (String line : lines.subList(1, lines.size())) {
+            Matcher m = CLASSIC_PREFIX_PATTERN.matcher(line);
+            if (m.find()) {
+                processedLines.add(m.replaceFirst(""));
+            } else {
+                processedLines.add(line.stripLeading());
+            }
+        }
+        return stripCommonLeadingWhitespace(processedLines);
+    }
+    private static String markdownCommentText(String input) {
+        return stripCommonLeadingWhitespace(input.lines().peek((line) -> checkState(line.contains("///"), "Line does not contain ///: %s", line)).map((line) -> line.substring(line.indexOf("///") + 3)).toList());
+    }
+    private static String stripCommonLeadingWhitespace(List<String> lines) {
+        int leadingSpace = lines.stream().filter((line) -> NOT_SPACE_OR_TAB.matchesAnyOf(line)).mapToInt(NOT_SPACE_OR_TAB::indexIn).min().orElse(0);
+        return lines.stream().map((line) -> line.length() < leadingSpace ? "" : line.substring(leadingSpace)).collect(joining("\n"));
+    }
+    private JavadocFormatter() {}
+}

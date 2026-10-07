@@ -1,0 +1,14 @@
+package spoon.test.prettyprinter.testclasses;
+
+import spoon.test.prettyprinter.testclasses.sub.Constants;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static java.lang.System.out;
+
+public class ImportStatic {
+    public static void main(String[] args, java.lang.String[] args2, String args3, java.lang.String args4) throws Exception {
+        assertTrue(false);
+        out.println(Constants.READY);
+        System.out.println(Constants.READY);
+        java.lang.System.out.println(Constants.READY);
+    }
+}

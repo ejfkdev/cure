@@ -1,0 +1,3 @@
+@Dup
+@Dup @interface Dup {
+}

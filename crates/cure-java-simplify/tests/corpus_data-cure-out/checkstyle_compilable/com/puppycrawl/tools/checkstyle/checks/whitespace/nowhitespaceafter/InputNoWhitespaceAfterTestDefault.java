@@ -1,0 +1,137 @@
+package com . puppycrawl // violation ''.' is followed by whitespace'
+    .;
+
+tools. // violation ''.' is followed by whitespace'
+    checkstyle.checks.whitespace.nowhitespaceafter;
+class InputNoWhitespaceAfterTestDefault {
+    private int mVar1 = 1;
+    private int mVar2 = 1;
+    private int mVar3 = 1;
+    void method1() {
+        int b = 1;
+        b += 1;
+        b -= -1 + b;
+        b = b++ + b--;
+        b = ++b - --b;
+    }
+    void method2() {
+        synchronized (this) {}
+        try {} catch (RuntimeException e) {}
+    }
+    private int mVar4 = 1;
+    private void fastExit() {}
+    private int nonVoid() {
+        return 2;
+    }
+    private void testCasts() {
+        Object o = (Object) new Object();
+        o = (Object) o;
+        o = (Object) o;
+        o = (Object) o;
+    }
+    private void testQuestions() {
+        boolean b = true;
+    }
+    private void starTest() {
+        int x = 24;
+    }
+    private void boolTest() {
+        int z = ~1 + ~2;
+    }
+    private void divTest() {
+        int h = 2;
+    }
+    private java.lang.String dotTest() {
+        Object o = new Object();
+        o.toString();
+        o.toString();
+        o.toString();
+        return o.toString();
+    }
+    public void assertTest() {
+        assert true;
+        assert true : "Whups";
+        assert "OK".equals(null) ? false : true : "Whups";
+        assert true;
+        assert true : "Whups";
+    }
+    void donBradman(Runnable aRun) {
+        donBradman(new Runnable() {
+            public void run() {
+            }
+        });
+        Runnable r = new Runnable() {
+            public void run() {
+            }
+        };
+    }
+    void rfe521323() {
+        doStuff();
+        for (int i = 0; i < 5; i++) {}
+    }
+    private int i;
+    private int i1, i2, i3;
+    private int i4, i5, i6;
+    void bug806243() {
+        Object o = new InputNoWhitespaceAfterTestAssignment() {
+            private int j ;
+            //           ^ whitespace
+        };
+    }
+    void doStuff() {}
+}
+
+interface IFoo {
+    void foo();
+}
+
+class SpecialCasesInForLoop {
+    void forIterator() {
+        for (int i = 0; i++ < 5; ) {}
+        int i = 0;
+        for (; i < 5; i++) {}
+        for (int anInt : getSomeInts()) {}
+    }
+    int[] getSomeInts() {
+        return null;
+    }
+    public void myMethod() {
+        new Thread() {
+            public void run() {
+            }
+        }.start();
+    }
+    public void foo(java.util.List<? extends String[]> bar, Comparable<? super Object[]> baz) {}
+    public void mySuperMethod() {
+        new Runnable() {
+                public void run() {
+                }
+            }.run();
+    }
+    public void testNullSemi() {}
+    public void register(Object obj) {}
+    public void doSomething(String[] args) {
+        register(boolean[].class);
+        register(args);
+    }
+    public void parentheses() {
+        testNullSemi();
+    }
+    public static void testNoWhitespaceBeforeEllipses(String... args) {}
+    @interface BAD {
+    }
+    @interface BAD2 {
+    }
+    @interface BAD3 {
+    }
+    @interface Ok {
+    }
+    static {
+        int[] err = new int[50];
+    }
+    Object foo() {
+        return (Object) "";
+    }
+    public Object[] variable;
+    int someStuff8[];
+}

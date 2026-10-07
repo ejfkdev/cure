@@ -1,0 +1,67 @@
+package com.puppycrawl.tools.checkstyle.grammar;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Map;
+import java.util.List;
+import java.util.function.IntBinaryOperator;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+
+public class InputRegressionJava8Class1 {
+    static class Inner1 {
+        static class Inner2<V> {
+            public void m() {}
+        }
+    }
+    static class Inner3<T> {
+        public void m() {}
+    }
+    public void m() {}
+    public static void sm() {}
+    void m1() throws @Nullable Exception {}
+    public static <T> void m2(T[] array) {}
+    public void m3() throws NullPointerException, @Nullable ArrayIndexOutOfBoundsException {}
+    public void m4(InputRegressionJava8Class1 this) {}
+    public void m5(@Nullable InputRegressionJava8Class1 this) {}
+    {
+        List<String> vlist = new ArrayList<String>();
+    }
+    public void instructions() {
+        boolean b = Math.random() > 0;
+        int vint;
+        List<String> vlist = new ArrayList<String>();
+        Supplier<?> s;
+        Map.Entry e;
+        String str = (String) "";
+        new Inner3().m();
+        IntBinaryOperator ibo = Math::max;
+        s = Inner1.Inner2::new;
+        Runnable r1 = () -> m();
+        Runnable r2 = () -> {
+            m();
+        };
+        Collections.sort(vlist, (l,  r) -> l == r ? 0 : 1);
+        Predicate<?> t = b ? null : ((object) -> null.equals(object));
+        Double mPi = Math.PI;
+    }
+    static final Comparator<?> f = (Comparator<?>) ((dateTime1, dateTime2) -> {
+    return 0;
+});
+    private class Inner {
+        public Inner(InputRegressionJava8Class1 InputRegressionJava8Class1) 
+            .this) {}
+    }
+}
+
+class InputRegressionJava8TypeParam<@Nullable T> {
+}
+
+@Retention(RetentionPolicy.CLASS)
+@Target({ ElementType.TYPE_USE }) @interface Nullable {
+}

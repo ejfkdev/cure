@@ -129,3 +129,90 @@ pub fn structurally_equal<L: Lang>(lang: &L, a: L::Id, b: L::Id) -> bool {
     }
     ca.iter().zip(cb.iter()).all(|(&x, &y)| structurally_equal(lang, x, y))
 }
+
+// ---------------------------------------------------------------------------
+// 结构化简化指标：节点数 / 判定点（McCabe 决策点）/ 最大嵌套深度。
+//
+// 与行数不同，这三项**不受格式化影响**——只被语义简化改变。用于
+// 区分「真简化」与「纯格式归一」，以及在大语料上定位未简化的文件
+// （指标零变化 = 无规则命中）。
+// ---------------------------------------------------------------------------
+
+/// 一个根（通常是方法体）的结构指标。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeMetrics {
+    /// 子树节点总数（从根可达的 arena 节点；不含编辑残留的游离节点）。
+    pub nodes: u64,
+    /// 判定点数：if / while / do / for / foreach / case / catch / 三元 /
+    /// `&&` / `||`（McCabe 复杂度的决策点部分）。
+    pub decisions: u64,
+    /// 最大嵌套深度（语句容器嵌套层数；反编译嵌套块与扁平化状态机
+    /// 的直接体现）。
+    pub max_depth: u32,
+}
+
+impl TreeMetrics {
+    pub fn add(&mut self, other: TreeMetrics) {
+        self.nodes += other.nodes;
+        self.decisions += other.decisions;
+        self.max_depth = self.max_depth.max(other.max_depth);
+    }
+}
+
+/// 是否为语句容器（进入其孩子算一层嵌套）。
+fn is_container(k: NodeKind) -> bool {
+    matches!(
+        k,
+        NodeKind::Block
+            | NodeKind::If
+            | NodeKind::While
+            | NodeKind::DoWhile
+            | NodeKind::For
+            | NodeKind::ForEach
+            | NodeKind::Try
+            | NodeKind::Catch
+            | NodeKind::Switch
+            | NodeKind::Synchronized
+    )
+}
+
+/// 是否为判定点（kind 级）。
+fn is_decision_kind(k: NodeKind) -> bool {
+    matches!(
+        k,
+        NodeKind::If
+            | NodeKind::While
+            | NodeKind::DoWhile
+            | NodeKind::For
+            | NodeKind::ForEach
+            | NodeKind::Case
+            | NodeKind::Catch
+            | NodeKind::Ternary
+    )
+}
+
+/// 从 `root`（方法体等）累计结构指标。
+pub fn subtree_metrics<L: Lang>(lang: &L, root: L::Id) -> TreeMetrics {
+    let mut m = TreeMetrics::default();
+    walk_metrics(lang, root, 0, &mut m);
+    m
+}
+
+fn walk_metrics<L: Lang>(lang: &L, id: L::Id, depth: u32, m: &mut TreeMetrics) {
+    m.nodes += 1;
+    let k = lang.kind(id);
+    if is_decision_kind(k) {
+        m.decisions += 1;
+    }
+    // 短路 && / || 是独立判定点（路径分叉）
+    if k == NodeKind::Binary && lang.bin_op(id).is_some_and(|o| o.is_short_circuit()) {
+        m.decisions += 1;
+    }
+    let child_depth = if is_container(k) { depth + 1 } else { depth };
+    if child_depth > m.max_depth {
+        m.max_depth = child_depth;
+    }
+    for &c in lang.children(id) {
+        walk_metrics(lang, c, child_depth, m);
+    }
+}

@@ -1,0 +1,3 @@
+@interface An {
+    void a();
+}

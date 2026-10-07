@@ -1,0 +1,15 @@
+module com.example.app {
+    requires java.base;
+    requires transitive java.sql;
+    requires static com.example.annotations;
+
+    exports com.example.api;
+    exports com.example.internal to com.example.other;
+
+    opens com.example.model;
+    opens com.example.secrets to com.example.friend;
+
+    uses com.example.api.Service;
+
+    provides com.example.api.Service with com.example.impl.ServiceImpl;
+}

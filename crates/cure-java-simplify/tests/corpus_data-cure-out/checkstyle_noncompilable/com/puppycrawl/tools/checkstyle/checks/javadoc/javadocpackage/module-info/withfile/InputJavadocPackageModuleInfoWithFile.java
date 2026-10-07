@@ -1,0 +1,4 @@
+package withfile;
+
+class InputJavadocPackageModuleInfoWithFile {
+}

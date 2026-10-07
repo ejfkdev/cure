@@ -1,0 +1,3 @@
+@interface An {
+    int[][] a();
+}

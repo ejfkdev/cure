@@ -185,7 +185,9 @@ threads (cores × 1.5):
 | OpenJDK full source corpus, output tree written | 371,674 / 4.70 GB | 27.5 s | ~430 MiB |
 
 The full-corpus runs execute parse → simplify → print for every file with
-**0 parse failures and 0 panics**.
+**0 parse failures and 0 panics**. On the 3,999-file vendored corpus,
+`--stats` classifies: 951 structurally simplified / 2,025 format-only /
+47 untouched (nodes −4.7 %, decisions −5.0 %).
 
 - Parallelism: dynamic work queue, default threads = cores × 1.5 (measured
   −7% vs 1:1 on heterogeneous P/E cores; CPU and RSS neutral).

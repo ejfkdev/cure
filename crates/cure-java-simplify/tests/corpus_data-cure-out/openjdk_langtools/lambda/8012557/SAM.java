@@ -1,0 +1,3 @@
+interface SAM {
+    String m();
+}

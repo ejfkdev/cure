@@ -170,6 +170,13 @@ struct FileResult {
     edits: usize,
     lines_before: usize,
     lines_after: usize,
+    /// 结构指标（--stats/--report 惰性计算；零值 = 未采集）。
+    nodes_before: u64,
+    nodes_after: u64,
+    decisions_before: u64,
+    decisions_after: u64,
+    depth_before: u32,
+    depth_after: u32,
     by_rule: Vec<(&'static str, usize)>,
     /// --diff 生成的差异文本（未启用或差异过大时为空）
     diff_text: String,
@@ -617,6 +624,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             });
         };
         let r = (backend.process)(&src, &opts, None, &display)?;
+        // --stats/--report：单文件也输出汇总（结构指标随处可得）
+        if opts.stats || opts.report {
+            print_stats_summary(&[r.clone()], &opts);
+        }
         return Ok(final_code_opts(r.changed, r.errored, &opts));
     }
 
@@ -721,8 +732,27 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         }
     }
 
-    // 汇总
-    if all.len() > 1 {
+    // --diff：串行打印（保持顺序）
+    if opts.diff {
+        for r in &all {
+            if r.changed && !r.diff_text.is_empty() {
+                println!("{}", r.diff_text);
+            }
+        }
+    }
+
+    // 汇总（多文件与单文件共用）
+    print_stats_summary(&all, &opts);
+
+    let any_changed = all.iter().any(|r| r.changed);
+    let any_error = all.iter().any(|r| r.errored);
+    Ok(final_code_opts(any_changed, any_error, &opts))
+}
+
+/// 汇总统计（stderr）。单文件 + stdout 路径同样调用——简化效果指标
+/// （节点/判定点/嵌套）应当随处可得。
+fn print_stats_summary(all: &[FileResult], opts: &Options) {
+    {
         let changed = all.iter().filter(|r| r.changed).count();
         let errored = all.iter().filter(|r| r.errored).count();
         let edits: usize = all.iter().map(|r| r.edits).sum();
@@ -737,8 +767,31 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         );
         if opts.stats || opts.report {
             eprintln!("  行数 {lb} → {la}（{:+.1}%）", (la as f64 - lb as f64) * 100.0 / lb.max(1) as f64);
+            // 结构指标：与行数不同，不受格式化影响——区分「真简化」与
+            // 「纯格式归一」，并定位零简化文件（规则缺口线索）
+            let nb: u64 = all.iter().map(|r| r.nodes_before).sum();
+            let na: u64 = all.iter().map(|r| r.nodes_after).sum();
+            let db: u64 = all.iter().map(|r| r.decisions_before).sum();
+            let da: u64 = all.iter().map(|r| r.decisions_after).sum();
+            let dpb: u32 = all.iter().map(|r| r.depth_before).max().unwrap_or(0);
+            let dpa: u32 = all.iter().map(|r| r.depth_after).max().unwrap_or(0);
+            eprintln!(
+                "  节点 {nb} → {na}（{:+.1}%）判定点 {db} → {da}（{:+.1}%）",
+                (na as f64 - nb as f64) * 100.0 / nb.max(1) as f64,
+                (da as f64 - db as f64) * 100.0 / db.max(1) as f64
+            );
+            eprintln!("  嵌套深度（文件最大值）{dpb} → {dpa}");
+            let structural: usize = all.iter().filter(|r| r.nodes_after < r.nodes_before).count();
+            let fmt_only: usize = all
+                .iter()
+                .filter(|r| r.changed && r.nodes_after >= r.nodes_before && r.nodes_before > 0)
+                .count();
+            let untouched: usize = all.iter().filter(|r| !r.changed).count();
+            eprintln!(
+                "  简化质量：结构简化 {structural} / 仅格式 {fmt_only} / 未变 {untouched}"
+            );
             let mut by_rule: std::collections::BTreeMap<&'static str, usize> = Default::default();
-            for r in &all {
+            for r in all {
                 for (k, v) in &r.by_rule {
                     *by_rule.entry(k).or_insert(0) += v;
                 }
@@ -750,10 +803,6 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             }
         }
     }
-
-    let any_changed = all.iter().any(|r| r.changed);
-    let any_error = all.iter().any(|r| r.errored);
-    Ok(final_code_opts(any_changed, any_error, &opts))
 }
 
 fn final_code_opts(any_changed: bool, any_error: bool, opts: &Options) -> ExitCode {
@@ -779,10 +828,17 @@ fn process_source(
     // 批处理下纯浪费（采样 Lines::next ~2%）
     let need_lines = opts.stats || opts.report;
     let lines_before = if need_lines { src.lines().count() } else { 0 };
+    // 结构指标（节点/判定点/嵌套）与行数同门控：37 万文件批处理下
+    // 全量 walk 是纯浪费（各 O(节点)）
+    let before_metrics =
+        if need_lines { cure_java_ast::unit_metrics(&outcome.ast, &outcome.unit) } else { Default::default() };
 
     let mut result = FileResult {
         errored: had_errors,
         lines_before,
+        nodes_before: before_metrics.nodes,
+        decisions_before: before_metrics.decisions,
+        depth_before: before_metrics.max_depth,
         display: display.to_string(),
         ..Default::default()
     };
@@ -794,6 +850,12 @@ fn process_source(
         }
         cfg.remove_dead_methods = opts.dead_code;
         let report = simplify_unit(&mut outcome.ast, &mut outcome.unit, &cfg);
+        if need_lines {
+            let after_metrics = cure_java_ast::unit_metrics(&outcome.ast, &outcome.unit);
+            result.nodes_after = after_metrics.nodes;
+            result.decisions_after = after_metrics.decisions;
+            result.depth_after = after_metrics.max_depth;
+        }
         result.edits = report.edits;
         result.by_rule = report.by_rule.iter().map(|(k, v)| (*k, *v)).collect();
         if opts.report {
@@ -801,6 +863,14 @@ fn process_source(
                 "cure: {display}: {} 次改写 / {} 轮",
                 report.edits, report.iterations
             );
+            if need_lines {
+                eprintln!(
+                    "  结构：节点 {}→{} / 判定点 {}→{} / 嵌套 {}→{}",
+                    before_metrics.nodes, result.nodes_after,
+                    before_metrics.decisions, result.decisions_after,
+                    before_metrics.max_depth, result.depth_after
+                );
+            }
             if !report.by_rule.is_empty() {
                 let detail: Vec<String> =
                     report.by_rule.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -811,6 +881,13 @@ fn process_source(
     let printed = print_unit(&outcome.ast, &outcome.unit);
     if need_lines {
         result.lines_after = printed.lines().count();
+        if result.nodes_before > 0 && result.nodes_after == 0 {
+            // format_only（未跑简化）：结构视为不变。简化跑过则不可能
+            // 归零——有方法体的单元 after 至少含各 Block 根节点
+            result.nodes_after = result.nodes_before;
+            result.decisions_after = result.decisions_before;
+            result.depth_after = result.depth_before;
+        }
     }
 
     if had_errors {

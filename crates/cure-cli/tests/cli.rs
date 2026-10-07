@@ -339,3 +339,64 @@ fn single_file_with_unimplemented_ext_is_clear_error() {
         .success()
         .stdout(predicate::str::contains("return 1;"));
 }
+
+// ---- 简化效果指标（--stats：节点/判定点/嵌套 + 文件分类）----
+
+#[test]
+fn stats_reports_structural_metrics_and_classification() {
+    // 结构简化文件（恒真谓词 if + 逆运算噪声对）
+    let dir = TempDir::new().unwrap();
+    let p = tmp_java(
+        &dir,
+        "Noise.java",
+        "class Noise{int f(){int a=0;if(2<3){a=1;}a+=1;a-=1;return a;}}",
+    );
+    let out = cure()
+        .env("CURE_LANG", "zh")
+        .arg("--stats")
+        .arg(&p)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("节点"), "{stderr}");
+    assert!(stderr.contains("判定点"), "{stderr}");
+    assert!(stderr.contains("简化质量：结构简化 1"), "{stderr}");
+    assert!(
+        stderr.contains("判定点 1 → 0"),
+        "if(常量谓词) 折叠应减判定点: {stderr}"
+    );
+
+    // 纯格式文件：无可简化结构（无规则命中）→ 分类为「仅格式」
+    let p2 = tmp_java(&dir, "Fmt.java", "class Fmt{int m(){return foo();}}");
+    let out2 = cure()
+        .env("CURE_LANG", "zh")
+        .arg("--stats")
+        .arg(&p2)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+    assert!(
+        stderr2.contains("简化质量：结构简化 0 / 仅格式 1 / 未变 0"),
+        "{stderr2}"
+    );
+    assert!(stderr2.contains("节点 4 → 4"), "{stderr2}");
+}
+
+#[test]
+fn metrics_unit_counting() {
+    // 引擎侧 TreeMetrics 精确性：判定点 = if + while + for + case + && + 三元
+    let mut out = cure_java_parser::parse(
+        "class A{int f(int x){if(x>0){x=1;}while(x<3){x=x+1;}for(int i=0;i<2;i++){}\
+         switch(x){case 1:break;default:break;}return x>0?1:(x&&true?2:3);}}",
+    );
+    let before = cure_java_ast::unit_metrics(&out.ast, &out.unit);
+    // if=1 while=1 for=1 case×2(default)=2 &&=1 ?:×2=2 → 8
+    assert_eq!(before.decisions, 8, "{before:?}");
+    assert!(before.nodes > 40, "{before:?}");
+    assert!(before.max_depth >= 2, "{before:?}");
+    let _ = &mut out;
+}

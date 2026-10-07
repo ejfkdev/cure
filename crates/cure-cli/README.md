@@ -40,6 +40,11 @@ Highlights:
   macOS/Windows thread pool. Default build: zero runtime dependencies.
 - Dry runs (`--check`), diffs (`--diff`), stats (`--stats`/`--report`),
   rule toggles (`--disable`), in-place mode (`-w`), thread control (`-j`).
+- **Simplification-quality metrics** (`--stats`): AST nodes, decision
+  points, max nesting — before vs. after. Untouched by formatting, they
+  separate real simplification from reformatting; per-file classification
+  (structurally simplified / format-only / untouched) surfaces files no
+  rule reached.
 
 Full documentation — rule catalog, verification methodology, performance
 notes, and the 中文版 — in the

@@ -11,6 +11,7 @@
 //! 语言 crate（如 cure-java-ast）实现 [`Lang`] 并注册规则；本 crate 零外部依赖。
 
 pub mod analysis;
+pub use analysis::{subtree_metrics, TreeMetrics};
 pub mod cost;
 pub mod effect;
 pub mod kind;

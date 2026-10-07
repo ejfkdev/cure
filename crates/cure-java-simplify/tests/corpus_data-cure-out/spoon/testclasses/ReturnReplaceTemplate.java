@@ -1,0 +1,19 @@
+package spoon.test.template.testclasses;
+
+import spoon.template.ExtensionTemplate;
+import spoon.template.Local;
+import spoon.template.TemplateParameter;
+
+public class ReturnReplaceTemplate extends ExtensionTemplate {
+    public String method() throws Throwable {
+        return _statement_.S();
+    }
+    TemplateParameter<String> _statement_;
+    @Local
+	public ReturnReplaceTemplate(TemplateParameter<String> statement) {
+        this._statement_ = statement;
+    }
+    @Local String sample() {
+        return System.currentTimeMillis() % 2L == 0 ? "Panna" : "Orel";
+    }
+}
