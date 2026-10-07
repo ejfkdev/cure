@@ -216,6 +216,10 @@ pub struct JavaAst {
     /// 字段声明类型表（名字 → JType；同名二见移除）——调用点实参静态
     /// 类型解析用（VarRef 解析不到局部时查字段）。collect_unit_consts 填充。
     pub field_types: HashMap<String, JType>,
+    /// final 字段名集合（同名二见移除——保守）。static_exec 截断守卫
+    /// 用：前缀字段写被 rest 再赋值时，仅 final 才放弃（非 final 的
+    /// 材料化写是死写，语义恒等、可编译）。
+    pub final_fields: HashSet<String>,
     /// 可内联的单 return 方法：名字 → (参数名表, 返回表达式节点)。
     /// 由 simplify_unit 填充（解密 helper：d(0) → 方法体）。
     pub inline_methods: HashMap<String, (Vec<String>, JavaId)>,

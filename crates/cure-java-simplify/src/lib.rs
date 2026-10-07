@@ -879,7 +879,13 @@ impl Rule<JavaAst> for StaticExec {
             for ev in ex.effect_log().iter() {
                 if let vexec::EffectEvent::FieldWrite(k) = ev {
                     if let Some(name) = lang.name_of_key(*k) {
-                        if rest_reassigns_field(lang, &true_rest, &name) {
+                        // final 双重赋值不可编译 → 放弃整段；非 final 的
+                        // 材料化写被 rest 再赋值杀掉 = 死写，语义恒等
+                        //（a3/a4/a5：尾部 fernflower 复制分支再赋值非 final
+                        // 字段曾使整段放弃——全有或全无 → 放宽为部分材料化）
+                        if lang.final_fields.contains(&name)
+                            && rest_reassigns_field(lang, &true_rest, &name)
+                        {
                             return None;
                         }
                     }
@@ -3353,6 +3359,7 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
     ast.const_scalars.clear();
     ast.inline_methods.clear();
     ast.field_types.clear();
+    ast.final_fields.clear();
 
     // 第一遍（递归含嵌套类型——规则也处理嵌套类体内的 VarRef）：
     // 遮蔽集（局部/参数同名声明）+ 全单元名字写计数 + 字段声明名计数。
@@ -3365,9 +3372,10 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
     for ty in &unit.types {
         collect_bodies_recursive(ty, &mut bodies, &mut shadowed, &mut field_decls);
     }
-    // 字段类型表（调用点实参类型解析用；同名二见移除——保守）
+    // 字段类型表 + final 集合（调用点实参类型解析 / 截断守卫 finality 用；
+    // 同名二见移除——保守）
     for ty in &unit.types {
-        collect_field_types(ty, &mut ast.field_types);
+        collect_field_types(ty, &mut ast.field_types, &mut ast.final_fields);
     }
     // 写扫描：赋值目标子树全部名字（含数组元素写——改内容同样破坏
     // 常量性）、++/-- 目标、Member 目标的成员名（this.a=x / A.a=x——
@@ -3563,20 +3571,29 @@ fn collect_bodies_recursive(
     }
 }
 
-/// 递归收集字段声明类型（名字 → JType；同名二见移除）。
-fn collect_field_types(ty: &TypeDecl, out: &mut std::collections::HashMap<String, JType>) {
+/// 递归收集字段声明类型（名字 → JType）与 final 集合（同名二见移除）。
+fn collect_field_types(
+    ty: &TypeDecl,
+    out: &mut std::collections::HashMap<String, JType>,
+    finals: &mut std::collections::HashSet<String>,
+) {
     for m in &ty.members {
         match m {
-            Member::Field { ty: fty, declarators, .. } => {
+            Member::Field { mods, ty: fty, declarators } => {
+                let is_final = mods.split_whitespace().any(|w| w == "final");
                 for d in declarators {
                     if out.contains_key(&d.name) {
                         out.remove(&d.name);
+                        finals.remove(&d.name);
                     } else {
                         out.insert(d.name.clone(), fty.clone());
+                        if is_final {
+                            finals.insert(d.name.clone());
+                        }
                     }
                 }
             }
-            Member::Type(t) => collect_field_types(t, out),
+            Member::Type(t) => collect_field_types(t, out, finals),
             _ => {}
         }
     }

@@ -1489,3 +1489,28 @@ fn import_used_by_catch_type_kept() {
     );
     assert!(out.contains("import java.io.UnsupportedEncodingException;"), "{out}");
 }
+
+#[test]
+fn nonfinal_reassign_in_rest_allows_materialize() {
+    // 非 final 字段：rest 再赋值 → 材料化写 = 死写（语义恒等）→ 放行；
+    // 死局部 x/y 随前缀重写消失（final 才整段放弃——对照
+    // clinit_reassignment_in_rest_bails）
+    let out = run_src(
+        "class A{static String c;static{c=\"V\";int x=1;int y=2;java.util.Objects.requireNonNull(c);c=\"W\";}static void m(){System.out.println(c);}}",
+    );
+    assert!(out.contains("c = \"V\";"), "{out}");
+    assert!(out.contains("c = \"W\";"), "{out}");
+    assert!(!out.contains("int x = 1;"), "{out}");
+}
+
+#[test]
+fn final_reassign_in_rest_still_bails() {
+    // final 字段：rest 再赋值 → 材料化写构成双重赋值不可编译 → 整段放弃
+    let out = run_src(
+        "class A{static final String c;static{int x=1;int y=2;c=\"V\";java.util.Objects.requireNonNull(c);c=\"W\";}static void m(){System.out.println(c);}}",
+    );
+    // 放弃整段：x/y 由 dead_decl 独立清除，但 c=\"V\" 不能以材料化形式出现两次
+    let v_count = out.matches("c = \"V\";").count();
+    assert!(v_count <= 1, "{out}");
+    assert!(out.contains("c = \"W\";"), "{out}");
+}
