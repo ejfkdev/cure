@@ -4025,6 +4025,7 @@ fn is_x_equals(lang: &JavaAst, e: JavaId, x: &str) -> bool {
 // 门面
 // ---------------------------------------------------------------------------
 
+
 /// Java 默认规则集（引擎通用规则 + Java 特有规则；保守集，不含 DCE 类）。
 pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     let mut rules: Vec<Box<dyn Rule<JavaAst>>> = cure_engine::rules::default_rules();

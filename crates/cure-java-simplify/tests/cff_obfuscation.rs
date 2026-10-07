@@ -166,12 +166,12 @@ public class DiamondC {
 "#;
     let (cleaned, edits) = run_case("Diamond", src);
     assert!(edits >= 1, "CFF 未被还原：\n{cleaned}");
-    assert!(cleaned.contains("x = x * 7;"), "{cleaned}");
-    // CFF 还原出 if/else，后续规则（赋值传播+三元归并）继续折成内联三元
-    assert!(cleaned.contains(r#"x > 10 ? "pos" : "neg""#), "{cleaned}");
-    assert!(cleaned.contains(r#""!""#), "{cleaned}");
+    // CFF 还原出 if/else → 赋值传播+三元归并折成内联三元；assign_back_fold
+    // 把 `x = x * 7` 折回字面量 init 后全链常量化（javac 差分验证行为一致）
+    assert!(cleaned.contains(r#"println("out=pos!")"#), "{cleaned}");
     assert!(!cleaned.contains("switch"), "{cleaned}");
     assert!(!cleaned.contains("int s"), "{cleaned}");
+    assert!(!cleaned.contains("x"), "{cleaned}");
 }
 
 #[test]
@@ -250,9 +250,11 @@ public class DefaultC {
 "#;
     let (cleaned, edits) = run_case("Default", src);
     assert!(edits >= 1, "CFF 未被还原：\n{cleaned}");
-    assert!(cleaned.contains("v = v + 9;"), "{cleaned}");
-    assert!(cleaned.contains(r#"println("v=" + v)"#), "{cleaned}");
+    // assign_back_fold 把 `v = v + 9` 折回字面量 init 后全链常量化
+    //（run_case 内 javac 差分验证行为一致）
+    assert!(cleaned.contains(r#"println("v=12")"#), "{cleaned}");
     assert!(!cleaned.contains("switch"), "{cleaned}");
+    assert!(!cleaned.contains("v = v"), "{cleaned}");
 }
 
 #[test]

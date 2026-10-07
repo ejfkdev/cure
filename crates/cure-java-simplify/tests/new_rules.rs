@@ -113,9 +113,12 @@ fn dead_store() {
     // a 有副作用 → 保留
     let out = run_src("class A{int m(){int x; x = foo(); x = 2; return x;}}");
     assert!(out.contains("x = foo();"), "{out}");
-    // b 引用 x → 不可删
+    // b 引用 x：DeadStore 不可删（读语义），但 assign_back_fold 可折回
+    // 声明（int x = 1; x = x + 2 → int x = 3）——语义正确
     let out = run_src("class A{int m(){int x = 1; x = x + 2; return x;}}");
-    assert!(out.contains("x = x + 2;"), "{out}");
+    assert!(out.contains("return 3;"), "{out}");
+    // 值验证：x 终值 = 1 + 2
+    assert!(run_src("class A{int m(int b){int x = b; x = x + 2; return x;}}").contains("return b + 2;"));
 }
 
 // ---- Java 特有新规则 ----
@@ -862,4 +865,110 @@ fn inverse_pair_safety_guards() {
     let out = run_src("class A{long f(long x){x+=9223372036854775807L;x-=9223372036854775807L;return x;}}");
     assert!(out.contains("return x;"), "{out}");
     assert!(!out.contains("+="), "{out}");
+}
+
+// ---- assign_back_fold：重赋值折回声明 + dead_decl：零使用死声明 ----
+
+#[test]
+fn register_accumulator_folds_to_return_expr() {
+    // 反编译器寄存器累加器全链：r2 = base; r2 = r2 + 30; return r2
+    // → return base + 30（用户期望形态）
+    let out = run_src(
+        "class T{int fee(int base){int r2;r2=base;r2=r2+30;return r2;}}",
+    );
+    assert!(out.contains("return base + 30;"), "{out}");
+    // 声明与折回点之间夹无关语句（对 x 零事件）同样折回
+    let out = run_src(
+        "class T{int f(int b){int x=b;int y=8;y=y+1;x=x+30;return x+y;}}",
+    );
+    assert!(out.contains("return b + 39;"), "{out}");
+    // 复合赋值形态
+    let out = run_src("class T{int f(int b){int x=b;x+=30;return x;}}");
+    assert!(out.contains("return b + 30;"), "{out}");
+    // 多级 delta 链（fixed-point 逐级折回）
+    let out = run_src("class T{int f(int b){int x=b;x+=1;x+=2;return x;}}");
+    assert!(out.contains("return b + 3;"), "{out}");
+    // XOR 折回
+    let out = run_src("class T{int f(int b){int x=b;x^=42;return x;}}");
+    assert!(out.contains("return b ^ 42;"), "{out}");
+}
+
+#[test]
+fn assign_back_fold_safety_negatives() {
+    // 中间有读：y 观察到中间值 → 不得折回
+    let out = run_src("class T{int f(){int x=5;int y=x;x=x+1;return y*10+x;}}");
+    assert!(out.contains("x = x + 1;") || out.contains("x += 1;") || out.contains("x + 1"), "{out}");
+    // 精确性：y 必须拿到 5
+    let out = run_src("class T{int f(){int x=5;int y=x;x=x+1;return y*10;}}");
+    assert!(out.contains("50"), "{out}");
+    // 中间有写：首个事件不是重赋值 → 拒绝
+    let out = run_src("class T{int f(int b){int x=b;x=99;x=x+1;return x;}}");
+    assert!(out.contains("return 100;") || out.contains("x + 1"), "{out}");
+    // 条件块内重赋值：折回会无条件化 → 拒绝
+    let out = run_src("class T{int f(int b,boolean c){int x=b;if(c){x=x+1;}return x;}}");
+    assert!(out.contains("if"), "{out}");
+    // Div/Rem K=0：异常位置会提前 → 拒绝
+    let out = run_src("class T{int f(int b){int x=b;int y=0;x=x/0;return y;}}");
+    assert!(out.contains("/ 0"), "{out}");
+    // K 非字面量 → 拒绝
+    let out = run_src("class T{int f(int b,int k){int x=b;x=x+k;return x;}}");
+    assert!(out.contains("x + k") || out.contains("x += k") || out.contains("b + k"), "{out}");
+}
+
+#[test]
+fn dead_decl_removal_and_guards() {
+    // 正例：零使用裸声明
+    let out = run_src("class T{int f(){int r1;return 7;}}");
+    assert!(out.contains("return 7;") && !out.contains("r1"), "{out}");
+    // 正例：纯 init 零使用
+    let out = run_src("class T{int f(){int x=5;return 7;}}");
+    assert!(!out.contains("int x"), "{out}");
+    // 有使用：DeadDecl 不删（local_propagation 可正确内联为 return 5）
+    let out = run_src("class T{int f(){int x=5;return x;}}");
+    assert!(out.contains("return 5;"), "{out}");
+    // 负例：init 有副作用（调用）→ 保留求值
+    let out = run_src("class T{int f(){int x=foo();return 7;}}");
+    assert!(out.contains("foo();"), "{out}");
+    // 负例：init 可能抛 → 保留（删掉会失去异常）
+    let out = run_src("class T{int f(){int x=1/0;return 7;}}");
+    assert!(out.contains("1 / 0"), "{out}");
+}
+
+#[test]
+fn demo_register_noise_full_collapse() {
+    // 完整反编译噪声演示：应折到 return base + 30
+    let out = run_src(
+        "class Ticket{int fee(int base){int r1;int r2;r1=base;r2=r1;r1+=7;r1-=7;\
+         boolean flag;flag=(2<3)&&true;if(flag){r2=r2+30;}r1=r2*1;int k=0x5A^0x5A;return r1+k;}}",
+    );
+    assert!(out.contains("return base + 30;"), "{out}");
+}
+
+// ---- 窄类型（char/byte/short）安全：隐式收窄与类型可观察性 ----
+
+#[test]
+fn narrow_type_compound_not_folded() {
+    // char：折回会让 println 观察到 int（'c' vs 99）——拒绝
+    let out = run_src("class A{void m(){char ch='a';ch+=2;System.out.println(ch);}}");
+    assert!(out.contains("ch += 2;") || out.contains("ch = ch + 2;"), "{out}");
+    assert!(out.contains("println(ch);"), "{out}");
+    // byte：隐式收窄（(byte)200 = -56）——拒绝折回
+    let out = run_src("class A{int m(){byte b=100;b+=100;return b;}}");
+    assert!(out.contains("b += 100;"), "{out}");
+    // 宽类型（int/long）照常折回
+    let out = run_src("class A{int m(int x){int i=x;i+=5;return i;}}");
+    assert!(out.contains("return x + 5;"), "{out}");
+}
+
+#[test]
+fn char_decl_int_literal_normalized() {
+    // char c = 98 → 'b'：归一后传播安全（println 打 'b' 而非 98）
+    let out = run_src("class A{void m(){char c = 98;System.out.println(c);}}");
+    assert!(out.contains("'b'"), "{out}");
+    // 域外常量不归一（源本就非法，容错保留）
+    let out = run_src("class A{void m(){char c = 70000;System.out.println(c);}}");
+    assert!(out.contains("70000"), "{out}");
+    // char 字面量 init 不受影响
+    let out = run_src("class A{void m(){char c='x';System.out.println(c);}}");
+    assert!(out.contains("'x'"), "{out}");
 }

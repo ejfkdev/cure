@@ -41,7 +41,7 @@ the same thing.
   `javac`/`java` runs, and whole-corpus re-parse/idempotency checks (details
   below). These layers caught real bugs during development; they are not
   decorative.
-- **55 simplification rules** (32 language-agnostic + 23 Java-specific),
+- **57 simplification rules** (34 language-agnostic + 23 Java-specific),
   including control-flow flattening recovery, statement-level
   `StringBuilder` chain recovery, XOR-noise removal, and partial evaluation
   ("virtual execution") of literal-only JDK calls.
@@ -143,7 +143,7 @@ byte-identical output and preserved side-effect call sequences:
 
 ## Rule catalog
 
-**Engine (language-agnostic, 32):** `paren_removal`, `const_condition`,
+**Engine (language-agnostic, 34):** `paren_removal`, `const_condition`,
 `boolean_return`, `if_to_ternary`, `if_assign_ternary`, `if_else_empty`,
 `bool_compare`, `double_not`, `bool_not_fold`, `bool_short_circuit`,
 `not_compare`, `ternary_fold`, `ternary_bool`, `ternary_bool_op`,
@@ -155,7 +155,8 @@ concat constant merging `("a"+x)+"b"+"c" → "a"+x+"bc"`), `local_propagation`,
 block-scope declaration anchoring), `store_kill` (distant dead stores /
 register pre-declarations killed on the dominating path only),
 `multi_use_copy`, `trailing_return`, `trailing_continue` (label-aware),
-`inverse_assign_pair` (`x+=K;x-=K` register-noise pairs), `dead_store`, `store_kill`, double_neg_fold (fold `-(-lit)`), block_flatten (unnecessary nested blocks collapse), opt-in `unreachable_after_terminal`.
+`inverse_assign_pair` (`x+=K;x-=K` register-noise pairs), `dead_store`, `store_kill`,
+`assign_back_fold` (`x=e; x=x+K` register accumulator folded into the decl), `dead_decl`, double_neg_fold (fold `-(-lit)`), block_flatten (unnecessary nested blocks collapse), opt-in `unreachable_after_terminal`.
 
 **Java-specific (23):** `cast_simplify`, `self_compare`,
 `string_builder_fold`, `box_unbox_chain`, `iterator_to_for_each`,

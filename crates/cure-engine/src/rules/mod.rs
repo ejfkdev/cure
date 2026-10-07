@@ -444,6 +444,191 @@ impl<L: Lang> Rule<L> for SelfAssign {
 // x+0 → x, 0+x → x, x-0 → x, x*1 → x, 1*x → x, x/1 → x
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// 死声明删除：`T x;`（零使用、零求值）或 `T x = V;`（V 纯/MayRead 且
+// 零使用）。声明之后整个区域对 x 零事件（读/写/遮蔽/不透明全无）。
+// 反编译器把寄存器噪声折叠后常残留零用途声明（如 PMD 噪声文件消解
+// 后的 `int a;`）。匿名类捕获由 opaque 守卫拒绝（对抗波 4 教训）。
+// ---------------------------------------------------------------------------
+
+pub struct DeadDecl;
+
+impl<L: Lang> Rule<L> for DeadDecl {
+    fn name(&self) -> &'static str {
+        "dead_decl"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::VarDecl]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk } = ctx;
+        if lang.kind(id) != NodeKind::VarDecl {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        // 有 init：V 的求值会被一并删除——仅纯/只读可删（MayThrow 不行：
+        // `int x = 1/0;` 删掉会失去异常）
+        if let Some(&v) = ch.first() {
+            if lang.effect(v) > Effect::MayRead {
+                return None;
+            }
+        }
+        let parent = walk.parent(id)?;
+        if lang.kind(parent) != NodeKind::Block {
+            return None;
+        }
+        let idx = walk.index(id)?;
+        let stmts = lang.children(parent).to_vec();
+        // **句法扫描**（任何同名 VarRef 引用 → 保留）：事件模型对复合
+        // 赋值目标内的读有盲区（`arr[j] += 5` 的 j——scan_region 的
+        // Assign 分支只递归 RHS），零事件 ≠ 零引用（differential Adv5
+        // 抓获：删掉 j 后 arr[j] 悬空）。写目标本身也是 VarRef，同样被
+        // 句法扫描覆盖。
+        let name_str = lang.var_name(id)?.to_string();
+        let referenced = stmts[idx + 1..].iter().any(|&s| {
+            subtree_contains(&*lang, s, |n| {
+                lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name_str.as_str())
+            })
+        });
+        if referenced {
+            return None;
+        }
+        // 遮蔽 / 不透明（匿名类捕获的原文引用无 AST 节点）仍走事件扫描
+        let name_key = lang.var_key(id)?;
+        let mut w = Watch::<L>::new(name_key, &[]);
+        for &s in &stmts[idx + 1..] {
+            scan_region(&*lang, s, &mut w);
+        }
+        if w.opaque || w.shadowed {
+            return None;
+        }
+        Some(Edit::Delete { node: id })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 重赋值折回声明（寄存器累加器形态）：
+//   T x = e; …（对 x 零事件）…; x = x op K;  →  T x = e op K;
+//   （复合形态 `x op= K` 与展开形态 `x = x op K` 均可）
+//
+// e 的求值位置**不动**（仍在声明处）；被删除的只是后面那条纯 delta
+// 语句；声明与折回点之间对 x 零事件 ⇒ 中间值从未被观察 ⇒ 恒安全。
+// 语义：x 的终值 (e op K) 由同一算符作用于同一操作数计算——精确
+// （整数环绕/浮点舍入均逐位一致）。
+// 拒绝：Div/Rem 且 K==0（折回后异常从后面的语句提前到声明处——
+// 中间语句的副作用顺序改变）；K 非字面量；op 为短路/比较。
+// 之后 local_propagation 可继续把 e op K 内联到唯一使用处。
+// ---------------------------------------------------------------------------
+
+pub struct AssignBackFold;
+
+impl<L: Lang> Rule<L> for AssignBackFold {
+    fn name(&self) -> &'static str {
+        "assign_back_fold"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::VarDecl]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, walk } = ctx;
+        if lang.kind(id) != NodeKind::VarDecl {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        let (&init, has_init) = (ch.first()?, !ch.is_empty());
+        if !has_init {
+            return None; // 无 init 用 decl_assign_merge / dead_decl 处理
+        }
+        let name_key = lang.var_key(id)?;
+        // 窄类型（byte/short/char 等）复合赋值含隐式收窄——折回声明
+        // 产出超域非法常量或丢静态类型（differential Adv2 抓获：
+        // `char ch = 'a'; ch += 2` 折后 println 打 99 而非 'c'）
+        if !lang.is_wide_decl(id) {
+            return None;
+        }
+        let parent = walk.parent(id)?;
+        if lang.kind(parent) != NodeKind::Block {
+            return None;
+        }
+        let idx = walk.index(id)?;
+        let stmts = lang.children(parent).to_vec();
+
+        // 扫描声明之后的语句：对 x 的首个引用必须恰是「重赋值」。
+        // 句法扫描兜底事件模型盲区（复合赋值目标内的读——`arr[j]+=5`
+        // 的 j 对事件索引不可见）；首个引用非重赋值形态 → 中间值被
+        // 观察，拒绝。
+        let name_str = lang.var_name(id)?.to_string();
+        for &s in &stmts[idx + 1..] {
+            let mut w = Watch::<L>::new(name_key, &[]);
+            scan_region(&*lang, s, &mut w);
+            let referenced = subtree_contains(&*lang, s, |n| {
+                lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name_str.as_str())
+            });
+            let touched = referenced || w.opaque || w.shadowed;
+            if !touched {
+                continue; // 与 x 无关的语句，跳过
+            }
+            // 首个触碰 x 的语句必须是重赋值 `x = x op K`
+            let assign = match lang.kind(s) {
+                NodeKind::Assign => s,
+                NodeKind::ExprStmt => {
+                    let c = lang.children(s);
+                    if c.len() == 1 && lang.kind(c[0]) == NodeKind::Assign {
+                        c[0]
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None, // 读/遮蔽/不透明先出现 → 中间值被观察
+            };
+            let ach = lang.children(assign).to_vec();
+            if ach.len() != 2 {
+                return None;
+            }
+            let (target, rhs) = (ach[0], ach[1]);
+            if lang.kind(target) != NodeKind::VarRef || lang.var_key(target) != Some(name_key) {
+                return None;
+            }
+            // (op, K)：复合形态（RHS 即字面量操作数）/ 展开形态
+            // （RHS = Binary{x op K}）
+            let (op, k) = match lang.assign_op(assign) {
+                Some(op) => (op, lang.literal(rhs).and_then(|x| x.as_int())?),
+                None => {
+                    if lang.kind(rhs) != NodeKind::Binary {
+                        return None;
+                    }
+                    let op = lang.bin_op(rhs)?;
+                    let rc = lang.children(rhs).to_vec();
+                    if rc.len() != 2 || lang.kind(rc[0]) != NodeKind::VarRef {
+                        return None;
+                    }
+                    // 左操作数必须是 x 自身（名字键等值）；右操作数字面量
+                    if lang.var_key(rc[0]) != Some(name_key) {
+                        return None;
+                    }
+                    (op, lang.literal(rc[1]).and_then(|x| x.as_int())?)
+                }
+            };
+            if op.is_short_circuit() || op.is_comparison() {
+                return None;
+            }
+            // Div/Rem 且 K==0：折回后异常提前 → 中间语句副作用顺序改变
+            if matches!(op, BinOp::Div | BinOp::Rem) && k == 0 {
+                return None;
+            }
+            let lit = lang.build_int(k, false);
+            let merged = lang.build_bin(op, init, lit);
+            // 声明原位换 init（Splice 孩子），语句删除
+            return Some(Edit::Multi(vec![
+                Edit::Delete { node: s },
+                Edit::Splice { node: id, index: 0, remove: ch.len(), insert: vec![merged] },
+            ]));
+        }
+        None
+    }
+}
+
 pub struct ArithIdentity;
 
 impl<L: Lang> Rule<L> for ArithIdentity {
@@ -543,6 +728,28 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         let stmts: Vec<L::Id> = lang.children(parent).to_vec();
         if index + 1 > stmts.len() {
             return None;
+        }
+
+        // 字符类型声明：内联值必须是 Char 字面量（其他 int 型值——字面量
+        // 或表达式——会让 println/拼接观察到 int 而非 char：
+        // `char c = 98; println(c)` 打 'b'，内联后打 98）。int 字面量
+        // init 就地转换为 Char 字面量再传播（Java char 域 u16；转换
+        // 随声明删除获得正成本——纯归一化规则过不了严格降本门）。
+        let mut value = value;
+        if lang.is_char_decl(id) {
+            match lang.literal(value) {
+                Some(LitRef::Char(_)) => {}
+                Some(LitRef::Int(v)) => {
+                    // Java char = UTF-16 单元：域 [0, 0xFFFF]（代理区也拒，
+                    // 打印不合法）
+                    let c = u32::try_from(v)
+                        .ok()
+                        .filter(|&u| (0..=0xFFFF).contains(&u) && !(0xD800..=0xDFFF).contains(&u))
+                        .and_then(char::from_u32)?;
+                    value = lang.build_char(c);
+                }
+                _ => return None,
+            }
         }
 
         // 扫描 decl 之后的区域（用途/遮蔽全区间；写冲突窗口见下）
@@ -2741,6 +2948,8 @@ pub fn default_rules<L: Lang>() -> Vec<Box<dyn Rule<L>>> {
         Box::new(MultiUseCopyPropagation),
         Box::new(TrailingReturn),
         Box::new(InverseAssignPair),
+        Box::new(DeadDecl),
+        Box::new(AssignBackFold),
         Box::new(DeadStore),
         Box::new(StoreKill),
     ]

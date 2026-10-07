@@ -823,7 +823,7 @@ fn fold_i32(op: BinOp, a: i64, b: i64) -> Option<i64> {
         }
         Shl => x.wrapping_shl((y as u32) & 31) as i64,
         Shr => x.wrapping_shr((y as u32) & 31) as i64,
-        UShr => (x as u32).wrapping_shr(x as u32 & 31) as i64,
+        UShr => (x as u32).wrapping_shr((y as u32) & 31) as i64,
         BitAnd => (x & y) as i64,
         BitXor => (x ^ y) as i64,
         BitOr => (x | y) as i64,
@@ -1211,6 +1211,19 @@ impl Lang for JavaAst {
 
     fn is_local_var(&self, id: JavaId) -> bool {
         matches!(self.data(id), NodeData::VarRef { .. })
+    }
+
+    fn is_char_decl(&self, decl: JavaId) -> bool {
+        matches!(self.data(decl), NodeData::VarDecl { ty: JType::Char, .. })
+    }
+
+    fn is_wide_decl(&self, decl: JavaId) -> bool {
+        // 窄类型（byte/short/char）复合赋值含隐式收窄：delta 折回声明
+        // 会产出超域非法常量或丢静态类型（char 99 → println 打数字）
+        !matches!(
+            self.data(decl),
+            NodeData::VarDecl { ty: JType::Byte | JType::Short | JType::Char, .. }
+        )
     }
 
     fn bin_op(&self, id: JavaId) -> Option<BinOp> {

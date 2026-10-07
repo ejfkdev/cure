@@ -137,6 +137,23 @@ pub trait Lang {
         self.kind(id) == NodeKind::VarRef
     }
 
+    /// 声明（VarDecl 节点）的类型域是否容纳 int 算术结果。窄类型
+    /// （Java byte/short/char）的复合赋值含**隐式收窄**
+    /// （`b += K` ≡ `b = (byte)(b + K)`）——把 delta 折回声明会产出
+    /// 非法（超域常量）或变义（丢静态类型：`char ch = 99` 内联进
+    /// println 打数字而非字符）的字面量。默认 true（宽域语言）。
+    fn is_wide_decl(&self, _decl: Self::Id) -> bool {
+        true
+    }
+
+    /// 声明是否为字符类型。字符类型变量对 **int 字面量内联类型敏感**：
+    /// `char c = 98; println(c)` 打印 'b'，而内联成 `println(98)` 打印
+    /// 98——静态类型可被 println / 字符串拼接观察。窄域规则（如
+    /// local_propagation）须拒绝非 Char 字面量值出字符声明。
+    fn is_char_decl(&self, _decl: Self::Id) -> bool {
+        false
+    }
+
     fn bin_op(&self, id: Self::Id) -> Option<BinOp>;
     fn un_op(&self, id: Self::Id) -> Option<UnOp>;
     fn literal(&self, id: Self::Id) -> Option<LitRef<'_>>;

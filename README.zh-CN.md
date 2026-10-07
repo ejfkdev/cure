@@ -38,7 +38,7 @@ class B {                                     class B {
 - **简化效果指标**（`--stats`）：AST 节点数、判定点（圈复杂度）、最大
   嵌套的前后对比 + 文件分类（结构简化 / 仅格式 / 未变）——三项不受
   格式化影响，能区分「真简化」与「纯格式归一」，零简化文件直接可见。
-- **55 条简化规则**（引擎通用 32 + Java 专属 23），含控制流扁平化
+- **57 条简化规则**（引擎通用 34 + Java 专属 23），含控制流扁平化
   还原、语句级 StringBuilder 链还原、XOR 噪声剥除、纯字面量 JDK 调用
   的部分求值（"虚拟执行"）。
 - **真实代码库规模** —— OpenJDK 全源码语料（371,674 文件 / 4.7 GB）
@@ -132,7 +132,7 @@ cure [选项] <文件.java>... | <目录> | -
 
 ## 规则清单
 
-**引擎通用（32）**：`paren_removal`、`const_condition`、`boolean_return`、
+**引擎通用（34）**：`paren_removal`、`const_condition`、`boolean_return`、
 `if_to_ternary`、`if_assign_ternary`、`if_else_empty`、`bool_compare`、
 `double_not`、`bool_not_fold`、`bool_short_circuit`、`not_compare`、
 `ternary_fold`、`ternary_bool`、`ternary_bool_op`、`const_fold_bin`
@@ -143,7 +143,8 @@ cure [选项] <文件.java>... | <目录> | -
 `decl_assign_merge`、`assign_propagation`（拷贝赋值内联，块内声明锚点
 防逃逸）、`store_kill`（支配路径击杀远距死存储/寄存器预声明）、
 `multi_use_copy`、`trailing_return`、`trailing_continue`（标签感知）、
-`inverse_assign_pair`（`x+=K;x-=K` 寄存器噪声对抵消）、`dead_store`、`store_kill`、double_neg_fold（`-(-lit)` 折叠）、block_flatten（无谓嵌套块塌平）、选配 `unreachable_after_terminal`。
+`inverse_assign_pair`（`x+=K;x-=K` 寄存器噪声对抵消）、`assign_back_fold`（`x=e; x=x+K`
+寄存器累加折回声明）、`dead_decl`（零使用死声明删除）、`dead_store`、`store_kill`、double_neg_fold（`-(-lit)` 折叠）、block_flatten（无谓嵌套块塌平）、选配 `unreachable_after_terminal`。
 
 **Java 专属（23）**：`cast_simplify`、`self_compare`、
 `string_builder_fold`、`box_unbox_chain`、`iterator_to_for_each`、
