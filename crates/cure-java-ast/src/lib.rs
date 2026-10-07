@@ -762,6 +762,17 @@ impl JavaAst {
     pub fn set_param_scope(&mut self, params: &[(String, JType)]) {
         self.param_scope = params.to_vec();
     }
+
+    /// 名字是否为当前方法参数（虚拟执行的字段写守卫——参数写不得
+    /// 误记为字段写）。
+    pub fn is_param_name(&self, name: &str) -> bool {
+        self.param_scope.iter().any(|(n, _)| n == name)
+    }
+
+    /// 名字键 → 名字反查（虚拟执行的字段写材料化）。
+    pub fn name_of_key(&self, k: u32) -> Option<String> {
+        Some(self.names.name(k).to_string())
+    }
     pub fn clear_param_scope(&mut self) {
         self.param_scope.clear();
     }
@@ -1221,6 +1232,10 @@ impl Lang for JavaAst {
         // 差分审查抓获：dead_store 曾据此把 `first = cl;`（静态字段写）
         // 当局部死存储消除，双向链表表头更新静默丢失。
         matches!(self.data(id), NodeData::VarRef { .. }) && self.var_type(id).is_some()
+    }
+
+    fn is_inferred_decl(&self, decl: JavaId) -> bool {
+        matches!(self.data(decl), NodeData::VarDecl { ty: JType::Var, .. })
     }
 
     fn is_char_decl(&self, decl: JavaId) -> bool {

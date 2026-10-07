@@ -1,3 +1,0 @@
-@Dup
-@Dup @interface Dup {
-}

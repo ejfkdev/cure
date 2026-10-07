@@ -2957,7 +2957,12 @@ impl<L: Lang> Rule<L> for StoreKill {
                     Edit::Delete { node: assign_stmt },
                 ]));
             }
-            // 否则：剥除 init（裸声明）——init 必须可丢弃（副作用调用不得删！）
+            // 否则：剥除 init（裸声明）——init 必须可丢弃（副作用调用不得删！）。
+            // 推断类型声明（Java `var`）剥 init 后非法——拒绝
+            //（obf_fuzz 差分 seed 4 抓获：`var flag;` 编译失败）
+            if lang.is_inferred_decl(id) {
+                return None;
+            }
             if lang.effect(first_value) > Effect::MayRead {
                 return None;
             }

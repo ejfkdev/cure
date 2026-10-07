@@ -1,3 +1,0 @@
-class BadNestedLambda {
-    void test() {}
-}

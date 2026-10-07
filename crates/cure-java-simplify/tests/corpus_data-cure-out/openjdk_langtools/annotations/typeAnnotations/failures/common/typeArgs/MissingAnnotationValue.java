@@ -1,9 +1,0 @@
-import java.lang.annotation.*;
-
-class MissingAnnotationValue<K> {
-    MissingAnnotationValue<@A String> l;
-}
-
-@Target(ElementType.TYPE_USE) @interface A {
-    int field();
-}

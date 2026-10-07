@@ -1,3 +1,0 @@
-enum EnumTypeChangesEnum {
-    A, C
-}

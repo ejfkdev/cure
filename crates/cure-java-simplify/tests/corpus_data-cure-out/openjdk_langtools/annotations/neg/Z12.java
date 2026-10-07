@@ -1,3 +1,0 @@
-@interface An {
-    void a();
-}

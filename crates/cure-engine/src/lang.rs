@@ -146,6 +146,13 @@ pub trait Lang {
         true
     }
 
+    /// 声明是否为**推断类型**（Java 10 `var`）。推断声明剥除 init 后
+    /// 变成 `var x;`——非法源码（obf_fuzz 差分抓获）。剥 init 类规则
+    /// 必须拒绝。默认 false。
+    fn is_inferred_decl(&self, _decl: Self::Id) -> bool {
+        false
+    }
+
     /// 声明是否为字符类型。字符类型变量对 **int 字面量内联类型敏感**：
     /// `char c = 98; println(c)` 打印 'b'，而内联成 `println(98)` 打印
     /// 98——静态类型可被 println / 字符串拼接观察。窄域规则（如

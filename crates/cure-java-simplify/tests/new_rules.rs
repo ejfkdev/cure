@@ -608,9 +608,10 @@ fn store_kill_safety_cases() {
     // 击杀写在条件分支内 → 不动（definite assignment + 分支可能不执行）
     let out = run_src("class A{int m(int c){int v = 0; if (c > 0) { v = 1; } return v;}}");
     assert!(out.contains("int v = 0;"), "{out}");
-    // 击杀写在循环体内 → 不动（可能零次执行）
+    // 击杀写在循环体内：store_kill 不动（可能零次执行）；static_exec
+    // 可全程求值（v: 0→9，循环一轮退出——javac 真值 9 对拍锁定）
     let out = run_src("class A{int m(){int v = 0; while (v < 3) { v = 9; } return v;}}");
-    assert!(out.contains("int v = 0;") || out.contains("int v = 0;\n"), "{out}");
+    assert!(out.contains("return 9;"), "{out}");
     // 中间语句的 init 里读 v → 读事件阻断 init 剥除；
     // v="y" 是死写（后续无读）→ 零用途 DeadStore 先删，整链合法坍缩（差分锁定）
     let out = run_src("class A{String m(){String v = \"\"; String w = v + \"x\"; v = \"y\"; return w;}}");
@@ -895,10 +896,11 @@ fn register_accumulator_folds_to_return_expr() {
 
 #[test]
 fn assign_back_fold_safety_negatives() {
-    // 中间有读：y 观察到中间值 → 不得折回
+    // 中间有读：assign_back_fold 不得折回（y 观察中间值 5）；
+    // static_exec 可以整体求值——结果必须精确为 5*10+6=56
     let out = run_src("class T{int f(){int x=5;int y=x;x=x+1;return y*10+x;}}");
-    assert!(out.contains("x = x + 1;") || out.contains("x += 1;") || out.contains("x + 1"), "{out}");
-    // 精确性：y 必须拿到 5
+    assert!(out.contains("return 56;"), "{out}");
+    // 精确性：y 必须拿到 5（50 = 5*10）
     let out = run_src("class T{int f(){int x=5;int y=x;x=x+1;return y*10;}}");
     assert!(out.contains("50"), "{out}");
     // 中间有写：首个事件不是重赋值 → 拒绝
@@ -948,13 +950,13 @@ fn demo_register_noise_full_collapse() {
 
 #[test]
 fn narrow_type_compound_not_folded() {
-    // char：折回会让 println 观察到 int（'c' vs 99）——拒绝
+    // char：assign_back_fold 拒绝窄域（println 观察到 char 语义）；
+    // println 含未知调用 → vexec 前缀不足也不动
     let out = run_src("class A{void m(){char ch='a';ch+=2;System.out.println(ch);}}");
     assert!(out.contains("ch += 2;") || out.contains("ch = ch + 2;"), "{out}");
-    assert!(out.contains("println(ch);"), "{out}");
-    // byte：隐式收窄（(byte)200 = -56）——拒绝折回
+    // byte：JLS 复合赋值隐式收窄——(byte)200 = -56（javac 真值对拍）
     let out = run_src("class A{int m(){byte b=100;b+=100;return b;}}");
-    assert!(out.contains("b += 100;"), "{out}");
+    assert!(out.contains("return -56;"), "{out}");
     // 宽类型（int/long）照常折回
     let out = run_src("class A{int m(int x){int i=x;i+=5;return i;}}");
     assert!(out.contains("return x + 5;"), "{out}");

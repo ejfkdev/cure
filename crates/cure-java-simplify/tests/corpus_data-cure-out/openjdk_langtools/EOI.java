@@ -1,4 +1,0 @@
- {}
-foobar
-class foobar {
-}

@@ -5,6 +5,8 @@
 //! 引擎规则（布尔、自赋值、常量条件、局部传播……）定义在 cure-engine，
 //! 通过 `Lang` 抽象复用；本 crate 只放需要 Java 类型/负载信息的规则。
 
+mod vexec;
+
 use cure_engine::kind::{BinOp, UnOp};
 use cure_engine::{Config, Edit, Lang, LitRef, NodeKind, Report, RewriteCtx, Rule};
 use cure_java_ast::{CompilationUnit, JavaAst, JavaId, JType, Lit, Member, NodeData, TypeDecl};
@@ -722,6 +724,270 @@ impl Rule<JavaAst> for EmptyFinallyStrip {
 // 语义：捕获后原样重抛对求值顺序、副作用、异常路径与堆栈完全透明
 //（栈深 +1 帧的差异源码层不可观察）。
 // ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// 虚拟执行 V2（static_exec）：对**根块**（方法体 / 静态初始化块 / 字段
+// init）的纯计算段整体求值，重写为「逃逸局部 = 常量」+「字段写 = 常量」
+// 的直线赋值。
+//
+// 目标形态（fernflower 语料 12/66 文件、残留噪声主体）：静态字符串
+// 解密机——`"密文".toCharArray()` + `switch(i%5)` 常量键 + `(char)(c^k)`
+// 循环 + `new String(arr).intern()`。语义全部由 vexec 解释器保守
+// 求值（任何未知读/副作用/超预算立即放弃）。
+//
+// 正确性不变量：
+//   - 仅根块（walk 无父）——嵌套块的存储无法区分外层局部/字段；
+//   - 方法参数写 → 放弃（param 守卫）；
+//   - 单路径确定性：条件/循环的条件全部求值为常量，执行走过的就是
+//     全部活路径；
+//   - 提前 Return/Break 只允许发生在**最后一条**顶层语句（此前返回
+//     则后续语句在别的路径可达，单路径值不构成证明）；
+//   - 逃逸局部（后半块句法引用的段内局部）与字段写的值必须可
+//     材料化（Str/Int/Long/Bool/Str[]），否则放弃；
+//   - 值中含未配对代理（UTF-8 不可表示）→ 放弃。
+// ---------------------------------------------------------------------------
+
+
+/// 幂等守卫用的宽松等价：字面量按**值**等价（NumRaw{val:Int(0)} ≡
+/// Int(0)——打印相同），VarDecl 忽略类型标注差异（Int ≡ var）。
+/// static_exec 产物每轮被零打印差编辑重写（ASTParserTokenManager
+/// 抓获：ExprStmt→裸Assign/NumRaw→Int 交替），须在此归零。
+fn print_equiv(lang: &JavaAst, a: JavaId, b: JavaId) -> bool {
+    if lang.kind(a) != lang.kind(b) {
+        // ExprStmt{X} ≡ X（裸语句形态差异）
+        let (ia, ib) = (lang.kind(a), lang.kind(b));
+        let unwrap = |k: NodeKind, x: JavaId| -> Option<JavaId> {
+            if k == NodeKind::ExprStmt {
+                lang.children(x).first().copied()
+            } else {
+                Some(x)
+            }
+        };
+        return match (unwrap(ia, a), unwrap(ib, b)) {
+            (Some(x), Some(y)) => print_equiv_inner(lang, x, y),
+            _ => false,
+        };
+    }
+    print_equiv_inner(lang, a, b)
+}
+
+fn print_equiv_inner(lang: &JavaAst, a: JavaId, b: JavaId) -> bool {
+    if lang.kind(a) != lang.kind(b) {
+        return false;
+    }
+    // 字面量按值等价
+    match (lang.literal(a), lang.literal(b)) {
+        (Some(x), Some(y)) => {
+            if x != y {
+                return false;
+            }
+        }
+        (None, None) => {}
+        _ => return false,
+    }
+    let (ca, cb) = (lang.children(a), lang.children(b));
+    if ca.len() != cb.len() {
+        return false;
+    }
+    ca.iter().zip(cb.iter()).all(|(&x, &y)| print_equiv_inner(lang, x, y))
+}
+
+pub struct StaticExec;
+
+impl Rule<JavaAst> for StaticExec {
+    fn name(&self) -> &'static str {
+        "static_exec"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Block]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        // 仅根块：嵌套块的裸名存储无法区分外层局部与字段
+        if ctx.parent(id).is_some() {
+            return None;
+        }
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::Block {
+            return None;
+        }
+        let stmts = lang.children(id).to_vec();
+        if stmts.len() < 3 {
+            return None; // 少于 3 条语句的段无折叠价值
+        }
+        // 逐条执行（前缀语义：abort 处截断）
+        let mut ex = vexec::Exec::new(lang);
+        let mut prefix = 0usize;
+        let mut early_exit: Option<vexec::Flow> = None;
+        for (i, &st) in stmts.iter().enumerate() {
+            match ex.exec_stmt(st) {
+                Ok(vexec_flow) => {
+                    prefix = i + 1;
+                    match vexec_flow {
+                        vexec::Flow::Normal => {}
+                        other => {
+                            // Return/Break 逃逸到顶层：仅允许最后一条语句
+                            early_exit = Some(other);
+                            if i + 1 != stmts.len() {
+                                return None;
+                            }
+                            break;
+                        }
+                    }
+                }
+                Err(()) => break,
+            }
+        }
+        if prefix < 3 {
+            return None;
+        }
+        // ---- 逃逸分析：后半块句法引用的段内局部（含数组基）----
+        // 逃逸局部必须材料化（否则删除前缀会丢失其值/数组内容）
+        let rest = &stmts[prefix..];
+        let mut escaping: Vec<u32> = Vec::new();
+        // 只考虑**存活**局部（前缀末仍在作用域）：循环体声明已随块弹出，
+        // 后半段对同名者的引用属于**它们自己的**声明（bd.java 的 var682
+        // 在 34 个段里同名复用——按 decl_order 全算会假逃逸出 Undef）
+        for &k in ex.decl_order() {
+            if ex.var_value(k).is_none() {
+                continue; // 已随作用域弹出的声明——非本段存活局部
+            }
+            let name = lang.name_of_key(k)?;
+            let referenced = rest.iter().any(|&st| {
+                cure_engine::analysis::subtree_contains(lang, st, |n| {
+                    lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name.as_str())
+                })
+            });
+            if referenced {
+                escaping.push(k);
+            }
+        }
+
+        // ---- 材料化输出（先提取数据再 drop 执行器，解除 &mut 借用）----
+        // Return 载荷是段输出的一部分：`int m(){…;return x;}` 的 x 必须
+        // 物化为 `return <常量>;`（CLI 测试抓获：方法体曾被吞成空体）
+        let ret_payload: Option<Option<vexec::VVal>> = match &early_exit {
+            Some(vexec::Flow::Return(v)) => Some(v.clone()),
+            _ => None,
+        };
+        let writes: Vec<(u32, vexec::VVal)> =
+            ex.field_writes().iter().map(|(k, v)| (*k, v.clone())).collect();
+        let escaped: Vec<(u32, vexec::VVal)> = escaping
+            .iter()
+            .map(|&k| (k, ex.var_value(k).cloned().unwrap_or(vexec::VVal::Undef)))
+            .collect();
+        drop(ex);
+        let mut new_stmts: Vec<JavaId> = Vec::new();
+        // 字段写（静态语境裸名赋值；按首次写顺序）
+        for (fk, v) in &writes {
+            // 参数守卫（方法根：字段名撞参数名 → 放弃）
+            let name = lang.name_of_key(*fk)?;
+            if lang.is_param_name(&name) {
+                return None;
+            }
+            let (val, mut extra) = materialize(lang, v)?;
+            let tgt = lang.var(&name);
+            new_stmts.push(lang.assign(tgt, val));
+            new_stmts.append(&mut extra);
+        }
+        // 逃逸局部（保持原声明序）：值不可材料化 → 放弃整段重写
+        for (k, v) in &escaped {
+            let name = lang.name_of_key(*k)?;
+            let (val, mut extra) = materialize(lang, v)?;
+            let stmt = lang.var_decl(&name, JType::Var, Some(val));
+            new_stmts.push(stmt);
+            new_stmts.append(&mut extra);
+        }
+        // return 语句（载荷物化；void 裸 return 不发——方法体末尾可省，
+        // trailing_return 会清理）
+        if let Some(v) = &ret_payload.flatten() {
+            let (val, mut extra) = materialize(lang, v)?;
+            let stmt = lang.ret(Some(val));
+            new_stmts.push(stmt);
+            new_stmts.append(&mut extra);
+        }
+        if new_stmts.is_empty() && !escaped.is_empty() {
+            return None;
+        }
+        if new_stmts.is_empty() && escaped.is_empty() && prefix == stmts.len() && early_exit.is_none() {
+            // 纯死段（无输出无逃逸）：整段删除
+        }
+        // 幂等守卫：产物与输入完全一致（同数量同类型同字节）→ 跳过
+        //（ASTParserTokenManager 曾每轮 1 次零差编辑——振荡误报）
+        if new_stmts.len() == stmts[..prefix].len() {
+            let identical = new_stmts
+                .iter()
+                .zip(stmts[..prefix].iter())
+                .all(|(&n, &o)| print_equiv(lang, n, o));
+            if identical {
+                return None;
+            }
+        }
+        Some(Edit::Splice {
+            node: id,
+            index: 0,
+            remove: prefix,
+            insert: new_stmts,
+        })
+    }
+}
+
+/// 值 → 常量字面量节点（不可材料化 → None）。
+/// 值 → 常量表达式节点 + 追加语句（部分填充数组需 new T[n] + 分槽赋值）。
+fn materialize(lang: &mut JavaAst, v: &vexec::VVal) -> Option<(JavaId, Vec<JavaId>)> {
+    use vexec::VVal;
+    match v {
+        VVal::I(x) => Some((lang.lit(Lit::Int(*x as i64)), vec![])),
+        VVal::L(x) => Some((lang.lit(Lit::Long(*x)), vec![])),
+        VVal::B(b) => Some((lang.lit(Lit::Bool(*b)), vec![])),
+        VVal::S(s) => Some((lang.lit(Lit::Str(s.clone())), vec![])),
+        VVal::CA(a) => {
+            // char[] 字面量：new char[]{...}
+            let chars: Vec<char> = a.borrow().clone();
+            let lits: Vec<JavaId> = chars.iter().map(|&c| lang.lit(Lit::Char(c))).collect();
+            let lit_arr = lang.array_lit(lits);
+            let node = lang.new_array(JType::Char, 1, 0, vec![], Some(lit_arr));
+            Some((node, vec![]))
+        }
+        VVal::SA(elems) => {
+            // String[]：全填充 → 字面量数组；部分填充 → new String[n] +
+            // 逐元素赋值（null 槽保留——后半段继续填充）
+            let arr = elems.borrow().clone();
+            if arr.iter().all(|e| matches!(e, VVal::S(_))) {
+                let lits: Vec<JavaId> = arr
+                    .iter()
+                    .map(|e| match e {
+                        VVal::S(sv) => lang.lit(Lit::Str(sv.clone())),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                let lit_arr = lang.array_lit(lits);
+                let node =
+                    lang.new_array(JType::Ref("String".to_string()), 1, 0, vec![], Some(lit_arr));
+                Some((node, vec![]))
+            } else if arr.iter().all(|e| matches!(e, VVal::S(_) | VVal::Undef)) {
+                let n = arr.len() as i64;
+                let size = lang.lit(Lit::Int(n));
+                let node =
+                    lang.new_array(JType::Ref("String".to_string()), 1, 1, vec![size], None);
+                let mut extra = Vec::new();
+                for (i, e) in arr.iter().enumerate() {
+                    if let VVal::S(sv) = e {
+                        let idx = lang.lit(Lit::Int(i as i64));
+                        let val = lang.lit(Lit::Str(sv.clone()));
+                        let elem = lang.index(node, idx);
+                        extra.push(lang.assign(elem, val));
+                    }
+                }
+                Some((node, extra))
+            } else {
+                None // 混合非字符串元素 → 不可材料化
+            }
+        }
+        // Undef → 不可材料化（逃逸未初始化值可疑，放弃）
+        VVal::Undef => None,
+    }
+}
 
 pub struct TryUnwrapRethrow;
 
@@ -4128,6 +4394,7 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(EmptyFinallyStrip));
     rules.push(Box::new(TryUnwrapNoCatch));
     rules.push(Box::new(TryUnwrapRethrow));
+    rules.push(Box::new(StaticExec));
     rules.push(Box::new(LoopHeadBreak));
     rules.push(Box::new(WhileIteratorToForEach));
     rules.push(Box::new(ConcatValueOfDrop));

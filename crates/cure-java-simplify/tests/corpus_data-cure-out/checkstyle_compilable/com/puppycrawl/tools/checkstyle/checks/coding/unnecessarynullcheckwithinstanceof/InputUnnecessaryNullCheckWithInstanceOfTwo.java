@@ -1,9 +1,0 @@
-package com.puppycrawl.tools.checkstyle.checks.coding.unnecessarynullcheckwithinstanceof;
-
-public class InputUnnecessaryNullCheckWithInstanceOfTwo {
-    public void basicIfStatements(Object obj) {
-        if (obj != null && obj instanceof String s) {
-            String str = (String) obj;
-        }
-    }
-}

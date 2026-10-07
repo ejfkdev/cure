@@ -213,9 +213,9 @@ public class LoopC {
 "#;
     let (cleaned, edits) = run_case("Loop", src);
     assert!(edits >= 1, "CFF 未被还原：\n{cleaned}");
-    assert!(cleaned.contains("while (i < 5) {"), "{cleaned}");
-    assert!(cleaned.contains("acc += i;"), "{cleaned}");
-    assert!(cleaned.contains("i++;"), "{cleaned}");
+    // vexec 全程静态执行：CFF 还原为 while 循环后，累加器/字符串拼接
+    // 继续被折叠成单常量（javac 差分验证行为一致）
+    assert!(cleaned.contains(r#"println("acc=10")"#), "{cleaned}");
     assert!(!cleaned.contains("switch"), "{cleaned}");
     // 空 case 2（纯出口）被丢弃
     assert!(!cleaned.contains("s = 8"), "{cleaned}");
@@ -290,7 +290,10 @@ public class NegC {
     let before = print_unit(&outcome.ast, &outcome.unit);
     simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
     let after = print_unit(&outcome.ast, &outcome.unit);
-    assert!(after.contains("switch"), "s 后续被用 → 不应还原：\n{after}");
+    // vexec 对该 main 做了全程静态执行（switch 形态消失），但 `s=2 x=5`
+    // 的值证明语义保持（run_case 的 javac 差分同源代码；此用例直接比对
+    // 输出值）
+    assert!(after.contains(r#"println("s=2 x=5")"#), "值必须一致：\n{after}");
     let _ = before;
 }
 
@@ -327,10 +330,8 @@ public class UnrC {
     assert!(outcome.errors.is_empty());
     let report = simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
     let after = print_unit(&outcome.ast, &outcome.unit);
-    assert!(
-        report.by_rule.contains_key("cff_recover"),
-        "不可达 case 应作为死代码丢弃并还原：\n{after}"
-    );
+    // 死 case 体已消失；CFF 还原后整段被 static_exec 折叠为常量输出
+    // （by_rule 断言不可靠——多规则接力时归属可能在任一环）
     assert!(after.contains(r#"println("x=5")"#), "{after}");
     assert!(!after.contains("x = 6;"), "死 case 体必须消失：\n{after}");
     assert!(!after.contains("switch"), "{after}");
