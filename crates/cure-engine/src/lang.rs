@@ -144,6 +144,44 @@ pub trait Lang {
         None
     }
 
+    // ---- 字面量折叠语义（数值/字符串语义全权归属语言侧）----
+    //
+    // 引擎规则只做**形态**匹配（双字面量、算符类别、代价门槛）；一切
+    // 数值语义——宽度与环绕、除零策略、移位掩码、字符串拼接的强制
+    // 转换规则——由这些钩子的语言实现决定。默认全部不折（保守）。
+
+    /// 字面量二元折叠：算术/位运算/移位（`+ - * / % << >> >>> & | ^`）
+    /// 与字符串拼接。操作数为字面量节点 id；返回折叠产物节点。
+    fn fold_lit_bin(&mut self, _op: BinOp, _l: Self::Id, _r: Self::Id) -> Option<Self::Id> {
+        None
+    }
+
+    /// 字面量比较折叠（如 `1 < 2`）。可比较的字面量种类与字符串比较
+    /// 语义（引用比较 vs 值比较）由语言侧决定；返回布尔结果。
+    fn fold_lit_cmp(&mut self, _op: BinOp, _l: Self::Id, _r: Self::Id) -> Option<bool> {
+        None
+    }
+
+    /// 负数值字面量的取反（`-(-lit)` 外层负消除）。宽度溢出时必须
+    /// 返回 None 拒绝折叠（如 Java i32 的 `-(-2147483648)`）。
+    fn fold_lit_neg(&mut self, v: i64, _wide: bool) -> Option<i64> {
+        Some(-v)
+    }
+
+    /// 常量重结合合并：`(x op1 K1) op2 K2` 的常量合并结果。
+    /// 语言侧负责宽度回绕（Java i32 的 `K1+K2` 溢出必须回绕，否则
+    /// 产物是非法字面量）。
+    fn reassoc_delta(
+        &mut self,
+        _op1: BinOp,
+        _k1: i64,
+        _op2: BinOp,
+        _k2: i64,
+        _wide: bool,
+    ) -> Option<ReassocOutcome<Self::Id>> {
+        None
+    }
+
     /// 每轮扫描前由引擎调用；语言侧在此刷新缓存（效果表、变量类型表等）。
     /// `root` 是本轮简化的根（通常是方法体），语言侧可据此做作用域分析。
     fn prepare(&mut self, _root: Self::Id) {}
@@ -152,4 +190,14 @@ pub trait Lang {
     fn cost_weight(&self, kind: NodeKind) -> u64 {
         crate::cost::default_weight(kind)
     }
+}
+
+/// [`Lang::reassoc_delta`] 的合并结果。
+#[derive(Clone, Copy, Debug)]
+pub enum ReassocOutcome<Id> {
+    /// 合并为中性元（`(x+K1)-K1` 类）→ 直接替换为 `x`。
+    Neutral,
+    /// 合并后的常量字面量节点 + 建议算符（`x op lit`；负常量由语言侧
+    /// 决定用 `Sub` 正字面量还是 `Add` 负字面量表达）。
+    Lit(Id, BinOp),
 }

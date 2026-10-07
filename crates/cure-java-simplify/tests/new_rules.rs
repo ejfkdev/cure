@@ -772,3 +772,42 @@ class A {
 "#);
     assert!(out.contains("it.next()"), "{out}");
 }
+
+// ---- 宽度回绕（语义参数化迁移中修复的两个 i32 溢出边界）----
+
+#[test]
+fn reassoc_i32_overflow_wraps() {
+    // (x + 2147483647) + 1：合并值 2^31 溢出 i32 —— 必须回绕为 -2147483648
+    // 表达（`x + 2147483648` 是非法 int 字面量，javac 拒绝）
+    let out = run_src("class A{int f(int x){return (x + 2147483647) + 1;}}");
+    assert!(!out.contains("+ 2147483648"), "非法字面量泄漏: {out}");
+    assert!(out.contains("- 2147483648") || out.contains("+ -2147483648"), "{out}");
+    // 输出必须可干净重解析（自洽性）
+    let back = parse(&out);
+    assert!(back.errors.is_empty(), "{:?}", back.errors);
+    // long 域不回绕（合法）
+    let out = run_src("class A{long f(long x){return (x + 9223372036854775806L) + 2L;}}");
+    assert!(out.contains("- 9223372036854775808L") || out.contains("+ -9223372036854775808L"), "{out}");
+}
+
+#[test]
+fn fold_i32_min_negation_refused() {
+    // Int(-2147483648) 的 -(-lit) 取反溢出 → 拒绝折叠（原实现产出
+    // 非法字面量 +2147483648）
+    let mut out = parse("class A{int f(){int a = -3 - 4; int b = -2147483648 - 0; return -(-2147483648 - 0);}}");
+    // 构造负字面量最值：fold 产 Int(-2147483648)，外层取负必须被拒绝
+    cure_java_simplify::simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
+    let printed = cure_java_print::print_unit(&out.ast, &out.unit);
+    assert!(!printed.contains("return 2147483648;"), "{printed}");
+    let back = parse(&printed);
+    assert!(back.errors.is_empty(), "{:?}", back.errors);
+}
+
+#[test]
+fn fold_neg_normal_still_works() {
+    // 常规负字面量取反不受影响
+    let out = run_src("class A{int f(){int a = -3 - 4; return -a;}}");
+    // a 折为 -7 后 -a 保留（a 是变量非字面量）——换个直接形态：
+    let out2 = run_src("class A{int f(){return -(-7);}}");
+    assert!(out2.contains("return 7;"), "{out2}");
+}

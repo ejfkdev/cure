@@ -23,6 +23,6 @@ pub mod walk;
 
 pub use effect::Effect;
 pub use kind::{BinOp, LitRef, NodeKind, UnOp};
-pub use lang::Lang;
+pub use lang::{Lang, ReassocOutcome};
 pub use pass::{simplify, Config, Report};
 pub use rule::{Edit, Rule, RewriteCtx};

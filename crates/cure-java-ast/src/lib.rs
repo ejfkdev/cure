@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 
+use cure_engine::lang::ReassocOutcome;
 use cure_engine::Lang;
 
 // 本 crate 自用 + 供下游 crate（如 cure-java-print/parser）免依赖引擎直接使用
@@ -877,6 +878,85 @@ impl JavaAst {
 // Lang 实现
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// JLS 整数折叠辅助（从 cure-engine 迁入——数值语义归属语言侧）
+// ---------------------------------------------------------------------------
+
+/// i64 算术（long 语义）：除/余除数为 0 不折（ArithmeticException）。
+/// 移位量按 JLS 掩码（long: & 63）。
+fn fold_i64(op: BinOp, a: i64, b: i64) -> Option<i64> {
+    use BinOp::*;
+    Some(match op {
+        Add => a.wrapping_add(b),
+        Sub => a.wrapping_sub(b),
+        Mul => a.wrapping_mul(b),
+        Div => {
+            if b == 0 {
+                return None;
+            }
+            a.wrapping_div(b)
+        }
+        Rem => {
+            if b == 0 {
+                return None;
+            }
+            a.wrapping_rem(b)
+        }
+        Shl => a.wrapping_shl((b as u64 & 63) as u32),
+        Shr => a.wrapping_shr((b as u64 & 63) as u32),
+        UShr => ((a as u64).wrapping_shr((b as u64 & 63) as u32)) as i64,
+        BitAnd => a & b,
+        BitXor => a ^ b,
+        BitOr => a | b,
+        _ => return None,
+    })
+}
+
+/// i32 算术（int 语义）：操作数按 i32 回绕；移位量按 JLS 掩码（& 31）。
+fn fold_i32(op: BinOp, a: i64, b: i64) -> Option<i64> {
+    use BinOp::*;
+    let (x, y) = (a as i32, b as i32);
+    Some(match op {
+        Add => x.wrapping_add(y) as i64,
+        Sub => x.wrapping_sub(y) as i64,
+        Mul => x.wrapping_mul(y) as i64,
+        Div => {
+            if y == 0 {
+                return None;
+            }
+            x.wrapping_div(y) as i64
+        }
+        Rem => {
+            if y == 0 {
+                return None;
+            }
+            x.wrapping_rem(y) as i64
+        }
+        Shl => x.wrapping_shl((y as u32) & 31) as i64,
+        Shr => x.wrapping_shr((y as u32) & 31) as i64,
+        UShr => (x as u32).wrapping_shr(x as u32 & 31) as i64,
+        BitAnd => (x & y) as i64,
+        BitXor => (x ^ y) as i64,
+        BitOr => (x | y) as i64,
+        _ => return None,
+    })
+}
+
+/// 数值比较折叠（整数/字符提升为 int 后比较）。
+fn cmp_i64(op: BinOp, x: i64, y: i64) -> Option<bool> {
+    use BinOp::*;
+    Some(match op {
+        Lt => x < y,
+        Le => x <= y,
+        Gt => x > y,
+        Ge => x >= y,
+        Eq => x == y,
+        Ne => x != y,
+        _ => return None,
+    })
+}
+
 impl Lang for JavaAst {
     type Id = JavaId;
     type NameKey = u32;
@@ -929,6 +1009,123 @@ impl Lang for JavaAst {
     fn build_assign(&mut self, target: JavaId, value: JavaId) -> JavaId {
         self.assign(target, value)
     }
+
+    // ---- 字面量折叠语义（JLS；引擎侧只做形态匹配）----
+
+    fn fold_lit_bin(&mut self, op: BinOp, l: JavaId, r: JavaId) -> Option<JavaId> {
+        let ll = self.literal(l)?;
+        let rr = self.literal(r)?;
+        // 字符串拼接（Str 与 Str/Char/Int/Long/Bool 字面量——拼接的隐式
+        // valueOf 对这些基元是确定性的；浮点除外：Double.toString 算法与
+        // Rust Display 不保证逐位一致）
+        if op == BinOp::Add {
+            let str_of = |x: LitRef<'_>| -> Option<String> {
+                match x {
+                    LitRef::Str(s) => Some(s.to_string()),
+                    LitRef::Char(c) => Some(c.to_string()),
+                    LitRef::Int(v) => Some(v.to_string()),
+                    LitRef::Long(v) => Some(v.to_string()),
+                    LitRef::Bool(b) => Some(b.to_string()),
+                    _ => None,
+                }
+            };
+            if matches!(ll, LitRef::Str(_)) || matches!(rr, LitRef::Str(_)) {
+                if let (Some(a), Some(b)) = (str_of(ll), str_of(rr)) {
+                    return Some(self.build_str(&format!("{a}{b}")));
+                }
+            }
+        }
+        // 整数折叠（JLS 环绕）：1+2→3、2*3→6、1<<3→8、& | ^ 等。
+        // 除/余除数为 0 不折叠（ArithmeticException 语义）。
+        let int_of = |x: LitRef<'_>| -> Option<i64> {
+            match x {
+                // Java 中 char 参与算术时提升为 int
+                LitRef::Int(v) | LitRef::Long(v) => Some(v),
+                LitRef::Char(c) => Some(c as u32 as i64),
+                _ => None,
+            }
+        };
+        let (a, b) = (int_of(ll)?, int_of(rr)?);
+        let wide = matches!(ll, LitRef::Long(_)) || matches!(rr, LitRef::Long(_));
+        let v = if wide { fold_i64(op, a, b) } else { fold_i32(op, a, b) }?;
+        Some(self.build_int(v, wide))
+    }
+
+    fn fold_lit_cmp(&mut self, op: BinOp, l: JavaId, r: JavaId) -> Option<bool> {
+        let ll = self.literal(l)?;
+        let rr = self.literal(r)?;
+        // 整数/字符按数值比较（char 与 int 比较同样提升为 int）
+        let int_of = |x: LitRef<'_>| -> Option<i64> {
+            match x {
+                LitRef::Int(v) | LitRef::Long(v) => Some(v),
+                LitRef::Char(c) => Some(c as u32 as i64),
+                _ => None,
+            }
+        };
+        if let (Some(x), Some(y)) = (int_of(ll), int_of(rr)) {
+            return cmp_i64(op, x, y);
+        }
+        // 布尔相等（装箱引用 == 语义上不可折，但布尔字面量场景下
+        // true/false 是规范实例，值比较与引用比较一致）
+        if let (LitRef::Bool(x), LitRef::Bool(y)) = (ll, rr) {
+            if matches!(op, BinOp::Eq | BinOp::Ne) {
+                return Some(if op == BinOp::Eq { x == y } else { x != y });
+            }
+        }
+        // 字符串（引用比较）与浮点（NaN）不折
+        None
+    }
+
+    fn fold_lit_neg(&mut self, v: i64, wide: bool) -> Option<i64> {
+        // `-(-2147483648)`：i32 域内无 +2147483648，拒绝折叠
+        let n = -v;
+        if !wide && n > i32::MAX as i64 {
+            return None;
+        }
+        Some(n)
+    }
+
+    fn reassoc_delta(
+        &mut self,
+        op1: BinOp,
+        k1: i64,
+        op2: BinOp,
+        k2: i64,
+        wide: bool,
+    ) -> Option<ReassocOutcome<JavaId>> {
+        use BinOp::*;
+        let raw: i64 = match (op1, op2) {
+            (BitXor, BitXor) => k1 ^ k2,
+            (a, b) if matches!(a, Add | Sub) && matches!(b, Add | Sub) => {
+                let sign = |o: BinOp| if o == Sub { -1i64 } else { 1i64 };
+                sign(a) * k1 + sign(b) * k2
+            }
+            _ => return None,
+        };
+        // JLS 宽度回绕：i32 合并结果溢出必须回绕——不回绕会产出
+        // 非法字面量（`x + 2147483648` 无法作为 int 编译）
+        let d = if wide { raw } else { raw as i32 as i64 };
+        if d == 0 {
+            return Some(ReassocOutcome::Neutral);
+        }
+        if op1 == BitXor && op2 == BitXor {
+            return Some(ReassocOutcome::Lit(self.build_int(d, wide), BitXor));
+        }
+        if d > 0 {
+            Some(ReassocOutcome::Lit(self.build_int(d, wide), Add))
+        } else {
+            // 负 delta 用 `x - |d|`；|d| 回绕后仍为负（仅 ±2^31 边界）
+            // 或宽整数 -2^63 取反溢出时，退回 `x + d`（负字面量）——
+            // 二者模 2^宽度 同余，语法均合法
+            let nd = if wide { d.checked_neg().unwrap_or(d) } else { (d as i32).wrapping_neg() as i64 };
+            if nd > 0 {
+                Some(ReassocOutcome::Lit(self.build_int(nd, wide), Sub))
+            } else {
+                Some(ReassocOutcome::Lit(self.build_int(d, wide), Add))
+            }
+        }
+    }
+
     fn copy_subtree(&mut self, id: JavaId) -> JavaId {
         let old_children: Vec<JavaId> = self.nodes[id.0 as usize].children.as_slice().to_vec();
         let mut children = Vec::with_capacity(old_children.len());

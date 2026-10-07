@@ -9,7 +9,7 @@ use crate::effect::Effect;
 use crate::kind::{BinOp, LitRef, NodeKind, UnOp};
 use crate::pattern::{matches, Pat};
 use crate::rule::{Edit, RewriteCtx, Rule};
-use crate::lang::Lang;
+use crate::lang::{Lang, ReassocOutcome};
 
 // ---------------------------------------------------------------------------
 // 括号消除：Paren(x) → x（纯分组节点，删除永远安全）
@@ -1026,9 +1026,9 @@ impl<L: Lang> Rule<L> for TernaryBool {
 }
 
 // ---------------------------------------------------------------------------
-// 整数常量折叠（Java 包装算术语义）：1+2→3、2*3→6、1<<3→8、& | ^ 等。
-// 除/余 除数为 0 不折叠（异常语义）。Int 按 i32 回绕，Long 按 i64。
-// 字符串字面量拼接："a"+"b"→"ab"。
+// 整数常量折叠 + 字符串拼接：形态匹配在引擎（双字面量 + 非短路/比较
+// 算符），数值/拼接**语义**全权在 Lang::fold_lit_bin（Java：JLS i32/i64
+// 环绕 + 移位掩码 + 除零不折 + "a"+1 拼接；其他语言各自定义）。
 // ---------------------------------------------------------------------------
 
 pub struct ConstFoldBin;
@@ -1051,110 +1051,15 @@ impl<L: Lang> Rule<L> for ConstFoldBin {
         }
         let ch = lang.children(id);
         let (l, r) = (*ch.first()?, *ch.get(1)?);
-        // 字符串拼接（Str 与 Str/Char/Int/Long/Bool 字面量——拼接的隐式
-        // valueOf 对这些基元是确定性的；浮点除外：Double.toString 算法与
-        // Rust Display 不保证逐位一致）
-        if op == BinOp::Add {
-            let lit_str_of = |n: L::Id| -> Option<String> {
-                match lang.literal(n)? {
-                    LitRef::Str(s) => Some(s.to_string()),
-                    LitRef::Char(c) => Some(c.to_string()),
-                    LitRef::Int(v) => Some(v.to_string()),
-                    LitRef::Long(v) => Some(v.to_string()),
-                    LitRef::Bool(b) => Some(b.to_string()),
-                    _ => None,
-                }
-            };
-            if let (Some(a), Some(b)) = (lit_str_of(l), lit_str_of(r)) {
-                if matches!(lang.literal(l), Some(LitRef::Str(_)))
-                    || matches!(lang.literal(r), Some(LitRef::Str(_)))
-                {
-                    let joined = format!("{a}{b}");
-                    let with = lang.build_str(&joined);
-                    return Some(Edit::Replace { target: id, with });
-                }
-            }
-        }
-        let int_of = |x: Option<LitRef<'_>>| -> Option<i64> {
-            match x? {
-                // Java 中 char 参与算术时提升为 int
-                LitRef::Int(v) | LitRef::Long(v) => Some(v),
-                LitRef::Char(c) => Some(c as u32 as i64),
-                _ => None,
-            }
-        };
-        let (a, b) = (int_of(lang.literal(l))?, int_of(lang.literal(r))?);
-        let is_long = matches!(lang.literal(l), Some(LitRef::Long(_)))
-            || matches!(lang.literal(r), Some(LitRef::Long(_)));
-        let folded: Option<i64> = if is_long {
-            fold_i64(op, a, b)
-        } else {
-            fold_i32(op, a, b).map(|v| v as i64)
-        };
-        let v = folded?;
-        let with = lang.build_int(v, is_long);
+        // 双字面量才考虑折叠（具体哪些组合可折由语言语义决定）
+        lang.literal(l)?;
+        lang.literal(r)?;
+        let with = lang.fold_lit_bin(op, l, r)?;
         Some(Edit::Replace {
             target: id,
             with,
         })
     }
-}
-
-fn fold_i64(op: BinOp, a: i64, b: i64) -> Option<i64> {
-    use BinOp::*;
-    Some(match op {
-        Add => a.wrapping_add(b),
-        Sub => a.wrapping_sub(b),
-        Mul => a.wrapping_mul(b),
-        Div => {
-            if b == 0 {
-                return None;
-            }
-            a.wrapping_div(b)
-        }
-        Rem => {
-            if b == 0 {
-                return None;
-            }
-            a.wrapping_rem(b)
-        }
-        Shl => a.wrapping_shl((b as u64 & 63) as u32),
-        Shr => a.wrapping_shr((b as u64 & 63) as u32),
-        UShr => ((a as u64).wrapping_shr((b as u64 & 63) as u32)) as i64,
-        BitAnd => a & b,
-        BitXor => a ^ b,
-        BitOr => a | b,
-        _ => return None,
-    })
-}
-
-fn fold_i32(op: BinOp, a: i64, b: i64) -> Option<i64> {
-    use BinOp::*;
-    let (x, y) = (a as i32, b as i32);
-    Some(match op {
-        Add => x.wrapping_add(y) as i64,
-        Sub => x.wrapping_sub(y) as i64,
-        Mul => x.wrapping_mul(y) as i64,
-        Div => {
-            if y == 0 {
-                return None;
-            }
-            x.wrapping_div(y) as i64
-        }
-        Rem => {
-            if y == 0 {
-                return None;
-            }
-            x.wrapping_rem(y) as i64
-        }
-        Shl => x.wrapping_shl((y as u32) & 31) as i64,
-        Shr => x.wrapping_shr((y as u32) & 31) as i64,
-        UShr => (x as u32).wrapping_shr(x as u32 & 31) as i64,
-        BitAnd => (x & y) as i64,
-        BitXor => (x ^ y) as i64,
-        BitOr => (x | y) as i64,
-        _ => return None,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1470,18 +1375,16 @@ impl<L: Lang> Rule<L> for DoubleNegFold {
                 with: x,
             });
         }
-        // -(-lit)：负数值字面量取外层负 → 正字面量
-        if let Some(v) = lang.literal(inner).and_then(|l| match l {
+        // -(-lit)：负数值字面量取外层负 → 正字面量（宽度溢出时语言侧
+        // 拒绝——Java i32 的 `-(-2147483648)` 无法表示）
+        if let Some((v, wide)) = lang.literal(inner).and_then(|l| match l {
             LitRef::Int(v) => Some((v, false)),
             LitRef::Long(v) => Some((v, true)),
             _ => None,
         }) {
-            if v.0 < 0 {
-                let with = if v.1 {
-                    lang.build_int(-v.0, true)
-                } else {
-                    lang.build_int(-v.0, false)
-                };
+            if v < 0 {
+                let n = lang.fold_lit_neg(v, wide)?;
+                let with = lang.build_int(n, wide);
                 return Some(Edit::Replace {
                     target: id,
                     with,
@@ -1557,48 +1460,17 @@ impl<L: Lang> Rule<L> for CmpConstFold {
         }
         let ch = lang.children(id);
         let (l, r) = (*ch.first()?, *ch.get(1)?);
-        let int_of = |x: Option<LitRef<'_>>| -> Option<i64> {
-            match x? {
-                LitRef::Int(v) | LitRef::Long(v) => Some(v),
-                LitRef::Char(c) => Some(c as u32 as i64),
-                _ => None,
-            }
-        };
-        use LitRef::*;
-        let result: Option<bool> = match (int_of(lang.literal(l)), int_of(lang.literal(r))) {
-            (Some(x), Some(y)) => cmp_i64(op, x, y),
-            _ => {
-                if let (Some(Bool(x)), Some(Bool(y))) = (lang.literal(l), lang.literal(r)) {
-                    if matches!(op, BinOp::Eq | BinOp::Ne) {
-                        Some(if op == BinOp::Eq { x == y } else { x != y })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-        };
-        let v = result?;
+        // 双字面量才考虑折叠；可比较种类与比较语义由语言决定
+        // （Java：整数/字符/布尔 Eq/Ne；字符串是引用比较 → 不折）
+        lang.literal(l)?;
+        lang.literal(r)?;
+        let v = lang.fold_lit_cmp(op, l, r)?;
         let with = lang.build_bool(v);
         Some(Edit::Replace {
             target: id,
             with,
         })
     }
-}
-
-fn cmp_i64(op: BinOp, x: i64, y: i64) -> Option<bool> {
-    use BinOp::*;
-    Some(match op {
-        Lt => x < y,
-        Le => x <= y,
-        Gt => x > y,
-        Ge => x >= y,
-        Eq => x == y,
-        Ne => x != y,
-        _ => return None,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1759,6 +1631,8 @@ impl<L: Lang> Rule<L> for ArithReassoc {
         }
 
         // 整数重结合：(x ± K1) ± K2 → x ± K、(x ^ K1) ^ K2 → x ^ K
+        // 常量合并与宽度回绕语义在 Lang::reassoc_delta（Java：i32/i64
+        // JLS 环绕——i32 合并溢出不回绕会产出非法字面量）
         let k1 = lang.literal(ich[1]).and_then(|x| x.as_int())?;
         let k2 = lang.literal(och[1]).and_then(|x| x.as_int())?;
         if !lang.is_exact_int(x) {
@@ -1766,28 +1640,9 @@ impl<L: Lang> Rule<L> for ArithReassoc {
         }
         let is_long = matches!(lang.literal(ich[1]), Some(LitRef::Long(_)))
             || matches!(lang.literal(och[1]), Some(LitRef::Long(_)));
-        let sign = |o: BinOp| if o == BinOp::Sub { -1i64 } else { 1i64 };
-        let delta: Option<i64> = match (op1, op2) {
-            (BinOp::BitXor, BinOp::BitXor) => Some(k1 ^ k2),
-            (a, b) if matches!(a, BinOp::Add | BinOp::Sub)
-                && matches!(b, BinOp::Add | BinOp::Sub) =>
-            {
-                Some(sign(a) * k1 + sign(b) * k2)
-            }
-            _ => None,
-        };
-        let d = delta?;
-        let with = if d == 0 {
-            x
-        } else if op1 == BinOp::BitXor && op2 == BinOp::BitXor {
-            let lit = lang.build_int(d, is_long);
-            lang.build_bin(BinOp::BitXor, x, lit)
-        } else if d > 0 {
-            let lit = lang.build_int(d, is_long);
-            lang.build_bin(BinOp::Add, x, lit)
-        } else {
-            let lit = lang.build_int(-d, is_long);
-            lang.build_bin(BinOp::Sub, x, lit)
+        let with = match lang.reassoc_delta(op1, k1, op2, k2, is_long)? {
+            ReassocOutcome::Neutral => x,
+            ReassocOutcome::Lit(lit, op) => lang.build_bin(op, x, lit),
         };
         Some(Edit::Replace {
             target: id,
