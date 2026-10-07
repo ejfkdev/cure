@@ -683,16 +683,24 @@ impl<L: Lang> Rule<L> for ArithIdentity {
 // ---------------------------------------------------------------------------
 
 
-/// 语句区间内名字的**句法** VarRef 引用计数（含赋值目标、数组下标基——
-/// 事件模型对这些位置的读不可见）。传播类规则的引用计数兜底。
+/// 语句区间内名字的**句法** VarRef 出现次数（逐节点计数；含赋值目标、
+/// 数组下标基——事件模型对这些位置的读不可见）。传播类规则的引用
+/// 计数兜底。注意与「语句级存在性」区分：同一语句里出现两次要计 2。
 fn count_name_refs<L: Lang>(lang: &L, stmts: &[L::Id], name: &str) -> usize {
     let mut n: usize = 0;
     for &s in stmts {
-        n += usize::from(subtree_contains(&*lang, s, |x| {
-            lang.kind(x) == NodeKind::VarRef && lang.var_name(x) == Some(name)
-        }));
+        count_var_refs(lang, s, name, &mut n);
     }
     n
+}
+
+fn count_var_refs<L: Lang>(lang: &L, node: L::Id, name: &str, n: &mut usize) {
+    if lang.kind(node) == NodeKind::VarRef && lang.var_name(node) == Some(name) {
+        *n += 1;
+    }
+    for &c in lang.children(node) {
+        count_var_refs(lang, c, name, n);
+    }
 }
 
 pub struct LocalPropagation;
@@ -2615,6 +2623,15 @@ impl<L: Lang> Rule<L> for MultiUseCopyPropagation {
             return None;
         }
         if w1.wrote(name_key) || w1.wrote(src_key) {
+            return None;
+        }
+        // 句法守卫：x 在赋值后的句法出现总数（含数组写 base——x[i]=v
+        // 的 x 不产生事件，事件模型盲区）必须等于事件 uses 数。
+        // 出现 > uses ⇒ 存在事件看不见的引用（bd.java 差分二轮抓获：
+        // var10004 = var154 的读被替换、var10004[i]= 写目标残留 →
+        // 读写裂脑 → 类初始化 AIOOBE）
+        let synth = count_name_refs(&*lang, &stmts[idx + 1..], &name);
+        if synth != w1.uses.len() {
             return None;
         }
         // y 也不得在【赋值前】与 x 指向不同值（x=y 之前 y 已是其所值，无需检查）；
