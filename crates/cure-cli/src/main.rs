@@ -50,6 +50,7 @@ cure — 容错式代码简化 / 格式化工具
       --disable <规则名>   禁用指定规则（可多次）
       --dead-code          删除全单元零引用的 private 方法（反射场景慎用）
       --strict             有解析错误时退出码 1（默认仅 stderr 提示）
+  -j, --threads <N>       并行工作线程数（默认=CPU 核心数 × 1.5）
   -h, --help               本帮助
   -V, --version            版本
 
@@ -84,6 +85,8 @@ struct Options {
     dead_code: bool,
     strict: bool,
     stdin: bool,
+    /// 工作线程数（0/None = 自动；见 worker_threads()）
+    threads: usize,
 }
 
 /// 单文件处理结果（聚合统计用）。
@@ -117,6 +120,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         dead_code: false,
         strict: false,
         stdin: false,
+        threads: 0,
     };
     let mut i = 0;
     while i < args.len() {
@@ -161,6 +165,13 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 let v = args.get(i).ok_or("missing value for --disable")?;
                 opts.disabled.push(v.clone());
             }
+            "-j" | "--threads" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for --threads")?;
+                opts.threads = v
+                    .parse::<usize>()
+                    .map_err(|_| format!("--threads 需要正整数，得到 `{v}`"))?;
+            }
             other if other.starts_with('-') => {
                 return Err(format!("未知选项 `{other}`"));
             }
@@ -195,6 +206,22 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         }
     }
     Ok(opts)
+}
+
+/// 工作线程数决策。
+///
+/// - 用户显式指定（`--threads N` / `-j N`，N≥1）：直接采用
+/// - 自动（0）：CPU 核心数 × 1.5（下取整）。37 万文件实测（18 核，
+///   5 轮交错）：1:1 中位 17.3s、1.5× 16.0s（−7%，每轮方向一致；
+///   CPU 时间与峰值 RSS 持平），2×/3× 无进一步收益。机理：P/E 核
+///   异构下动态取号队列 + 适度超订让快核吸收慢核拖尾（1:1 时 E 核
+///   线程是关键路径）；多余线程无事可做时近零成本。
+///
+/// 任何情况下不超过任务数（少于一个文件/线程无意义），且至少 1。
+fn worker_threads(user: usize, jobs: usize) -> usize {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let n = if user >= 1 { user } else { cores + cores / 2 };
+    n.min(jobs).max(1)
 }
 
 /// 目录模式默认输出根：输入目录的同级 `<名>-cure/`。
@@ -498,11 +525,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     // 常聚集（fernflower bd.java 0.3s vs 小文件 1ms），连续切片会把多个
     // 大文件堆进同一线程成为关键路径——3000 文件混合负载实测并行度仅
     // 7.3×/18 核，改队列后取号即做、天然均衡。
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(jobs.len())
-        .max(1);
+    let n_threads = worker_threads(opts.threads, jobs.len());
     let opts2 = opts.clone();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let shared: Vec<(&PathBuf, &Option<PathBuf>, &str)> =
@@ -914,6 +937,18 @@ fn myers_script(a: &[&str], b: &[&str]) -> Option<Vec<(usize, usize, DiffOp)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_threads_policy() {
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        // 自动 = 1.5× 核心数（任务充足时）
+        assert_eq!(worker_threads(0, 10_000), (cores + cores / 2).min(10_000));
+        // 用户指定优先；不超过任务数；至少 1
+        assert_eq!(worker_threads(3, 10), 3);
+        assert_eq!(worker_threads(5, 2), 2);
+        assert_eq!(worker_threads(1, 1), 1);
+        assert_eq!(worker_threads(0, 1), 1);
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("cure_cli_test_{name}_{}", std::process::id()));
