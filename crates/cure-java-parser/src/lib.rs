@@ -128,12 +128,17 @@ pub fn parse(src: &str) -> ParseOutcome {
     // JLS 3.3：\uXXXX 预解码（词法之前）——token 偏移与 text_of 均基于
     // 解码后的文本
     let decoded = preprocess_unicode_escapes(src);
-    let (tokens, lex_errs) = lex(decoded.as_ref());
-    // Borrowed→一次拷贝（与无预处理时代相同）；Owned→直接移入（解码即终值）
+    // 借用 decode 结果（无逃逸文件零拷贝；有逃逸借用局部 owned——
+    // 生命周期包含于本函数）
+    let decoded_ref: &str = match &decoded {
+        std::borrow::Cow::Borrowed(b) => *b,
+        std::borrow::Cow::Owned(o) => o.as_str(),
+    };
+    let (tokens, lex_errs) = lex(decoded_ref);
     let mut p = Parser {
         t: tokens,
         pos: 0,
-        src: decoded.into_owned(),
+        src: decoded_ref,
         errs: Vec::new(),
         ast: JavaAst::new(),
         in_case_label: false,
@@ -157,10 +162,13 @@ pub fn parse(src: &str) -> ParseOutcome {
 // 解析器
 // ---------------------------------------------------------------------------
 
-struct Parser {
-    t: Vec<Token>,
+struct Parser<'src> {
+    t: Vec<Token<'src>>,
     pos: usize,
-    src: String,
+    /// 借用源（无 \uXXXX 逃逸的文件零拷贝——曾 into_owned() 每文件
+    /// 整源克隆，37 万文件 = 4.6GB memcpy；有逃逸时借用 decode 后的
+    /// 局部 owned String，生命周期完全包含在 parse() 内）
+    src: &'src str,
     errs: Vec<ParseError>,
     ast: JavaAst,
     /// case 标签解析中：`AOSP ->` 不是单参 lambda
@@ -170,13 +178,13 @@ struct Parser {
 /// 解析深度上限（防御恶意/超长输入导致的失控）。
 const STEP_GUARD: usize = 2_000_000;
 
-impl Parser {
+impl<'src> Parser<'src> {
     // ---- 基础 ----
 
-    fn tok(&self) -> &Token {
+    fn tok(&self) -> &Token<'src> {
         &self.t[self.pos.min(self.t.len() - 1)]
     }
-    fn peek(&self, off: usize) -> &Token {
+    fn peek(&self, off: usize) -> &Token<'src> {
         &self.t[(self.pos + off).min(self.t.len() - 1)]
     }
     fn at(&self, s: &str) -> bool {
@@ -226,15 +234,15 @@ impl Parser {
     /// 声明）。两 token 前瞻判定——不进 is_modifier_kw（value 是常见标识符，
     /// 会误吃变量名/字段名）
     fn at_value_decl(&self) -> bool {
-        self.at_kw("value") && matches!(&self.peek(1).tok, Tok::Ident(c) if c == "class")
+        self.at_kw("value") && matches!(&self.peek(1).tok, Tok::Ident(c) if *c == "class")
     }
 
     fn at_kw(&self, s: &str) -> bool {
-        matches!(self.tok().tok, Tok::Ident(ref i) if i == s)
+        matches!(self.tok().tok, Tok::Ident(i) if i == s)
     }
     /// `@interface` 注解类型声明（`@` 是独立 punct，词法层不成单 token）。
     fn at_annotation_decl(&self) -> bool {
-        self.at_punct("@") && matches!(&self.peek(1).tok, Tok::Ident(ref i) if i == "interface")
+        self.at_punct("@") && matches!(&self.peek(1).tok, Tok::Ident(i) if *i == "interface")
     }
     fn bump(&mut self) -> Token {
         let t = self.t[self.pos.min(self.t.len() - 1)].clone();
@@ -318,7 +326,7 @@ impl Parser {
                     break;
                 }
                 if matches!(&t.tok, Tok::Ident(i) if matches!(
-                    i.as_str(),
+                    *i,
                     "if" | "for" | "while" | "do" | "try" | "return" | "throw" | "break"
                         | "continue" | "switch" | "synchronized" | "assert" | "final" | "class"
                 ) || is_primitive_kw(i))
@@ -520,7 +528,7 @@ impl Parser {
             // opens/provides/uses…; }——无专用节点，整文件 RAW 保真
             //（jdk-sources 每模块一个 module-info.java，87 失败中占 70）
             if self.at_kw("module")
-                || (self.at_kw("open") && matches!(&self.peek(1).tok, Tok::Ident(m) if m == "module"))
+                || (self.at_kw("open") && matches!(&self.peek(1).tok, Tok::Ident(m) if *m == "module"))
             {
                 let text = self.text_of(mods_start, self.src.len());
                 unit.raws.push(text.trim().to_string());
@@ -569,9 +577,9 @@ impl Parser {
             }
             // non-sealed：三 token 序列合并（对抗波 3：单独消费 non 会留下
             // `-sealed` 残体产出非法输出）
-            if matches!(&self.tok().tok, Tok::Ident(n) if n == "non")
+            if matches!(&self.tok().tok, Tok::Ident(n) if *n == "non")
                 && matches!(&self.peek(1).tok, Tok::Punct("-"))
-                && matches!(&self.peek(2).tok, Tok::Ident(s) if s == "sealed")
+                && matches!(&self.peek(2).tok, Tok::Ident(s) if *s == "sealed")
             {
                 self.bump();
                 self.bump();
@@ -632,7 +640,7 @@ impl Parser {
         self.bump(); // kw
         let mut name = match &self.tok().tok {
             Tok::Ident(i) => {
-                let n = i.clone();
+                let n = i.to_string();
                 self.bump();
                 n
             }
@@ -843,8 +851,8 @@ impl Parser {
         }
         // 构造器：Name( … 或 record 紧凑构造器 Name {
         if let Tok::Ident(n) = &self.tok().tok {
-            if n == class_name && (self.peek(1).is_punct("(") || self.peek(1).is_punct("{")) {
-                let name = n.clone();
+            if *n == class_name && (self.peek(1).is_punct("(") || self.peek(1).is_punct("{")) {
+                let name = n.to_string();
                 self.bump();
                 let compact = self.at_punct("{");
                 let params = if compact { Vec::new() } else { self.param_list() };
@@ -866,7 +874,7 @@ impl Parser {
         let ty = self.parse_type()?;
         let mut name = match &self.tok().tok {
             Tok::Ident(i) => {
-                let n = i.clone();
+                let n = i.to_string();
                 self.bump();
                 n
             }
@@ -970,7 +978,7 @@ impl Parser {
             }
             match &self.tok().tok {
                 Tok::Ident(n) => {
-                    name = n.clone();
+                    name = n.to_string();
                     self.bump();
                 }
                 _ => break,
@@ -1034,7 +1042,7 @@ impl Parser {
             };
             let name = match &self.tok().tok {
                 Tok::Ident(i) => {
-                    let n = i.clone();
+                    let n = i.to_string();
                     self.bump();
                     n
                 }
@@ -1138,7 +1146,7 @@ impl Parser {
     fn parse_type_base(&mut self) -> Option<JType> {
         let base = match &self.tok().tok {
             Tok::Ident(i) if is_primitive_kw(i) => {
-                let t = match i.as_str() {
+                let t = match *i {
                     "byte" => JType::Byte,
                     "short" => JType::Short,
                     "int" => JType::Int,
@@ -1153,7 +1161,7 @@ impl Parser {
                 t
             }
             Tok::Ident(i) if !is_type_reserved(i) => {
-                let mut name = i.clone();
+                let mut name = i.to_string();
                 self.bump();
                 // 点分名 + 段级泛型（GO<String>.RU<Integer>——内部类型限定，
                 // TWR/声明里出现；ProblemReferenceBinding 形态）：循环吞
@@ -1173,7 +1181,7 @@ impl Parser {
                             self.bump(); // .
                             self.skip_mods_annotations();
                             if let Tok::Ident(seg) = &self.tok().tok {
-                                let seg = seg.clone();
+                                let seg = seg.to_string();
                                 self.bump();
                                 name.push('.');
                                 name.push_str(&seg);
@@ -1185,7 +1193,7 @@ impl Parser {
                             if is_type_reserved(seg) {
                                 break;
                             }
-                            let seg = seg.clone();
+                            let seg = seg.to_string();
                             self.bump();
                             self.bump();
                             name.push('.');
@@ -1516,7 +1524,7 @@ impl Parser {
         if let Some(ty) = self.try_decl_prefix() {
             let mut first_name = match &self.tok().tok {
                 Tok::Ident(i) => {
-                    let n = i.clone();
+                    let n = i.to_string();
                     self.bump();
                     Some(n)
                 }
@@ -1568,7 +1576,7 @@ impl Parser {
                 }
                 let name = match &self.tok().tok {
                     Tok::Ident(i) => {
-                        let n = i.clone();
+                        let n = i.to_string();
                         self.bump();
                         n
                     }
@@ -1667,7 +1675,7 @@ impl Parser {
             // instanceof is by no means a valid declaration name (k instanceof String was once judged
             // as the declaration "type k, name instanceof" — jdk-sources SignatureUtil:
             // case EDDSA -> k instanceof EdECPrivateKey ? … storm root cause)
-            Tok::Ident(i) if i != "instanceof" => Some(ty),
+            Tok::Ident(i) if *i != "instanceof" => Some(ty),
             _ => {
                 self.pos = save;
                 None
@@ -1774,7 +1782,7 @@ impl Parser {
         }
         if let Some(ty) = self.parse_type() {
             if let Tok::Ident(n) = &self.tok().tok {
-                let name = n.clone();
+                let name = n.to_string();
                 self.bump();
                 // C 风格维度变量：for (int _[] : …) / for (int x[] : arr)
                 //（openjdk UnnamedErrors 抓获——曾残留 [ 触发经典 for 路径风暴）
@@ -1815,7 +1823,7 @@ impl Parser {
                 // 声明式 init：`int i = 0, j = 1`（后续声明符无类型 token）
                 let name = match &self.tok().tok {
                     Tok::Ident(i) => {
-                        let n = i.clone();
+                        let n = i.to_string();
                         self.bump();
                         n
                     }
@@ -1845,7 +1853,7 @@ impl Parser {
                 while self.eat(",") {
                     let n2 = match &self.tok().tok {
                         Tok::Ident(i) => {
-                            let n = i.clone();
+                            let n = i.to_string();
                             self.bump();
                             n
                         }
@@ -1956,7 +1964,7 @@ impl Parser {
                     if let Some(ty) = self.try_decl_prefix() {
                         let name = match &self.tok().tok {
                             Tok::Ident(i) => {
-                                let n = i.clone();
+                                let n = i.to_string();
                                 self.bump();
                                 n
                             }
@@ -2024,7 +2032,7 @@ impl Parser {
             }
             let name = match &self.tok().tok {
                 Tok::Ident(i) => {
-                    let n = i.clone();
+                    let n = i.to_string();
                     self.bump();
                     n
                 }
@@ -2142,7 +2150,7 @@ impl Parser {
                                 }
                                 self.skip_balanced("(", ")");
                                 // 模式绑定名：case Box<String>(String s) box
-                                if matches!(&self.tok().tok, Tok::Ident(i) if i != "when") {
+                                if matches!(&self.tok().tok, Tok::Ident(i) if *i != "when") {
                                     self.bump();
                                 }
                                 self.consume_when_guard();
@@ -2160,7 +2168,7 @@ impl Parser {
                             let start = self.cur_start();
                             if self.parse_type().is_some() {
                                 if let Tok::Ident(bind) = &self.tok().tok {
-                                    if !is_reserved_after_type(bind) && bind != "when" {
+                                    if !is_reserved_after_type(bind) && *bind != "when" {
                                         self.bump();
                                         while self.at_punct("[")
                                             && self.peek(1).is_punct("]")
@@ -2270,7 +2278,7 @@ impl Parser {
                 // 整体并入 Ref 原文（含可选绑定/when）
                 if self.at_punct("(") {
                     self.skip_balanced("(", ")");
-                    if matches!(&self.tok().tok, Tok::Ident(i) if i != "when" && !is_reserved_after_type(i)) {
+                    if matches!(&self.tok().tok, Tok::Ident(i) if *i != "when" && !is_reserved_after_type(i)) {
                         self.bump();
                     }
                     self.consume_when_guard();
@@ -2307,7 +2315,7 @@ impl Parser {
                     continue;
                 }
                 let bind = match &self.tok().tok {
-                    Tok::Ident(i) if !is_reserved_after_type(i) && i != "when" => {
+                    Tok::Ident(i) if !is_reserved_after_type(i) && *i != "when" => {
                         let b = i.clone();
                         self.bump();
                         Some(b)
@@ -2493,7 +2501,7 @@ impl Parser {
                     if self.at_punct("::") {
                         self.bump();
                         let m = match &self.tok().tok {
-                            Tok::Ident(m) => m.clone(),
+                            Tok::Ident(m) => m.to_string(),
                             _ => String::new(),
                         };
                         if !m.is_empty() {
@@ -2516,7 +2524,7 @@ impl Parser {
             if self.at_punct(".") {
                 self.bump();
                 match &self.tok().tok {
-                    Tok::Ident(name) if name == "new" => {
+                    Tok::Ident(name) if *name == "new" => {
                         // 限定内部类创建 outer.new Inner(...)：表示为
                         // Call{Member{recv, "new Inner"}, args}——打印精确还原
                         // `recv.new Inner(args)`；效果=Call（保守 Unknown）；
@@ -2578,7 +2586,7 @@ impl Parser {
                         if self.at_punct("::") {
                             self.bump();
                             let m = match &self.tok().tok {
-                                Tok::Ident(m) => m.clone(),
+                                Tok::Ident(m) => m.to_string(),
                                 _ => String::new(),
                             };
                             if !m.is_empty() {
@@ -2666,7 +2674,7 @@ impl Parser {
                     && (matches!(&self.t[p].tok, Tok::Punct(c) if *c == "::")
                         || (matches!(&self.t[p].tok, Tok::Punct(c) if *c == ".")
                             && p + 1 < self.t.len()
-                            && matches!(&self.t[p + 1].tok, Tok::Ident(i) if i == "class")));
+                            && matches!(&self.t[p + 1].tok, Tok::Ident(i) if *i == "class")));
                 if dims_tail {
                     let mut dims = String::new();
                     loop {
@@ -2681,7 +2689,7 @@ impl Parser {
                     }
                     // T[].class：Member{recv=e, name=dims+"class"}（打印 recv[].class）
                     if self.at_punct(".")
-                        && matches!(&self.peek(1).tok, Tok::Ident(i) if i == "class")
+                        && matches!(&self.peek(1).tok, Tok::Ident(ref i) if *i == "class")
                     {
                         self.bump(); // .
                         self.bump(); // class
@@ -2735,7 +2743,7 @@ impl Parser {
                 self.bump();
                 let name = match &self.tok().tok {
                     Tok::Ident(i) => {
-                        let n = i.clone();
+                        let n = i.to_string();
                         self.bump();
                         n
                     }
@@ -2743,7 +2751,7 @@ impl Parser {
                         let _ = self.type_args_raw();
                         match &self.tok().tok {
                             Tok::Ident(i) => {
-                                let n = i.clone();
+                                let n = i.to_string();
                                 self.bump();
                                 n
                             }
@@ -2914,7 +2922,7 @@ impl Parser {
                 Some(self.ast.lit(Lit::TextBlock(content.clone())))
             }
             Tok::Ident(i) => {
-                let name = i.clone();
+                let name = i.to_string();
                 match name.as_str() {
                     "true" => {
                         self.bump();
@@ -3198,7 +3206,7 @@ fn starts_unary_operand(t: &Token) -> bool {
         // instanceof 不是合法一元操作数——(Integer.MAX_VALUE) instanceof byte
         // 的限定名可解析为类型，instanceof 形似变量 → 误判 cast 吞掉关键字
         //（openjdk PrimitiveInstanceOfNumericValueTests 抓获）
-        Tok::Ident(i) if i != "instanceof" => true,
+        Tok::Ident(ref i) if *i != "instanceof" => true,
         Tok::Num(_) | Tok::Str(_) | Tok::Char(_) | Tok::TextBlock(_) => true,
         Tok::Punct(p) => matches!(*p, "(" | "!" | "~" | "++" | "--"),
         _ => false,

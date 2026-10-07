@@ -5,44 +5,46 @@
 
 /// token 种类（携带原文）。
 #[derive(Clone, PartialEq, Debug)]
-pub enum Tok {
-    Ident(String),
+pub enum Tok<'a> {
+    /// 标识符（借用源——词法期零分配；37 万文件 × 每文件数千 token
+    /// 曾是 malloc 大头）
+    Ident(&'a str),
     /// 运算符/标点（规范形态，如 ">>" "=="; 单字符皆为一字节）。
     Punct(&'static str),
-    /// 数值字面量原文（含前后缀，如 "0x1FL"、"1.5e2f"）。
-    Num(String),
-    Char(String),
-    Str(String),
-    /// 文本块内容（已去掉两侧 `"""` 与首行换行）。
+    /// 数值字面量原文（含前后缀，如 "0x1FL"、"1.5e2f"；借用源）。
+    Num(&'a str),
+    Char(&'a str),
+    Str(&'a str),
+    /// 文本块内容（已去掉两侧 `"""` 与首行换行；需加工，保持 String）。
     TextBlock(String),
-    /// 词法错误（原文片段）。
+    /// 词法错误（原文片段；罕见）。
     Error(String),
     Eof,
 }
 
 #[derive(Clone, PartialEq, Debug)]
-pub struct Token {
-    pub tok: Tok,
+pub struct Token<'a> {
+    pub tok: Tok<'a>,
     pub start: usize,
     pub end: usize,
     pub line: usize,
     pub col: usize,
 }
 
-impl Token {
+impl Token<'_> {
     pub fn is_punct(&self, s: &str) -> bool {
         matches!(&self.tok, Tok::Punct(p) if *p == s)
     }
     pub fn is_ident(&self, s: &str) -> bool {
-        matches!(&self.tok, Tok::Ident(i) if i == s)
+        matches!(&self.tok, Tok::Ident(i) if *i == s)
     }
     pub fn text(&self) -> String {
         match &self.tok {
-            Tok::Ident(i) => i.clone(),
+            Tok::Ident(i) => i.to_string(),
             Tok::Punct(p) => (*p).to_string(),
-            Tok::Num(n) => n.clone(),
-            Tok::Char(c) => c.clone(),
-            Tok::Str(s) => s.clone(),
+            Tok::Num(n) => n.to_string(),
+            Tok::Char(c) => c.to_string(),
+            Tok::Str(s) => s.to_string(),
             Tok::TextBlock(_) => String::new(),
             Tok::Error(e) => e.clone(),
             Tok::Eof => String::new(),
@@ -78,7 +80,7 @@ struct Lexer<'a> {
     pos: usize,
     line: usize,
     col: usize,
-    toks: Vec<Token>,
+    toks: Vec<Token<'a>>,
     errs: Vec<LexError>,
 }
 
@@ -163,7 +165,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 self.toks.push(Token {
-                    tok: Tok::Ident(self.s[start..self.pos].to_string()),
+                    tok: Tok::Ident(&self.s[start..self.pos]),
                     start,
                     end: self.pos,
                     line,
@@ -316,9 +318,8 @@ impl<'a> Lexer<'a> {
                 }
             }
             self.suffix();
-            let text = self.s[start..self.pos].to_string();
             self.toks.push(Token {
-                tok: Tok::Num(text),
+                tok: Tok::Num(&self.s[start..self.pos]),
                 start,
                 end: self.pos,
                 line,
@@ -338,7 +339,7 @@ impl<'a> Lexer<'a> {
             }
             self.suffix();
             self.toks.push(Token {
-                tok: Tok::Num(self.s[start..self.pos].to_string()),
+                tok: Tok::Num(&self.s[start..self.pos]),
                 start,
                 end: self.pos,
                 line,
@@ -409,7 +410,7 @@ impl<'a> Lexer<'a> {
             }
         }
         self.toks.push(Token {
-            tok: Tok::Num(self.s[start..self.pos].to_string()),
+            tok: Tok::Num(&self.s[start..self.pos]),
             start,
             end: self.pos,
             line,
@@ -454,7 +455,7 @@ impl<'a> Lexer<'a> {
             }
         }
         self.toks.push(Token {
-            tok: Tok::Char(self.s[start..self.pos].to_string()),
+            tok: Tok::Char(&self.s[start..self.pos]),
             start,
             end: self.pos,
             line,
@@ -494,7 +495,7 @@ impl<'a> Lexer<'a> {
             }
         }
         self.toks.push(Token {
-            tok: Tok::Str(self.s[start..self.pos].to_string()),
+            tok: Tok::Str(&self.s[start..self.pos]),
             start,
             end: self.pos,
             line,
