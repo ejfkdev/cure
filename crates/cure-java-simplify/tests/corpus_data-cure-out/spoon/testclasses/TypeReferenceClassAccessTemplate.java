@@ -12,6 +12,8 @@ public class TypeReferenceClassAccessTemplate extends ExtensionTemplate {
         o = $Type$.out;
         $Type$ ret = new $Type$();
         o = $Type$.currentTimeMillis();
+        o = $Type$.class;
+        o = o instanceof $Type$;
         return ret;
     }
     @Local

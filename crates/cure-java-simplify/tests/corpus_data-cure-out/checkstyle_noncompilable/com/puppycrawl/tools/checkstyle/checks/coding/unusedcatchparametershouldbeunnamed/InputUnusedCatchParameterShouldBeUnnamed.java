@@ -39,9 +39,7 @@ public class InputUnusedCatchParameterShouldBeUnnamed {
         }
         try {
             int x = 1 / 0;
-        } catch (Exception A) {
-            ATwo a;
-        }
+        } catch (Exception A) {}
         try {
             int x = 1 / 0;
         } catch (Exception A) {

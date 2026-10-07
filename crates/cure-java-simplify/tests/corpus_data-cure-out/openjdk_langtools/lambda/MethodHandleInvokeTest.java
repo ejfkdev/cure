@@ -7,7 +7,8 @@ public class MethodHandleInvokeTest {
     private static void m(Obj2Obj param) {}
     public static void main(String[] args) {
         m((obj) -> {
-            null.invoke(obj);
+            MethodHandle mhandle = null;
+            mhandle.invoke(obj);
             return null;
         });
     }

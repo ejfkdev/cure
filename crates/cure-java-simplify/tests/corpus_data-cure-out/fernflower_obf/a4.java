@@ -12,18 +12,15 @@ public class a4 implements ac {
     public static void main(String[] var0) throws Exception {
         t.a.setLevel(Level.FINE);
         t.a();
+        a = true;
         while (true) {
             Thread.sleep(10000L);
             System.out.println(c[1] + ((ad) b.a()).a());
         }
     }
     public void a() throws Exception {
-        try {
-            if (a) {
-                System.out.println(c[0] + DateFormat.getTimeInstance().format(new Date()));
-            }
-        } catch (Exception var1) {
-            throw var1;
+        if (a) {
+            System.out.println(c[0] + DateFormat.getTimeInstance().format(new Date()));
         }
     }
     static {

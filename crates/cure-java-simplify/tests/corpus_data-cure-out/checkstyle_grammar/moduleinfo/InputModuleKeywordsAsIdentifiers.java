@@ -24,7 +24,6 @@ public class InputModuleKeywordsAsIdentifiers {
                 }
             }
         transitive();
-        java.util.function.Supplier<String> s = this::provides;
     }
     void transitive() {
         with(module, open);

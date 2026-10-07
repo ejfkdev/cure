@@ -8,17 +8,11 @@ class InputOperatorWrap2 {
         Arrays.sort(null, String::compareToIgnoreCase);
         Arrays.sort(null, String::compareToIgnoreCase);
     }
-    void testAssignment() {
-        int y = 0;
-    }
+    void testAssignment() {}
     <
         T extends Comparable &
         java.io.Serializable
-    > void testGenerics1() {
-        Comparable<
-            String
-            > c = "";
-    }
+    > void testGenerics1() {}
 }
 
 class badCase22<T extends Foo2 &

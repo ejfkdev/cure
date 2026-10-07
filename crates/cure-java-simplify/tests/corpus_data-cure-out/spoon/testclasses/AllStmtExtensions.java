@@ -6,9 +6,6 @@ public class AllStmtExtensions {
     public AllStmtExtensions() {}
     void m1() {
         assert false;
-        {
-            int j = 10;
-        }
     }
     void m2() {}
     void m3() {

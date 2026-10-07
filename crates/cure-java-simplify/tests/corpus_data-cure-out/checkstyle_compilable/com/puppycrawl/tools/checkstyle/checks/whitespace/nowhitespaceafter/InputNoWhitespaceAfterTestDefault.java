@@ -1,15 +1,11 @@
-package com . puppycrawl // violation ''.' is followed by whitespace'
-    .;
+package com.puppycrawl.tools.checkstyle.checks.whitespace.nowhitespaceafter;
 
-tools. // violation ''.' is followed by whitespace'
-    checkstyle.checks.whitespace.nowhitespaceafter;
 class InputNoWhitespaceAfterTestDefault {
     private int mVar1 = 1;
     private int mVar2 = 1;
     private int mVar3 = 1;
     void method1() {
-        int b = 1;
-        b += 1;
+        int b = 2;
         b -= -1 + b;
         b = b++ + b--;
         b = ++b - --b;
@@ -25,22 +21,11 @@ class InputNoWhitespaceAfterTestDefault {
     }
     private void testCasts() {
         Object o = (Object) new Object();
-        o = (Object) o;
-        o = (Object) o;
-        o = (Object) o;
     }
-    private void testQuestions() {
-        boolean b = true;
-    }
-    private void starTest() {
-        int x = 24;
-    }
-    private void boolTest() {
-        int z = ~1 + ~2;
-    }
-    private void divTest() {
-        int h = 2;
-    }
+    private void testQuestions() {}
+    private void starTest() {}
+    private void boolTest() {}
+    private void divTest() {}
     private java.lang.String dotTest() {
         Object o = new Object();
         o.toString();

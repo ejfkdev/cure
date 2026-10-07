@@ -16,7 +16,5 @@ class MethodReference52 {
     interface WrongGetClass {
         Class<List<String>> m();
     }
-    void test(int[] iarr, List<String> ls) {
-        WrongGetClass c5 = ls::getClass;
-    }
+    void test(int[] iarr, List<String> ls) {}
 }

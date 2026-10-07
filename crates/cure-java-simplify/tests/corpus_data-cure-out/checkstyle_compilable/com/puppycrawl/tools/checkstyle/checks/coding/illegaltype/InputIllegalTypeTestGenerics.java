@@ -13,7 +13,6 @@ public abstract class InputIllegalTypeTestGenerics {
     public java.util.List<Map<Boolean, Foo>> list;
     private void methodCall() {
         Bounded.foo();
-        Consumer<Foo> consumer = Foo::foo;
     }
     public <T extends Boolean, U extends Serializable> void typeParameter(T a) {}
     public void fullName(java.util.ArrayList<? super Boolean> a) {}

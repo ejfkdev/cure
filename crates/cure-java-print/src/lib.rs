@@ -287,11 +287,13 @@ impl<'a> Printer<'a> {
         self.out.push_str(&t.name);
         self.out.push_str(&t.ty_params);
         self.out.push_str(&t.header);
-        if !t.permits.is_empty() {
-            self.out.push_str(&format!(" permits {}", t.permits.join(", ")));
-        }
+        // JLS 声明序：extends 在 permits 之前（permits 提前 javac 报
+        //「需要 '{'」——差分审查抓获，JDK 语料 SourceFileAttribute 复现）
         if !t.extends.is_empty() {
             self.out.push_str(&format!(" extends {}", t.extends.join(", ")));
+        }
+        if !t.permits.is_empty() {
+            self.out.push_str(&format!(" permits {}", t.permits.join(", ")));
         }
         if !t.implements.is_empty() {
             self.out

@@ -10,16 +10,12 @@ class j extends i<ak> {
             {
                 label20:
                     {
-                        try {
-                            var10000 = var2;
-                            if (an.k) {
-                                break label21;
-                            }
-                            if (var2 != null) {
-                                break label20;
-                            }
-                        } catch (a_ var3) {
-                            throw var3;
+                        var10000 = var2;
+                        if (an.k) {
+                            break label21;
+                        }
+                        if (var2 != null) {
+                            break label20;
                         }
                         var2 = new al(var1);
                         ai.b().put(var1, var2);

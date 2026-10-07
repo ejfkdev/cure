@@ -48,12 +48,10 @@ public class T8271079 {
         URLConnection connection = uri.toURL().openConnection();
         connection.setUseCaches(false);
         if (connection instanceof JarURLConnection jar) {
-            try {
+            {
                 JarEntry entry = jar.getJarEntry();
                 out.println("JarEntry#getName: " + entry.getName());
                 connection.getInputStream().close();
-            } catch (FileNotFoundException e) {
-                throw e;
             }
         }
     }

@@ -19,7 +19,5 @@ public class InputUnusedImportsFromStaticMethodRefExtended {
     void testMethodRefWithQualifiedName() {
         Optional.empty().map(java.util.Objects::nonNull);
     }
-    void testMethodRefWithGenericType() {
-        Function<String[],List<String>> listGetter = Arrays::asList;
-    }
+    void testMethodRefWithGenericType() {}
 }

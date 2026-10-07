@@ -11,16 +11,12 @@ public class ab implements u {
         while (true) {
             if (var1.hasNext()) {
                 Object var2 = var1.next();
-                try {
-                    v.a(var2);
-                    if (var3 != 0) {
-                        break;
-                    }
-                    if (var3 == 0) {
-                        continue;
-                    }
-                } catch (Exception var5) {
-                    throw var5;
+                v.a(var2);
+                if (var3 != 0) {
+                    break;
+                }
+                if (var3 == 0) {
+                    continue;
                 }
                 int var4 = ap.c;
                 ++var4;

@@ -11,7 +11,6 @@ class MethodReference09 {
         }
         static void test() {
             SAM s1 = Foo.getThis()::getX;
-            SAM s2 = this::getX;
         }
     }
 }

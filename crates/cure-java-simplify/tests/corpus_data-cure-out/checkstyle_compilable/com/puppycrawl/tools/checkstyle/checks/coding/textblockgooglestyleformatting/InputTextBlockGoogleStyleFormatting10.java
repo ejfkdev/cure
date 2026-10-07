@@ -11,7 +11,5 @@ public class InputTextBlockGoogleStyleFormatting10 {
                     this is a simple sentence
                        this is a simple sentence
                 """);
-        String simpleScript10 = """
-                """;
     }
 }

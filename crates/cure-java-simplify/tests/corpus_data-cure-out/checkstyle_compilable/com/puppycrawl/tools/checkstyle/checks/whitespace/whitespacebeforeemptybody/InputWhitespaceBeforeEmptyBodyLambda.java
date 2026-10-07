@@ -7,7 +7,5 @@ public class InputWhitespaceBeforeEmptyBodyLambda {
     interface Bar {
         int bar();
     }
-    void test() {
-        Bar c = () -> 0;
-    }
+    void test() {}
 }

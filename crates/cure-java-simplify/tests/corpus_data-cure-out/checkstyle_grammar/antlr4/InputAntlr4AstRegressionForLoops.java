@@ -20,9 +20,7 @@ public class InputAntlr4AstRegressionForLoops {
             j++;
         }
         for (int i = 0; i < 1; i++) {}
-        for (int i = 0; i < 1; i++) {
-            int x = i;
-        }
+        for (int i = 0; i < 1; i++) {}
         for (int i = 0; i < 1; i++) {
             Serializable s = new Serializable() {
                 int i = 3;
@@ -71,9 +69,7 @@ public class InputAntlr4AstRegressionForLoops {
             for (i = 7; i < 10; i += 1) {}
         }
         for (String name : new String[] {}) {}
-        for (i = 0; i < 10; i++) {
-            String name = "";
-        }
+        for (i = 0; i < 10; i++) {}
         for (int EXPR = 0; EXPR < 1; EXPR++) {
             for (int j = 0; j < 1; i++) {
                 i++;

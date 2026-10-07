@@ -12,7 +12,6 @@ public class InputMethodReferences<T> extends ParentClass {
         InputMethodReferences tl = new InputMethodReferences();
         numbers.forEach(this::println);
         numbers.forEach(super::println);
-        Function<Integer, String[]> messageArrayFactory = String[]::new;
     }
 }
 

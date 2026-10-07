@@ -4,7 +4,5 @@ public class InputSingleSpaceSeparatorComments2 {
     int i = 0;
     int j = 0;
     int k;
-    void foo() {
-        int a = 0;
-    }
+    void foo() {}
 }

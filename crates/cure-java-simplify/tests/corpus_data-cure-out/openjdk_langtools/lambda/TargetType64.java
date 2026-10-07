@@ -3,7 +3,5 @@ class TargetType64 {
         void m(X x);
     }
     void g(Object o) {}
-    void test() {
-        SAM<?> s2 = this::g;
-    }
+    void test() {}
 }

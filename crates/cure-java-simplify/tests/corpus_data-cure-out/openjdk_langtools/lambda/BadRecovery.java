@@ -5,9 +5,7 @@ class BadRecovery {
     void m(SAM1 m) {}
     void test() {
         m((receiver, t) -> {
-            receiver.someMemberOfReceiver(() -> {
-                Object x = f;
-            });
+            receiver.someMemberOfReceiver(() -> {});
         });
     }
 }

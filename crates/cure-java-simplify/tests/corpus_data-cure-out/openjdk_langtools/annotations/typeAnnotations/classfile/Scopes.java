@@ -11,6 +11,8 @@ public class Scopes<T extends @Scopes.UniqueInner Object> extends ClassfileTestH
         new Scopes().run();
     }
     public void run() throws Exception {
+        expected_tinvisibles = 1;
+        expected_invisibles = 1;
         test(getClassFile("Scopes.class"));
         countAnnotations();
         if (errors > 0) 

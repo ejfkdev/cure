@@ -12,9 +12,7 @@ public class InputAvoidEscapedUnicodeCharacters2One {
     public Object fooChar() {
         return 65279;
     }
-    public void multiplyString() {
-        String allCharactersEscaped = "μμ";
-    }
+    public void multiplyString() {}
     private static String abbreviate(TimeUnit unit) {
         switch (unit) {
             case NANOSECONDS:

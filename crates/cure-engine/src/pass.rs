@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::kind::NodeKind;
 use crate::rule::{apply_edit, Edit, RewriteCtx, Rule};
-use crate::walk::walk;
+use crate::walk::{walk, Walk};
 use crate::lang::Lang;
 
 #[derive(Clone, Debug)]
@@ -46,6 +46,38 @@ pub struct Report {
     pub discarded: usize,
     /// 按规则名统计的编辑数。
     pub by_rule: BTreeMap<&'static str, usize>,
+}
+
+
+/// 见应用环内的注释。只处理 target==当前检查节点 的直接折叠——
+/// ancestor 目标的折叠不产生「合法→非法」转变（原形态本非语句位）。
+fn legalize_stmt_fold<L: Lang>(
+    lang: &L,
+    snap: &Walk<L>,
+    id: L::Id,
+    edit: Edit<L>,
+) -> Option<Edit<L>> {
+    let Edit::Replace { target, with } = &edit else { return Some(edit) };
+    if *target != id || lang.kind(*with) != NodeKind::Literal {
+        return Some(edit);
+    }
+    // Binary→Literal 不制造新非法性（Binary 语句本就非法输入）；
+    // 只有合法语句形态（调用/new）被换成字面量才是
+    if !matches!(lang.kind(id), NodeKind::Call | NodeKind::New) {
+        return Some(edit);
+    }
+    let Some(&(parent, _)) = snap.parents.get(&id) else { return Some(edit) };
+    if lang.kind(parent) != NodeKind::ExprStmt || lang.children(parent).len() != 1 {
+        return Some(edit);
+    }
+    // 语句的容器必须是 Block：Label 独子语句被删会让 Label 无孩子
+    //（printer panic——spoon ExecutableReferencePosition 抓获）；Case/
+    // Synchronized 体等容器同理保守拒绝
+    let Some(&(grand, _)) = snap.parents.get(&parent) else { return Some(edit) };
+    if lang.kind(grand) != NodeKind::Block {
+        return None; // 放弃提案（返回原 Replace 会留下裸字面量，同样非法）
+    }
+    Some(Edit::Delete { node: parent })
 }
 
 /// 对 `root`（通常是方法体 Block）运行规则集直到 fixed point。
@@ -134,6 +166,13 @@ pub fn simplify<L: Lang>(
                 };
                 let proposal = rule.check(ctx, id);
                 let Some(edit) = proposal else {
+                    continue;
+                };
+                // JLS 14.8 合法化：Call/New 折叠为字面量且恰为
+                // ExpressionStatement 独子 → 裸字面量语句非法
+                //（`String.valueOf(temp);` → `"7";`）→ 值被丢弃的
+                // 纯调用语句整体删除（能折叠成字面量的调用必然无副作用）
+                let Some(edit) = legalize_stmt_fold(&*lang, &snap, id, edit) else {
                     continue;
                 };
                 let structural = rule.structural();

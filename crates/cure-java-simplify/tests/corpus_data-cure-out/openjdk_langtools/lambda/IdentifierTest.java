@@ -17,7 +17,8 @@ public class IdentifierTest {
             in_fix = "_";
         }
         public void testClassMembersAccess(String[] _args) {
-            new _().testTryCatch();
+            _ _ = new _();
+            _.testTryCatch();
             _.in_fix = "__";
         }
         public void testTryCatch() {

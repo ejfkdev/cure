@@ -2959,9 +2959,7 @@ public class bd {
                     i(c, b);
                     j(c, b);
                     return;
-                } catch (Exception var3) {
-                    boolean var140 = false;
-                }
+                } catch (Exception var3) {}
             }
     }
 }

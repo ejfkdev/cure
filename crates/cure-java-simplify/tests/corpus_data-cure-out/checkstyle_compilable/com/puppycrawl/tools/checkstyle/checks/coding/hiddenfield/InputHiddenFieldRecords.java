@@ -5,19 +5,14 @@ import java.util.Locale;
 public class InputHiddenFieldRecords {
     public record MyRecord1() {
         private static int myHiddenInt = 2;
-        public MyRecord1 {
-            int myHiddenInt = 5;
-        }
+        public MyRecord1 {}
         MyRecord1(String string) {
             this();
-            int myHiddenInt = 6;
         }
     }
     static class MyClass {
         private static int hiddenField = 5;
-        MyClass(String string) {
-            int hiddenField = 10;
-        }
+        MyClass(String string) {}
         static final Object OBJ = "";
         static String hiddenStaticField = "hiddenStaticField";
         static {
@@ -35,22 +30,14 @@ public class InputHiddenFieldRecords {
         }
     }
     record MyRecord13(String string, Integer x) {
-        void foo() {
-            Integer x = 8;
-        }
-        void foo2() {
-            String string = "string";
-        }
+        void foo() {}
+        void foo2() {}
     }
     class MyClass13 {
         Integer x = 7;
         String string = "string";
-        void foo() {
-            Integer x = 8;
-        }
-        void foo2() {
-            String string = "string";
-        }
+        void foo() {}
+        void foo2() {}
     }
     record MyTestRecord3(String str, Locale treeSet) {
         void foo(Locale hashMap) {}

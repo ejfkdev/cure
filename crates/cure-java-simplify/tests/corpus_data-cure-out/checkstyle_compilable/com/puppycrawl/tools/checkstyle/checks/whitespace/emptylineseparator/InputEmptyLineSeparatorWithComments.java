@@ -94,9 +94,7 @@ public class InputEmptyLineSeparatorWithComments {
         abs(1);
     }
     {}
-    {
-        int i = 1;
-    }
+    {}
     public InputEmptyLineSeparatorWithComments() {
         testNoViolationWithJavadoc = 1;
     }

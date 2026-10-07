@@ -21,9 +21,7 @@ public class InputExplicitInitialization {
     static char ch1 = 0;
     static char ch2 = '\u0000';
     static char ch3 = '\\';
-    void method() {
-        String s = null;
-    }
+    void method() {}
 }
 
 interface interface1 {

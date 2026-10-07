@@ -5,12 +5,8 @@ import java.io.IOException;
 class InputJavadocVariableTagsMethods2 {
     void method14(int aOne) {}
     void method14() throws java.io.IOException {}
-    static {
-        int x = 1;
-    }
-    {
-        int z = 2;
-    }
+    static {}
+    {}
     private static final int ON_SECOND_LINE = 2;
     void method15() throws java.io.IOException {}
     public String toString() {

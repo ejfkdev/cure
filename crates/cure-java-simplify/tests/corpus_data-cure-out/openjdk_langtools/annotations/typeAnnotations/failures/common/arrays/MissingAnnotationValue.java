@@ -1,9 +1,7 @@
 import java.lang.annotation.*;
 
 class MissingAnnotationValue {
-    void test() {
-        String[] s;
-    }
+    void test() {}
 }
 
 @Target(ElementType.TYPE_USE) @interface A {

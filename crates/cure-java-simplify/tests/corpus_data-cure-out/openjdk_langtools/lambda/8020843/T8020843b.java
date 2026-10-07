@@ -17,7 +17,5 @@ class T8020843b {
     static Object m2(long t) {
         return null;
     }
-    static void test() {
-        BiFunction<T8020843b, String, Object> f2 = T8020843b::m2;
-    }
+    static void test() {}
 }

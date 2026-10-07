@@ -2,38 +2,26 @@ package com.puppycrawl.tools.checkstyle.checks.coding.hiddenfield;
 
 class InputHiddenField6 {
     private int hidden = 0;
-    public InputHiddenField6() {
-        int hidden = 0;
-    }
+    public InputHiddenField6() {}
     public InputHiddenField6(int hidden) {}
-    public void shadow() {
-        int hidden = 0;
-    }
+    public void shadow() {}
     public void shadowFor() {
         for (int hidden = 0; hidden < 1; hidden++) {}
     }
     public void shadowParam(int hidden) {}
     public class Inner {
         private int innerHidden = 0;
-        public Inner() {
-            int innerHidden = 0;
-        }
+        public Inner() {}
         public Inner(int innerHidden) {}
-        private void innerShadow() {
-            int hidden = 0;
-        }
+        private void innerShadow() {}
         private void innerShadowFor() {
             for (int innerHidden = 0; innerHidden < 1; innerHidden++) {}
             for (int hidden = 0; hidden < 1; hidden++) {}
         }
         private void shadowParam(int innerHidden, int hidden) {}
-        {
-            int hidden = 0;
-        }
+        {}
     }
-    {
-        int hidden = 0;
-    }
+    {}
 }
 
 interface NothingHidden6 {
@@ -64,28 +52,16 @@ class PropertySetter26 {
 
 class StaticFields6 {
     private static int hidden;
-    public static void staticMethod() {
-        int hidden;
-    }
-    public void method() {
-        int hidden;
-    }
-    static {
-        int hidden;
-    }
-    {
-        int hidden;
-    }
+    public static void staticMethod() {}
+    public void method() {}
+    static {}
+    {}
 }
 
 class StaticMethods6 {
     private int notHidden;
-    public static void method() {
-        int notHidden;
-    }
-    static {
-        int notHidden;
-    }
+    public static void method() {}
+    static {}
     private int x;
     private static int y;
     static class Inner {
@@ -116,12 +92,8 @@ enum HiddenEnum16 {
     int hidden;
     static int hiddenStatic;
     HiddenEnum16(int hidden) {}
-    public void doSomething() {
-        int hidden = 0;
-    }
-    public static void doSomethingStatic() {
-        int hiddenStatic = 0;
-    }
+    public void doSomething() {}
+    public static void doSomethingStatic() {}
 }
 
 abstract class InputHiddenFieldBug10845126 {
@@ -167,9 +139,7 @@ class OneLetterField6 {
 }
 
 class DuplicateFieldFromPreviousClass6 {
-    public void method() {
-        int i = 0;
-    }
+    public void method() {}
 }
 
 class NestedEnum6 {

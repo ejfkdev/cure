@@ -34,15 +34,11 @@ class InputLeftCurlyTestLineBreakAfter {
         synchronized (this) {
             do {} while (x == 2);
         }
-        for (int k = 0; k < 1; k++) {
-            String innerBlockVariable = "";
-        }
+        for (int k = 0; k < 1; k++) {}
         for (int k = 0; k < 1; k++) {}
         return a;
     }
-    static {
-        int x = 1;
-    }
+    static {}
     void method2() {}
 }
 

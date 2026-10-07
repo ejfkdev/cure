@@ -118,9 +118,7 @@ class T0x1D<T> {
 }
 
 class T0x00 {
-    void m0x00(Long l1) {
-        Object l2 = (Long) l1;
-    }
+    void m0x00(Long l1) {}
 }
 
 class T0x01<T> {
@@ -192,9 +190,7 @@ class T0x15<T> extends ArrayList<@W T> {
 }
 
 class T0x03<T> {
-    void m0x03(T typeObj, Object obj) {
-        boolean ok = obj instanceof String[];
-    }
+    void m0x03(T typeObj, Object obj) {}
 }
 
 class T0x05<T> {
@@ -204,12 +200,8 @@ class T0x05<T> {
 }
 
 class T0x09<T> {
-    void g() {
-        List<@Z String> l = null;
-    }
-    void a() {
-        String[] as = null;
-    }
+    void g() {}
+    void a() {}
 }
 
 class T0x19 {

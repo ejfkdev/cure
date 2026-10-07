@@ -4,9 +4,7 @@ class InputUpperEllSemantic {
     static {
         Boolean x = new Boolean(true);
     }
-    static {
-        int a = 0;
-    }
+    static {}
     static {}
     private static final long IGNORE = 666l + 666L;
     public void triggerEmptyBlockWithoutBlock() {}

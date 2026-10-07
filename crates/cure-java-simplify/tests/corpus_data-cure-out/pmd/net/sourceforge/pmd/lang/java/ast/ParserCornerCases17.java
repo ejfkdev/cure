@@ -40,9 +40,7 @@ public class ParserCornerCases17 {
             }
         }
     }
-    public void underscoreInNumericLiterals() {
-        int x10 = 05_2;
-    }
+    public void underscoreInNumericLiterals() {}
     public String stringsInSwitchStatements() {
         String dayOfWeekArg = "Wednesday";
         String typeOfDay;

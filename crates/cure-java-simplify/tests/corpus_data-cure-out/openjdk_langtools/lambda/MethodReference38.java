@@ -10,7 +10,5 @@ class MethodReference38 {
     }
     enum E {
     }
-    void test() {
-        SAM s4 = E::new;
-    }
+    void test() {}
 }

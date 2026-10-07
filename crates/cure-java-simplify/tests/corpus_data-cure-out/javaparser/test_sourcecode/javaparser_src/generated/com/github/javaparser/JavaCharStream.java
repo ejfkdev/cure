@@ -134,6 +134,8 @@ public class JavaCharStream {
             tokenBegin = bufpos;
             return buffer[bufpos];
         }
+        tokenBegin = 0;
+        bufpos = -1;
         return readChar();
     }
     protected void AdjustBuffSize() {
@@ -280,6 +282,9 @@ public class JavaCharStream {
         this(dstream, 1, 1, 4096);
     }
     public void ReInit(java.io.Reader dstream, int startline, int startcolumn, int buffersize) {
+        inputStream = dstream;
+        line = startline;
+        column = startcolumn - 1;
         if (buffer == null || buffersize != buffer.length) {
             available = bufsize = buffersize;
             buffer = new char[buffersize];

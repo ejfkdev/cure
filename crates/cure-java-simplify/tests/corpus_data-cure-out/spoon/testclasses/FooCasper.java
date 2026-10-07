@@ -31,12 +31,14 @@ public class FooCasper {
         null[0].bar();
     }
     public void bug4() {
-        null.toString();
+        Object tab = null;
+        tab.toString();
     }
     public FooCasper(int i) {}
     public FooCasper() {}
     public void toString_support() {
-        null.toString();
+        FooCasper o = null;
+        o.toString();
     }
     public void array_support() {
         FooCasper[] array = new FooCasper[10];
@@ -45,10 +47,12 @@ public class FooCasper {
         array[2].bar();
     }
     public void literal() {
-        null.literal();
+        FooCasper tab = null;
+        tab.literal();
     }
     public void literal2() {
         FooCasper tab = new FooCasper();
-        null.literal();
+        tab = null;
+        tab.literal();
     }
 }

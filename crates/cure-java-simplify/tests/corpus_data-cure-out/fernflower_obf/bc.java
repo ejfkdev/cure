@@ -33,31 +33,23 @@ public class bc extends DefaultHandler {
             {
                 label67:
                     {
-                        try {
-                            var10000 = this;
-                            if (var7 != 0) {
-                                break label63;
-                            }
-                            if (!this.a) {
-                                break label67;
-                            }
-                        } catch (SAXException var10) {
-                            throw var10;
+                        var10000 = this;
+                        if (var7 != 0) {
+                            break label63;
+                        }
+                        if (!this.a) {
+                            break label67;
                         }
                         String var4 = this.b.toString();
                         label55:
                             {
                                 for (az var6 : this.d) {
-                                    try {
-                                        var6.a(var4);
-                                        if (var7 != 0) {
-                                            break label55;
-                                        }
-                                        if (var7 != 0) {
-                                            break;
-                                        }
-                                    } catch (SAXException var9) {
-                                        throw var9;
+                                    var6.a(var4);
+                                    if (var7 != 0) {
+                                        break label55;
+                                    }
+                                    if (var7 != 0) {
+                                        break;
                                     }
                                 }
                                 this.b = new StringBuilder();
@@ -69,12 +61,8 @@ public class bc extends DefaultHandler {
         Iterator var11 = var10000.d.iterator();
         while (var11.hasNext()) {
             az var12 = (az) var11.next();
-            try {
-                if (var12.b(var1, var3)) {
-                    var11.remove();
-                }
-            } catch (SAXException var8) {
-                throw var8;
+            if (var12.b(var1, var3)) {
+                var11.remove();
             }
             if (var7 != 0) {
                 break;
@@ -92,12 +80,8 @@ public class bc extends DefaultHandler {
         }
         try {
             ay var9 = (ay) this.c.get(var3);
-            try {
-                if (var9 != null) {
-                    this.d.add(new az(var9, var1, var3, var4));
-                }
-            } catch (ParserConfigurationException var7) {
-                throw var7;
+            if (var9 != null) {
+                this.d.add(new az(var9, var1, var3, var4));
             }
         } catch (ParserConfigurationException var8) {
             throw new SAXException(var8);

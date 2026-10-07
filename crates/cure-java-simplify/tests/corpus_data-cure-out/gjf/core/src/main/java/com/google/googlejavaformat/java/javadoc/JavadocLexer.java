@@ -180,6 +180,7 @@ final class JavadocLexer {
             somethingSinceNewline = true;
             return FooterJavadocTagStart::new;
         }
+        somethingSinceNewline = true;
         if (input.tryConsumeRegex(SNIPPET_TAG_OPEN_PATTERN)) {
             if (contextStack.containsAny(BRACE_CONTEXTS)) {
                 contextStack.push(NestingContext.BRACE_CONTEXT);

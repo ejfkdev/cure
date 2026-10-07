@@ -101,7 +101,6 @@ public class BindingsTest1 {
                 s.length();
             };
             r2.run();
-            String s2 = s;
         }
         if (o1 instanceof String s) {
             new Runnable() {
@@ -114,7 +113,6 @@ public class BindingsTest1 {
                 s.length();
             };
             r2.run();
-            String s2 = s;
         }
         boolean result = o1 instanceof String a1 ? o1 instanceof String a2 : !(o1 instanceof String a3);
         boolean result2 = o1 instanceof String a1 ? o1 instanceof String a2 : !switch (0) {

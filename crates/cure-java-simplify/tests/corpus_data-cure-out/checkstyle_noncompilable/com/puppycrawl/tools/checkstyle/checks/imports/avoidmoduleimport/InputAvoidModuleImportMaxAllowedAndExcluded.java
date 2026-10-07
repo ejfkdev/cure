@@ -5,7 +5,5 @@ import module java.xml;
 import module java.desktop;
 
 public class InputAvoidModuleImportMaxAllowedAndExcluded {
-    public void method() {
-        int a = 1;
-    }
+    public void method() {}
 }

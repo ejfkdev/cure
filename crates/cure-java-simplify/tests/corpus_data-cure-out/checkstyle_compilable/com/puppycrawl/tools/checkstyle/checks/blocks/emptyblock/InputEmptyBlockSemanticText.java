@@ -31,8 +31,6 @@ class InputEmptyBlockSemanticText {
             synchronized (new Object()) {}
         }
     }
-    static {
-        int a = 0;
-    }
+    static {}
     static {}
 }

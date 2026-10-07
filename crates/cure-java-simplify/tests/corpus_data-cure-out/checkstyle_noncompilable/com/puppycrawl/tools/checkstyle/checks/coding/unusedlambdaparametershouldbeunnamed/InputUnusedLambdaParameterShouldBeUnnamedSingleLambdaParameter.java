@@ -25,7 +25,6 @@ public class InputUnusedLambdaParameterShouldBeUnnamedSingleLambdaParameter {
             Object a = new C();
             return "x";
         }).toList();
-        Function<String, String> function = (s) -> "x";
         Xs = list.stream().map((C) -> {
             C = "a";
             return "x";

@@ -43,11 +43,7 @@ public class ToEvaluate {
         return (T) element;
     }
     private static String tryCatchAndStatement(CtElement element) {
-        try {
-            element.getClass();
-        } catch (RuntimeException e) {
-            throw e;
-        }
+        element.getClass();
         return "This must not be removed";
     }
     private static String simplifyOnlyWhenPossible(CtElement element) {

@@ -1,12 +1,8 @@
 package spoon.test.executable.testclasses;
 
 public class ExecutableRefTestSource implements MyIntf {
-    public void testMethod() {
-        "Hello World";
-    }
-    public void testConstructor() {
-        "Hello World";
-    }
+    public void testMethod() {}
+    public void testConstructor() {}
     @Override
 	public void myMethod() {}
 }

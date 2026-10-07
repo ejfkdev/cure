@@ -8,7 +8,7 @@ public class FooLabel {
             getClass();
         labelx:
             label3:
-                "";
+                new String();
         getClass();
         label4:
             x = false;

@@ -19,7 +19,6 @@ public class InputInnerTypeLastClass {
         		}
 
         		int test6 = 600;
-        int test8 = 800;
     }
     class Inner1 {
         int test4 = 400;
@@ -30,7 +29,6 @@ public class InputInnerTypeLastClass {
             			}
 
             			int test11 = 600;
-            int test12 = 800;
         }
     }
     void methodTest2() {
@@ -48,7 +46,6 @@ class Temp2 {
             			}
 
             			int test11 = 600;
-            int test12 = 800;
         }
     }
     void methodTest2() {

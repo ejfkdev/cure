@@ -14,21 +14,7 @@ public class r {
     }
     private static a9 a(p param0) {}
     public static a9 a(Throwable var0) {
-        try {
-            if (var0 instanceof a9) {
-                return (a9) var0;
-            }
-        } catch (a9 var1) {
-            throw var1;
-        }
-        try {
-            if (var0 instanceof SQLException) {
-                return a(c[0]).a(var0).a();
-            }
-        } catch (a9 var2) {
-            throw var2;
-        }
-        return a(c[1]).a(var0).a();
+        return var0 instanceof a9 ? (a9) var0 : var0 instanceof SQLException ? a(c[0]).a(var0).a() : a(c[1]).a(var0).a();
     }
     static a9 b(p var0) {
         return a(var0);

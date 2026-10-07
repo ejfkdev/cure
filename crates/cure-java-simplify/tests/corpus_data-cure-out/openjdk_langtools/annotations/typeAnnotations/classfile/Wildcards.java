@@ -9,6 +9,8 @@ public class Wildcards extends ClassfileTestHelper {
         new Wildcards().run();
     }
     public void run() throws Exception {
+        expected_tinvisibles = 3;
+        expected_tvisibles = 0;
         ClassModel cm = getClassFile("Wildcards$Test.class");
         test(cm);
         for (FieldModel fm : cm.fields()) {
@@ -27,7 +29,6 @@ public class Wildcards extends ClassfileTestHelper {
         }
         List<? extends @A Number> f;
         List<? extends @A Object> test(List<? extends @A Number> p) {
-            List<? extends @A Object> l;
             return null;
         }
     }

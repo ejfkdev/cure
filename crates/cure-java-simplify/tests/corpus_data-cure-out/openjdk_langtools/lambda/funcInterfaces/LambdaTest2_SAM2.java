@@ -31,8 +31,6 @@ public class LambdaTest2_SAM2 {
                 BufferedReader br = new BufferedReader(new FileReader(f));
                 while ((temp = br.readLine()) != null) 
                     sb.append(temp).append("\n");
-            } catch (FileNotFoundException fne) {
-                throw fne;
             } catch (IOException e) {
                 e.printStackTrace();
             }

@@ -208,6 +208,11 @@ pub struct JavaAst {
     /// 供引擎 scan_region 快路径——收集器在 cure-tree，只依赖 Lang
     /// 钩子，遍历序与引擎原递归严格一致。
     events: EventStore<JavaId, u32>,
+    /// 上次 prepare 的根。B3 早退（events_clean）只对**树全局**缓存
+    /// （事件索引/效果表）合法；var_types 是 **root 相关**的作用域分析
+    /// ——根变化时必须重建，否则 is_local_var 全 false、传播规则停摆
+    /// （deobfuscate 差分抓获：`t = bump(2)` 不再内联）。
+    prepared_root: Option<JavaId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,7 +1215,12 @@ impl Lang for JavaAst {
     }
 
     fn is_local_var(&self, id: JavaId) -> bool {
-        matches!(self.data(id), NodeData::VarRef { .. })
+        // VarRef 必须解析到局部变量/参数（var_types 作用域解析）才可
+        // 被传播/删除规则触碰——字段引用（this.x / 静态字段裸名）有
+        // 跨方法可见性。未解析（Raw 区域/坏代码）同样返回 false（保守）。
+        // 差分审查抓获：dead_store 曾据此把 `first = cl;`（静态字段写）
+        // 当局部死存储消除，双向链表表头更新静默丢失。
+        matches!(self.data(id), NodeData::VarRef { .. }) && self.var_type(id).is_some()
     }
 
     fn is_char_decl(&self, decl: JavaId) -> bool {
@@ -1278,6 +1288,7 @@ impl Lang for JavaAst {
     /// 1) 效果表——arena 按升序扫描（child index < parent index 不变量）；
     /// 2) 变量类型表——从 root 做作用域栈遍历。
     fn prepare(&mut self, root: JavaId) {
+
         if cnt_prepare_on() {
             PREPARE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             PREPARE_NODES.fetch_add(self.nodes.len(), std::sync::atomic::Ordering::Relaxed);
@@ -1307,8 +1318,16 @@ impl Lang for JavaAst {
         // = 726 倍冗余（37 万文件语料 prepare 占 57% 线程时间）。
         self.events.resize(n_nodes);
         if self.events.is_clean() {
+            if self.prepared_root == Some(root) {
+                return;
+            }
+            // 树全局缓存（事件/效果表）仍有效；根变了 → 只重建
+            // root 相关的作用域分析段
+            self.rebuild_var_types(root);
+            self.prepared_root = Some(root);
             return;
         }
+        self.prepared_root = Some(root);
         self.events.mark_clean();
         for sr in cure_tree::stmt_roots(self, root) {
             let idx = sr.0 as usize;
@@ -1321,7 +1340,13 @@ impl Lang for JavaAst {
         // children-先于-parent 索引序 + 注入节点违例多轮收敛）----
         let effects = cure_tree::rebuild_effects(self, n_nodes);
         self.effect_cache = effects;
+        self.rebuild_var_types(root);
+    }
+}
 
+impl JavaAst {
+    /// root 相关的作用域分析（从 prepare 提取——根变化时单独重建）。
+    pub(crate) fn rebuild_var_types(&mut self, root: JavaId) {
         // ---- 变量类型（作用域栈）----
         self.var_types.clear();
         self.var_types.resize(self.nodes.len(), None);

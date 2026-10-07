@@ -1,12 +1,8 @@
 import java.lang.annotation.*;
 
 class Expressions {
-    void instanceOf() {
-        boolean b = null instanceof String;
-    }
-    void instanceOfArray() {
-        boolean b2 = null instanceof String[];
-    }
+    void instanceOf() {}
+    void instanceOfArray() {}
     void objectCreation() {
         new @A String();
         new @B(0) String();

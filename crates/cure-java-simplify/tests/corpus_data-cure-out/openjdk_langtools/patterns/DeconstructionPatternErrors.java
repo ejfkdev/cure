@@ -26,7 +26,6 @@ public class DeconstructionPatternErrors {
         switch (r1) {
             case GenRecord<>(String s) -> {}
         }
-        boolean b = p instanceof P(int i) p;
     }
     <T> void typeVarTest(T p) {
         if (p instanceof T(int i) && i == 0) ;

@@ -595,11 +595,7 @@ public class Switches {
         };
         return f.apply(o1, o2);
     }
-    private void switchOverNullNPE(I i) {
-        int r = switch (null) {
-            default -> 1;
-        };
-    }
+    private void switchOverNullNPE(I i) {}
     private int switchOverNull1() {
         return switch (null) {
             case Object o -> 2;

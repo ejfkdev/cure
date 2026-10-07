@@ -1,4 +1,4 @@
-package com . google . googlejavaformat . java . javatests;
+package com.google.googlejavaformat.java.javatests;
 
 import com . google . common . base . Charsets;
 import com . google . common

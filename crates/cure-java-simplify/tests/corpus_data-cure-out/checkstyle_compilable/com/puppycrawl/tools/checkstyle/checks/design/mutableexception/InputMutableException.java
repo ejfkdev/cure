@@ -25,9 +25,7 @@ public class InputMutableException {
         private int errorCode;
         public class CustomFailure extends ThreadDeath {
             private int errorCode;
-            public void someMethod() {
-                int i = 0;
-            }
+            public void someMethod() {}
         }
     }
     class CustomException extends java.lang.Exception {

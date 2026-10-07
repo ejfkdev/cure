@@ -5,14 +5,10 @@ import java.util.logging.Level;
 public class v {
     private static final String[] a;
     public static Object a(Object var0) {
-        try {
-            if (var0 != null) {
-                a(var0, var0.getClass());
-            }
-            return var0;
-        } catch (IllegalArgumentException var1) {
-            throw var1;
+        if (var0 != null) {
+            a(var0, var0.getClass());
         }
+        return var0;
     }
     private static void a(Object param0, Class<?> param1) {}
     private static void a(Field var0, Object var1) {
@@ -20,15 +16,11 @@ public class v {
         Throwable var10000;
         label43:
             {
-                try {
-                    if (var3 != 0) {
-                        return;
-                    }
-                    if (!List.class.isAssignableFrom(var0.getType())) {
-                        break label43;
-                    }
-                } catch (Throwable var7) {
-                    throw var7;
+                if (var3 != 0) {
+                    return;
+                }
+                if (!List.class.isAssignableFrom(var0.getType())) {
+                    break label43;
                 }
                 Throwable var2;
                 try {

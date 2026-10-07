@@ -192,9 +192,13 @@ public class Switch02 extends JTTTest {
         runTest("test2char", (char) (0xFFFF - 21));
         runTest("test2char", (char) (0xFFFF - 22));
         runTest("test2char", (char) (0xFFFF - 23));
+        staticCharVal = (char) 0xFFFF;
         runTest("test2char", '\u0000');
+        staticCharVal = (char) (0xFFFF - 21);
         runTest("test2char", (char) 0xFFFF);
+        staticCharVal = (char) (0xFFFF - 22);
         runTest("test2char", (char) 0xFFFF);
+        staticCharVal = (char) (0xFFFF - 23);
         runTest("test2char", (char) 0xFFFF);
     }
     @Test
@@ -205,10 +209,15 @@ public class Switch02 extends JTTTest {
         runTest("test2short", (short) (-0x7FFF + 22));
         runTest("test2short", (short) (-0x7FFF + 23));
         runTest("test2short", (short) 0x7FFF);
+        staticShortVal = short - 0x7FFF;
         runTest("test2short", (short) 0);
+        staticShortVal = (short) (-0x7FFF + 21);
         runTest("test2short", (short) 0);
+        staticShortVal = (short) (-0x7FFF + 22);
         runTest("test2short", (short) 0);
+        staticShortVal = (short) (-0x7FFF + 23);
         runTest("test2short", (short) 0);
+        staticShortVal = (short) 0x7FFF;
         runTest("test2short", (short) 0);
     }
     @Test
@@ -219,10 +228,15 @@ public class Switch02 extends JTTTest {
         runTest("test2byte", (byte) (-0x7F + 22));
         runTest("test2byte", (byte) (-0x7F + 23));
         runTest("test2byte", (byte) 0x7F);
+        staticByteVal = byte - 0x7F;
         runTest("test2short", (short) 0);
+        staticByteVal = (byte) (-0x7F + 21);
         runTest("test2short", (short) 0);
+        staticByteVal = (byte) (-0x7F + 22);
         runTest("test2short", (short) 0);
+        staticByteVal = (byte) (-0x7F + 23);
         runTest("test2short", (short) 0);
+        staticByteVal = (byte) 0x7F;
         runTest("test2short", (short) 0);
     }
 }

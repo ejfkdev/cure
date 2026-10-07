@@ -42,7 +42,5 @@ public class MethodReference73 {
     static void m15(String x) {}
     static void m16(MethodReference73 rec, String x, int i) {}
     void m16(String x, int i) {}
-    static void test() {
-        SAM s16 = MethodReference73::m16;
-    }
+    static void test() {}
 }

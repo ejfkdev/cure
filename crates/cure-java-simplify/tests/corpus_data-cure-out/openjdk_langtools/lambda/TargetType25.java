@@ -10,9 +10,7 @@ class TargetType25 {
         m2((s1) -> (s2) -> 1);
         m3((s1) -> (s2) -> (s3) -> 1);
     }
-    void testExprLambdaInAssignmentContext() {
-        F<String, F<String, F<String, Integer>>> fn3 = (s1) -> (s2) -> (s3) -> 1;
-    }
+    void testExprLambdaInAssignmentContext() {}
     void testStatementLambdaInMethodContext() {
         m1((s1) -> {
             return 1;

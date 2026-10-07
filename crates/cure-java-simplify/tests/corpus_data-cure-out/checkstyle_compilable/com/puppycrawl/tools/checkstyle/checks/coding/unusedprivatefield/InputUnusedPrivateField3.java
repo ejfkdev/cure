@@ -4,9 +4,7 @@ public class InputUnusedPrivateField3 {
     public int publicField;
     private int usedField;
     private int copyfield;
-    void setCopyfield() {
-        int copy = copyfield;
-    }
+    void setCopyfield() {}
     private static final int CONSTANT = 10;
     void useField() {
         System.out.println(usedField);

@@ -4,7 +4,6 @@ public class AnnotationCatchExpression {
     void m1(String s) {
         try {
             s.length();
-            int i = 0;
         } catch (@CustomAnnotation(something =  "annotation string") NullPointerException | NumberFormatException e) {
             e.printStackTrace();
         }
@@ -12,7 +11,6 @@ public class AnnotationCatchExpression {
     void m2(String s) {
         try {
             s.length();
-            int i = 0;
         } catch (NullPointerException e0) {
             e0.printStackTrace();
         } catch (@CustomAnnotation(something =  "annotation string") NumberFormatException e1) {

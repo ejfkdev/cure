@@ -61,6 +61,5 @@ public class MethodRef7 {
         assertTrue(c.m(mr).equals("wahoo"));
         C2 c2 = MethodRef7::wahoo;
         assertTrue(c2.m(mr, 2).equals("wahoo 2"));
-        D2 d2 = Fee::new;
     }
 }

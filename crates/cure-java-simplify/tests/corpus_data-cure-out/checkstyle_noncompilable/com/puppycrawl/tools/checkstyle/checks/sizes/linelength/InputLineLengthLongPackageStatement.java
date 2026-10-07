@@ -1,6 +1,5 @@
-package com.nameofcompany.nameofdivision.nameofproject.systemtests.;
+package com.nameofcompany.nameofdivision.nameofproject.systemtests.parallel.areaoftest.featuretested.flowtested;
 
-parallel.areaoftest.featuretested.flowtested;
 public class InputLineLengthLongPackageStatement {
     @Override
     public String toString() {

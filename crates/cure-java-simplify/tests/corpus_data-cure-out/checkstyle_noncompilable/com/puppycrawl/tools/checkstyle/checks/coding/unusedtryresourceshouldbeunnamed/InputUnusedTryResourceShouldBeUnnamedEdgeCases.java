@@ -19,9 +19,7 @@ public class InputUnusedTryResourceShouldBeUnnamedEdgeCases {
         } catch (Exception e) {}
     }
     void testUsedInTernary() throws Exception {
-        try (AutoCloseable a = lock()) {
-            Object x = a != null ? a : null;
-        } catch (Exception e) {}
+        try (AutoCloseable a = lock()) {} catch (Exception e) {}
     }
     void testMultiCatchShadowing() throws Exception {
         try (AutoCloseable e = lock()) {} catch (IOException | RuntimeException e) {
@@ -51,14 +49,10 @@ public class InputUnusedTryResourceShouldBeUnnamedEdgeCases {
         } catch (Exception e) {}
     }
     void testUsedInStringConcat() throws Exception {
-        try (AutoCloseable a = lock()) {
-            String s = "resource=" + a;
-        } catch (Exception e) {}
+        try (AutoCloseable a = lock()) {} catch (Exception e) {}
     }
     void testUsedInInstanceof() throws Exception {
-        try (AutoCloseable a = lock()) {
-            boolean b = a instanceof AutoCloseable;
-        } catch (Exception e) {}
+        try (AutoCloseable a = lock()) {} catch (Exception e) {}
     }
     void testBareReferenceMatchingDeclaredResource() throws Exception {
         try (AutoCloseable r = lock()) {

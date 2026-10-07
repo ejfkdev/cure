@@ -4,9 +4,7 @@ import java.util.List;
 import java.util.Map;
 
 class T8077247 {
-    public static void test() {
-        int x = 66;
-    }
+    public static void test() {}
     public static int add(int x, int y) {
         long rslt = (long) x + (long) y;
         if (Integer.MIN_VALUE <= rslt && rslt <= Integer.MAX_VALUE) {

@@ -3,9 +3,7 @@ package com.puppycrawl.tools.checkstyle.grammar.antlr4;
 import org.apache.tools.ant.types.Path;
 
 public class InputAntlr4AstRegressionExpressions {
-    public void method() {
-        null;
-    }
+    public void method() {}
     public static <T> T method(String fieldName) {
         return null;
     }

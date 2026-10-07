@@ -10,8 +10,9 @@ class T8016177e {
         return null;
     }
     <T> void test() {
+        Map<T, Boolean> map = null;
         TerminalOp<T, Void> forEachOp = makeRef((t) -> {
-            null.put(t, null);
+            map.put(t, null);
         });
     }
 }

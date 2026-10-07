@@ -50,13 +50,9 @@ class e<K, V> implements a<K, V> {
         long var1 = this.e.b();
         long var3 = this.f.b();
         long var10000;
-        try {
-            if (var1 + var3 == 0L) {
-                var10000 = 0L;
-                return var10000;
-            }
-        } catch (a_ var5) {
-            throw var5;
+        if (var1 + var3 == 0L) {
+            var10000 = 0L;
+            return var10000;
         }
         return Math.round(100.0 * (double) var1 / (double) (var1 + var3));
     }
@@ -85,17 +81,13 @@ class e<K, V> implements a<K, V> {
         long var10004;
         label16:
             {
-                try {
-                    var10000 = new b;
-                    var10001 = var10000;
-                    var10002 = var1;
-                    var10003 = var2;
-                    if (this.k > 0L) {
-                        var10004 = this.k + System.currentTimeMillis();
-                        break label16;
-                    }
-                } catch (a_ var4) {
-                    throw var4;
+                var10000 = new b;
+                var10001 = var10000;
+                var10002 = var1;
+                var10003 = var2;
+                if (this.k > 0L) {
+                    var10004 = this.k + System.currentTimeMillis();
+                    break label16;
                 }
                 var10004 = 0L;
             }

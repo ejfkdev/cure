@@ -19,7 +19,6 @@ public class InputRequireThisEnumInnerClassesAndBugs3 {
             e.toString();
         }
         this.i--;
-        "10";
     }
     <T> void method3() {
         i = 3;

@@ -5,8 +5,6 @@ class MethodReference58 {
     interface F_Integer {
         <X extends Integer> void m(X x);
     }
-    void test() {
-        F_Integer f2 = this::g;
-    }
+    void test() {}
     <Z extends Number> void g(Z z) {}
 }

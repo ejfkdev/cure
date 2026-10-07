@@ -6,15 +6,11 @@ class T8175317 {
     void testMethodLambda(List l) {
         m(() -> l);
     }
-    void testAssignLambda(List l) {
-        Supplier<List<String>> s = () -> l;
-    }
+    void testAssignLambda(List l) {}
     void testMethodMref() {
         m(this::g);
     }
-    void testAssignMref() {
-        Supplier<List<String>> s = this::g;
-    }
+    void testAssignMref() {}
     List g() {
         return null;
     }

@@ -14,14 +14,7 @@ public class a1 implements a0 {
     }
     public a0 a(String var1) throws XPathExpressionException {
         Node var2 = (Node) b.newXPath().compile(var1).evaluate(this.a, XPathConstants.NODE);
-        try {
-            if (var2 == null) {
-                return null;
-            }
-        } catch (XPathExpressionException var3) {
-            throw var3;
-        }
-        return new a1(var2);
+        return var2 == null ? null : new a1(var2);
     }
     public List<a0> b(String var1) throws XPathExpressionException {
         int var5 = bc.e;
@@ -31,18 +24,14 @@ public class a1 implements a0 {
         ArrayList var10000;
         while (true) {
             if (var4 < var2.getLength()) {
-                try {
-                    var10000 = var3;
-                    if (var5 != 0) {
-                        break;
-                    }
-                    var3.add(new a1(var2.item(var4)));
-                    ++var4;
-                    if (var5 == 0) {
-                        continue;
-                    }
-                } catch (XPathExpressionException var7) {
-                    throw var7;
+                var10000 = var3;
+                if (var5 != 0) {
+                    break;
+                }
+                var3.add(new a1(var2.item(var4)));
+                ++var4;
+                if (var5 == 0) {
+                    continue;
                 }
                 int var6 = ap.c;
                 ++var6;

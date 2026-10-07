@@ -12,10 +12,8 @@ public class LocalVariableSyntaxForLambdaParameters {
     }
     public void createLambdas() {
         Function<Integer, String> lambda1 = (var x) -> String.valueOf(x);
-        BiFunction<Integer, Integer, Integer> lambda2 = (var x, var y) -> x + y;
     }
     public void createAnnotatedLambdaParameters() {
         Function<Integer, String> lambda1 = (@Nonnull var x) -> String.valueOf(x);
-        BiFunction<Integer, Integer, Integer> lambda2 = (@Nonnull var x, @Nonnull var y) -> x + y;
     }
 }

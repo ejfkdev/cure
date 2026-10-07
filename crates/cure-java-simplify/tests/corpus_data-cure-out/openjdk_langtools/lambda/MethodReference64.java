@@ -15,9 +15,7 @@ class MethodReference64 {
     }
     void m(ClassFactory cf) {}
     void m(ArrayFactory cf) {}
-    void testAssign() {
-        ArrayFactory a2 = Foo[]::new;
-    }
+    void testAssign() {}
     void testMethod() {
         m(Anno::new);
         m(E::new);

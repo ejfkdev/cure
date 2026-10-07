@@ -11,9 +11,7 @@ public class ConstFoldTest {
         new ConstFoldTest().run();
     }
     class CFTest {
-        void m() {
-            boolean b = true;
-        }
+        void m() {}
     }
     final String regex = "\\sif(?:null|nonnull|eq|ne){1}\\s";
     void run() throws Exception {

@@ -14,9 +14,7 @@ import static java.lang.annotation.ElementType.TYPE_USE;
 }
 
 class T0x1E {
-    void m0x1E() {
-        Class<Object> c = Object.class;
-    }
+    void m0x1E() {}
     Class<?> c = String.class;
     Class<? extends @A String> as = String.class;
 }

@@ -38,13 +38,7 @@ public class InputPatternVariableAssignmentCheck1 {
                 }
             }
         }
-        if (obj instanceof Boolean b) {
-            boolean boo = true;
-        }
         if (obj instanceof Integer t) ;
-        if (obj instanceof String s) {
-            String z = "bye";
-        }
         Rectangle antiFigure = obj instanceof Rectangle f ? (f = null) : new Rectangle(40, 40);
         if (obj instanceof String rectName) {
             this.theMatch = testBooleans(obj);
@@ -57,9 +51,7 @@ public class InputPatternVariableAssignmentCheck1 {
                 }
             }
         }
-        if (obj instanceof Integer) {
-            String s = "something";
-        } else {
+        if (!(obj instanceof Integer)) {
             assert obj instanceof Double s;
         }
     }

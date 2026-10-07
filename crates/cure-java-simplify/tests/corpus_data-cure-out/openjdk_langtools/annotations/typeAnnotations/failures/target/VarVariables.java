@@ -17,7 +17,6 @@ class VarVariables {
         try (var v = open()) {} catch (Exception ex) {}
         try (var v = open()) {} catch (Exception ex) {}
         try (var v = open()) {} catch (Exception ex) {}
-        boolean b3 = o instanceof R(@TA var v);
     }
     private AutoCloseable open() {
         return null;

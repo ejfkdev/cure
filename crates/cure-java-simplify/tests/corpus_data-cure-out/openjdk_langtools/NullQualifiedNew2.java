@@ -6,7 +6,8 @@ public class NullQualifiedNew2 {
         int i = 1;
         a:
             try {
-                null.new Inner(i++) {};
+                NullQualifiedNew2 c = null;
+                c.new Inner(i++) {};
             } catch (NullPointerException e) {
                 break a;
             }

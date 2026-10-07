@@ -7,6 +7,8 @@ public class StaticInitializer extends ClassfileTestHelper {
         new StaticInitializer().run();
     }
     public void run() throws Exception {
+        expected_tinvisibles = 4;
+        expected_tvisibles = 0;
         ClassModel cm = getClassFile("StaticInitializer$Test.class");
         test(cm);
         for (FieldModel fm : cm.fields()) {

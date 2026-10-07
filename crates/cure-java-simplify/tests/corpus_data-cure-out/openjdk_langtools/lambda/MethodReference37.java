@@ -8,12 +8,8 @@ class MethodReference37 {
     static class Outer {
         class Inner {
         }
-        void test1() {
-            SAM2<Inner, Outer> sam = Inner::new;
-        }
-        void test2() {
-            SAM2<Inner, Outer> sam1 = Inner::new;
-        }
+        void test1() {}
+        void test2() {}
     }
     static void test1() {
         SAM2<Outer.Inner, Outer> sam = Outer.Inner::new;

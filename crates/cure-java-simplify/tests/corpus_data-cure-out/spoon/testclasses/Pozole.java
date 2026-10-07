@@ -14,12 +14,8 @@ public class Pozole<A extends Annotation> {
         addDeliciousIngredient((Class<? extends A>) Annotation.class);
     }
     void addDeliciousIngredient(java.lang.Class<? extends A> ingredient) {}
-    public void eat() {
-        Object a = null;
-    }
-    public void season() {
-        Object a = null;
-    }
+    public void eat() {}
+    public void season() {}
     public void prepare() {
         class Test<T extends Runnable & Serializable> {
         		}

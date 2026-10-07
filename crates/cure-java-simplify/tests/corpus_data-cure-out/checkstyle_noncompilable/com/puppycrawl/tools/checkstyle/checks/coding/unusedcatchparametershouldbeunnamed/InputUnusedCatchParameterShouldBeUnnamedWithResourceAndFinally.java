@@ -30,17 +30,11 @@ public class InputUnusedCatchParameterShouldBeUnnamedWithResourceAndFinally {
         }
     }
     void testTryWithResource() {
-        try (var a = lock()) {
-            int y = 5;
-        } catch (Exception e) {}
-        try (var a = lock()) {
-            int y = 5;
-        } catch (Exception e) {
+        try (var a = lock()) {} catch (Exception e) {}
+        try (var a = lock()) {} catch (Exception e) {
             System.out.println(e.toString());
         }
-        try (var a = lock()) {
-            int y = 5;
-        } catch (Exception _) {
+        try (var a = lock()) {} catch (Exception _) {
             System.out.println(e.toString());
         }
     }

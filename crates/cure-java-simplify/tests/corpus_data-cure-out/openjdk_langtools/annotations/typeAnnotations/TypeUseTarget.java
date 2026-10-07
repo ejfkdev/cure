@@ -5,7 +5,6 @@ import java.lang.annotation.ElementType;
     @A String[] field;
     @A String test(@A TypeUseTarget<K> this, @A String param, @A String... vararg) {
         @A Object o = new @A String @A [3];
-        TypeUseTarget<@A String> target;
         return (String) null;
     }
     <K> String genericMethod(K k) {

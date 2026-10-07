@@ -5,7 +5,6 @@ class Q {
     class T {
     }
     static void f() {
-        Q.T t;
         int zero = Q.zero;
         Q.f();
     }

@@ -8,6 +8,7 @@ public class T6266772 {
         }
     }
     void s() {
+        calledS = true;
         if (getClass() != T6266772.class) 
             throw new AssertionError(getClass());
     }

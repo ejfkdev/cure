@@ -131,8 +131,8 @@ public abstract class Node implements Cloneable {
     }
     protected void setAsParentNodeOf(List<? extends Node> childNodes) {
         if (childNodes != null) {
-            for (Object e : childNodes) {
-                e.setParentNode(this);
+            for (Node current : childNodes) {
+                current.setParentNode(this);
             }
         }
     }

@@ -16,12 +16,8 @@ class a2 implements EntityResolver {
         URL var3 = new URL(var2);
         if (b.equals(var3.getProtocol())) {
             File var4 = new File(var3.getFile());
-            try {
-                if (var4.exists()) {
-                    return new InputSource(new FileInputStream(var4));
-                }
-            } catch (SAXException var5) {
-                throw var5;
+            if (var4.exists()) {
+                return new InputSource(new FileInputStream(var4));
             }
         }
         return null;

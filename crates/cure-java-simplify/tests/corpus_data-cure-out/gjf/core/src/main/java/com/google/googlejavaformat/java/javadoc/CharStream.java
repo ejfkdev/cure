@@ -27,7 +27,10 @@ final class CharStream {
         return true;
     }
     String readAndResetRecorded() {
-        return input.substring(position, tokenEnd);
+        String result = input.substring(position, tokenEnd);
+        position = tokenEnd;
+        tokenEnd = -1;
+        return result;
     }
     boolean isExhausted() {
         return position == input.length();

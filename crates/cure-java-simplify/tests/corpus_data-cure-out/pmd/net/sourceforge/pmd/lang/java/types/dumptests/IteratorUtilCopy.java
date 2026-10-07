@@ -386,6 +386,7 @@ public final class IteratorUtilCopy {
         @Override
         public T next() {
             T next = super.next();
+            currentValue = next;
             prepareViewOn(next);
             numYielded++;
             return next;

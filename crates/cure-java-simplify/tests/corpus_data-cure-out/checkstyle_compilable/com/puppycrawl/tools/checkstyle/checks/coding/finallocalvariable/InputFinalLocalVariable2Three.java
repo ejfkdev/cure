@@ -2,13 +2,9 @@ package com.puppycrawl.tools.checkstyle.checks.coding.finallocalvariable;
 
 public class InputFinalLocalVariable2Three {
     class class22 {
-        public void method1() {
-            int x = 3;
-        }
+        public void method1() {}
         public void method2() {
-            for (int i = 0; i < 5; i++) {
-                int x = 3;
-            }
+            for (int i = 0; i < 5; i++) {}
             int y;
             for (int i = 0; i < 5; i++) {
                 y = 3;
@@ -25,9 +21,7 @@ public class InputFinalLocalVariable2Three {
             do {
                 m = 0;
             } while (false);
-            do {
-                int n = 0;
-            } while (true);
+            do {} while (true);
         }
         private void foo() {
             int q;
@@ -58,9 +52,7 @@ public class InputFinalLocalVariable2Three {
                 m = 0;
                 i++;
             }
-            while (true) {
-                int n = 0;
-            }
+            while (true) {}
         }
         int[] array = new int[10];
         public void method5() {
@@ -68,9 +60,7 @@ public class InputFinalLocalVariable2Three {
             for (int a : array) {
                 r = 0;
             }
-            for (int a : array) {
-                int t = 0;
-            }
+            for (int a : array) {}
         }
     }
     class classs32 {

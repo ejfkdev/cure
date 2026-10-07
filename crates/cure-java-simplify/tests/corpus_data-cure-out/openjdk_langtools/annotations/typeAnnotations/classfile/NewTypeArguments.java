@@ -9,6 +9,8 @@ public class NewTypeArguments extends ClassfileTestHelper {
         new NewTypeArguments().run();
     }
     public void run() throws Exception {
+        expected_tinvisibles = 3;
+        expected_tvisibles = 0;
         ClassModel cm = getClassFile("NewTypeArguments$Test.class");
         test(cm);
         for (FieldModel fm : cm.fields()) {

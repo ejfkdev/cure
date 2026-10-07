@@ -3,7 +3,5 @@
 }
 
 class T {
-    static {
-        java.lang.annotation.Annotation at = null;
-    }
+    static {}
 }

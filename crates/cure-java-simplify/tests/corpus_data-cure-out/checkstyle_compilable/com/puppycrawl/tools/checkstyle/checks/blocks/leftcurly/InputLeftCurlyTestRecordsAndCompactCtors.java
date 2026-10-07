@@ -18,9 +18,7 @@ public class InputLeftCurlyTestRecordsAndCompactCtors {
         }
     }
     record MyTestRecord3(Integer i, Node node) {
-        public MyTestRecord3 {
-            int x = 5;
-        }
+        public MyTestRecord3 {}
         public static void main(String... args) {
             System.out.println("works!");
         }

@@ -51,13 +51,9 @@ public class b<K, V> {
             boolean var10000;
             label18:
                 {
-                    try {
-                        if (var7) {
-                            var10000 = false;
-                            break label18;
-                        }
-                    } catch (a_ var8) {
-                        throw var8;
+                    if (var7) {
+                        var10000 = false;
+                        break label18;
                     }
                     var10000 = true;
                 }

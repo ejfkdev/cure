@@ -34,20 +34,18 @@ public class InputRegressionJava8Class1 {
     }
     public void instructions() {
         boolean b = Math.random() > 0;
-        int vint;
+        Object o = null;
         List<String> vlist = new ArrayList<String>();
         Supplier<?> s;
-        Map.Entry e;
         String str = (String) "";
         new Inner3().m();
-        IntBinaryOperator ibo = Math::max;
         s = Inner1.Inner2::new;
         Runnable r1 = () -> m();
         Runnable r2 = () -> {
             m();
         };
         Collections.sort(vlist, (l,  r) -> l == r ? 0 : 1);
-        Predicate<?> t = b ? null : ((object) -> null.equals(object));
+        Predicate<?> t = b ? null : ((object) -> o.equals(object));
         Double mPi = Math.PI;
     }
     static final Comparator<?> f = (Comparator<?>) ((dateTime1, dateTime2) -> {

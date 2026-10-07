@@ -10,62 +10,40 @@ public class InputRightCurlySwitchWhen {
     public void testSwitchRuleWhenGuard() {
         Object obj = new Object();
         switch (obj) {
-            case ColoredPoint(int x, _, _) when (x >= 2) -> {
-                int y = 0;
-            }
-            case ColoredPoint(int x, _, _) when (x == 1) -> {
-                int y = 1;
-            }
-            case ColoredPoint(int x, _, _) when (x == 0) -> {
-                int y = 2;
-            }
+            case ColoredPoint(int x, _, _) when (x >= 2) -> {}
+            case ColoredPoint(int x, _, _) when (x == 1) -> {}
+            case ColoredPoint(int x, _, _) when (x == 0) -> {}
             default -> {}
         }
     }
     public void testSwitchRuleWhenGuard2() {
         Object obj = new Object();
         switch (obj) {
-            case ColoredPoint(int x, _, _) when (x >= 5) -> {
-                int y = 3;
-            }
-            default -> {
-                int z = 4;
-            }
+            case ColoredPoint(int x, _, _) when (x >= 5) -> {}
+            default -> {}
         }
     }
     public void testSwitchRuleWhenGuard3() {
         Object obj = new Object();
         switch (obj) {
-            case ColoredPoint(int x, _, _) when (x == 7) -> {
-                int a = 1;
-            }
-            case ColoredPoint(int x, _, _) when (x == 8) -> {
-                int b = 2;
-            }
+            case ColoredPoint(int x, _, _) when (x == 7) -> {}
+            case ColoredPoint(int x, _, _) when (x == 8) -> {}
             default -> {}
         }
     }
     public void testSwitchRuleWhenGuard4() {
         Object obj = new Object();
         switch (obj) {
-            case ColoredPoint(int x, _, _) when (x == 9) -> {
-                int x1 = 10;
-            }
-            case ColoredPoint(int x, _, _) when (x == 10) -> {
-                int x2 = 20;
-            }
+            case ColoredPoint(int x, _, _) when (x == 9) -> {}
+            case ColoredPoint(int x, _, _) when (x == 10) -> {}
             default -> {}
         }
     }
     public void testSwitchRuleWhenGuard5() {
         Object obj = new Object();
         switch (obj) {
-            case ColoredPoint(int x, _, _) when (x == 11) -> {
-                int v = 1;
-            }
-            case ColoredPoint(int x, _, _) when (x == 12) -> {
-                int v = 2;
-            }
+            case ColoredPoint(int x, _, _) when (x == 11) -> {}
+            case ColoredPoint(int x, _, _) when (x == 12) -> {}
             default -> {}
         }
     }

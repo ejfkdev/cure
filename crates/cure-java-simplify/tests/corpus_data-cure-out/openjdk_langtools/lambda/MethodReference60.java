@@ -11,7 +11,5 @@ public class MethodReference60 {
     interface BadArrayFactory3<X> {
         X make(String s);
     }
-    public static void meth() {
-        ArrayFactory<Integer[]> factory5 = int[]::new;
-    }
+    public static void meth() {}
 }

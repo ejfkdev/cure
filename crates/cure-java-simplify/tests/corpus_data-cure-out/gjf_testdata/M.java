@@ -138,7 +138,8 @@ import java.util.List;
             Pair<Pair<Integer, Integer>, Pair<Integer, Integer>>> pair3 = ImmutableList.of(null).get(0);
     }
     void f(int... x) {
-        null.identity().identity().identity().identity().identity().identity().identity().identity().identity().identity().identity().identity();
+        M m = null;
+        m.identity().identity().identity().identity().identity().identity().identity().identity().identity().identity().identity().identity();
         f(x[0] + x[1] + x[2] + x[3] + x[4] + x[5] + x[6] + x[7] + x[8] + x[9] + x[11] + x[12] + x[13] + x[14] + x[15]);
     }
     static void method999(Object... args) {

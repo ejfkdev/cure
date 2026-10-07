@@ -7,44 +7,28 @@ public class o {
     private static final String c;
     public boolean a() {
         boolean var10000;
-        try {
-            if (this.a == null) {
-                var10000 = true;
-                return var10000;
-            }
-        } catch (IllegalArgumentException var1) {
-            throw var1;
+        if (this.a == null) {
+            var10000 = true;
+            return var10000;
         }
         return false;
     }
     public boolean b() {}
     public boolean c() {
         boolean var10000;
-        try {
-            if (!this.b()) {
-                var10000 = true;
-                return var10000;
-            }
-        } catch (IllegalArgumentException var1) {
-            throw var1;
+        if (!this.b()) {
+            var10000 = true;
+            return var10000;
         }
         return false;
     }
     public o a(String... var1) {
-        try {
-            if (this.b()) {
-                return this;
-            }
-        } catch (IllegalArgumentException var7) {
-            throw var7;
+        if (this.b()) {
+            return this;
         }
         for (String var5 : var1) {
-            try {
-                if (this.a.equals(var5)) {
-                    return b((Object) null);
-                }
-            } catch (IllegalArgumentException var6) {
-                throw var6;
+            if (this.a.equals(var5)) {
+                return b((Object) null);
             }
         }
         return this;
@@ -55,13 +39,9 @@ public class o {
     }
     public Object a(Object var1) {
         Object var10000;
-        try {
-            if (this.a == null) {
-                var10000 = var1;
-                return var10000;
-            }
-        } catch (IllegalArgumentException var2) {
-            throw var2;
+        if (this.a == null) {
+            var10000 = var1;
+            return var10000;
         }
         return this.a;
     }
@@ -69,56 +49,30 @@ public class o {
     public <V> V b(Class<V> param1, V param2) {}
     public String f() {
         String var10000;
-        try {
-            if (this.a()) {
-                var10000 = null;
-                return var10000;
-            }
-        } catch (IllegalArgumentException var1) {
-            throw var1;
+        if (this.a()) {
+            var10000 = null;
+            return var10000;
         }
         return this.g();
     }
     public String g() {
         String var10000;
-        try {
-            if (this.a == null) {
-                var10000 = "";
-                return var10000;
-            }
-        } catch (IllegalArgumentException var1) {
-            throw var1;
+        if (this.a == null) {
+            var10000 = "";
+            return var10000;
         }
         return this.a.toString();
     }
     public String a(String var1) {
         String var10000;
-        try {
-            if (this.a()) {
-                var10000 = var1;
-                return var10000;
-            }
-        } catch (IllegalArgumentException var2) {
-            throw var2;
+        if (this.a()) {
+            var10000 = var1;
+            return var10000;
         }
         return this.g();
     }
     public boolean a(boolean var1) {
-        try {
-            if (this.a()) {
-                return var1;
-            }
-        } catch (IllegalArgumentException var2) {
-            throw var2;
-        }
-        try {
-            if (this.a instanceof Boolean) {
-                return (Boolean) this.a;
-            }
-        } catch (IllegalArgumentException var3) {
-            throw var3;
-        }
-        return Boolean.parseBoolean(String.valueOf(this.a));
+        return this.a() ? var1 : this.a instanceof Boolean ? (Boolean) this.a : Boolean.parseBoolean(String.valueOf(this.a));
     }
     public boolean h() {
         return this.a(false);
@@ -138,19 +92,11 @@ public class o {
         return this.g();
     }
     public <E extends Enum<E>> E a(Class<E> var1) {
-        try {
-            if (this.a == null) {
-                return null;
-            }
-        } catch (Exception var4) {
-            throw var4;
+        if (this.a == null) {
+            return null;
         }
-        try {
-            if (var1.isAssignableFrom(this.a.getClass())) {
-                return (E) this.a;
-            }
-        } catch (Exception var5) {
-            throw var5;
+        if (var1.isAssignableFrom(this.a.getClass())) {
+            return (E) this.a;
         }
         try {
             return (E) Enum.valueOf(var1, String.valueOf(this.a));
@@ -160,92 +106,35 @@ public class o {
     }
     public String b(int var1) {
         String var2 = this.g();
-        try {
-            if (var2 == null) {
-                return null;
-            }
-        } catch (IllegalArgumentException var3) {
-            throw var3;
+        if (var2 == null) {
+            return null;
         }
         if (var1 < 0) {
             var1 *= -1;
-            try {
-                if (var2.length() < var1) {
-                    return "";
-                }
-            } catch (IllegalArgumentException var4) {
-                throw var4;
-            }
-            return var2.substring(var1);
+            return var2.length() < var1 ? "" : var2.substring(var1);
         } else {
-            try {
-                if (var2.length() < var1) {
-                    return var2;
-                }
-            } catch (IllegalArgumentException var5) {
-                throw var5;
-            }
-            return var2.substring(0, var1);
+            return var2.length() < var1 ? var2 : var2.substring(0, var1);
         }
     }
     public String c(int var1) {
         String var2 = this.g();
-        try {
-            if (var2 == null) {
-                return null;
-            }
-        } catch (IllegalArgumentException var3) {
-            throw var3;
+        if (var2 == null) {
+            return null;
         }
         if (var1 < 0) {
             var1 *= -1;
-            try {
-                if (var2.length() < var1) {
-                    return var2;
-                }
-            } catch (IllegalArgumentException var4) {
-                throw var4;
-            }
-            return var2.substring(0, var2.length() - var1);
+            return var2.length() < var1 ? var2 : var2.substring(0, var2.length() - var1);
         } else {
-            try {
-                if (var2.length() < var1) {
-                    return var2;
-                }
-            } catch (IllegalArgumentException var5) {
-                throw var5;
-            }
-            return var2.substring(var2.length() - var1);
+            return var2.length() < var1 ? var2 : var2.substring(var2.length() - var1);
         }
     }
     public String a(int var1, int var2) {
         String var3 = this.g();
-        try {
-            if (var3 == null) {
-                return null;
-            }
-        } catch (IllegalArgumentException var4) {
-            throw var4;
-        }
-        try {
-            if (var1 > var3.length()) {
-                return "";
-            }
-        } catch (IllegalArgumentException var5) {
-            throw var5;
-        }
-        return var3.substring(var1, Math.min(var3.length(), var2));
+        return var3 == null ? null : var1 > var3.length() ? "" : var3.substring(var1, Math.min(var3.length(), var2));
     }
     public int k() {
         String var1 = this.g();
-        try {
-            if (var1 == null) {
-                return 0;
-            }
-        } catch (IllegalArgumentException var2) {
-            throw var2;
-        }
-        return var1.length();
+        return var1 == null ? 0 : var1.length();
     }
     public boolean b(Class<?> param1) {}
     static {

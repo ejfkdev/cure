@@ -19,7 +19,6 @@ public class MethodRef_neg {
     void method() {
         A a;
         C c;
-        D d = this::foo;
         a = MethodRef_neg::make;
         c = MethodRef_neg::make;
     }

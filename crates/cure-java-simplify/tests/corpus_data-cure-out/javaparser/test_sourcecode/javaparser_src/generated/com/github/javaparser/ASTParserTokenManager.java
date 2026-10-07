@@ -130,12 +130,14 @@ public class ASTParserTokenManager implements ASTParserConstants {
         return jjMoveNfa_0(jjStopStringLiteralDfa_0(pos, active0, active1, active2), pos + 1);
     }
     private int jjStopAtPos(int pos, int kind) {
+        jjmatchedKind = kind;
+        jjmatchedPos = pos;
         return pos + 1;
     }
     private int jjMoveStringLiteralDfa0_0() {
         switch (curChar) {
             case 26:
-                return 1;
+                return jjStopAtPos(0, 131);
             case 33:
                 jjmatchedKind = 93;
                 return jjMoveStringLiteralDfa1_0(0x0L, 0x1000000000L, 0x0L);
@@ -146,9 +148,9 @@ public class ASTParserTokenManager implements ASTParserConstants {
                 jjmatchedKind = 109;
                 return jjMoveStringLiteralDfa1_0(0x0L, 0x40004000000000L, 0x0L);
             case 40:
-                return 1;
+                return jjStopAtPos(0, 81);
             case 41:
-                return 1;
+                return jjStopAtPos(0, 82);
             case 42:
                 jjmatchedKind = 107;
                 return jjMoveStringLiteralDfa1_0(0x0L, 0x10000000000000L, 0x0L);
@@ -156,7 +158,7 @@ public class ASTParserTokenManager implements ASTParserConstants {
                 jjmatchedKind = 105;
                 return jjMoveStringLiteralDfa1_0(0x0L, 0x4008000000000L, 0x0L);
             case 44:
-                return 1;
+                return jjStopAtPos(0, 88);
             case 45:
                 jjmatchedKind = 106;
                 return jjMoveStringLiteralDfa1_0(0x0L, 0x4008010000000000L, 0x0L);
@@ -170,7 +172,7 @@ public class ASTParserTokenManager implements ASTParserConstants {
                 jjmatchedKind = 96;
                 return jjMoveStringLiteralDfa1_0(0x0L, 0x8000000000000000L, 0x0L);
             case 59:
-                return 1;
+                return jjStopAtPos(0, 87);
             case 60:
                 jjmatchedKind = 92;
                 return jjMoveStringLiteralDfa1_0(0x0L, 0x402000400000000L, 0x10L);
@@ -181,13 +183,13 @@ public class ASTParserTokenManager implements ASTParserConstants {
                 jjmatchedKind = 130;
                 return jjMoveStringLiteralDfa1_0(0x0L, 0x1800000800000000L, 0x3L);
             case 63:
-                return 1;
+                return jjStopAtPos(0, 95);
             case 64:
-                return 1;
+                return jjStopAtPos(0, 90);
             case 91:
-                return 1;
+                return jjStopAtPos(0, 85);
             case 93:
-                return 1;
+                return jjStopAtPos(0, 86);
             case 94:
                 jjmatchedKind = 111;
                 return jjMoveStringLiteralDfa1_0(0x0L, 0x100000000000000L, 0x0L);
@@ -224,14 +226,14 @@ public class ASTParserTokenManager implements ASTParserConstants {
             case 119:
                 return jjMoveStringLiteralDfa1_0(0x0L, 0x1L, 0x0L);
             case 123:
-                return 1;
+                return jjStopAtPos(0, 83);
             case 124:
                 jjmatchedKind = 110;
                 return jjMoveStringLiteralDfa1_0(0x0L, 0x80002000000000L, 0x0L);
             case 125:
-                return 1;
+                return jjStopAtPos(0, 84);
             case 126:
-                return 1;
+                return jjStopAtPos(0, 94);
             default:
                 return jjMoveNfa_0(0, 0);
         }
@@ -246,7 +248,7 @@ public class ASTParserTokenManager implements ASTParserConstants {
         switch (curChar) {
             case 38:
                 if ((active1 & 0x4000000000L) != 0L) 
-                    return 2;
+                    return jjStopAtPos(1, 102);
                 break;
             case 42:
                 if ((active0 & 0x100L) != 0L) 
@@ -254,17 +256,17 @@ public class ASTParserTokenManager implements ASTParserConstants {
                 break;
             case 43:
                 if ((active1 & 0x8000000000L) != 0L) 
-                    return 2;
+                    return jjStopAtPos(1, 103);
                 break;
             case 45:
                 if ((active1 & 0x10000000000L) != 0L) 
-                    return 2;
+                    return jjStopAtPos(1, 104);
                 break;
             case 46:
                 return jjMoveStringLiteralDfa2_0(active0, 0L, active1, 0x2000000000000000L, active2, 0L);
             case 58:
                 if ((active1 & 0x8000000000000000L) != 0L) 
-                    return 2;
+                    return jjStopAtPos(1, 127);
                 break;
             case 60:
                 if ((active1 & 0x2000000000000L) != 0L) {
@@ -274,26 +276,26 @@ public class ASTParserTokenManager implements ASTParserConstants {
                 return jjMoveStringLiteralDfa2_0(active0, 0L, active1, 0x400000000000000L, active2, 0L);
             case 61:
                 if ((active1 & 0x200000000L) != 0L) 
-                    return 2; else if ((active1 & 0x400000000L) != 0L) 
-                    return 2; else if ((active1 & 0x800000000L) != 0L) 
-                    return 2; else if ((active1 & 0x1000000000L) != 0L) 
-                    return 2; else if ((active1 & 0x4000000000000L) != 0L) 
-                    return 2; else if ((active1 & 0x8000000000000L) != 0L) 
-                    return 2; else if ((active1 & 0x10000000000000L) != 0L) 
-                    return 2; else if ((active1 & 0x20000000000000L) != 0L) 
-                    return 2; else if ((active1 & 0x40000000000000L) != 0L) 
-                    return 2; else if ((active1 & 0x80000000000000L) != 0L) 
-                    return 2; else if ((active1 & 0x100000000000000L) != 0L) 
-                    return 2; else if ((active1 & 0x200000000000000L) != 0L) 
-                    return 2;
+                    return jjStopAtPos(1, 97); else if ((active1 & 0x400000000L) != 0L) 
+                    return jjStopAtPos(1, 98); else if ((active1 & 0x800000000L) != 0L) 
+                    return jjStopAtPos(1, 99); else if ((active1 & 0x1000000000L) != 0L) 
+                    return jjStopAtPos(1, 100); else if ((active1 & 0x4000000000000L) != 0L) 
+                    return jjStopAtPos(1, 114); else if ((active1 & 0x8000000000000L) != 0L) 
+                    return jjStopAtPos(1, 115); else if ((active1 & 0x10000000000000L) != 0L) 
+                    return jjStopAtPos(1, 116); else if ((active1 & 0x20000000000000L) != 0L) 
+                    return jjStopAtPos(1, 117); else if ((active1 & 0x40000000000000L) != 0L) 
+                    return jjStopAtPos(1, 118); else if ((active1 & 0x80000000000000L) != 0L) 
+                    return jjStopAtPos(1, 119); else if ((active1 & 0x100000000000000L) != 0L) 
+                    return jjStopAtPos(1, 120); else if ((active1 & 0x200000000000000L) != 0L) 
+                    return jjStopAtPos(1, 121);
                 break;
             case 62:
                 if ((active1 & 0x4000000000000000L) != 0L) 
-                    return 2; else if ((active2 & 0x2L) != 0L) {
+                    return jjStopAtPos(1, 126); else if ((active2 & 0x2L) != 0L) {
                     jjmatchedKind = 129;
                     jjmatchedPos = 1;
                 } else if ((active2 & 0x10L) != 0L) 
-                    return 2;
+                    return jjStopAtPos(1, 132);
                 return jjMoveStringLiteralDfa2_0(active0, 0L, active1, 0x1800000000000000L, active2, 0x1L);
             case 97:
                 return jjMoveStringLiteralDfa2_0(active0, 0x240020060000L, active1, 0L, active2, 0L);
@@ -337,7 +339,7 @@ public class ASTParserTokenManager implements ASTParserConstants {
                 return jjMoveStringLiteralDfa2_0(active0, 0x80000000010000L, active1, 0L, active2, 0L);
             case 124:
                 if ((active1 & 0x2000000000L) != 0L) 
-                    return 2;
+                    return jjStopAtPos(1, 101);
                 break;
             default:
                 break;
@@ -356,12 +358,12 @@ public class ASTParserTokenManager implements ASTParserConstants {
         switch (curChar) {
             case 46:
                 if ((active1 & 0x2000000000000000L) != 0L) 
-                    return 3;
+                    return jjStopAtPos(2, 125);
                 break;
             case 61:
                 if ((active1 & 0x400000000000000L) != 0L) 
-                    return 3; else if ((active1 & 0x800000000000000L) != 0L) 
-                    return 3;
+                    return jjStopAtPos(2, 122); else if ((active1 & 0x800000000000000L) != 0L) 
+                    return jjStopAtPos(2, 123);
                 break;
             case 62:
                 if ((active2 & 0x1L) != 0L) {
@@ -428,7 +430,7 @@ public class ASTParserTokenManager implements ASTParserConstants {
         switch (curChar) {
             case 61:
                 if ((active1 & 0x1000000000000000L) != 0L) 
-                    return 4;
+                    return jjStopAtPos(3, 124);
                 break;
             case 97:
                 return jjMoveStringLiteralDfa4_0(active0, 0x80000001c0808000L, active1, 0L);
@@ -785,6 +787,8 @@ public class ASTParserTokenManager implements ASTParserConstants {
         return jjStartNfa_0(10, active0, 0L, 0L);
     }
     private int jjStartNfaWithStates_0(int pos, int kind, int state) {
+        jjmatchedKind = kind;
+        jjmatchedPos = pos;
         try {
             curChar = input_stream.readChar();
         } catch (java.io.IOException e) {
@@ -1739,7 +1743,7 @@ public class ASTParserTokenManager implements ASTParserConstants {
         switch (curChar) {
             case 47:
                 if ((active0 & 0x400L) != 0L) 
-                    return 2;
+                    return jjStopAtPos(1, 10);
                 break;
             default:
                 return 2;
@@ -1763,7 +1767,7 @@ public class ASTParserTokenManager implements ASTParserConstants {
         switch (curChar) {
             case 47:
                 if ((active0 & 0x200L) != 0L) 
-                    return 2;
+                    return jjStopAtPos(1, 9);
                 break;
             default:
                 return 2;
@@ -1987,10 +1991,13 @@ public class ASTParserTokenManager implements ASTParserConstants {
     }
     public void ReInit(JavaCharStream stream) {
         jjmatchedPos = jjnewStateCnt = 0;
+        curLexState = defaultLexState;
+        input_stream = stream;
         ReInitRounds();
     }
     private void ReInitRounds() {
         int i;
+        jjround = 0x80000001;
         for (i = 130; i-- > 0; ) 
             jjrounds[i] = 0x80000000;
     }

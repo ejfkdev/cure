@@ -14,7 +14,6 @@ public class SubTemplate extends SuperTemplate {
         super.toBeOverriden();
     }
     public void methodWithTemplatedParameters(Object params) {
-        List var;
         ArrayList l;
         List o = (ArrayList) new ArrayList();
         invocation.S();

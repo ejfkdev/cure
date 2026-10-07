@@ -1,12 +1,5 @@
 class T {
-    void f(String v) {
-        int x = switch (v) {
-            case "zero" -> 0;
-            case "one" -> 1;
-            case "two" -> 2;
-            default -> -1;
-        };
-    }
+    void f(String v) {}
     void g(String v) {
         int x = switch (v) {
             case "zero":

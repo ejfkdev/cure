@@ -4,9 +4,7 @@ public class IntersectionTypeReceiverTest2 {
     interface J {
         void foo();
     }
-    static <T extends I & J> void bar(T t) {
-        Runnable r = t::foo;
-    }
+    static <T extends I & J> void bar(T t) {}
     public static void main(String[] args) {
         class A implements I, J {
                     public void foo() {

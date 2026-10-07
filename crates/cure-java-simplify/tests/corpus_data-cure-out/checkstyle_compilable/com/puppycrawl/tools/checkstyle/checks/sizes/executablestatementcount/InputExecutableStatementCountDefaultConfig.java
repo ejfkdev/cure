@@ -50,7 +50,5 @@ public class InputExecutableStatementCountDefaultConfig {
         }).start();
     }
     public InputExecutableStatementCountDefaultConfig(String someString) {}
-    static Runnable r1 = () -> {
-    "Hello world one!";
-};
+    static Runnable r1 = () -> {};
 }

@@ -8,20 +8,10 @@ class TargetType66 {
     void g(SAM1 s1) {}
     void g(SAM2 s2) {}
     void test() {
-        g((x) -> {
-            String s = x;
-        });
-        g((x) -> {
-            Integer i = x;
-        });
-        g((x) -> {
-            Object o = x;
-        });
-        g((x) -> {
-            Character c = x;
-        });
-        g((x) -> {
-            Character c = "";
-        });
+        g((x) -> {});
+        g((x) -> {});
+        g((x) -> {});
+        g((x) -> {});
+        g((x) -> {});
     }
 }

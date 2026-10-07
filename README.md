@@ -41,7 +41,7 @@ the same thing.
   `javac`/`java` runs, and whole-corpus re-parse/idempotency checks (details
   below). These layers caught real bugs during development; they are not
   decorative.
-- **57 simplification rules** (34 language-agnostic + 23 Java-specific),
+- **58 simplification rules** (34 language-agnostic + 24 Java-specific),
   including control-flow flattening recovery, statement-level
   `StringBuilder` chain recovery, XOR-noise removal, and partial evaluation
   ("virtual execution") of literal-only JDK calls.
@@ -171,6 +171,8 @@ be unwrapped: `(mark(5) ^ 0x5A) ^ 0x5A → mark(5)`), `str_len_fold`,
 when evaluation succeeds, never on the exception path),
 `base64_new_string_fold`, `cff_recover` (control-flow flattening recovery),
 `twr_recover` + `string_switch_recover` (decompiler-shape restoration),
+`try_unwrap_rethrow` (`catch (E e) { throw e; }` unwrapping — the most frequent
+fernflower leftover, ≥23 sites in a 66-file corpus),
 new_string_char_array_fold (`new String(CHAR_ARRAY)`), empty_finally_strip, try_unwrap_no_catch, static_array_index_fold (literal array indexing), const_method_inline (single-return helper inlining — string decrypters), trailing_continue (label-aware tail continue removal).
 
 ## Performance

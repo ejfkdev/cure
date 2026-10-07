@@ -9,7 +9,6 @@ public class InputMultipleStringLiterals6 {
     String debugStr = ", , " + ", ";
     void method1() {
         System.identityHashCode("StringContents");
-        String a2 = "StringContents";
     }
     @SuppressWarnings("unchecked") void method2() {}
     @SuppressWarnings("unchecked") void method3() {}

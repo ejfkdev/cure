@@ -7,11 +7,7 @@ class EffectivelyFinalThrows {
     }
     void test2(SAM<Checked> s) throws Checked {
         test(() -> {
-            try {
-                s.t();
-            } catch (Throwable t) {
-                throw t;
-            }
+            s.t();
         });
     }
     static class Checked extends Exception {

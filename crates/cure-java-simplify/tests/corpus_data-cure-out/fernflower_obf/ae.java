@@ -22,14 +22,7 @@ public class ae implements ad {
     public void a() {}
     public void b() {}
     public String a() {
-        try {
-            if (this.b == 0L) {
-                return "-";
-            }
-        } catch (a_ var1) {
-            throw var1;
-        }
-        return DateFormat.getDateTimeInstance().format(new Date(this.b));
+        return this.b == 0L ? "-" : DateFormat.getDateTimeInstance().format(new Date(this.b));
     }
     static List a(ae var0) {
         return var0.a;

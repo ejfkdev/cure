@@ -1,9 +1,5 @@
 package com.helloworld;
 
 class Foo {
-    void foo() {
-        var bar = """
-        bar\
-         bar""";
-    }
+    void foo() {}
 }

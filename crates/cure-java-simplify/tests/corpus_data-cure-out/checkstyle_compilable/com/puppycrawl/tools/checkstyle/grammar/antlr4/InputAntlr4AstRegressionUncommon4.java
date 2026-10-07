@@ -11,7 +11,6 @@ public class InputAntlr4AstRegressionUncommon4 {
     void m3() throws FileNotFoundException {
         int x = 4;
         m4(x, x);
-        BiFunction<Integer, Integer, Integer> lambda13 = (/* param1 */ a /* param1 */, /* param2 */ b /* param2 */) -> a + b;
     }
     int m4(int z, int q) throws FileNotFoundException {
         try (java.io.BufferedReader bufferedReader = new BufferedReader(new FileReader("path"))) {} catch (IOException e) {

@@ -4,10 +4,6 @@ public class BadAccess {
     interface SAM {
         int m();
     }
-    static void test1() {
-        SAM s = () -> i + I + 0 + 0;
-    }
-    void test2() {
-        SAM s = () -> i + I + 0 + 0;
-    }
+    static void test1() {}
+    void test2() {}
 }

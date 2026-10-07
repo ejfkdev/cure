@@ -18,6 +18,7 @@ public record InputRequireThisRecordDefault(int x, int y) {
         InputRequireThisRecordDefault.i = i;
     }
     void method1() {
+        i = 3 + y;
         int w = this.x;
     }
     void method2(int i) {
@@ -30,7 +31,6 @@ public record InputRequireThisRecordDefault(int x, int y) {
             e.toString();
         }
         this.setI(this.getIPlusX() - 1);
-        "10";
     }
     <T> void method3() {
         setI(3);

@@ -72,8 +72,7 @@ class InputExecutableStatementCountRecords {
     private final int field = id(switch (value) {
     case 0 -> -1;
     case 2 -> {
-        int temp = 0;
-        temp += 3;
+        int temp = 3;
         yield temp;
     }
     default -> throw new IllegalStateException();

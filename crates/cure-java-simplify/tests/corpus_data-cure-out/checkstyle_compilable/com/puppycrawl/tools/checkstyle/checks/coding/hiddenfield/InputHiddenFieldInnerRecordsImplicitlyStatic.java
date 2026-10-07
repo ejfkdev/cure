@@ -25,9 +25,7 @@ class Scratch {
 class TestOne {
     String name;
     record data(String str, int integer) {
-        void method() {
-            String name = str;
-        }
+        void method() {}
         public boolean isTrue(String name) {
             return true;
         }

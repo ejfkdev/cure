@@ -20,14 +20,10 @@ public class ax {
     }
     public String a(boolean var1) {
         String var2 = String.valueOf(((double) System.nanoTime() - (double) this.a) / 1000.0);
-        try {
-            if (var1) {
-                this.b();
-            }
-            return var2;
-        } catch (a_ var3) {
-            throw var3;
+        if (var1) {
+            this.b();
         }
+        return var2;
     }
     public String e() {
         String var1 = this.c() + b[1];

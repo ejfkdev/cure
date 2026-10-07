@@ -7,7 +7,5 @@ class LambdaConv25 {
     }
     interface C extends A, B {
     }
-    void test() {
-        C c = () -> {};
-    }
+    void test() {}
 }

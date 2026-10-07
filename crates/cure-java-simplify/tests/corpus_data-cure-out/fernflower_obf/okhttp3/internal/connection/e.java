@@ -280,18 +280,14 @@ public final class e extends okhttp3.internal.http2.d.c implements okhttp3.j {
                         return false;
                     } catch (SocketTimeoutException var16) {
                         return true;
-                    } catch (IOException var17) {
-                        boolean var29 = false;
-                    }
+                    } catch (IOException var17) {}
                 } else {
                     try {
                         this.y.setSoTimeout(var3);
                         return true;
                     } catch (SocketTimeoutException var18) {
                         return true;
-                    } catch (IOException var19) {
-                        boolean var31 = false;
-                    }
+                    } catch (IOException var19) {}
                 }
                 return false;
             } else {

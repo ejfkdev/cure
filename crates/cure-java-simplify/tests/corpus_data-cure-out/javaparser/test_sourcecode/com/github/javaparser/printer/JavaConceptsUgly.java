@@ -4,6 +4,7 @@ package japa.bdd.samples;
 public class JavaConceptsUgly {
     static int x = 0;
     public static void main(String[] args) {
+        x = x;
         x = ~x;
         --x;
         boolean b;

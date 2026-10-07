@@ -2970,8 +2970,7 @@ public class Types {
         }
         @Override
             public Integer visitClassType(ClassType t, Void ignored) {
-            int result = visit(t.getEnclosingType());
-            result *= 127;
+            int result = visit(t.getEnclosingType()) * 127;
             result += t.tsym.flatName().hashCode();
             for (Type s : t.getTypeArguments()) {
                 result *= 127;

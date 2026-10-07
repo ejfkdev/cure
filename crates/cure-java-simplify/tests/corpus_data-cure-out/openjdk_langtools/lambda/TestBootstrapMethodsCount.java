@@ -99,7 +99,8 @@ public class TestBootstrapMethodsCount {
         @Override
         public Void visitMethodInvocation(MethodInvocationTree node, Void p) {
             super.visitMethodInvocation(node, p);
-            Symbol oldSym = ((JCIdent) ((JCMethodInvocation) node).meth).sym;
+            JCIdent ident = (JCIdent) ((JCMethodInvocation) node).meth;
+            Symbol oldSym = ident.sym;
             if (!oldSym.isConstructor()) {
                 ident.sym = new Symbol.DynamicMethodSymbol(oldSym.name, oldSym.owner, bsm.asHandle(), oldSym.type, new LoadableConstant[0]);
             }

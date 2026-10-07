@@ -23,7 +23,6 @@ class badCaseForTestDot<T extends FooForTestDot &  BarForTestDot> {
             foo(1, s);
         } catch (FooExceptionForTestDot | BarExceptionForTestDot e) {}
         foo(1, s);
-        int[] i;
     }
     public static String foo(int i, String s) throws FooExceptionForTestDot, BarExceptionForTestDot {
         return new StringBuilder("").append("", 0, 1).append("").toString();

@@ -70,6 +70,10 @@ public class CombinationsTargetTest3 extends ClassfileTestHelper {
     }
     public void test(int tinv, int tvis, int inv, int vis, Boolean Arepeats, Boolean BDrepeats, Boolean ABmix, String rtn, String et2, Integer N, srce source) throws Exception {
         ++testcount;
+        expected_tvisibles = tvis;
+        expected_tinvisibles = tinv;
+        expected_visibles = vis;
+        expected_invisibles = inv;
         File testFile;
         String tname = "Test" + N.toString();
         String testDef = "Test " + testcount + " parameters: tinv=" + tinv + ", tvis=" + tvis + ", inv=" + inv + ", vis=" + vis + ", Arepeats=" + Arepeats + ", BDrepeats=" + BDrepeats + ", ABmix=" + ABmix + ", retention: " + rtn + ", anno2: " + et2 + ", src=" + source;

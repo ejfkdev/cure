@@ -59,14 +59,8 @@ public class JavaConceptsInnerClasses<T extends List<int[]>, X> extends Base imp
             i = x[0];
             assert true;
             assert true : 2;
-            {
-                int iii = 3;
-                iii += 3;
-            }
             label:
-                {
-                    int iii = 1;
-                }
+                {}
             switch (i) {
             }
             ll:

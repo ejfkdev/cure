@@ -62,7 +62,6 @@ class Test2 {
         @A Outer.@B Inner f2 = null;
         Outer.Static f3 = null;
         @A Outer.@C Inner f4 = null;
-        MyList<Outer . @Cv("Data") Static> f7 = null;
     }
 }
 

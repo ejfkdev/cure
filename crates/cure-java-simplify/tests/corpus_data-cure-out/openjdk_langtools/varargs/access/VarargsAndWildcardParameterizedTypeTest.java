@@ -3,6 +3,7 @@ class VarargsAndWildcardParameterizedTypeTest {
         String m(T... t);
     }
     void m() {
-        null.m(Integer.valueOf(1), Integer.valueOf(1));
+        I<? super Integer> i = null;
+        i.m(Integer.valueOf(1), Integer.valueOf(1));
     }
 }

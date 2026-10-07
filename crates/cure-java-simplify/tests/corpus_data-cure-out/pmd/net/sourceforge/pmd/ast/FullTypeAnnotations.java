@@ -28,9 +28,7 @@ public class FullTypeAnnotations {
         x = (Type1 & Type2) y;
     }
     boolean isNonNull = myString instanceof String;
-    {
-        Supplier<@Vernal Date> sup = Arrays::sort;
-    }
+    {}
     @Readonly Document[][] docs1;
     [2][12]; // array of arrays of read-only documents
     Document[][] docs2;

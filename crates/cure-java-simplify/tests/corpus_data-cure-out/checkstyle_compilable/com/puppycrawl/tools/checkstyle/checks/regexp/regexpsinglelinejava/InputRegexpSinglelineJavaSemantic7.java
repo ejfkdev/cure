@@ -89,8 +89,6 @@ class InputRegexpSinglelineJavaSemantic7 {
             synchronized (new Object()) {}
         }
     }
-    static {
-        int a = 0;
-    }
+    static {}
     static {}
 }

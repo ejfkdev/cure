@@ -4,7 +4,7 @@ class InputRequireThisAllowLocalVars {
     private String s1 = "foo1";
     String s2 = "foo2";
     InputRequireThisAllowLocalVars() {
-        String s2 = "bar2";
+        s1 = "bar1";
     }
     public int getS1() {
         return 1;

@@ -9,7 +9,8 @@ class T8357653b {
     class C extends A<String> {
         static class D {
             {
-                String s = null.rett();
+                B<?> b = null;
+                String s = b.rett();
                 String s2 = new B[1][0].rett();
             }
         }

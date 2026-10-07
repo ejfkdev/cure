@@ -5,7 +5,5 @@ public class LambdaConv26 {
     Object m() {
         return null;
     }
-    void test() {
-        I i2 = this::m;
-    }
+    void test() {}
 }

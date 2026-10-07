@@ -208,7 +208,5 @@ class OtherClass extends InputAntlr4AstRegressionUncommon {
 }
 
 record TestRecord(int[] x, int[]... y) {
-    void foo() {
-        IntFunction<int[]> r13 = int[]<String>::new;
-    }
+    void foo() {}
 }

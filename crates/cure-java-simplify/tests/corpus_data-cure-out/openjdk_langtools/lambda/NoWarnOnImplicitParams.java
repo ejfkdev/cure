@@ -1,9 +1,7 @@
 import java.util.List;
 
 class NoWarnOnImplicitParams {
-    public void testRawMerge(List<String> ls) {
-        R12 r12_2 = (List l) -> "Foo";
-    }
+    public void testRawMerge(List<String> ls) {}
     interface R1 {
         Object m(List<String> ls);
     }

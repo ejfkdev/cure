@@ -29,7 +29,6 @@ public class SubtypeModel<A extends X> {
         List<? extends Y> listExtendsY = new ArrayList<>();
         List<? super X> listSuperX = new ArrayList<>();
         List<? super Y> listSuperY = new ArrayList<>();
-        X x = null;
         listRaw = listSuperY;
         listAll = listSuperY;
         listExtendsX = listExtendsY;

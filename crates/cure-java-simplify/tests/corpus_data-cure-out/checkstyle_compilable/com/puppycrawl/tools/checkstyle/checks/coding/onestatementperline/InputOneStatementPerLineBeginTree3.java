@@ -16,8 +16,6 @@ public class InputOneStatementPerLineBeginTree3 {
         for (int i = 0; i < 20; i++) {}
     }
     private void foo4() {
-        for (int n = 0, k = 1; n < 5; ) {
-            int b = 2;
-        }
+        for (int n = 0, k = 1; n < 5; ) {}
     }
 }

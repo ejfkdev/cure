@@ -27,7 +27,6 @@ class BasicTest<@D T extends @A Object> extends @B LinkedList<@E T> implements @
         boolean b = o instanceof Object;
         @A Map<@B List<@C String>, @D String> map =
                     new @A HashMap<@B List<@C String>, @D String>();
-        Class<? extends @A String> c2 = null;
     }
     void test2(@C @D BasicTest<T> this) throws @A IllegalArgumentException, @B IOException {}
     void test3(@B Object... objs) {}

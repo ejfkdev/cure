@@ -5,9 +5,7 @@ import _._;
 class _ {
     String _ = null;
     void _(String _) {}
-    void testLocal() {
-        String _ = null;
-    }
+    void testLocal() {}
     void testFor() {
         for (int _ = 0; _ < 10; _++) ;
     }

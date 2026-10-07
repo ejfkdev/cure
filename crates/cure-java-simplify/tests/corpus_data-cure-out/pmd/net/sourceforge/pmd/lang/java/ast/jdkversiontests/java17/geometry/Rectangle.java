@@ -1,4 +1,4 @@
 package com.example.geometry;
 
-public sealed class Rectangle permits TransparentRectangle, FilledRectangle extends Shape {
+public sealed class Rectangle extends Shape permits TransparentRectangle, FilledRectangle {
 }

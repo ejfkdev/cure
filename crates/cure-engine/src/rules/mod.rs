@@ -682,6 +682,19 @@ impl<L: Lang> Rule<L> for ArithIdentity {
 //     （保持 V 先于语句内其他效果求值）。
 // ---------------------------------------------------------------------------
 
+
+/// 语句区间内名字的**句法** VarRef 引用计数（含赋值目标、数组下标基——
+/// 事件模型对这些位置的读不可见）。传播类规则的引用计数兜底。
+fn count_name_refs<L: Lang>(lang: &L, stmts: &[L::Id], name: &str) -> usize {
+    let mut n: usize = 0;
+    for &s in stmts {
+        n += usize::from(subtree_contains(&*lang, s, |x| {
+            lang.kind(x) == NodeKind::VarRef && lang.var_name(x) == Some(name)
+        }));
+    }
+    n
+}
+
 pub struct LocalPropagation;
 
 impl<L: Lang> Rule<L> for LocalPropagation {
@@ -752,7 +765,15 @@ impl<L: Lang> Rule<L> for LocalPropagation {
             }
         }
 
-        // 扫描 decl 之后的区域（用途/遮蔽全区间；写冲突窗口见下）
+        // 扫描 decl 之后的区域（用途/遮蔽全区间；写冲突窗口见下）。
+        // 句法引用计数兜底事件盲区：赋值目标内的读（t[k]=… 的 t）
+        // 对事件索引不可见——bd.java 差分抓获：load 被替换而 store
+        // 目标残留，输出引用已删除的变量。
+        let name_str = lang.var_name(id)?.to_string();
+        let syntactic_refs = count_name_refs(&*lang, &stmts[index + 1..], &name_str);
+        if syntactic_refs != 1 {
+            return None;
+        }
         let name_key = lang.var_key(id)?;
         let mut wa = Watch::<L>::new(name_key, &[]);
         for &s in &stmts[index + 1..] {
@@ -762,6 +783,35 @@ impl<L: Lang> Rule<L> for LocalPropagation {
             return None;
         }
         let use_id = wa.uses[0];
+
+        // 纯自赋值（x = x）形态拒绝传播：让 self_assign 先删。传播会把
+        // RHS 换成声明值制造悬挂写 `i = 1`——store_kill 删声明后
+        // dead_store 因锚点缺失无法清理（golden self_assign_removed
+        // 抓获：期望 keep(); 实得 i = 1; keep();）
+        if let Some(&(p, _)) = walk.parents.get(&use_id) {
+            if lang.kind(p) == NodeKind::Assign && lang.assign_op(p).is_none() {
+                let pch = lang.children(p);
+                if pch.len() == 2
+                    && lang.kind(pch[0]) == NodeKind::VarRef
+                    && lang.var_key(pch[0]) == Some(name_key)
+                    && pch[1] == use_id
+                {
+                    return None;
+                }
+            }
+        }
+        // null 字面量不得内联进调用接收者位（`null.setArgName(...)`
+        // 无法编译——差分审查抓获）；其余位置（赋值 RHS/声明 init）合法
+        if matches!(lang.literal(value), Some(LitRef::Null)) {
+            // 接收者位：AST 形态 Call→Member→[recv]（VarRef 的父是
+            // Member）或 Call→[recv]（静态调用无此形态，防御保留）
+            if let Some(&(p, _)) = walk.parents.get(&use_id) {
+                let at_head = lang.children(p).first() == Some(&use_id);
+                if at_head && matches!(lang.kind(p), NodeKind::Member | NodeKind::Call) {
+                    return None;
+                }
+            }
+        }
         // value 读到的名字键（写冲突兴趣集；reads 含 name 自身——一票否决）
         let mut watch_keys: Vec<L::NameKey> = Vec::new();
         collect_read_keys(&*lang, value, &mut watch_keys);
@@ -783,6 +833,10 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         // 值的传播只关心窗口内写，但**删声明**要求名字彻底无残留引用——
         // 使用点之后的死写（如 v = "y"）同样引用声明，残留会让输出失去声明。
         if let Some(ui) = use_stmt_idx {
+            // 句法版：任何残留引用（含事件不可见的目标位）都拒绝删声明
+            if count_name_refs(&*lang, &stmts[ui + 1..], &name_str) != 0 {
+                return None;
+            }
             let mut wc = Watch::<L>::new(name_key, &[name_key]);
             for &s in &stmts[ui + 1..] {
                 scan_region(&*lang, s, &mut wc);
@@ -2295,8 +2349,12 @@ impl<L: Lang> Rule<L> for AssignPropagation {
             return None;
         }
 
-        // 扫描赋值之后的区域（用途/遮蔽全区间；写冲突窗口见下）
+        // 扫描赋值之后的区域（用途/遮蔽全区间；写冲突窗口见下）。
+        // 句法引用计数兜底（同 local_propagation——bd.java 教训）
         let name_key = lang.var_key(target)?;
+        if count_name_refs(&*lang, &stmts[idx + 1..], &name) != 1 {
+            return None;
+        }
         let mut wa = Watch::<L>::new(name_key, &[]);
         for &s in &stmts[idx + 1..] {
             scan_region(&*lang, s, &mut wa);
@@ -2305,6 +2363,17 @@ impl<L: Lang> Rule<L> for AssignPropagation {
             return None;
         }
         let use_id = wa.uses[0];
+        // null 字面量不得内联进调用接收者位（同 local_propagation）
+        if matches!(lang.literal(value), Some(LitRef::Null)) {
+            // 接收者位：AST 形态 Call→Member→[recv]（VarRef 的父是
+            // Member）或 Call→[recv]（静态调用无此形态，防御保留）
+            if let Some(&(p, _)) = walk.parents.get(&use_id) {
+                let at_head = lang.children(p).first() == Some(&use_id);
+                if at_head && matches!(lang.kind(p), NodeKind::Member | NodeKind::Call) {
+                    return None;
+                }
+            }
+        }
         // 写冲突兴趣集：value 读到的名字键 + x 自身（自身被写 → 覆盖，拒绝）
         let mut watch_keys: Vec<L::NameKey> = Vec::new();
         collect_read_keys(&*lang, value, &mut watch_keys);

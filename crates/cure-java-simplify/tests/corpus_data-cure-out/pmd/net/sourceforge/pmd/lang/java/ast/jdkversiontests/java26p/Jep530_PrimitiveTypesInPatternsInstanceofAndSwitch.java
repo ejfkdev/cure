@@ -47,12 +47,7 @@ public class Jep530_PrimitiveTypesInPatternsInstanceofAndSwitch {
             return 1;
         }
     }
-    void instanceofWithPrimitives() {
-        int i = 42;
-        if (i instanceof byte) {
-            byte b = (byte) i;
-        }
-    }
+    void instanceofWithPrimitives() {}
     void switchOnAllPrimitives() {
         User user = new User();
         User.startProcessing(User.OrderStatus.NEW, switch (user.isLoggedIn()) {

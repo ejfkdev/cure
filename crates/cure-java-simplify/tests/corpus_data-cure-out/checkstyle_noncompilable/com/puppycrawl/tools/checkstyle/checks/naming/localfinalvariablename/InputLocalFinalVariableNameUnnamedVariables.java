@@ -10,9 +10,7 @@ public class InputLocalFinalVariableNameUnnamedVariables {
         for (var __ : new int[0]) {}
         for (var _BAD : new int[0]) {}
     }
-    void testLocalVariable(Object obj) {
-        var _BAD = obj;
-    }
+    void testLocalVariable(Object obj) {}
     public AutoCloseable lock() {
         return null;
     }

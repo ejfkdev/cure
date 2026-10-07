@@ -2,9 +2,7 @@ package com.puppycrawl.tools.checkstyle.checks.whitespace.operatorwrap;
 
 public class InputOperatorWrapInstanceOfOperatorEndOfLine {
     void test(Object o) {}
-    void test2(Object o) {
-        boolean e = o instanceof Integer i;
-    }
+    void test2(Object o) {}
     void test3(Object o) {
         switch (o) {
             case Number n when n instanceof

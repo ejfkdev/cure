@@ -23,12 +23,5 @@ public class ArrayAccessTemplate extends ExtensionTemplate {
         this.blocks = blocks;
         strings = new String[] {"first", "second"};
     }
-    @Local void sampleBlocks() {
-        {
-            int i = 0;
-        }
-        {
-            String s = "Spoon is cool!";
-        }
-    }
+    @Local void sampleBlocks() {}
 }

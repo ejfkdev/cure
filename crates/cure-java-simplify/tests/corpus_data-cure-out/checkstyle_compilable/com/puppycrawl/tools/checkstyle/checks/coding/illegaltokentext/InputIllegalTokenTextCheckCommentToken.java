@@ -11,9 +11,7 @@ public class InputIllegalTokenTextCheckCommentToken {
         }
     }
     public native void nativeMethod();
-    public void methodWithLiterals() {
-        String refCase = "<A hReF=\"";
-    }
+    public void methodWithLiterals() {}
     public void methodWithLabels() {
         label:
             {

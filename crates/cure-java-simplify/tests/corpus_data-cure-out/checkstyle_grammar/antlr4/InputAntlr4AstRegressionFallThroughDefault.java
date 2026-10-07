@@ -56,7 +56,6 @@ public class InputAntlr4AstRegressionFallThroughDefault {
                     } while (true);
                 case 16:
                     for (int j1 = 0; j1 < 10; j1++) {
-                        "something";
                         return;
                     }
                 case 17:
@@ -179,7 +178,6 @@ public class InputAntlr4AstRegressionFallThroughDefault {
                     } while (true);
                 case 16:
                     for (int j1 = 0; j1 < 10; j1++) {
-                        "something";
                         return;
                     }
                 case 17:

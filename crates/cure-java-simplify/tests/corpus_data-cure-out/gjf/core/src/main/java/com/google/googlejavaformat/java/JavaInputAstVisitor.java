@@ -256,8 +256,6 @@ class JavaInputAstVisitor extends TreePathScanner<Void, Void> {
         int previous = builder.depth();
         try {
             super.scan(tree, null);
-        } catch (FormattingError e) {
-            throw e;
         } catch (Throwable t) {
             throw new FormattingError(builder.diagnostic(Throwables.getStackTraceAsString(t)));
         } finally {

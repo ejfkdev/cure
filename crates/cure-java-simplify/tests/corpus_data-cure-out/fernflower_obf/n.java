@@ -39,25 +39,17 @@ public class n<F, S> {
         Object var10000;
         label28:
             {
-                try {
-                    if (this.a == null) {
-                        var10000 = "";
-                        break label28;
-                    }
-                } catch (a_ var2) {
-                    throw var2;
+                if (this.a == null) {
+                    var10000 = "";
+                    break label28;
                 }
                 var10000 = this.a;
             }
         Object var10001;
-        try {
-            var3 = var10000.hashCode() / 2;
-            if (this.b == null) {
-                var10001 = "";
-                return var3 + var10001.hashCode() / 2;
-            }
-        } catch (a_ var1) {
-            throw var1;
+        var3 = var10000.hashCode() / 2;
+        if (this.b == null) {
+            var10001 = "";
+            return var3 + var10001.hashCode() / 2;
         }
         return var3 + this.b.hashCode() / 2;
     }
@@ -77,17 +69,13 @@ public class n<F, S> {
         while (true) {
             if (var2.hasNext()) {
                 Map.Entry var3 = (Map.Entry) var2.next();
-                try {
-                    var10000 = var1;
-                    if (var4) {
-                        break;
-                    }
-                    var1.add(new n(var3.getKey(), var3.getValue()));
-                    if (!var4) {
-                        continue;
-                    }
-                } catch (a_ var6) {
-                    throw var6;
+                var10000 = var1;
+                if (var4) {
+                    break;
+                }
+                var1.add(new n(var3.getKey(), var3.getValue()));
+                if (!var4) {
+                    continue;
                 }
                 int var5 = ap.c;
                 ++var5;

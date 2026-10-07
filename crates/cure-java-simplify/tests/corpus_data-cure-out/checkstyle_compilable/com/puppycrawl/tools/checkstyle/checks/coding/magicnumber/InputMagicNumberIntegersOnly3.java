@@ -10,15 +10,9 @@ class InputMagicNumberIntegersOnly3 {
     public int hashcode() {
         return 13;
     }
-    static {
-        int x = 21;
-    }
-    {
-        int y = 37;
-    }
-    public InputMagicNumberIntegersOnly3() {
-        int z = 101;
-    }
+    static {}
+    {}
+    public InputMagicNumberIntegersOnly3() {}
     @InputMagicNumberIntMethodAnnotation(42)
     public void another() {}
     @InputMagicNumberIntMethodAnnotation(value=43)

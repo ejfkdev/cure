@@ -3,7 +3,5 @@ public class MethodReference15 {
         void m();
     }
     static void m() {}
-    static void test() {
-        SAM s = MethodReference15::m;
-    }
+    static void test() {}
 }

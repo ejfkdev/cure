@@ -22,9 +22,7 @@ public class InputAntlr4AstRegressionSuppressWarnings {
         myObject.myMethod();
         myObject.new @SuppressWarnings("unused") MyObject2();
     }
-    public static <T> void foo4(Object str) {
-        List<@SuppressWarnings("unused") ? extends Comparable<T>> unchangeable;
-    }
+    public static <T> void foo4(Object str) {}
     abstract class UnmodifiableList<T> implements @SuppressWarnings("unused")List<@SuppressWarnings("unused") T> {
     }
     class MyObject {

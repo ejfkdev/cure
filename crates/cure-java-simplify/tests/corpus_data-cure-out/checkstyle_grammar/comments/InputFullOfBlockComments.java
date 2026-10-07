@@ -1,4 +1,4 @@
-package /*2*/ com/*3*/./*4*/puppycrawl/*5*/./*6*/tools/*7*/./*8*/checkstyle.grammar/*9*/./*10*/comments/*11*/;
+package com.puppycrawl.tools.checkstyle.grammar.comments;
 
 public class InputFullOfBlockComments {
     public/*20*/ static String main(String[] args) {

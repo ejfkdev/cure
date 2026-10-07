@@ -15,14 +15,10 @@ public class s {
         return this;
     }
     public s a(String var1, Object var2) {
-        try {
-            if (var2 != null) {
-                this.b.put(var1, var2.toString());
-            }
-            return this;
-        } catch (a_ var3) {
-            throw var3;
+        if (var2 != null) {
+            this.b.put(var1, var2.toString());
         }
+        return this;
     }
     public a9 a() {
         return r.b(this.b());

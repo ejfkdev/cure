@@ -25,7 +25,6 @@ public class InputCommentsIndentationInSwitchBlockTwo {
             case 3:
                 {}
         }
-        String breaks = "</table>";
     }
     public void foo2() {
         switch (1) {

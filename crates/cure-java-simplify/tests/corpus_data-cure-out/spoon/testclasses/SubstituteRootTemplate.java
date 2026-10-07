@@ -16,7 +16,5 @@ public class SubstituteRootTemplate extends StatementTemplate {
 	public SubstituteRootTemplate(CtBlock<Void> block) {
         this.block = block;
     }
-    @Local void sampleBlock() {
-        String s = "Spoon is cool!";
-    }
+    @Local void sampleBlock() {}
 }

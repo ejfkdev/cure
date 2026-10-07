@@ -8,6 +8,8 @@ public class T8008762 extends ClassfileTestHelper {
         new T8008762().run();
     }
     public void run() throws Exception {
+        expected_tinvisibles = 0;
+        expected_tvisibles = 4;
         ClassModel cm = getClassFile("T8008762$Test$1$InnerAnon.class");
         test(cm);
         for (FieldModel fm : cm.fields()) {

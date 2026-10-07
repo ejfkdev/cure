@@ -1,5 +1,6 @@
 public class MethodReference74 extends pkg.Parent {
     public void protectedMethod() {
+        log = "In child, calling ... ";
         Runnable r = super::protectedMethod;
         r.run();
         run(super::protectedMethod);

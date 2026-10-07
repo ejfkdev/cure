@@ -5,12 +5,8 @@ public class ag {
     private int d = 0;
     public void a(long param1) {}
     public double a() {
-        try {
-            if (this.d == 0) {
-                return 0.0;
-            }
-        } catch (a_ var4) {
-            throw var4;
+        if (this.d == 0) {
+            return 0.0;
         }
         double var1 = 0.0;
         for (int var3 = 0; var3 <= this.d; ++var3) {

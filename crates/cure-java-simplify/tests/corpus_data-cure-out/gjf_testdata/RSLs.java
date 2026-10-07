@@ -60,10 +60,5 @@ bar
         """
     hello
     """.codePoints().forEach(System.err::println);
-        String u = stringVariableOne + """
-            ...
-            """ + stringVariableTwo + """
-                    ...
-                    """;
     }
 }

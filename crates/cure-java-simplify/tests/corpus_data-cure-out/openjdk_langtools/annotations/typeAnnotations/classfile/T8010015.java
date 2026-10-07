@@ -8,6 +8,8 @@ public class T8010015 extends ClassfileTestHelper {
         new T8010015().run();
     }
     public void run() throws Exception {
+        expected_tvisibles = 1;
+        expected_visibles = 1;
         ClassModel cm = getClassFile("T8010015$Test$1innerClass.class");
         for (FieldModel fm : cm.fields()) {
             test(fm);

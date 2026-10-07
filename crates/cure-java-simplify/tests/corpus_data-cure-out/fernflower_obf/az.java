@@ -20,13 +20,9 @@ class az {
         this.a(var3, var4);
     }
     private boolean a() {
-        try {
-            if (this.b()) {
-                this.d.a(new a1(this.b));
-                return true;
-            }
-        } catch (DOMException var1) {
-            throw var1;
+        if (this.b()) {
+            this.d.a(new a1(this.b));
+            return true;
         }
         this.c = this.c.getParentNode();
         return false;
@@ -46,12 +42,8 @@ class az {
         this.c.appendChild(var3);
     }
     public boolean b(String var1, String var2) {
-        try {
-            if (!this.c.getNodeName().equals(var2)) {
-                throw new DOMException((short) 12, e[0] + var2 + e[1] + this.c.getNodeName());
-            }
-        } catch (DOMException var3) {
-            throw var3;
+        if (!this.c.getNodeName().equals(var2)) {
+            throw new DOMException((short) 12, e[0] + var2 + e[1] + this.c.getNodeName());
         }
         return this.a();
     }

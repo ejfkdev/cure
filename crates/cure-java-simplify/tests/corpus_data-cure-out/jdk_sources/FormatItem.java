@@ -21,8 +21,6 @@ class FormatItem {
     private static long charMix(long lengthCoder, char value) {
         try {
             return (long) CHAR_MIX.invokeExact(lengthCoder, value);
-        } catch (Error | RuntimeException ex) {
-            throw ex;
         } catch (Throwable ex) {
             throw new RuntimeException(ex);
         }

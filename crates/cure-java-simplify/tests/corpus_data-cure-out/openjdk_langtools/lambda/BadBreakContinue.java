@@ -8,28 +8,12 @@ class BadBreakContinue {
     SAM s2 = () -> {
     continue;
 };
-    SAM s3 = () -> {
-    SAM s3_2 = () -> {
-        continue;
-    };
-};
+    SAM s3 = () -> {};
     void testLabelled() {
         loop:
-            while (true) {
-                SAM s3 = () -> {
-                    SAM s3_2 = () -> {
-                        continue loop;
-                    };
-                };
-            }
+            while (true) {}
     }
     void testNonLabelled() {
-        while (true) {
-            SAM s3 = () -> {
-                SAM s3_2 = () -> {
-                    continue;
-                };
-            };
-        }
+        while (true) {}
     }
 }

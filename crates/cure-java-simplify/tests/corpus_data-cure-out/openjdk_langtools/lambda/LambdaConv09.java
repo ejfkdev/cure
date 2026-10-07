@@ -20,7 +20,5 @@ class LambdaConv09 {
     }
     interface Foo7<T> extends Foo2, Foo6<T> {
     }
-    void test() {
-        Foo7 f7 = (x, y) -> 1;
-    }
+    void test() {}
 }

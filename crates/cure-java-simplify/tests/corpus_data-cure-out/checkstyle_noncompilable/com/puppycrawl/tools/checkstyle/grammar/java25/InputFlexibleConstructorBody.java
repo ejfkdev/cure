@@ -26,6 +26,7 @@ class Outer extends Jep512 {
         if (number > 0) {
             throw new IllegalArgumentException("number must be positive");
         }
+        i = number;
         super();
     }
     Outer() {}

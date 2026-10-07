@@ -7,7 +7,5 @@ import static spoon.test.variable.testclasses.ForStaticVariables.Map;
 public class Burritos {
     Map uneMap;
     String bla = Map;
-    void foo() {
-        Object x = SPOONED_CLASSES;
-    }
+    void foo() {}
 }

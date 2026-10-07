@@ -12,7 +12,5 @@ public class InputInappropriateJavadocBlockTagsOnFieldDefault {
     public int invalidProvides;
     public int noJavadocField = 0;
     public int emptyJavadocField = 1;
-    public void method() {
-        int localVariable = 0;
-    }
+    public void method() {}
 }

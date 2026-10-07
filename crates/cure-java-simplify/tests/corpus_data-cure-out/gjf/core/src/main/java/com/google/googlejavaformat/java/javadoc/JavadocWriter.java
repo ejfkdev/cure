@@ -90,6 +90,7 @@ final class JavadocWriter {
         }
     }
     void writeFooterJavadocTagStart(FooterJavadocTagStart token) {
+        continuingListItemOfInnermostList = false;
         indentStack.reset();
         postWriteModifiedContinuingListStack.reset();
         if (!continuingFooterTag) {
@@ -114,6 +115,7 @@ final class JavadocWriter {
             requestBlankLine();
         }
         writeToken(token);
+        continuingListItemOfInnermostList = false;
         int indent = token.value().isEmpty() ? 0 : 2;
         indentStack.push(new ListIndent(indent));
         postWriteModifiedContinuingListStack.push();
@@ -137,6 +139,7 @@ final class JavadocWriter {
             indentStack.popUntil(ListItemIndent.class);
         }
         writeToken(token);
+        continuingListItemOfInnermostList = true;
         int indent = token.value().length();
         indentStack.push(new ListItemIndent(indent));
     }
@@ -198,6 +201,7 @@ final class JavadocWriter {
         requestBlankLine();
     }
     void writeMoeEndStripComment(MoeEndStripComment token) {
+        requestedWhitespace = NONE;
         writeLineBreakNoAutoIndent();
         output.append(indentForMoeEndStripComment);
         writeToken(token);
@@ -240,6 +244,7 @@ final class JavadocWriter {
         });
         writeNewline();
         output.append(token.end());
+        wroteAnythingSignificant = true;
         requestBlankLine();
     }
     void writeMarkdownTable(MarkdownTable token) {
@@ -253,6 +258,7 @@ final class JavadocWriter {
             writeNewline(AutoIndent.NO_AUTO_INDENT);
             output.append(line);
         }
+        wroteAnythingSignificant = true;
         requestBlankLine();
     }
     @Override

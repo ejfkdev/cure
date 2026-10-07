@@ -7,8 +7,6 @@ class MethodReference62 {
     }
     static abstract class Sub extends Sup {
         abstract int foo();
-        void test() {
-            SAM s = super::foo;
-        }
+        void test() {}
     }
 }

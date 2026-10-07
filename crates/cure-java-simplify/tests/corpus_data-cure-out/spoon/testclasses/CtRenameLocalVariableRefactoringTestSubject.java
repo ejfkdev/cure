@@ -8,9 +8,7 @@ import java.util.function.Function;
 import static org.junit.jupiter.api.Assertions.*;
 
 public class CtRenameLocalVariableRefactoringTestSubject {
-    public CtRenameLocalVariableRefactoringTestSubject() {
-        int local1 = 0;
-    }
+    public CtRenameLocalVariableRefactoringTestSubject() {}
     public void checkModelConsistency() throws Throwable {
         Method[] methods = getClass().getDeclaredMethods();
         for (Method method : methods) {

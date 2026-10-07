@@ -36,29 +36,21 @@ public class an implements am {
         List var10000;
         label45:
             {
-                try {
-                    var10000 = this.h;
-                    if (var4) {
-                        return var10000;
-                    }
-                    if (var10000 != null) {
-                        break label45;
-                    }
-                } catch (a_ var6) {
-                    throw var6;
+                var10000 = this.h;
+                if (var4) {
+                    return var10000;
+                }
+                if (var10000 != null) {
+                    break label45;
                 }
                 ArrayList var1 = new ArrayList();
                 for (MemoryPoolMXBean var3 : this.c) {
-                    try {
-                        var1.add(new aw(this, var3));
-                        if (var4) {
-                            break label45;
-                        }
-                        if (var4) {
-                            break;
-                        }
-                    } catch (a_ var5) {
-                        throw var5;
+                    var1.add(new aw(this, var3));
+                    if (var4) {
+                        break label45;
+                    }
+                    if (var4) {
+                        break;
                     }
                 }
                 this.h = var1;

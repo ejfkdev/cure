@@ -1,4 +1,4 @@
-package @A p1.p2;
+package Ap1.p2;
 
 import java.lang.annotation.*;
 

@@ -9,6 +9,5 @@ class P<
         x++;
         int k = ++x;
         int kk = --x;
-        boolean bb = false;
     }
 }

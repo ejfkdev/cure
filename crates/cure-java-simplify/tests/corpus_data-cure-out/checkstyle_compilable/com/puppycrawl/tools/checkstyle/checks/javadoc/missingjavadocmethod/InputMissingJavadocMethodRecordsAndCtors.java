@@ -10,6 +10,7 @@ public class InputMissingJavadocMethodRecordsAndCtors {
             return mNumber;
         }
         public void setNumber1() {
+            mNumber = mNumber;
         }
     }
     public record MySecondRecord() {

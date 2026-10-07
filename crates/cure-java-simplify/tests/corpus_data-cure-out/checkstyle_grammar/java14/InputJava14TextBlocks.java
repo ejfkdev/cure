@@ -30,9 +30,5 @@ public class InputJava14TextBlocks {
             line 2·······\s
             """;
     }
-    void lineTerminators() {
-        String s3 = """
-                \
-                """;
-    }
+    void lineTerminators() {}
 }

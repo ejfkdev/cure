@@ -972,3 +972,81 @@ fn char_decl_int_literal_normalized() {
     let out = run_src("class A{void m(){char c='x';System.out.println(c);}}");
     assert!(out.contains("'x'"), "{out}");
 }
+
+// ---- 差分审查轮修复的回归（agent 阅读代码发现）----
+
+#[test]
+fn field_write_not_killed_as_dead_store() {
+    // 静态/实例字段写不得按局部死存储消除（读点在其他方法）
+    let out = run_src(
+        "class A{static A first;A next;static A add(A c){if(first!=null){c.next=first;first.prev=c;}first=c;return c;}}",
+    );
+    assert!(out.contains("first = c;"), "{out}");
+    let out = run_src("class T{boolean done;T set(int o){done=false;return this;}}");
+    assert!(out.contains("done = false;") || out.contains("done = false"), "{out}");
+}
+
+#[test]
+fn alias_propagation_keeps_store_targets() {
+    // load 与 store 必须一起替换或都不替换（bd.java 裂脑：t 声明被删、
+    // t[k]= 残留 → 不可编译）
+    let out = run_src(
+        "class B{static String[] r;static{char[] v=\"aq\".toCharArray();char[] t=v;for(int k=0;v.length>k;++k){t[k]=(char)(v[k]^123);}r=new String[]{new String(t).intern()};}}",
+    );
+    // 要么整体保留（不传播），要么 t 的全部引用一致替换——不得只换 load
+    let has_decl = out.contains("char[] t = v;");
+    let store_uses_t = out.contains("t[k]");
+    assert_eq!(has_decl, store_uses_t, "{out}");
+    // 输出必须可重解析（自洽）
+    let back = parse(&out);
+    assert!(back.errors.is_empty(), "{:?}", back.errors);
+}
+
+#[test]
+fn pure_call_stmt_deleted_not_bare_literal() {
+    // 折叠成字面量的纯调用语句：整条删除（裸字面量语句 JLS 14.8 非法）
+    let out = run_src("class A{void m(){String.valueOf(7);\"\".concat(\"\");}}");
+    assert!(out.contains("void m() {}"), "{out}");
+    // 未知纯度的调用保留
+    let out = run_src("class A{void m(){foo();}}");
+    assert!(out.contains("foo();"), "{out}");
+}
+
+#[test]
+fn null_not_inlined_into_receiver() {
+    let out = run_src("class A{void m(){O o=null;o.setArg(\"x\");}}");
+    assert!(out.contains("o.setArg") && (out.contains("O o = null;")), "{out}");
+    let back = parse(&out);
+    assert!(back.errors.is_empty(), "{:?}", back.errors);
+}
+
+#[test]
+fn rethrow_only_catch_unwrapped() {
+    // 唯一 catch 且纯重抛 → 整体剥壳
+    let out = run_src("class A{double m() throws E{try{if(d==0)return 0.0;}catch(E v){throw v;}return 1.0;}}");
+    assert!(!out.contains("try"), "{out}");
+    assert!(!out.contains("catch"), "{out}");
+    // 混合：只删重抛臂，真处理保留
+    let out = run_src("class A{void m(){try{f();}catch(E e){throw e;}catch(R r){log(r);}}}");
+    assert!(out.contains("catch (R r)"), "{out}");
+    assert!(!out.contains("catch (E"), "{out}");
+}
+
+#[test]
+fn sealed_interface_clause_order() {
+    let out = run_src("sealed interface S extends A permits C {}");
+    assert!(out.contains("extends A permits C"), "{out}");
+    let back = parse(&out);
+    assert!(back.errors.is_empty(), "{:?}", back.errors);
+}
+
+#[test]
+fn multiline_package_with_comments() {
+    let src = "package com . foo // c\n    .bar. // d\n    baz;\nclass A{}";
+    let mut out = parse(src);
+    cure_java_simplify::simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
+    let printed = cure_java_print::print_unit(&out.ast, &out.unit);
+    assert!(printed.contains("package com.foo.bar.baz;"), "{printed}");
+    let back = parse(&printed);
+    assert!(back.errors.is_empty(), "{:?}", back.errors);
+}

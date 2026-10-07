@@ -7,6 +7,8 @@ public class InstanceInitializer extends ClassfileTestHelper {
         new InstanceInitializer().run();
     }
     public void run() throws Exception {
+        expected_tinvisibles = 4;
+        expected_tvisibles = 0;
         ClassModel cm = getClassFile("InstanceInitializer$Test.class");
         test(cm);
         for (FieldModel fm : cm.fields()) {

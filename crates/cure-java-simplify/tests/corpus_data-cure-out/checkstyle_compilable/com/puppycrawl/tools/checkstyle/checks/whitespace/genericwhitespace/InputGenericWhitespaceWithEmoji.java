@@ -12,7 +12,6 @@ public class InputGenericWhitespaceWithEmoji {
     }
     public <V> void methodName(V value) {
         Supplier<?> t = InputGenericWhitespaceMethodRef1.Nested2::new;
-        List<List<String>[]> listOfListOFArrays;
     }
     interface NumberEnum<T
  > {

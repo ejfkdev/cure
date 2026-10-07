@@ -9,7 +9,6 @@ public class InferenceTest789 {
     public static void main(String[] args) {
         new InferenceTest789().method1(() -> 1);
         SAM1<? extends Comparable<?>> sam1_3 = () -> Calendar.getInstance();
-        SAM2<? extends Serializable> sam2_2 = (a) -> 1;
     }
     void method1(SAM1<?> s) {
         System.out.println("s.m1()=" + s.m1() + " s.m1().getClass()=" + s.m1().getClass());

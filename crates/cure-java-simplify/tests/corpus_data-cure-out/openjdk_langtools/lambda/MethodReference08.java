@@ -6,8 +6,6 @@ class MethodReference08 {
         String getX() {
             return null;
         }
-        static void test() {
-            SAM s = Foo::getX;
-        }
+        static void test() {}
     }
 }

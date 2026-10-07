@@ -6,6 +6,7 @@ public class NullQualifiedNew {
         }
     }
     public static void main(String[] args) {
-        null.new Nested(6);
+        NullQualifiedNew e = null;
+        e.new Nested(6);
     }
 }

@@ -265,7 +265,8 @@ public class TestInvokeDynamic extends ComboInstance<TestInvokeDynamic> {
         @Override
         public Void visitMethodInvocation(MethodInvocationTree node, Void p) {
             super.visitMethodInvocation(node, p);
-            Symbol oldSym = ((JCIdent) ((JCMethodInvocation) node).meth).sym;
+            JCIdent ident = (JCIdent) ((JCMethodInvocation) node).meth;
+            Symbol oldSym = ident.sym;
             if (!oldSym.isConstructor()) {
                 LoadableConstant[] staticArgs = new LoadableConstant[arity.arity];
                 for (int i = 0; i < arity.arity; i++) {

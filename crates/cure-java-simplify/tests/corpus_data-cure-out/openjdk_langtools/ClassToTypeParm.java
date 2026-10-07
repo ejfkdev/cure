@@ -1,5 +1,3 @@
 class ClassToTypeParm<T> {
-    void f(Class c) {
-        T t = c;
-    }
+    void f(Class c) {}
 }

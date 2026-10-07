@@ -36,9 +36,6 @@ public class InputNoWhitespaceAfterNewGenericTypeArgument {
     }
     static SomeClass[] v2 = new FinalSubclass[4];
     public static int run(String[] args, PrintStream out) {
-        int[] i;
-        int[] j;
-        SomeInterface[] u;
         AnotherInterface[] w;
         SomeClass[][] x = (SomeClass[][]) null;
         x[0] = (SomeClass[]) new ImmediateSubclass[4];

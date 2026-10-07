@@ -71,7 +71,6 @@ public class UnnamedErrors {
     void testUnderscoreWithoutInitializer() {
         int _;
         int _;
-        int x2;
         for (int x = 1, _; x <= 1; x++) {}
     }
     void testUnderscoreWithBrackets() {
@@ -79,9 +78,7 @@ public class UnnamedErrors {
         for (int[] _ : new int[][] {new int[] {1}, new int[] {2}}) {}
     }
     void testUnderscoreInExpression() {
-        for (String s : _) {
-            int i = 1;
-        }
+        for (String s : _) {}
     }
     class Lock implements AutoCloseable {
         @Override

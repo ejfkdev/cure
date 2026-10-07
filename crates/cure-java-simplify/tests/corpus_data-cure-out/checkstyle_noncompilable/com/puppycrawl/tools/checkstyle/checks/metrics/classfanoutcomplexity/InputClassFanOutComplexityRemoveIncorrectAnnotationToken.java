@@ -395,6 +395,7 @@ public final class InputClassFanOutComplexityRemoveIncorrectAnnotationToken {
             packagesToTest.add(Reflection.getPackageName(declaringClass));
         }
         public FactoryMethodReturnValueTester thatReturn(Class<?> returnType) {
+            returnTypeToTest = returnType;
             return this;
         }
         public FactoryMethodReturnValueTester testNulls() throws Exception {

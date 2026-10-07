@@ -5,15 +5,11 @@ import java.io.IOException;
 
 public class InputRightCurlyTestAloneOrSinglelineTryCatchBlock {
     private void foo() {
-        try {
-            int b = 10;
-        } catch (Exception e) {}
+        try {} catch (Exception e) {}
     }
     private void testSingleLineTryBlock() {
         try {} catch (Exception e) {}
-        try {
-            int x = 5;
-        } catch (RuntimeException e) {} catch (Exception e) {}
+        try {} catch (RuntimeException e) {} catch (Exception e) {}
         try {} catch (RuntimeException e) {} catch (Exception e) {} finally {
             foo();
         }

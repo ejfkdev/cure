@@ -5,7 +5,5 @@ class LambdaConv22<U> {
     U make() {
         return null;
     }
-    void test(U u) {
-        Factory<U> fu2 = this::make;
-    }
+    void test(U u) {}
 }

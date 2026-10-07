@@ -30,9 +30,7 @@ public class InputAntlr4AstRegressionTrickySwitch {
             case "28":
                 {}
             case "12":
-                {
-                    int i;
-                }
+                {}
             case "13":
                 {}
             case "14":
@@ -42,13 +40,9 @@ public class InputAntlr4AstRegressionTrickySwitch {
                     foo1();
                 }
             case "16":
-                {
-                    int a;
-                }
+                {}
             case "17":
-                {
-                    int a;
-                }
+                {}
             case "18":
                 {
                     System.lineSeparator();
@@ -84,7 +78,6 @@ public class InputAntlr4AstRegressionTrickySwitch {
             case 3:
                 {}
         }
-        String breaks = "</table>";
     }
     public void foo2() {
         switch (1) {

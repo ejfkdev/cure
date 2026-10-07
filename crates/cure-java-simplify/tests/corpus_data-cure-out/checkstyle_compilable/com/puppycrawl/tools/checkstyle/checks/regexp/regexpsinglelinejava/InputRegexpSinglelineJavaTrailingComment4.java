@@ -9,9 +9,6 @@ public class InputRegexpSinglelineJavaTrailingComment4 {
                 }
             };
     }
-    void method2(long ms) {
-        int z;
-        int y;
-    }
+    void method2(long ms) {}
     final static public String NAME = "Some Name";
 }

@@ -6,7 +6,7 @@ public sealed class InputAstRegressionSealedAndPermits permits Circle, Square, R
 final class Circle extends InputAstRegressionSealedAndPermits implements Squircle {
 }
 
-sealed class Rectangle permits TransparentRectangle, FilledRectangle extends InputAstRegressionSealedAndPermits implements Cloneable {
+sealed class Rectangle extends InputAstRegressionSealedAndPermits permits TransparentRectangle, FilledRectangle implements Cloneable {
 }
 
 final class TransparentRectangle extends Rectangle {
@@ -22,7 +22,5 @@ sealed interface Squircle permits Circle, Square {
 }
 
 class Tricky {
-    public static void main(String[] args) {
-        int permits = -2;
-    }
+    public static void main(String[] args) {}
 }

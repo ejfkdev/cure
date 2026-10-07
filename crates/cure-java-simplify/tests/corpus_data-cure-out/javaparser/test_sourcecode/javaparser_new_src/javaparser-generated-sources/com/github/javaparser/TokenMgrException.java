@@ -49,7 +49,8 @@ public class TokenMgrException extends RuntimeException {
         return retval.toString();
     }
     protected static String LexicalErr(boolean EOFSeen, int lexState, int errorLine, int errorColumn, String errorAfter, int curChar) {
-        return "Lexical error at line " + errorLine + ", column " + errorColumn + ".  Encountered: " + (EOFSeen ? "<EOF> " : "\"" + addEscapes(String.valueOf((char) curChar)) + "\" (" + curChar + "), ") + "after : \"" + addEscapes(errorAfter) + "\"";
+        char curChar1 = (char) curChar;
+        return "Lexical error at line " + errorLine + ", column " + errorColumn + ".  Encountered: " + (EOFSeen ? "<EOF> " : "\"" + addEscapes(String.valueOf(curChar1)) + "\" (" + curChar + "), ") + "after : \"" + addEscapes(errorAfter) + "\"";
     }
     public String getMessage() {
         return super.getMessage();

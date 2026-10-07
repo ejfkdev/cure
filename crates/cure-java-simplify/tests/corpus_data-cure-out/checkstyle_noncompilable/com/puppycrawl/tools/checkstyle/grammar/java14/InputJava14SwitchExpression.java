@@ -11,7 +11,6 @@ import java.util.function.Supplier;
 public class InputJava14SwitchExpression {
     static class HardToParse {
         void foo() {
-            Instant Ascii;
             byte[] decodabet = new byte[1];
             Arrays.fill(decodabet, byte - 1);
             char[] chars = {'c', 'h', 'a', 'r', 's'};

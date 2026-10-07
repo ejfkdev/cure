@@ -20,9 +20,7 @@ class InputHiddenField2Misc {
         }
     }
     class DuplicateFieldFromPreviousClass2 {
-        public void method() {
-            int i = 0;
-        }
+        public void method() {}
     }
     class NestedEnum2 {
         enum Test {

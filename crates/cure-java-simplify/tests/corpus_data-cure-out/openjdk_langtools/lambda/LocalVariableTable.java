@@ -82,16 +82,12 @@ public class LocalVariableTable {
     }
     @Expect({ "x" })
     static class Lambda_Args0_Local1 {
-        Run0 r = () -> {
-    int x = 0;
-};
+        Run0 r = () -> {};
     }
     @Expect({ "x", "this" })
     static class Lambda_Args0_Local1_this {
         int v;
-        Run0 r = () -> {
-    int x = v;
-};
+        Run0 r = () -> {};
     }
     @Expect({ "a" })
     static class Lambda_Args1_Local0 {
@@ -99,26 +95,16 @@ public class LocalVariableTable {
     }
     @Expect({ "a", "x" })
     static class Lambda_Args1_Local1 {
-        Run1 r = (a) -> {
-    int x = a;
-};
+        Run1 r = (a) -> {};
     }
     @Expect({ "a", "x", "v" })
     static class Lambda_Args1_Local1_Captured1 {
-        void m() {
-            Run1 r = (a) -> {
-                int x = a + 0;
-            };
-        }
+        void m() {}
     }
     @Expect({ "a1", "a2", "x1", "x2", "this", "v1", "v2" })
     static class Lambda_Args2_Local2_Captured2_this {
         int v;
-        void m() {
-            Run2 r = (a1, a2) -> {
-                int x2 = a2 + 0 + v;
-            };
-        }
+        void m() {}
     }
     @Expect({ "e", "c" })
     static class Lambda_Try_Catch {

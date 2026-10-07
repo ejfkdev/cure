@@ -37,8 +37,6 @@ public class InputAntlr4AstRegressionNewTypeTree {
         double dnZ = slot.sin2Phi * cZ[1];
         Ef ef = new Ef();
         Transformer transformer = ef.forward ? ef.transformers[ef.transformers.length - 1] : ef.transformers[0];
-        int[][][][] a;
-        int[][][][] b;
     }
     void varargLong(@I String[][]... vararg2) {}
     @SuppressWarnings("unused") void withUpperBound(List<? extends int[][]> list) {}
@@ -98,7 +96,8 @@ public class InputAntlr4AstRegressionNewTypeTree {
         return null;
     }
     public Object newInstance(Object[] objects) {
-        return null.newInstance((Object[]) null);
+        InputAntlr4AstRegressionNewTypeTree tmpConstructor = null;
+        return tmpConstructor.newInstance((Object[]) null);
     }
     public TypeVariable<Class<String>>[] getTypeParameters() {
         ClassRepository info = getGenericInfo();

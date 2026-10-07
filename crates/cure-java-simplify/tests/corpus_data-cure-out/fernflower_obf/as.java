@@ -19,12 +19,8 @@ public class as extends ap {
     }
     public void a() {}
     public void a(long var1) {
-        try {
-            if (9223372036854775797L - var1 > this.d) {
-                this.d += var1;
-            }
-        } catch (a_ var3) {
-            throw var3;
+        if (9223372036854775797L - var1 > this.d) {
+            this.d += var1;
         }
     }
     public double d() {}

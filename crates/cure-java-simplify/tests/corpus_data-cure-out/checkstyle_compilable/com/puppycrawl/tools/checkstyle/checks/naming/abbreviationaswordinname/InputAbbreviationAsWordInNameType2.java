@@ -35,9 +35,7 @@ abstract class AbstractClassName32 {
 
 abstract class Class3Factory2 {
     class WellNamedFACTORY {
-        public void systematicMETHODName() {
-            int SYSTEMATICVariableName = 1;
-        }
+        public void systematicMETHODName() {}
     }
 }
 

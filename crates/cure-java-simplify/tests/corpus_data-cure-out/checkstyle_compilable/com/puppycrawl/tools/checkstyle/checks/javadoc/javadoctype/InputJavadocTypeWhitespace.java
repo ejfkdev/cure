@@ -1,13 +1,5 @@
-package com . puppycrawl
-    .;
+package com.puppycrawl.tools.checkstyle.checks.javadoc.javadoctype;
 
-tools.
-    checkstyle.checks.javadoc.javadoctype;
-
-/**
- * Class for testing javadoc issues.
- * violation missing author tag
- **/
 class InputJavadocTypeWhitespace {
     void donBradman(Runnable aRun) {
         donBradman(new Runnable() {

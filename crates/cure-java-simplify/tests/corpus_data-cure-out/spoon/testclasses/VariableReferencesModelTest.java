@@ -12,14 +12,8 @@ public class VariableReferencesModelTest {
     @Test
 	public void localVarsInNestedBlocks() {
         assertTrue(this.field == 15);
-        {
-            assertTrue(true);
-            int f1;
-            int f2;
-            int f3;
-            int f4;
-            assertTrue(true);
-        }
+        assertTrue(true);
+        assertTrue(true);
         int field = 3;
         assertTrue(field == 3);
         assertTrue(field == 3);

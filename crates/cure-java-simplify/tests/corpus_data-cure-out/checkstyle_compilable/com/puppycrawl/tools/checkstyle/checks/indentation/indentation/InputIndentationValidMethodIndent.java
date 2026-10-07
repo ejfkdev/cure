@@ -4,15 +4,9 @@ import java.util.Arrays;
 
 public class InputIndentationValidMethodIndent extends Object {
     public InputIndentationValidMethodIndent() {}
-    private InputIndentationValidMethodIndent(boolean test) {
-        int i = 8;
-    }
-    private InputIndentationValidMethodIndent(boolean test, boolean test2) {
-        int i = 8;
-    }
-    private InputIndentationValidMethodIndent(boolean test, boolean test2, boolean test3) {
-        int i = 8;
-    }
+    private InputIndentationValidMethodIndent(boolean test) {}
+    private InputIndentationValidMethodIndent(boolean test, boolean test2) {}
+    private InputIndentationValidMethodIndent(boolean test, boolean test2, boolean test3) {}
     public InputIndentationValidMethodIndent(int dummy) {}
     public void method2() {}
     public void method2(int x, int y, int w, int h, int x1, int y1, int w1, int h1) {}

@@ -28,7 +28,6 @@ public class Helper {
         }
     }
     public static boolean compileCode(String className, String contents, DiagnosticCollector<JavaFileObject> diagnostics) {
-        boolean ok;
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         if (compiler == null) {
             throw new RuntimeException("can't get javax.tools.JavaCompiler!");

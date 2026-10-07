@@ -38,7 +38,5 @@ class PrivateScope {
     interface FuncIfc {
         void a(int h);
     }
-    public void l() {
-        FuncIfc l2 = (limp) -> {};
-    }
+    public void l() {}
 }

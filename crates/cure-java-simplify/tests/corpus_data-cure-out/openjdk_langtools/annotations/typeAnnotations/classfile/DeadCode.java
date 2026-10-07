@@ -9,6 +9,8 @@ public class DeadCode extends ClassfileTestHelper {
         new DeadCode().run();
     }
     public void run() throws Exception {
+        expected_tinvisibles = 1;
+        expected_tvisibles = 0;
         ClassModel cm = getClassFile("DeadCode$Test.class");
         test(cm);
         for (FieldModel fm : cm.fields()) {

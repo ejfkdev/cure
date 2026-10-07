@@ -464,32 +464,32 @@ impl<'src> Parser<'src> {
                 break;
             }
             if self.at_kw("package") {
-                let start = self.cur_start();
                 // 容错：package 语句缺分号（Bar.java 形态）——扫到分号或
                 // 行尾即止（token 有 line 信息；不设界会吞掉整个 class 体
-                // → 4M 错误风暴）
+                // → 4M 错误风暴）。**点悬挂续行**：上一 token 是 `.` 时
+                // 标识符可在新行（多行 package 是合法 Java——差分审查
+                // 抓获：checkstyle NoWhitespaceAfter 的注释穿插多行
+                // package 曾被从 `.` 后截断，`tools.` 变孤儿语句）。
                 let pkg_line = self.tok().line;
+                self.bump(); // 跳过 package 关键字本身
+                let mut parts: String = String::new();
+                let mut prev_dot = false;
                 while !self.at_eof() && !self.at_punct(";") {
-                    if self.tok().line != pkg_line && !self.at_punct(".") {
-                        break; // 换行且非点连接（限定名 a.b.c 可跨行）
+                    if self.tok().line != pkg_line && !prev_dot && !self.at_punct(".") {
+                        break; // 换行且非点连接
                     }
+                    // 包名按 token 归一化（标识符 + 点拼接）：原文里的
+                    // 注释/空白/换行剥除——带尾注释的 raw 文本回打会把
+                    // `;` 吞进注释（`package a.b // c;` 非法）
+                    match &self.tok().tok {
+                        Tok::Ident(name) => parts.push_str(name),
+                        Tok::Punct(p) if *p == "." => parts.push('.'),
+                        _ => {}
+                    }
+                    prev_dot = self.at_punct(".");
                     self.bump();
                 }
-                // 包名文本区间终点：**在吃 ; 之前**取（曾吃过再取下一 token
-                // 起点 → ';' 落进区间并入包名 → 输出双分号，基线 diff 抓获）
-                let after_end = if self.at_punct(";") {
-                    let e = self.tok().start;
-                    self.bump();
-                    e
-                } else {
-                    self.t[self.pos - 1].end
-                };
-                let after = self.text_of(start, after_end);
-                let pkg = after
-                    .trim()
-                    .trim_start_matches("package")
-                    .trim()
-                    .to_string();
+                let pkg = parts;
                 unit.package = Some(pkg);
                 // 换行退出后仍可能跟悬空分号
                 self.eat(";");

@@ -28,14 +28,10 @@ class InputRightCurlyLeftTestAlone {
             } while (x == 2);
         }
         this.wait(666);
-        for (int k = 0; k < 1; k++) {
-            String innerBlockVariable = "";
-        }
+        for (int k = 0; k < 1; k++) {}
         return System.currentTimeMillis() > 1000 ? 1 : 2;
     }
-    static {
-        int x = 1;
-    }
+    static {}
     public enum GreetingsEnum {
         HELLO, GOODBYE
     }
@@ -46,9 +42,6 @@ class InputRightCurlyLeftTestAlone {
             flag = !flag;
         }
         String.CASE_INSENSITIVE_ORDER.equals("Xe-xe");
-        if (flag) {
-            "";
-        }
     }
 }
 
@@ -60,9 +53,7 @@ class FooCtorTestAlone {
 }
 
 class FooMethodTestAlone {
-    public void fooMethod() {
-        int i = 1;
-    }
+    public void fooMethod() {}
 }
 
 class FooInnerTestAlone {
@@ -89,9 +80,7 @@ class ClassWithStaticInitializersTestAlone {
     static {}
     static {}
     static class Inner {
-        static {
-            int i = 1;
-        }
+        static {}
     }
     public void emptyBlocks() {
         try {} catch (RuntimeException e) {

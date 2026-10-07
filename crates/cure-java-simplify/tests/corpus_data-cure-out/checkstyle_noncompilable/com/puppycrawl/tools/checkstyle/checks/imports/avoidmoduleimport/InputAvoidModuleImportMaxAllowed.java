@@ -5,7 +5,5 @@ import module java.net.http;
 import module java.desktop;
 
 public class InputAvoidModuleImportMaxAllowed {
-    public void doSomething() {
-        int b = 1;
-    }
+    public void doSomething() {}
 }

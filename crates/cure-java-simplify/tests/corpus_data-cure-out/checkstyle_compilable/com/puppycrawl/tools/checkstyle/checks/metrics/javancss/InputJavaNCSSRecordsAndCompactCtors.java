@@ -2,12 +2,8 @@ package com.puppycrawl.tools.checkstyle.checks.metrics.javancss;
 
 public class InputJavaNCSSRecordsAndCompactCtors {
     class TestClass {
-        private void testMethod1() {
-            int y = 2;
-        }
-        private void testMethod2() {
-            int abc = 1;
-        }
+        private void testMethod1() {}
+        private void testMethod2() {}
     }
     record MyRecord1(boolean t, boolean f) {
         public MyRecord1 {
@@ -26,13 +22,7 @@ public class InputJavaNCSSRecordsAndCompactCtors {
             System.out.println("test");
         }
         private void testMethod() {
-            for (int i = 0; i < 10; i++) {
-                if (i == 0) {
-                    int y = 2;
-                } else {
-                    int abc = 1;
-                }
-            }
+            for (int i = 0; i < 10; i++) {}
         }
     }
     record MyRecord3(boolean a, boolean b) {

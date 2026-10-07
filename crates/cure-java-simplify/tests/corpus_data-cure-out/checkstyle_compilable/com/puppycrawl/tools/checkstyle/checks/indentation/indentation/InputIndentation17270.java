@@ -1,14 +1,7 @@
 package com.puppycrawl.tools.checkstyle.checks.indentation.indentation;
 
 public class InputIndentation17270 {
-    private void test() {
-        String s = switch (0) {
-            case 0 -> "a";
-            case 1, 2 -> "b";
-            case 3, 4, 5 -> "c";
-            default -> "d";
-        };
-    }
+    private void test() {}
     private void testWrappedCaseLabels() {
         System.out.println(switch (0) {
             case 0 -> "a";

@@ -38,7 +38,7 @@ class B {                                     class B {
 - **简化效果指标**（`--stats`）：AST 节点数、判定点（圈复杂度）、最大
   嵌套的前后对比 + 文件分类（结构简化 / 仅格式 / 未变）——三项不受
   格式化影响，能区分「真简化」与「纯格式归一」，零简化文件直接可见。
-- **57 条简化规则**（引擎通用 34 + Java 专属 23），含控制流扁平化
+- **58 条简化规则**（引擎通用 34 + Java 专属 24），含控制流扁平化
   还原、语句级 StringBuilder 链还原、XOR 噪声剥除、纯字面量 JDK 调用
   的部分求值（"虚拟执行"）。
 - **真实代码库规模** —— OpenJDK 全源码语料（371,674 文件 / 4.7 GB）
@@ -157,7 +157,9 @@ cure [选项] <文件.java>... | <目录> | -
 `Integer.parseInt`、`Math.abs/max/min`、`Character.isXxx/toXxx`、字面量
 数组下标、cast 字面量——**只在求值成功时折叠**，异常路径保持原样）、
 `base64_new_string_fold`、`cff_recover`（控制流扁平化还原）、
-`twr_recover` + `string_switch_recover`（反编译形态还原）、new_string_char_array_fold（`new String(CHAR_ARRAY)`）、empty_finally_strip、try_unwrap_no_catch、static_array_index_fold（字面量数组下标）、const_method_inline（单 return helper 内联——解密器）、trailing_continue（标签感知尾 continue 删除）、
+`twr_recover` + `string_switch_recover`（反编译形态还原）、
+`try_unwrap_rethrow`（`catch (E e) { throw e; }` 纯重抛剥除——fernflower
+最高频残迹，66 文件语料 ≥23 处）、new_string_char_array_fold（`new String(CHAR_ARRAY)`）、empty_finally_strip、try_unwrap_no_catch、static_array_index_fold（字面量数组下标）、const_method_inline（单 return helper 内联——解密器）、trailing_continue（标签感知尾 continue 删除）、
 
 ## 性能
 

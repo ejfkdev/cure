@@ -711,6 +711,95 @@ impl Rule<JavaAst> for EmptyFinallyStrip {
 //   try { B } finally {} / try { B } → B
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// 纯重抛 catch 剥除（fernflower 异常表残迹——审查统计 ≥23 处/11 文件）：
+//   try { S } catch (T v) { throw v; }   →  S            （唯一 catch）
+//   try { S } catch (A a) { throw a; } catch (B b) { …真处理… } →
+//   try { S } catch (B b) { …真处理… }                   （只删重抛臂）
+// 守卫：catch 体**只有**一条 throw 语句且抛的正是 catch 绑定变量自身
+//（变量在其他处无使用——单一语句保证）；finally / 资源不动。
+// 语义：捕获后原样重抛对求值顺序、副作用、异常路径与堆栈完全透明
+//（栈深 +1 帧的差异源码层不可观察）。
+// ---------------------------------------------------------------------------
+
+pub struct TryUnwrapRethrow;
+
+impl Rule<JavaAst> for TryUnwrapRethrow {
+    fn name(&self) -> &'static str {
+        "try_unwrap_rethrow"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Try]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::Try {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        // 布局 [resource…, try_block, catch…, (finally)?]
+        let try_block = *ch.iter().find(|&&c| lang.kind(c) == NodeKind::Block)?;
+        let catches: Vec<JavaId> =
+            ch.iter().copied().filter(|&c| lang.kind(c) == NodeKind::Catch).collect();
+        if catches.is_empty() {
+            return None;
+        }
+        let rethrow_only = |c: JavaId| -> bool {
+            // Catch 布局 children: [block]；绑定名在 NodeData::Catch
+            let block = match lang.children(c).first() {
+                Some(&b) => b,
+                None => return false,
+            };
+            let stmts = lang.children(block);
+            if stmts.len() != 1 {
+                return false;
+            }
+            let stmt = stmts[0];
+            if lang.kind(stmt) != NodeKind::Throw {
+                return false;
+            }
+            let Some(&thrown) = lang.children(stmt).first() else { return false };
+            // 抛的必须是 catch 绑定变量自身（整枝唯一使用 ⇒ 无别名逃逸）
+            if lang.kind(thrown) != NodeKind::VarRef {
+                return false;
+            }
+            match &lang.node(c).data {
+                NodeData::Catch { name, .. } => lang.var_name(thrown) == Some(name.as_str()),
+                _ => false,
+            }
+        };
+        let all_rethrow = catches.iter().all(|&c| rethrow_only(c));
+        if all_rethrow {
+            // 无 finally / 资源（try_block 之外只允许这些 catch）→ 整体剥壳
+            let extras: Vec<JavaId> = ch
+                .iter()
+                .copied()
+                .filter(|&c| c != try_block && lang.kind(c) != NodeKind::Catch)
+                .collect();
+            if extras.is_empty() {
+                return Some(Edit::Replace {
+                    target: id,
+                    with: try_block,
+                });
+            }
+            return None;
+        }
+        // 混合：只删重抛臂（Splice 掉对应 catch 槽）——定位第一个重抛臂
+        for (slot, &c) in ch.iter().enumerate() {
+            if c != try_block && lang.kind(c) == NodeKind::Catch && rethrow_only(c) {
+                return Some(Edit::Splice {
+                    node: id,
+                    index: slot,
+                    remove: 1,
+                    insert: vec![],
+                });
+            }
+        }
+        None
+    }
+}
+
 pub struct TryUnwrapNoCatch;
 
 impl Rule<JavaAst> for TryUnwrapNoCatch {
@@ -4038,6 +4127,7 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(NewStringCharArrayFold));
     rules.push(Box::new(EmptyFinallyStrip));
     rules.push(Box::new(TryUnwrapNoCatch));
+    rules.push(Box::new(TryUnwrapRethrow));
     rules.push(Box::new(LoopHeadBreak));
     rules.push(Box::new(WhileIteratorToForEach));
     rules.push(Box::new(ConcatValueOfDrop));

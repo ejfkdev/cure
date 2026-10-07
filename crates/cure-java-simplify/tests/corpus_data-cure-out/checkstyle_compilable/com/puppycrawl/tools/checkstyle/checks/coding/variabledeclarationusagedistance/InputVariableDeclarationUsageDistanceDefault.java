@@ -9,9 +9,7 @@ public class InputVariableDeclarationUsageDistanceDefault {
         int d = ++b;
     }
     static {
-        int c;
-        int a = 7;
-        c = 2;
+        int c = 2;
         c--;
     }
     static {
@@ -28,7 +26,6 @@ public class InputVariableDeclarationUsageDistanceDefault {
     }
     public boolean testMethod() {
         new InputVariableDeclarationUsageDistanceDefault(2);
-        "7";
         boolean result = false;
         String str = "";
         if (test1 > 1) {
@@ -46,8 +43,7 @@ public class InputVariableDeclarationUsageDistanceDefault {
     }
     public void testMethod3() {
         int count;
-        int a = 3;
-        a = a + 3;
+        int a = 6;
         testMethod2();
         count = a + a;
     }
@@ -102,9 +98,7 @@ public class InputVariableDeclarationUsageDistanceDefault {
         m++;
         b++;
     }
-    public void testMethod9() {
-        boolean result = true;
-    }
+    public void testMethod9() {}
     public boolean testMethod10() {
         boolean result;
         try {
@@ -129,12 +123,8 @@ public class InputVariableDeclarationUsageDistanceDefault {
             a++;
         }
     }
-    public void testMethod12() {
-        boolean result = true;
-    }
-    public void testMethod13() {
-        int k = 16;
-    }
+    public void testMethod12() {}
+    public void testMethod13() {}
     public void testMethod14() {
         Session s = openSession();
         Transaction t = s.beginTransaction();
@@ -314,14 +304,8 @@ public class InputVariableDeclarationUsageDistanceDefault {
         }
         return builder.toString();
     }
-    public void testIssue32_5() {
-        boolean isANull = false;
-    }
-    public void testIssue32_6() {
-        false;
-        false;
-        false;
-    }
+    public void testIssue32_5() {}
+    public void testIssue32_6() {}
     public void testIssue32_7() {
         String line = "abc";
         otherWriter.write(line);
@@ -336,22 +320,24 @@ public class InputVariableDeclarationUsageDistanceDefault {
     }
     public void testIssue32_9() {
         Options options = new Options();
+        Option myOption = null;
         options.addBindFile(null);
         options.addBindFile(null);
         options.addBindFile(null);
         options.addBindFile(null);
         options.addBindFile(null);
         System.identityHashCode("message");
-        null.setArgName("abc");
+        myOption.setArgName("abc");
     }
     public void testIssue32_10() {
         Options options = new Options();
+        Option myOption = null;
         options.addBindFile(null);
         options.addBindFile(null);
         options.addBindFile(null);
         options.addBindFile(null);
         options.addBindFile(null);
-        null.setArgName("q");
+        myOption.setArgName("q");
     }
     public int testIssue32_11(String toDir) throws Exception {
         int count = 0;
@@ -365,7 +351,6 @@ public class InputVariableDeclarationUsageDistanceDefault {
             System.identityHashCode("Files on remote site: " + files.length);
             for (String ftpFile : files) {
                 if (files.length == 0) {
-                    "";
                     ftpFile.concat(files[2]);
                     count++;
                 }
@@ -621,9 +606,7 @@ class New6 {
             a = 2;
         } catch (Exception e) {}
     }
-    void m() {
-        int c = 2;
-    }
+    void m() {}
     void test() {
         System.lineSeparator();
         System.lineSeparator();

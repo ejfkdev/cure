@@ -12,11 +12,7 @@ final class InputFileLength {
         return badFormat1 + badFormat2 + badFormat3;
     }
     private void localVariables() {
-        for (int k = 0; k < 1; k++) {
-            String innerBlockVariable = "";
-        }
-        for (int I = 0; I < 1; I++) {
-            String InnerBlockVariable = "";
-        }
+        for (int k = 0; k < 1; k++) {}
+        for (int I = 0; I < 1; I++) {}
     }
 }

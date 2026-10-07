@@ -44,9 +44,7 @@ class TestAnonymousInnerClasses {
 }
 
 class TestNewKeyword {
-    private TestNewKeyword(String s) {
-        String a = "hello" + s;
-    }
+    private TestNewKeyword(String s) {}
     public int count() {
         return 1;
     }

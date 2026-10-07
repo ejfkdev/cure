@@ -12,7 +12,6 @@ public class InputArrayBracketNoWhitespaceNextToken {
     void testTokenOnNextLine(int[] arr) {
         int x = arr[0] + 1;
         int y = arr[0];
-        int[][][][] a;
         for (int i = 0; i < arr[0]; i++) {}
     }
     void testGetNextTokenFromParent(int[] arr) {
@@ -25,12 +24,8 @@ public class InputArrayBracketNoWhitespaceNextToken {
         int a = arr[0] + 1;
         int b = arr[0] - 1;
     }
-    public void method1() {
-        int[] a;
-    }
-    public void method2() {
-        int[] a;
-    }
+    public void method1() {}
+    public void method2() {}
     public void method3() {
         int[] a = new int[10];
         int b = a[0] + a[1];

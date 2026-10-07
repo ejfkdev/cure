@@ -18,7 +18,6 @@ public class InputPatternVariableNameUnnamed {
             case ColoredPoint(Point(int _, int x), String _Color) -> {}
             default -> {}
         }
-        boolean b = o instanceof Point(int _, int y) && obj instanceof ColoredPoint(Point(int _, int x), String __);
     }
     record Point(int x, int y) {
     }

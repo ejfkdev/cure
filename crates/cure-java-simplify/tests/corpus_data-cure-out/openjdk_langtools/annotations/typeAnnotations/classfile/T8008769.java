@@ -8,6 +8,7 @@ public class T8008769 extends ClassfileTestHelper {
         new T8008769().run();
     }
     public void run() throws Exception {
+        expected_tvisibles = 4;
         ClassModel cm = getClassFile("T8008769$Test.class");
         for (MethodModel mm : cm.methods()) {
             test(mm, true);

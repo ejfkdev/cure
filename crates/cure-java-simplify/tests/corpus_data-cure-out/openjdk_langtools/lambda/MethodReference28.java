@@ -13,16 +13,8 @@ class MethodReference28 {
     void m2(Integer i1, Integer i2) {}
     void m3(String s) {}
     void m4(String... ss) {}
-    static void testStatic() {
-        SAM1 s4 = MethodReference28::static_m4;
-    }
-    void testBadMember() {
-        SAM1 s4 = MethodReference28::m4;
-    }
-    void testMember() {
-        SAM1 s4 = this::m4;
-    }
-    static void testUnbound() {
-        SAM2 s4 = MethodReference28::m4;
-    }
+    static void testStatic() {}
+    void testBadMember() {}
+    void testMember() {}
+    static void testUnbound() {}
 }

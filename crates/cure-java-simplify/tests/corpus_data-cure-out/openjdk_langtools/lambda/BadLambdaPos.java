@@ -8,9 +8,7 @@ class Test {
         test(((int x) -> {}) + ((int x) -> {}));
         test(((int x) -> {}) instanceof Object);
     }
-    void test2() {
-        boolean b = ((int x) -> {}) instanceof Object;
-    }
+    void test2() {}
     void test3() {
         test((Object) ((int x) -> {}));
         Object o = (Object) ((int x) -> {});

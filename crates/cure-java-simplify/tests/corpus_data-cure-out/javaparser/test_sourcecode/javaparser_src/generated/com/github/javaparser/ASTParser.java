@@ -2043,7 +2043,6 @@ final class ASTParser implements ASTParserConstants {
         throw new Error("Missing return statement in function");
     }
     final public NameExpr SimpleName() {
-        NameExpr ret;
         jj_consume_token(IDENTIFIER);
         return new NameExpr(token.beginLine, token.beginColumn, token.endLine, token.endColumn, token.image);
         throw new Error("Missing return statement in function");
@@ -2788,9 +2787,7 @@ final class ASTParser implements ASTParserConstants {
         throw new Error("Missing return statement in function");
     }
     final public Expression PrimaryExpression() {
-        Expression ret;
-        Expression inner;
-        ret = PrimaryPrefix();
+        Expression ret = PrimaryPrefix();
         label_53:
             while (true) {
                 if (!jj_2_25(2)) {
@@ -2802,9 +2799,7 @@ final class ASTParser implements ASTParserConstants {
         throw new Error("Missing return statement in function");
     }
     final public Expression PrimaryExpressionWithoutSuperSuffix() {
-        Expression ret;
-        Expression inner;
-        ret = PrimaryPrefix();
+        Expression ret = PrimaryPrefix();
         label_54:
             while (true) {
                 if (!jj_2_26(2147483647)) {
@@ -3814,7 +3809,6 @@ final class ASTParser implements ASTParserConstants {
         Expression expr;
         AssignExpr.Operator op;
         Expression value;
-        Type type;
         List typeArgs = null;
         Statement lambdaBody = null;
         Expression inner = null;
@@ -4449,7 +4443,6 @@ final class ASTParser implements ASTParserConstants {
         BlockStmt tryBlock;
         BlockStmt finallyBlock = null;
         List catchs = null;
-        Parameter except;
         BlockStmt catchBlock;
         Modifier exceptModifier;
         Type exceptType;
@@ -4945,7 +4938,6 @@ final class ASTParser implements ASTParserConstants {
         throw new Error("Missing return statement in function");
     }
     final public Expression DefaultValue() {
-        Expression ret;
         jj_consume_token(_DEFAULT);
         return MemberValue();
         throw new Error("Missing return statement in function");
@@ -8184,7 +8176,9 @@ final class ASTParser implements ASTParserConstants {
         return false;
     }
     private boolean jj_3R_102() {
+        jj_lookingAhead = true;
         jj_semLA = getToken(1).kind == GT && ((GTToken) getToken(1)).realKind == RSIGNEDSHIFT;
+        jj_lookingAhead = false;
         return !jj_semLA || jj_3R_152() || (jj_scan_token(GT) || jj_scan_token(GT));
     }
     private boolean jj_3R_256() {
@@ -8224,7 +8218,9 @@ final class ASTParser implements ASTParserConstants {
         return false;
     }
     private boolean jj_3R_103() {
+        jj_lookingAhead = true;
         jj_semLA = getToken(1).kind == GT && ((GTToken) getToken(1)).realKind == RUNSIGNEDSHIFT;
+        jj_lookingAhead = false;
         return !jj_semLA || jj_3R_153() || (jj_scan_token(GT) || (jj_scan_token(GT) || jj_scan_token(GT)));
     }
     private boolean jj_3R_191() {
@@ -8427,6 +8423,8 @@ final class ASTParser implements ASTParserConstants {
         }
         token_source = new ASTParserTokenManager(jj_input_stream);
         token = new Token();
+        jj_ntk = -1;
+        jj_gen = 0;
         for (int i = 0; i < 175; i++) 
             jj_la1[i] = -1;
         for (int i = 0; i < jj_2_rtns.length; i++) 
@@ -8443,6 +8441,8 @@ final class ASTParser implements ASTParserConstants {
         }
         token_source.ReInit(jj_input_stream);
         token = new Token();
+        jj_ntk = -1;
+        jj_gen = 0;
         for (int i = 0; i < 175; i++) 
             jj_la1[i] = -1;
         for (int i = 0; i < jj_2_rtns.length; i++) 
@@ -8452,6 +8452,8 @@ final class ASTParser implements ASTParserConstants {
         jj_input_stream = new JavaCharStream(stream, 1, 1);
         token_source = new ASTParserTokenManager(jj_input_stream);
         token = new Token();
+        jj_ntk = -1;
+        jj_gen = 0;
         for (int i = 0; i < 175; i++) 
             jj_la1[i] = -1;
         for (int i = 0; i < jj_2_rtns.length; i++) 
@@ -8461,6 +8463,8 @@ final class ASTParser implements ASTParserConstants {
         jj_input_stream.ReInit(stream, 1, 1);
         token_source.ReInit(jj_input_stream);
         token = new Token();
+        jj_ntk = -1;
+        jj_gen = 0;
         for (int i = 0; i < 175; i++) 
             jj_la1[i] = -1;
         for (int i = 0; i < jj_2_rtns.length; i++) 
@@ -8469,6 +8473,8 @@ final class ASTParser implements ASTParserConstants {
     public ASTParser(ASTParserTokenManager tm) {
         token_source = tm;
         token = new Token();
+        jj_ntk = -1;
+        jj_gen = 0;
         for (int i = 0; i < 175; i++) 
             jj_la1[i] = -1;
         for (int i = 0; i < jj_2_rtns.length; i++) 
@@ -8477,6 +8483,8 @@ final class ASTParser implements ASTParserConstants {
     public void ReInit(ASTParserTokenManager tm) {
         token_source = tm;
         token = new Token();
+        jj_ntk = -1;
+        jj_gen = 0;
         for (int i = 0; i < 175; i++) 
             jj_la1[i] = -1;
         for (int i = 0; i < jj_2_rtns.length; i++) 
@@ -8485,6 +8493,7 @@ final class ASTParser implements ASTParserConstants {
     private Token jj_consume_token(int kind) {
         Token oldToken;
         token = (oldToken = token).next != null ? token.next : (token.next = token_source.getNextToken());
+        jj_ntk = -1;
         if (token.kind == kind) {
             jj_gen++;
             if (++jj_gc > 100) {
@@ -8500,6 +8509,8 @@ final class ASTParser implements ASTParserConstants {
             }
             return token;
         }
+        token = oldToken;
+        jj_kind = kind;
         throw generateParseException();
     }
     static private final class LookaheadSuccess extends java.lang.Error {
@@ -8530,6 +8541,7 @@ final class ASTParser implements ASTParserConstants {
     }
     final public Token getNextToken() {
         token = token.next != null ? token.next : (token.next = token_source.getNextToken());
+        jj_ntk = -1;
         jj_gen++;
         return token;
     }
@@ -8610,6 +8622,7 @@ final class ASTParser implements ASTParserConstants {
                 jj_expentries.add(jj_expentry);
             }
         }
+        jj_endpos = 0;
         jj_rescan_token();
         jj_add_error_token(0, 0);
         int[][] exptokseq = new int[jj_expentries.size()][];
@@ -8621,6 +8634,7 @@ final class ASTParser implements ASTParserConstants {
     final public void enable_tracing() {}
     final public void disable_tracing() {}
     private void jj_rescan_token() {
+        jj_rescan = true;
         for (int i = 0; i < 47; i++) {
             try {
                 JJCalls p = jj_2_rtns[i];

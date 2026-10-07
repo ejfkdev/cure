@@ -32,37 +32,19 @@ public class al implements Comparable<al> {
         return this.d;
     }
     public double e() {
-        try {
-            if (this.b.isEmpty()) {
-                return 0.0;
-            }
-        } catch (a_ var1) {
-            throw var1;
-        }
-        return this.e / (double) this.b.size();
+        return this.b.isEmpty() ? 0.0 : this.e / (double) this.b.size();
     }
     public double f() {
-        try {
-            if (this.c.isEmpty()) {
-                return 0.0;
-            }
-        } catch (a_ var1) {
-            throw var1;
-        }
-        return this.f / (double) this.c.size();
+        return this.c.isEmpty() ? 0.0 : this.f / (double) this.c.size();
     }
     public String toString() {
         StringBuilder var1 = new StringBuilder(this.a.a());
-        try {
-            var1.append(g[2]);
-            var1.append(this.a.b());
-            if (this.a.c() != null) {
-                var1.append(g[1]);
-                var1.append(this.a.c());
-                var1.append("]");
-            }
-        } catch (a_ var2) {
-            throw var2;
+        var1.append(g[2]);
+        var1.append(this.a.b());
+        if (this.a.c() != null) {
+            var1.append(g[1]);
+            var1.append(this.a.c());
+            var1.append("]");
         }
         var1.append(g[0]);
         var1.append(DecimalFormat.getNumberInstance().format(this.d()));
@@ -74,21 +56,7 @@ public class al implements Comparable<al> {
     }
     protected static boolean a(Object param0, Object param1) {}
     public int a(al var1) {
-        try {
-            if (var1 == null) {
-                return 1;
-            }
-        } catch (a_ var2) {
-            throw var2;
-        }
-        try {
-            if (a(this.a().a(), var1.a().a())) {
-                return this.a().b().compareTo(var1.a().b());
-            }
-        } catch (a_ var3) {
-            throw var3;
-        }
-        return this.a().a().compareTo(var1.a().a());
+        return var1 == null ? 1 : a(this.a().a(), var1.a().a()) ? this.a().b().compareTo(var1.a().b()) : this.a().a().compareTo(var1.a().a());
     }
     static {
         String[] var10000 = new String[3];

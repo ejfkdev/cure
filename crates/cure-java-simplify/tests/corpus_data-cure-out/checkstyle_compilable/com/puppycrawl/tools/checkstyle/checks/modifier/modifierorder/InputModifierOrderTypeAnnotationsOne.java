@@ -37,9 +37,7 @@ public class InputModifierOrderTypeAnnotationsOne extends MyClass {
     Collection<? super @TypeAnnotation File> c;
     List<@TypeAnnotation ? extends Comparable<T>> unchangeable;
     void foo6() throws @TypeAnnotation IOException {}
-    public void foo7() {
-        boolean isNonNull = "string" instanceof String;
-    }
+    public void foo7() {}
     class Nested {
     }
     class T {

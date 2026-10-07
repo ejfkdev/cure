@@ -1,9 +1,7 @@
 import java.lang.annotation.*;
 
 class BadCast {
-    static void main() {
-        Object o = "";
-    }
+    static void main() {}
 }
 
 @Target(ElementType.TYPE_USE) @interface A {

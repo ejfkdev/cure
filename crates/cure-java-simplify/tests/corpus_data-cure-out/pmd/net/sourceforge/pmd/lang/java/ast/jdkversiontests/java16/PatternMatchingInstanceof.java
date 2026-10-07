@@ -51,9 +51,7 @@ public class PatternMatchingInstanceof {
         new PatternMatchingInstanceof().test();
     }
     class Foo {
-        {
-            Object o = null instanceof Foo;
-        }
+        {}
     }
     @Target(value=ElementType.TYPE_USE) @interface Nullable {
     }

@@ -3,9 +3,6 @@ public class DuplicateBindingTest {
     public static boolean main(String[] args) {
         Object o1 = "";
         Object o2 = "";
-        if (args != null) {
-            int s;
-        }
         if (args.length == 1 ? o2 instanceof String s : o2 instanceof String s) {}
         if (args.length == 1 ? !(o2 instanceof String s) : !(o2 instanceof String s)) {}
         boolean b;

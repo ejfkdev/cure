@@ -3,9 +3,7 @@ package com.puppycrawl.tools.checkstyle.checks.coding.unusedtryresourceshouldbeu
 public class InputUnusedTryResourceShouldBeUnnamed {
     void test() {
         try (AutoCloseable a = lock()) {} catch (Exception e) {}
-        try (AutoCloseable b = lock()) {
-            AutoCloseable c = b;
-        } catch (Exception e) {}
+        try (AutoCloseable b = lock()) {} catch (Exception e) {}
         try (AutoCloseable d = lock()) {
             d.close();
         } catch (Exception e) {

@@ -1,4 +1,4 @@
-package /*2*/com.puppycrawl.tools.checkstyle.grammar.antlr4;
+package com.puppycrawl.tools.checkstyle.grammar.antlr4;
 
 public class InputAntlr4AstRegressionEmbeddedBlockComments {
 }

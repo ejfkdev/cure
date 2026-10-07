@@ -2,22 +2,10 @@ package spoon.test.delete.testclasses;
 
 @Deprecated
 public class Adobada {
-    {
-        int i;
-        int j;
-    }
-    static {
-        int i;
-        int j;
-    }
-    public Adobada() {
-        int i;
-        int j;
-    }
-    public void m() {
-        int i;
-        int j;
-    }
+    {}
+    static {}
+    public Adobada() {}
+    public void m() {}
     public Adobada m2() {
         return new Adobada() {
 			@Override

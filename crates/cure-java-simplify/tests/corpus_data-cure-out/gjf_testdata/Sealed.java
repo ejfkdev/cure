@@ -1,5 +1,5 @@
 class T {
-    sealed interface I permits C, B extends A {
+    sealed interface I extends A permits C, B {
     }
     final class C implements I {
     }

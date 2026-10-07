@@ -19,9 +19,7 @@ public class InputRightCurlyDefaultBlocksInSwitchStatementAloneOrSingleline2 {
     public static void test11() {
         switch (0) {
             case 0:
-                {
-                    int x = 0;
-                }
+                {}
             default:
                 {}
             case 1:
@@ -34,9 +32,7 @@ public class InputRightCurlyDefaultBlocksInSwitchStatementAloneOrSingleline2 {
             case 0:
                 {}
             default:
-                {
-                    int y;
-                }
+                {}
             case 1:
                 int x = 1;
                 break;
@@ -55,9 +51,7 @@ public class InputRightCurlyDefaultBlocksInSwitchStatementAloneOrSingleline2 {
     public static void test14() {
         switch (0) {
             case 0:
-                {
-                    int x = 1;
-                }
+                {}
             default:
                 {}
             case 1:
@@ -109,9 +103,7 @@ public class InputRightCurlyDefaultBlocksInSwitchStatementAloneOrSingleline2 {
         switch (0) {
             case 1:
             default:
-                {
-                    int x = 0;
-                }
+                {}
                 break;
         }
     }

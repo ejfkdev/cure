@@ -9,6 +9,8 @@ public class TypeCasts extends ClassfileTestHelper {
         new TypeCasts().run();
     }
     public void run() throws Exception {
+        expected_tinvisibles = 4;
+        expected_tvisibles = 0;
         ClassModel cm = getClassFile("TypeCasts$Test.class");
         test(cm);
         for (FieldModel fm : cm.fields()) {
@@ -26,12 +28,8 @@ public class TypeCasts extends ClassfileTestHelper {
         @Target({ElementType.TYPE_USE, ElementType.TYPE_PARAMETER}) @interface A {
         }
         void emit() {
-            Object o = null;
-            String s = null;
-            String a0 = (String) o;
-            Object a1 = (Object) o;
-            String b0 = (String) s;
-            Object b1 = (Object) s;
+            String a0 = (String) null;
+            Object b1 = (Object) null;
         }
         void alldeadcode() {}
     }
