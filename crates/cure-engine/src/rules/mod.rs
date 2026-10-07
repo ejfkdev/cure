@@ -1136,6 +1136,139 @@ impl<L: Lang> Rule<L> for ArithZero {
 // 含声明形：int x = a; x = b; → int x = b;
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// 逆运算对抵消（寄存器噪声）：`x op= K;` 紧跟 `x op⁻¹= K;`（同局部变量、
+// 同字面量常量、相邻语句、精确整型）→ 两条全删。
+//   `x += K; x -= K` → 删（模 2^w 加法群恒等）
+//   `x ^= K; x ^= K` → 删（XOR 自逆）
+//   `x -= K; x += K` → 删（对称）
+// 展开形态 `x = x + K; x = x - K`（RHS = Binary(x op K)）与混合形态
+// （`x += K; x = x - K`）同样处理——反编译器常输出展开形态。
+// 相邻 ⇒ 两句之间无任何求值 ⇒ 删除恒安全（x 终值不变；x 的旧值
+// 不被其他求值观察到）。
+// 守卫：x 为局部变量（is_local_var——字段写有可见副作用）；K 为
+// 无副作用字面量；x 精确整型（浮点 (x+K)-K 在溢出/Inf 上 ≠ x）。
+// 真实样本：PMD 语料 PMDTaskTestExample.java（a+=1; a-=1 交替 50 次
+// 完全不动——寄存器噪声经典形态，109 行全为噪声）。
+// ---------------------------------------------------------------------------
+
+pub struct InverseAssignPair;
+
+impl<L: Lang> Rule<L> for InverseAssignPair {
+    fn name(&self) -> &'static str {
+        "inverse_assign_pair"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Block]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
+        let RewriteCtx { lang, .. } = ctx;
+        let ch = lang.children(id).to_vec();
+        if ch.len() < 2 {
+            return None;
+        }
+        for w in 0..ch.len() - 1 {
+            let (s1, s2) = (ch[w], ch[w + 1]);
+            // 窗口左端不是赋值语句 → 滑到下一窗口（不能整check放弃）
+            let Some(a1) = norm_assign(lang, s1) else { continue };
+            let Some(a2) = norm_assign(lang, s2) else { continue };
+            // 同一局部变量（名字键等值）
+            if a1.key != a2.key || !a1.local || !a2.local {
+                continue;
+            }
+            // 精确整型（模 2^w 群恒等性成立；浮点舍入破坏交换律）
+            if !a1.exact_int || !a2.exact_int {
+                continue;
+            }
+            // 同一常量 + 互逆算符
+            if a1.k != a2.k {
+                continue;
+            }
+            let inverse = match (a1.op, a2.op) {
+                (BinOp::Add, BinOp::Sub) | (BinOp::Sub, BinOp::Add) => true,
+                (BinOp::BitXor, BinOp::BitXor) => true,
+                _ => false,
+            };
+            if !inverse {
+                continue;
+            }
+            // 删除两条语句：先删靠后的（索引不失效），再删靠前的
+            return Some(Edit::Multi(vec![
+                Edit::Delete { node: s2 },
+                Edit::Delete { node: s1 },
+            ]));
+        }
+        None
+    }
+}
+
+/// 归一化一条赋值语句 → `(变量键, 算符, 常量)`。
+/// 接受复合形态（`x op= K`，RHS 即字面量）与展开形态（`x = x op K`，
+/// RHS = Binary{op, VarRef(x), K}）。
+struct NormAssign<K> {
+    key: K,
+    op: BinOp,
+    k: i64,
+    local: bool,
+    /// 精确整型（浮点 (x+K)-K 在舍入/Inf 上 ≠ x，必须拒绝）
+    exact_int: bool,
+}
+
+fn norm_assign<L: Lang>(lang: &L, stmt: L::Id) -> Option<NormAssign<L::NameKey>> {
+    // 语句形态：ExprStmt{Assign} 或裸 Assign
+    let a = match lang.kind(stmt) {
+        NodeKind::ExprStmt => {
+            let c = lang.children(stmt);
+            if c.len() == 1 && lang.kind(c[0]) == NodeKind::Assign {
+                c[0]
+            } else {
+                return None;
+            }
+        }
+        NodeKind::Assign => stmt,
+        _ => return None,
+    };
+    let ch = lang.children(a).to_vec();
+    if ch.len() != 2 {
+        return None;
+    }
+    let (target, rhs) = (ch[0], ch[1]);
+    if lang.kind(target) != NodeKind::VarRef {
+        return None;
+    }
+    let key = lang.var_key(target)?;
+    let local = lang.is_local_var(target);
+    let exact_int = lang.is_exact_int(target);
+    // RHS 的求值效果：字面量 Pure；Binary(VarRef, lit) 是 Pure/MayRead——
+    // 展开形态对 x 旧值的读正是我们要抵消的一部分（两句间的观察点
+    // 为空），但 Binary 内若非纯形态拒绝
+    match lang.assign_op(a) {
+        // 复合形态：`x op= K`——RHS 就是操作数
+        Some(op) => {
+            let k = lang.literal(rhs).and_then(|x| x.as_int())?;
+            Some(NormAssign { key, op, k, local, exact_int })
+        }
+        // 展开形态：`x = x op K`——RHS = Binary{op, VarRef(x), K}
+        None => {
+            if lang.kind(rhs) != NodeKind::Binary {
+                return None;
+            }
+            let op = lang.bin_op(rhs)?;
+            let rc = lang.children(rhs).to_vec();
+            if rc.len() != 2 {
+                return None;
+            }
+            // 左操作数必须是 x 自身（名字键等值）
+            if lang.kind(rc[0]) != NodeKind::VarRef || lang.var_key(rc[0]) != Some(key) {
+                return None;
+            }
+            let k = lang.literal(rc[1]).and_then(|x| x.as_int())?;
+            Some(NormAssign { key, op, k, local, exact_int })
+        }
+    }
+}
+
 pub struct DeadStore;
 
 impl<L: Lang> Rule<L> for DeadStore {
@@ -2607,6 +2740,7 @@ pub fn default_rules<L: Lang>() -> Vec<Box<dyn Rule<L>>> {
         Box::new(AssignPropagation),
         Box::new(MultiUseCopyPropagation),
         Box::new(TrailingReturn),
+        Box::new(InverseAssignPair),
         Box::new(DeadStore),
         Box::new(StoreKill),
     ]

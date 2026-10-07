@@ -811,3 +811,55 @@ fn fold_neg_normal_still_works() {
     let out2 = run_src("class A{int f(){return -(-7);}}");
     assert!(out2.contains("return 7;"), "{out2}");
 }
+
+// ---- inverse_assign_pair：逆运算对抵消（寄存器噪声）----
+
+#[test]
+fn inverse_pair_compound_cascades() {
+    // PMD PMDTaskTestExample.java 形态：交替噪声整串抵消
+    let src = "class A{int f(){int a;a+=1;a-=1;a+=1;a-=1;return 7;}}";
+    let out = run_src(src);
+    assert!(out.contains("return 7;"), "{out}");
+    assert!(!out.contains("a += 1;") || !out.contains("a -= 1;"), "{out}");
+    // 交替 + 常量折半的残留声明由既有规则处理；成对部分必须消失
+    let src2 = "class A{int f(){int a;a+=5;a-=5;return a;}}";
+    let out2 = run_src(src2);
+    assert!(out2.contains("return a;"), "{out2}");
+    assert!(!out2.contains("+= 5;") && !out2.contains("-= 5;"), "{out2}");
+}
+
+#[test]
+fn inverse_pair_expanded_and_mixed_forms() {
+    // 展开形态（反编译器常见输出）
+    let out = run_src("class A{int f(int x){x=x+5;x=x-5;return x;}}");
+    assert!(out.contains("return x;"), "{out}");
+    // 混合形态：复合 + 展开
+    let out = run_src("class A{int f(int x){x+=5;x=x-5;return x;}}");
+    assert!(out.contains("return x;"), "{out}");
+    // XOR 自逆
+    let out = run_src("class A{int f(int x){x^=42;x^=42;return x;}}");
+    assert!(out.contains("return x;"), "{out}");
+    // 对称方向
+    let out = run_src("class A{int f(int x){x-=3;x+=3;return x;}}");
+    assert!(out.contains("return x;"), "{out}");
+}
+
+#[test]
+fn inverse_pair_safety_guards() {
+    // 浮点：不抵消（溢出/Inf 上 (x+K)-K ≠ x）
+    let out = run_src("class A{double f(double x){x+=1;x-=1;return x;}}");
+    assert!(out.contains("x += 1;"), "{out}");
+    // 字段：可见副作用，不抵消
+    let out = run_src("class A{int f;int g(){f+=1;f-=1;return f;}}");
+    assert!(out.contains("f += 1;"), "{out}");
+    // 中间有读：x 的中间值被观察到，不抵消
+    let out = run_src("class A{int f(int x){x+=1;int y=x*2;x-=1;return y;}}");
+    assert!(out.contains("x += 1;"), "{out}");
+    // 常量不同：不抵消
+    let out = run_src("class A{int f(int x){x+=1;x-=2;return x;}}");
+    assert!(out.contains("x += 1;"), "{out}");
+    // long 域同样抵消（模 2^64 群恒等）
+    let out = run_src("class A{long f(long x){x+=9223372036854775807L;x-=9223372036854775807L;return x;}}");
+    assert!(out.contains("return x;"), "{out}");
+    assert!(!out.contains("+="), "{out}");
+}
