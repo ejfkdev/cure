@@ -92,11 +92,25 @@ pub(crate) struct Exec<'a> {
     /// JLS 复合赋值隐式收窄：`byte b=100; b+=100` → (byte)200 = -56
     /// （javac 真值对拍抓获：vexec 曾输出 200）。
     var_width: HashMap<u32, u8>,
+    /// 执行效应日志（按发生序）：字段写与不透明 Class.forName 假设。
+    /// 材料化按日志序重放——语句位置/顺序与原执行一致。
+    effect_log: Vec<EffectEvent>,
+}
+
+/// 执行效应（材料化重放的单位）。
+#[derive(Clone, Debug)]
+pub(crate) enum EffectEvent {
+    /// 裸名赋值 → 字段写（名字键）。
+    FieldWrite(u32),
+    /// `Class.forName("<类名>")` 假设成功的不透明语句
+    ///（副作用 = 类初始化；重放为原语句 + 字面量实参）。
+    /// stmt/call 是原节点 id（材料化时克隆改造）。
+    ClassLoad { stmt: JavaId, call: JavaId, name: String },
 }
 
 impl<'a> Exec<'a> {
     pub(crate) fn new(ast: &'a JavaAst) -> Self {
-        Exec { ast, steps: 0, exhausted: false, vars: HashMap::new(), field_writes: Vec::new(), decl_order: Vec::new(), scopes: vec![Vec::new()], var_width: HashMap::new() }
+        Exec { ast, steps: 0, exhausted: false, vars: HashMap::new(), field_writes: Vec::new(), decl_order: Vec::new(), scopes: vec![Vec::new()], var_width: HashMap::new(), effect_log: Vec::new() }
     }
 
     /// 步数预算耗尽标志（规则据此放弃整段重写——中途状态不是
@@ -184,6 +198,9 @@ impl<'a> Exec<'a> {
                     NodeKind::Unary => {
                         let op = self.ast.un_op(inner).ok_or(())?;
                         if !op.is_incdec() {
+                            if self.try_class_forname(s, inner)? {
+                                return Ok(Flow::Normal);
+                            }
                             self.eval(inner)?;
                             return Ok(Flow::Normal);
                         }
@@ -191,6 +208,9 @@ impl<'a> Exec<'a> {
                         self.exec_incdec(tgt, op)
                     }
                     _ => {
+                        if self.try_class_forname(s, inner)? {
+                            return Ok(Flow::Normal);
+                        }
                         self.eval(inner)?;
                         Ok(Flow::Normal)
                     }
@@ -297,8 +317,14 @@ impl<'a> Exec<'a> {
             NodeData::Empty => Ok(Flow::Normal),
             // 裸表达式语句（for 步进等不包 ExprStmt 的场景；eval 含
             // 存储副作用——自增/自减在 eval 的 Unary 分支处理）
+            NodeData::Call => {
+                if self.try_class_forname(s, s)? {
+                    return Ok(Flow::Normal);
+                }
+                self.eval(s)?;
+                Ok(Flow::Normal)
+            }
             NodeData::Unary { .. }
-            | NodeData::Call
             | NodeData::Binary { .. }
             | NodeData::New { .. } => {
                 self.eval(s)?;
@@ -379,6 +405,7 @@ impl<'a> Exec<'a> {
         } else {
             self.field_writes.push((k, v));
         }
+        self.effect_log.push(EffectEvent::FieldWrite(k));
         Ok(Flow::Normal)
     }
 
@@ -956,6 +983,360 @@ impl<'a> Exec<'a> {
     pub(crate) fn decl_order(&self) -> &[u32] {
         &self.decl_order
     }
+    pub(crate) fn effect_log(&self) -> &[EffectEvent] {
+        &self.effect_log
+    }
+
+    // ---- Class.forName 假设 + 深快照 + 前缀遍历（子块截断）----
+
+    /// 语句位置的 `Class.forName(<常量串>)`：类存在性可判定且为 JDK
+    /// 自带 → 假设成功（不抛）。类初始化副作用保留：以 effect_log 记录，
+    /// 材料化时重放为「原语句 + 字面量实参」。仅值被丢弃的语句位置；
+    /// 表达式位置的返回值不可表示 → Err（保守 abort）。
+    fn try_class_forname(&mut self, stmt: JavaId, call: JavaId) -> R<bool> {
+        if self.ast.kind(call) != NodeKind::Call {
+            return Ok(false);
+        }
+        let ch = self.ast.children(call).to_vec();
+        let Some((callee, args)) = ch.split_first() else {
+            return Ok(false);
+        };
+        if self.ast.kind(*callee) != NodeKind::Member {
+            return Ok(false);
+        }
+        let mname = match self.ast.data(*callee) {
+            NodeData::Member { name } => self.ast.sn(*name),
+            _ => return Ok(false),
+        };
+        if mname != "forName" || args.len() != 1 {
+            return Ok(false);
+        }
+        // 接收方链尾必须是 Class（Class.forName / java.lang.Class.forName）
+        let recv = self.ast.children(*callee).first().copied();
+        let recv_tail = match recv.map(|r| self.ast.data(r)) {
+            Some(NodeData::VarRef { name }) => Some(self.ast.sn(*name)),
+            Some(NodeData::Member { name }) => Some(self.ast.sn(*name)),
+            _ => None,
+        };
+        if recv_tail != Some("Class") {
+            return Ok(false);
+        }
+        let name = match self.eval(args[0])? {
+            VVal::S(s) => s,
+            _ => return Err(()), // 非常量类名 → 不可判定 → abort
+        };
+        if !crate::jdk::class_loads(&name) {
+            return Err(()); // 可判定不存在 / 未知类 → 保守 abort
+        }
+        self.effect_log.push(EffectEvent::ClassLoad { stmt, call, name });
+        Ok(true)
+    }
+
+    /// 深快照：vars/field_writes/decl_order/scopes/var_width/effect_log
+    /// 全量克隆，数组内容深拷贝（别名保持——var10004 = var10003 的共享
+    /// 在快照/恢复后仍共享）。steps/exhausted 不回滚（预算语义）。
+    /// 用途：子块遍历中「失败语句的部分效应」撤销（数组内容污染不可由
+    /// 浅回滚恢复）。
+    fn deep_snapshot(&self) -> Snap {
+        let mut seen: HashMap<usize, VVal> = HashMap::new();
+        Snap {
+            vars: self
+                .vars
+                .iter()
+                .map(|(k, v)| (*k, snap_value(v, &mut seen)))
+                .collect(),
+            field_writes: self
+                .field_writes
+                .iter()
+                .map(|(k, v)| (*k, snap_value(v, &mut seen)))
+                .collect(),
+            decl_order: self.decl_order.clone(),
+            scopes: self.scopes.clone(),
+            var_width: self.var_width.clone(),
+            effect_log: self.effect_log.clone(),
+        }
+    }
+    fn deep_restore(&mut self, s: Snap) {
+        let mut seen: HashMap<usize, VVal> = HashMap::new();
+        self.vars = s
+            .vars
+            .into_iter()
+            .map(|(k, v)| (k, snap_value(&v, &mut seen)))
+            .collect();
+        self.field_writes = s
+            .field_writes
+            .into_iter()
+            .map(|(k, v)| (k, snap_value(&v, &mut seen)))
+            .collect();
+        self.decl_order = s.decl_order;
+        self.scopes = s.scopes;
+        self.var_width = s.var_width;
+        self.effect_log = s.effect_log;
+    }
+
+    /// 前缀遍历（子块截断核心）：逐语句执行，遇失败语句时若它是
+    /// Block/Label/Try 则**下降进它的孩子**继续（不整条执行），语句级
+    /// 失败前深快照、失败后回滚——遍历后的状态只含已完成语句的效应
+    /// （无「半途倾倒」）。返回各级截断层与真实剩余语句。
+    /// cuts 顺序：最深在前、根最后（根始终记录；嵌套层仅在部分完成时
+    /// 记录——完整完成的嵌套层效应归父层区间，避免双发）。
+    pub(crate) fn run_prefix(&mut self, stmts: &[JavaId]) -> R<PrefixRun> {
+        let mut run = PrefixRun {
+            cuts: Vec::new(),
+            rest_stack: Vec::new(),
+            early_exit: None,
+        };
+        self.run_level(stmts, None, true, &mut run)?;
+        Ok(run)
+    }
+
+    /// 单层遍历。根调用（is_root）不压作用域（外层 scopes[0] 即根域）；
+    /// 嵌套层压域、完整完成时弹层（同 exec_stmt(Block) 语义），部分完成
+    /// 停止时不弹（遍历即终止，状态供逃逸分析）。
+    fn run_level(
+        &mut self,
+        stmts: &[JavaId],
+        block: Option<JavaId>,
+        is_root: bool,
+        run: &mut PrefixRun,
+    ) -> R<()> {
+        let log_start = self.effect_log.len();
+        let decl_start = self.decl_order.len();
+        let scopes_at_entry = self.scopes.len();
+        if !is_root {
+            self.scopes.push(Vec::new());
+        }
+        let mut completed = 0usize;
+        let mut stopped_at: Option<usize> = None;
+        // 普通失败（非下降有进展）：rest 必须含失败语句本身（旧语义——
+        // 逃逸/再赋值分析需要看见它：CFF 的 switch(s) 状态机引用 s）
+        let mut include_failed_stmt = false;
+        // 失败语句前的日志位置（失败语句的效应已回滚/归内层）
+        let mut stop_log_end = self.effect_log.len();
+        'lvl: for (i, &st) in stmts.iter().enumerate() {
+            stop_log_end = self.effect_log.len();
+            let snap = self.deep_snapshot();
+            let cuts_len = run.cuts.len();
+            let rest_len = run.rest_stack.len();
+            let scopes_len = self.scopes.len();
+            let decl_len = self.decl_order.len();
+            if let Some(inner) = self.descend_target(st) {
+                let inner_stmts = self.ast.children(inner).to_vec();
+                let r = self.run_level(&inner_stmts, Some(inner), false, run);
+                let inner_stopped = run.rest_stack.len() > rest_len;
+                match (r, inner_stopped) {
+                    (Ok(()), false) => {
+                        // 整条语句完成：效应已在日志中，语句可被材料化替换
+                        completed = i + 1;
+                    }
+                    (Ok(()), true) | (Err(()), _) => {
+                        // 内层停止/失败于 m：
+                        //   m > 0 → 内层 cut 已记录，本语句留在本层 rest
+                        //   m == 0 → 撤销下降，整条语句按失败处理
+                        let inner_completed =
+                            run.cuts.get(cuts_len).map(|c| c.completed).unwrap_or(0);
+                        if inner_completed == 0 {
+                            run.cuts.truncate(cuts_len);
+                            run.rest_stack.truncate(rest_len);
+                            self.truncate_state(decl_len, scopes_len);
+                            self.deep_restore(snap);
+                            include_failed_stmt = true;
+                        }
+                        stopped_at = Some(i);
+                        break 'lvl;
+                    }
+                }
+            } else {
+                match self.exec_stmt(st) {
+                    Ok(Flow::Normal) => {
+                        completed = i + 1;
+                    }
+                    Ok(other) => {
+                        if is_root && i + 1 == stmts.len() {
+                            // 末尾 return/break 逃逸：现有根层语义
+                            run.early_exit = Some(other);
+                            completed = i + 1;
+                        } else {
+                            self.deep_restore(snap);
+                            stopped_at = Some(i);
+                            include_failed_stmt = true;
+                            break 'lvl;
+                        }
+                    }
+                    Err(()) => {
+                        self.deep_restore(snap);
+                        stopped_at = Some(i);
+                        include_failed_stmt = true;
+                        break 'lvl;
+                    }
+                }
+            }
+        }
+        let log_end = match stopped_at {
+            Some(_) => stop_log_end,
+            None => self.effect_log.len(),
+        };
+        if let Some(c) = stopped_at {
+            // 本层剩余：普通失败 → 含失败语句本身（旧语义）；下降有进展
+            // → 失败语句的内部剩余已由更深层压栈，这里只压后续兄弟
+            if include_failed_stmt {
+                let mut lvl = vec![stmts[c]];
+                lvl.extend_from_slice(&stmts[c + 1..]);
+                run.rest_stack.push(lvl);
+            } else {
+                run.rest_stack.push(stmts[c + 1..].to_vec());
+            }
+        } else if !is_root {
+            // 嵌套层完整完成：弹域清值（后续语句看不到其局部）
+            for k in self.scopes.pop().unwrap() {
+                self.vars.remove(&k);
+                self.var_width.remove(&k);
+            }
+        }
+        if is_root || stopped_at.is_some() {
+            run.cuts.push(LevelCut {
+                block_hint: block, // 根层 None → static_exec 回填根块 id
+                completed,
+                log_start,
+                log_end,
+                decl_start,
+            });
+        }
+        let _ = scopes_at_entry;
+        Ok(())
+    }
+
+    /// 下降撤销：弹出下降期间压入的作用域层并清值。
+    fn truncate_state(&mut self, decl_len: usize, scopes_len: usize) {
+        while self.scopes.len() > scopes_len {
+            for k in self.scopes.pop().unwrap() {
+                self.vars.remove(&k);
+                self.var_width.remove(&k);
+            }
+        }
+        self.decl_order.truncate(decl_len);
+    }
+
+    /// 失败语句的可下降目标：Label→子块 / Block(含 Group) / Try→体块。
+    fn descend_target(&self, st: JavaId) -> Option<JavaId> {
+        match self.ast.data(st) {
+            NodeData::Label { .. } => {
+                let child = self.ast.children(st).first().copied()?;
+                match self.ast.kind(child) {
+                    NodeKind::Block => Some(child),
+                    _ => None,
+                }
+            }
+            NodeData::Block | NodeData::Group => Some(st),
+            NodeData::Try => {
+                let ch = self.ast.children(st).to_vec();
+                let mut i = 0usize;
+                while i < ch.len()
+                    && self.ast.kind(ch[i]) != NodeKind::Block
+                    && self.ast.kind(ch[i]) != NodeKind::Catch
+                {
+                    i += 1;
+                }
+                let body = ch.get(i).copied()?;
+                if self.ast.kind(body) == NodeKind::Block {
+                    Some(body)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// 深快照载荷。
+struct Snap {
+    vars: HashMap<u32, VVal>,
+    field_writes: Vec<(u32, VVal)>,
+    decl_order: Vec<u32>,
+    scopes: Vec<Vec<u32>>,
+    var_width: HashMap<u32, u8>,
+    effect_log: Vec<EffectEvent>,
+}
+
+/// 深拷贝一个值（别名保持：seen 以 Rc 地址识别同一数组）。
+fn snap_value(v: &VVal, seen: &mut HashMap<usize, VVal>) -> VVal {
+    match v {
+        VVal::CA(a) => {
+            let addr = Rc::as_ptr(a) as usize;
+            if let Some(c) = seen.get(&addr) {
+                return c.clone();
+            }
+            let c = VVal::CA(Rc::new(RefCell::new(a.borrow().clone())));
+            seen.insert(addr, c.clone());
+            c
+        }
+        VVal::SA(a) => {
+            let addr = Rc::as_ptr(a) as usize;
+            if let Some(c) = seen.get(&addr) {
+                return c.clone();
+            }
+            let elems: Vec<VVal> = a
+                .borrow()
+                .iter()
+                .map(|e| snap_value(e, seen))
+                .collect();
+            let c = VVal::SA(Rc::new(RefCell::new(elems)));
+            seen.insert(addr, c.clone());
+            c
+        }
+        other => other.clone(),
+    }
+}
+
+/// 前缀遍历结果。
+pub(crate) struct PrefixRun {
+    /// 截断层（**最深在前、根最后**；根始终记录，嵌套层仅部分完成时记录）。
+    /// block_hint：嵌套层 = splice 目标块 id；根层 = None（static_exec
+    /// 以根块 id 回填）。
+    pub cuts: Vec<LevelCut>,
+    /// 各停止层的剩余兄弟语句（最深在前，长度 = 停止层数 = 有 cut 的
+    /// 嵌套层数）。
+    pub rest_stack: Vec<Vec<JavaId>>,
+    /// 根层末尾 return/break 逃逸（现有语义）。
+    pub early_exit: Option<Flow>,
+}
+
+impl PrefixRun {
+    /// 真实剩余语句全集（各层拼接——守卫用）。
+    pub fn true_rest(&self) -> Vec<JavaId> {
+        let mut all = Vec::new();
+        for lvl in &self.rest_stack {
+            all.extend_from_slice(lvl);
+        }
+        all
+    }
+    /// 第 j 个 cut（0=最深 … len-1=根）的剩余：
+    /// rest_stack[0..=j]（该层失败语句内部及以下的全部剩余）。
+    pub fn rest_for_cut(&self, j: usize) -> Vec<JavaId> {
+        let mut all = Vec::new();
+        for lvl in self.rest_stack.iter().take(j + 1) {
+            all.extend_from_slice(lvl);
+        }
+        all
+    }
+    /// 根 cut 的索引。
+    pub fn root_cut_index(&self) -> usize {
+        self.cuts.len() - 1
+    }
+}
+
+/// 单个截断层。
+pub(crate) struct LevelCut {
+    /// splice 目标块（None = 根层占位，static_exec 回填根块 id）。
+    pub block_hint: Option<JavaId>,
+    /// 该层已完成的孩子数。
+    pub completed: usize,
+    /// 该层拥有的日志区间 [start, end)。
+    pub log_start: usize,
+    pub log_end: usize,
+    /// 该层进入时的 decl_order 长度（逃逸局部范围）。
+    pub decl_start: usize,
 }
 
 fn narrow(x: i32, w: u8) -> i32 {

@@ -5,11 +5,13 @@
 //! 引擎规则（布尔、自赋值、常量条件、局部传播……）定义在 cure-engine，
 //! 通过 `Lang` 抽象复用；本 crate 只放需要 Java 类型/负载信息的规则。
 
+mod jdk;
+pub use jdk::set_jdk_home;
 mod vexec;
 
 use cure_engine::kind::{BinOp, UnOp};
 use cure_engine::{Config, Edit, Effect, Lang, LitRef, NodeKind, Report, RewriteCtx, Rule};
-use cure_java_ast::{CompilationUnit, JavaAst, JavaId, JType, Lit, Member, NodeData, TypeDecl};
+use cure_java_ast::{CompilationUnit, JavaAst, JavaId, JType, Lit, Member, NoopCandidate, NodeData, TypeDecl};
 
 // ---------------------------------------------------------------------------
 // Java 特有规则
@@ -839,7 +841,8 @@ impl Rule<JavaAst> for StaticExec {
         &[NodeKind::Block]
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
-        // 仅根块：嵌套块的裸名存储无法区分外层局部与字段
+        // 仅根块：嵌套块的裸名存储无法区分外层局部与字段（下降遍历在
+        // vexec 内部自带作用域管理，规则侧只见根）
         if ctx.parent(id).is_some() {
             return None;
         }
@@ -851,154 +854,178 @@ impl Rule<JavaAst> for StaticExec {
         if stmts.len() < 3 {
             return None; // 少于 3 条语句的段无折叠价值
         }
-        // 逐条执行（前缀语义：abort 处截断）
+        // 前缀遍历（子块截断）：逐语句执行，失败语句若是 Block/Label/Try
+        // 则下降进孩子继续；语句级失败前深快照、失败后回滚——遍历后的
+        // 状态只含已完成语句的效应（「半途倾倒」污染从根上消除，
+        // r/a4/a5/a3 的 AIOOBE/final 双赋值即此污染）。Class.forName
+        //（JDK 类）假设成功，作为不透明副作用进 effect_log 重放。
         let mut ex = vexec::Exec::new(lang);
-        let mut prefix = 0usize;
-        let mut early_exit: Option<vexec::Flow> = None;
-        for (i, &st) in stmts.iter().enumerate() {
-            match ex.exec_stmt(st) {
-                Ok(vexec_flow) => {
-                    prefix = i + 1;
-                    match vexec_flow {
-                        vexec::Flow::Normal => {}
-                        other => {
-                            // Return/Break 逃逸到顶层：仅允许最后一条语句
-                            early_exit = Some(other);
-                            if i + 1 != stmts.len() {
-                                return None;
-                            }
-                            break;
-                        }
-                    }
-                }
-                Err(()) => break,
-            }
-        }
-        let rest = &stmts[prefix..];
-        // 截断时第一遍解释器含失败语句的**部分效应**（中途字段写已记账、
-        // 块作用域未弹出）——不构成任何已完成前缀的状态。重放干净前缀：
-        // 已全部 Ok 的语句重跑必然收敛到同一状态。r/a4/a5/a3「半途倾倒」
-        // （倾倒出的中途字段赋值与出口残留赋值构成 final 双重赋值；循环
-        // 状态来自不同字符串互不匹配 → AIOOBE）的根因即此污染。
-        let ex = if prefix < stmts.len() {
-            let mut fresh = vexec::Exec::new(lang);
-            for &st in &stmts[..prefix] {
-                if !matches!(fresh.exec_stmt(st), Ok(vexec::Flow::Normal)) {
-                    return None; // 重放防回归保险：前缀语句在首遍均为 Normal
-                }
-            }
-            fresh
-        } else {
-            ex
-        };
+        let run = ex.run_prefix(&stmts).ok()?;
         // 步数预算耗尽：中途状态非收敛值——整段放弃（不回写任何常量）
         if ex.budget_exhausted() {
             return None;
         }
-        // 截断守卫：前缀已写字段若在后半段被**再赋值** → 放弃整段（与
-        // 材料化写构成 final 双重赋值，不可编译）。仅被**读取** → 放行：
-        // 材料化写恰好为该读供值（bd.java：前缀写 a="SHA-512"，出口段
-        // MessageDigest.getInstance(a) 读它）。数组元素写（name[i]=v）
-        // 改内容不改绑定 → 不算再赋值。
-        if prefix < stmts.len() {
-            for (k, _) in ex.field_writes() {
-                if let Some(name) = lang.name_of_key(*k) {
-                    if rest_reassigns_field(lang, rest, &name) {
-                        return None;
+        let root_idx = run.root_cut_index();
+        // 总完成量门槛（根 + 嵌套层合计；嵌套截断单独也有价值）
+        let total_completed: usize = run.cuts.iter().map(|c| c.completed).sum();
+        if total_completed < 3 {
+            return None;
+        }
+        // ---- 截断守卫：前缀字段写（全日志）被**真实剩余**再赋值 → 放弃
+        // 整段（final 双重赋值不可编译）。仅读 → 放行（材料化写恰为读
+        // 供值）。真实剩余 = 各停止层剩余语句全集（含失败语句内部）。
+        let true_rest = run.true_rest();
+        if !true_rest.is_empty() {
+            for ev in ex.effect_log().iter() {
+                if let vexec::EffectEvent::FieldWrite(k) = ev {
+                    if let Some(name) = lang.name_of_key(*k) {
+                        if rest_reassigns_field(lang, &true_rest, &name) {
+                            return None;
+                        }
                     }
                 }
             }
         }
-        if prefix < 3 {
-            return None;
-        }
-        // ---- 逃逸分析：后半块句法引用的段内局部（含数组基）----
-        // 逃逸局部必须材料化（否则删除前缀会丢失其值/数组内容）
-        let mut escaping: Vec<u32> = Vec::new();
-        // 只考虑**存活**局部（前缀末仍在作用域）：循环体声明已随块弹出，
-        // 后半段对同名者的引用属于**它们自己的**声明（bd.java 的 var682
-        // 在 34 个段里同名复用——按 decl_order 全算会假逃逸出 Undef）
-        for &k in ex.decl_order() {
-            if ex.var_value(k).is_none() {
-                continue; // 已随作用域弹出的声明——非本段存活局部
-            }
-            let name = lang.name_of_key(k)?;
-            let referenced = rest.iter().any(|&st| {
-                cure_engine::analysis::subtree_contains(lang, st, |n| {
-                    lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name.as_str())
-                })
-            });
-            if referenced {
-                escaping.push(k);
-            }
-        }
-
-        // ---- 材料化输出（先提取数据再 drop 执行器，解除 &mut 借用）----
+        // ---- 提取数据（解除 &mut 借用）----
+        let log: Vec<vexec::EffectEvent> = ex.effect_log().to_vec();
+        let field_finals: Vec<(u32, vexec::VVal)> =
+            ex.field_writes().iter().map(|(k, v)| (*k, v.clone())).collect();
+        let decl_order: Vec<u32> = ex.decl_order().to_vec();
         // Return 载荷是段输出的一部分：`int m(){…;return x;}` 的 x 必须
         // 物化为 `return <常量>;`（CLI 测试抓获：方法体曾被吞成空体）
-        let ret_payload: Option<Option<vexec::VVal>> = match &early_exit {
+        let ret_payload: Option<Option<vexec::VVal>> = match &run.early_exit {
             Some(vexec::Flow::Return(v)) => Some(v.clone()),
             _ => None,
         };
-        let writes: Vec<(u32, vexec::VVal)> =
-            ex.field_writes().iter().map(|(k, v)| (*k, v.clone())).collect();
-        let escaped: Vec<(u32, vexec::VVal)> = escaping
-            .iter()
-            .map(|&k| (k, ex.var_value(k).cloned().unwrap_or(vexec::VVal::Undef)))
-            .collect();
-        drop(ex);
-        let mut new_stmts: Vec<JavaId> = Vec::new();
-        // 字段写（静态语境裸名赋值；按首次写顺序）
-        for (fk, v) in &writes {
-            // 参数守卫（方法根：字段名撞参数名 → 放弃）
-            let name = lang.name_of_key(*fk)?;
-            if lang.is_param_name(&name) {
-                return None;
+        // 每层逃逸局部：decl_order[decl_start .. 更深层 decl_start] 中
+        // 存活且名字被该层以下剩余引用者。值先取出。
+        let mut escaped_by_cut: Vec<Vec<(u32, vexec::VVal)>> = Vec::new();
+        for (j, cut) in run.cuts.iter().enumerate() {
+            let range_end = if j == 0 {
+                decl_order.len()
+            } else {
+                run.cuts[j - 1].decl_start
+            };
+            let rest_j = run.rest_for_cut(j);
+            let mut esc: Vec<(u32, vexec::VVal)> = Vec::new();
+            for &k in &decl_order[cut.decl_start.min(range_end)..range_end] {
+                if ex.var_value(k).is_none() {
+                    continue; // 已随作用域弹出——非存活局部
+                }
+                let name = lang.name_of_key(k)?;
+                let referenced = rest_j.iter().any(|&st| {
+                    cure_engine::analysis::subtree_contains(lang, st, |n| {
+                        lang.kind(n) == NodeKind::VarRef
+                            && lang.var_name(n) == Some(name.as_str())
+                    })
+                });
+                if referenced {
+                    esc.push((k, ex.var_value(k).cloned().unwrap_or(vexec::VVal::Undef)));
+                }
             }
-            let (val, mut extra) = materialize(lang, v)?;
-            let tgt = lang.var(&name);
-            new_stmts.push(lang.assign(tgt, val));
-            new_stmts.append(&mut extra);
+            escaped_by_cut.push(esc);
         }
-        // 逃逸局部（保持原声明序）：值不可材料化 → 放弃整段重写
-        for (k, v) in &escaped {
-            let name = lang.name_of_key(*k)?;
-            let (val, mut extra) = materialize(lang, v)?;
-            let stmt = lang.var_decl(&name, JType::Var, Some(val));
-            new_stmts.push(stmt);
-            new_stmts.append(&mut extra);
+        drop(ex);
+        // ---- 每层材料化（日志区间按执行序重放）----
+        let mut edits: Vec<Edit<JavaAst>> = Vec::new();
+        for (j, cut) in run.cuts.iter().enumerate() {
+            let block_id = if j == root_idx {
+                id
+            } else {
+                cut.block_hint?
+            };
+            let mut insert: Vec<JavaId> = Vec::new();
+            // 日志区间 [log_start, log_end)：
+            for pos in cut.log_start..cut.log_end {
+                match &log[pos] {
+                    vexec::EffectEvent::FieldWrite(k) => {
+                        // 仅该名字全日志最后一次写发语句（末值；中间写被杀）
+                        let is_last = !log[pos + 1..]
+                            .iter()
+                            .any(|ev| matches!(ev, vexec::EffectEvent::FieldWrite(k2) if k2 == k));
+                        if !is_last {
+                            continue;
+                        }
+                        let name = lang.name_of_key(*k)?;
+                        // 参数守卫（方法根：字段名撞参数名 → 放弃）
+                        if lang.is_param_name(&name) {
+                            return None;
+                        }
+                        let v = field_finals
+                            .iter()
+                            .find(|(fk, _)| fk == k)
+                            .map(|(_, v)| v.clone())?;
+                        let (val, mut extra) = materialize(lang, &v)?;
+                        let tgt = lang.var(&name);
+                        insert.push(lang.assign(tgt, val));
+                        insert.append(&mut extra);
+                    }
+                    vexec::EffectEvent::ClassLoad { stmt, call, name } => {
+                        // 重放为原语句 + 字面量实参（副作用 = 类初始化）
+                        let lit = lang.lit(Lit::Str(name.clone()));
+                        let callee = *lang.children(*call).first()?;
+                        let callee_copy = lang.copy_subtree(callee);
+                        let new_call = lang.clone_node(*call, vec![callee_copy, lit]);
+                        let new_stmt = if lang.kind(*stmt) == NodeKind::ExprStmt {
+                            lang.clone_node(*stmt, vec![new_call])
+                        } else {
+                            new_call
+                        };
+                        insert.push(new_stmt);
+                    }
+                }
+            }
+            // 逃逸局部（保持原声明序）：值不可材料化 → 放弃整段重写
+            for (k, v) in &escaped_by_cut[j] {
+                let name = lang.name_of_key(*k)?;
+                let (val, mut extra) = materialize(lang, v)?;
+                let stmt = lang.var_decl(&name, JType::Var, Some(val));
+                insert.push(stmt);
+                insert.append(&mut extra);
+            }
+            // 根层 return 载荷（void 裸 return 不发——trailing_return 清理）
+            if j == root_idx {
+                if let Some(v) = ret_payload.clone().flatten() {
+                    let (val, mut extra) = materialize(lang, &v)?;
+                    let stmt = lang.ret(Some(val));
+                    insert.push(stmt);
+                    insert.append(&mut extra);
+                }
+            }
+            // 无内容无删减的层跳过
+            if insert.is_empty() && cut.completed == 0 {
+                continue;
+            }
+            // 幂等守卫：该层产物与被删前缀逐位一致 → 跳过该层
+            //（ASTParserTokenManager 曾每轮 1 次零差编辑——振荡误报）
+            {
+                let removed = lang.children(block_id).to_vec();
+                if insert.len() == cut.completed
+                    && cut.completed <= removed.len()
+                    && insert
+                        .iter()
+                        .zip(removed[..cut.completed].iter())
+                        .all(|(&n, &o)| print_equiv(lang, n, o))
+                {
+                    continue;
+                }
+            }
+            edits.push(Edit::Splice {
+                node: block_id,
+                index: 0,
+                remove: cut.completed,
+                insert,
+            });
         }
-        // return 语句（载荷物化；void 裸 return 不发——方法体末尾可省，
-        // trailing_return 会清理）
-        if let Some(v) = &ret_payload.flatten() {
-            let (val, mut extra) = materialize(lang, v)?;
-            let stmt = lang.ret(Some(val));
-            new_stmts.push(stmt);
-            new_stmts.append(&mut extra);
-        }
-        if new_stmts.is_empty() && !escaped.is_empty() {
+        if edits.is_empty() {
             return None;
         }
-        if new_stmts.is_empty() && escaped.is_empty() && prefix == stmts.len() && early_exit.is_none() {
-            // 纯死段（无输出无逃逸）：整段删除
+        // 纯死段（无输出无逃逸整段删除）等历史形态由空 insert splice 承载
+        if edits.len() == 1 {
+            Some(edits.pop().unwrap())
+        } else {
+            Some(Edit::Multi(edits))
         }
-        // 幂等守卫：产物与输入完全一致（同数量同类型同字节）→ 跳过
-        //（ASTParserTokenManager 曾每轮 1 次零差编辑——振荡误报）
-        if new_stmts.len() == stmts[..prefix].len() {
-            let identical = new_stmts
-                .iter()
-                .zip(stmts[..prefix].iter())
-                .all(|(&n, &o)| print_equiv(lang, n, o));
-            if identical {
-                return None;
-            }
-        }
-        Some(Edit::Splice {
-            node: id,
-            index: 0,
-            remove: prefix,
-            insert: new_stmts,
-        })
     }
 }
 
@@ -3325,6 +3352,7 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
     ast.const_fields.clear();
     ast.const_scalars.clear();
     ast.inline_methods.clear();
+    ast.field_types.clear();
 
     // 第一遍（递归含嵌套类型——规则也处理嵌套类体内的 VarRef）：
     // 遮蔽集（局部/参数同名声明）+ 全单元名字写计数 + 字段声明名计数。
@@ -3336,6 +3364,10 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
     let mut bodies: Vec<JavaId> = Vec::new();
     for ty in &unit.types {
         collect_bodies_recursive(ty, &mut bodies, &mut shadowed, &mut field_decls);
+    }
+    // 字段类型表（调用点实参类型解析用；同名二见移除——保守）
+    for ty in &unit.types {
+        collect_field_types(ty, &mut ast.field_types);
     }
     // 写扫描：赋值目标子树全部名字（含数组元素写——改内容同样破坏
     // 常量性）、++/-- 目标、Member 目标的成员名（this.a=x / A.a=x——
@@ -3531,6 +3563,25 @@ fn collect_bodies_recursive(
     }
 }
 
+/// 递归收集字段声明类型（名字 → JType；同名二见移除）。
+fn collect_field_types(ty: &TypeDecl, out: &mut std::collections::HashMap<String, JType>) {
+    for m in &ty.members {
+        match m {
+            Member::Field { ty: fty, declarators, .. } => {
+                for d in declarators {
+                    if out.contains_key(&d.name) {
+                        out.remove(&d.name);
+                    } else {
+                        out.insert(d.name.clone(), fty.clone());
+                    }
+                }
+            }
+            Member::Type(t) => collect_field_types(t, out),
+            _ => {}
+        }
+    }
+}
+
 /// 本类型静态初始化块顶层 `name = <常量>` 赋值收集（static_exec 材料
 /// 化后的形态）。只看本类型自己的 clinit：嵌套类初始化块里的裸名赋值
 /// 指向嵌套自己的静态字段（或外层字段——由写计数+唯一性守卫兜底），
@@ -3713,43 +3764,18 @@ impl Rule<JavaAst> for StaticArrayIndexFold {
 // opt-in 生效：表由 simplify_unit 在 --dead-code 下填充。
 // ---------------------------------------------------------------------------
 
-pub struct NoopPrivateCall;
-
-impl Rule<JavaAst> for NoopPrivateCall {
-    fn name(&self) -> &'static str {
-        "noop_private_call"
-    }
-    fn kinds(&self) -> &'static [NodeKind] {
-        &[NodeKind::ExprStmt]
-    }
-    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
-        let lang = ctx.lang;
-        if lang.kind(id) != NodeKind::ExprStmt {
-            return None;
-        }
-        let ch = lang.children(id).to_vec();
-        if ch.len() != 1 || lang.kind(ch[0]) != NodeKind::Call {
-            return None;
-        }
-        let call = ch[0];
-        let cch = lang.children(call).to_vec();
-        if cch.is_empty() || lang.kind(cch[0]) != NodeKind::VarRef {
-            return None; // 限定名调用（A.m / this.m）是别的方法解析域
-        }
-        let name = lang.var_name(cch[0])?.to_string();
-        let arity = cch.len() - 1;
-        let eligible = lang.noop_private_methods.get(&name)?;
-        if !eligible.contains(&arity) {
-            return None;
-        }
-        for &arg in &cch[1..] {
-            if lang.effect(arg) > Effect::MayRead {
-                return None;
-            }
-        }
-        Some(Edit::Delete { node: id })
-    }
-}
+// ---------------------------------------------------------------------------
+// 常量字段标量传播：static final 字面量字段的 VarRef 读点 → 字面量。
+// 跨方法/跨语句常量传播（bd.java：a="SHA-512" → getInstance(a) 处内联）。
+// 守卫：
+//   - assign 目标（含复合/++/--）跳过：clinit 的原赋值 lhs 不能替换；
+//   - Call 的 callee 跳过：字段与方法是不同命名空间（bd.java 的字段 a
+//     与静态方法 a 共存，a(c, b) 是调用不是字段读）；
+//   - const_scalars 只收声明类型与字面量种类精确匹配的标量（收集期
+//     已守卫过载解析；数组常量只走下标折叠）。
+// 语义：intern() 常量（bd 的 a/j 即 new String(...).intern() 材料）
+// 与同类字面量共享常量池实例 → == 身份比较亦保持。
+// ---------------------------------------------------------------------------
 
 pub struct ConstFieldPropagate;
 
@@ -3795,6 +3821,117 @@ impl Rule<JavaAst> for ConstFieldPropagate {
         let init = *lang.const_fields.get(&name)?;
         let lit = lang.copy_subtree(init);
         Some(Edit::Replace { target: id, with: lit })
+    }
+}
+
+pub struct NoopPrivateCall;
+
+impl Rule<JavaAst> for NoopPrivateCall {
+    fn name(&self) -> &'static str {
+        "noop_private_call"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::ExprStmt]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::ExprStmt {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        if ch.len() != 1 || lang.kind(ch[0]) != NodeKind::Call {
+            return None;
+        }
+        let call = ch[0];
+        let cch = lang.children(call).to_vec();
+        if cch.is_empty() || lang.kind(cch[0]) != NodeKind::VarRef {
+            return None; // 限定名调用（A.m / this.m）是别的方法解析域
+        }
+        let name = lang.var_name(cch[0])?.to_string();
+        let arity = cch.len() - 1;
+        let cands = lang.noop_private_methods.get(&name)?.get(&arity)?;
+        if cands.is_empty() {
+            return None;
+        }
+        // 类型适用性消解：实参静态类型（局部 var_type / 字段 field_types /
+        // 字面量种类）对每个候选形参表判定；未知实参 → 该候选视为适用
+        //（不能证不适用——保守）。唯一适用者且 noop → 删除语句。
+        let arg_types: Vec<Option<JType>> =
+            cch[1..].iter().map(|&a| static_arg_type(lang, a)).collect();
+        let mut applicable_noop = false;
+        let mut applicable_count = 0usize;
+        for c in cands {
+            let ok = c
+                .params
+                .iter()
+                .zip(arg_types.iter())
+                .all(|(pt, at)| arg_applicable(at.as_ref(), pt));
+            if ok {
+                applicable_count += 1;
+                applicable_noop = c.noop;
+            }
+        }
+        if applicable_count != 1 || !applicable_noop {
+            return None;
+        }
+        // 实参效应 ≤ MayRead（VarRef/字面量/纯算术——字段读不抛不写）
+        for &arg in &cch[1..] {
+            if lang.effect(arg) > Effect::MayRead {
+                return None;
+            }
+        }
+        Some(Edit::Delete { node: id })
+    }
+}
+
+/// 实参静态类型（判定过载适用性用）：局部/参数走 var_type 解析，字段
+/// 走 field_types 表，字面量按种类。null → None（任何引用形参都可能——
+/// 全候选适用，保守）。其余表达式 → None。
+fn static_arg_type(lang: &JavaAst, arg: JavaId) -> Option<JType> {
+    match lang.kind(arg) {
+        NodeKind::Literal => match lang.literal(arg)? {
+            LitRef::Str(_) => Some(JType::Ref("String".to_string())),
+            LitRef::Char(_) => Some(JType::Char),
+            LitRef::Bool(_) => Some(JType::Bool),
+            LitRef::Int(_) => Some(JType::Int),
+            LitRef::Long(_) => Some(JType::Long),
+            LitRef::Float(_) => Some(JType::Float),
+            LitRef::Double(_) => Some(JType::Double),
+            LitRef::Null => None,
+        },
+        NodeKind::VarRef => {
+            let nm = lang.var_name(arg)?;
+            lang.var_type(arg)
+                .cloned()
+                .or_else(|| lang.field_types.get(nm).cloned())
+        }
+        _ => None,
+    }
+}
+
+/// 实参类型对形参的适用性（保守方向：不能证不适用 → true）。
+/// JLS 过载解析的保守近似：精确简单名匹配 + Object 通配；装箱/拓宽
+/// 判不适用（配合「唯一适用」判定仍安全：装箱场景要么 0 适用要么
+/// 精确者胜出）。
+fn arg_applicable(at: Option<&JType>, pt: &JType) -> bool {
+    let Some(a) = at else { return true };
+    match pt {
+        JType::Ref(p) => {
+            let pbase = p.split('<').next().unwrap_or(p).trim();
+            pbase == "Object"
+                || pbase == "java.lang.Object"
+                || match a {
+                    JType::Ref(arend) => {
+                        let abase = arend.split('<').next().unwrap_or(arend).trim();
+                        abase == pbase
+                    }
+                    _ => false,
+                }
+        }
+        JType::Array(_) => false, // 简单名/字面量实参不适用数组形参（null → None 已兜底）
+        prim => match a {
+            p2 => std::mem::discriminant(p2) == std::mem::discriminant(prim),
+        },
     }
 }
 
@@ -4885,6 +5022,7 @@ pub fn simplify_unit(ast: &mut JavaAst, unit: &mut CompilationUnit, cfg: &Config
         if cfg.remove_dead_methods {
             round.edits += remove_dead_private_fields(ast, unit);
             round.edits += remove_dead_private_methods(ast, unit);
+            round.edits += remove_unused_imports(ast, unit);
         }
         total.edits += round.edits;
         total.iterations += round.iterations;
@@ -5070,20 +5208,17 @@ fn collect_member_roots(ty: &TypeDecl, out: &mut Vec<JavaId>) {
 // 与 remove_dead_private_methods 同一风险域（反射无法静态排除）。
 // ---------------------------------------------------------------------------
 
-/// 收集空私有方法：名字 → 可判空元数集合。
-/// 资格（全单元递归，同名同元数全部满足才收录）：
-///   - private（外部不可调用、不可被子类覆盖）；
-///   - 空体（Block 零语句——执行即返回，无任何效果）；
-///   - 非 varargs，且同名任意方法（含非同元数）都非 varargs
-///    （varargs 可吸收任意元数的调用——名字级一票否决）；
-///   - 修饰符串含 @（注解框架入口）→ 名字整体放弃。
-/// bd.java：public b(String, Class, Class[]) 与 private b(Hashtable,
-/// MessageDigest) 同名共存——元数隔离让 2 参调用可安全判定。
+/// 收集同名同元数方法候选（名字 → 元数 → 候选表）。
+/// 资格（全单元递归）：
+///   - 修饰符串含 @（注解框架入口）→ 名字一票否决；
+///   - varargs（可吸收任意元数调用）→ 名字一票否决；
+///   - 候选按 (private && 空体) 标记 noop——调用点做类型适用性消解后
+///     唯一适用且 noop 才删（bd.java：public c(Class, String) 与
+///     private c(Hashtable, MessageDigest) 同元数，实参类型消解分离）。
 fn collect_noop_private_methods(ast: &mut JavaAst, unit: &CompilationUnit) {
     use std::collections::{HashMap, HashSet};
     ast.noop_private_methods.clear();
-    // 名字 → (元数 → 是否全部 private+空体) + varargs/注解一票否决
-    let mut by_name: HashMap<String, HashMap<usize, bool>> = HashMap::new();
+    let mut by_name: HashMap<String, HashMap<usize, Vec<NoopCandidate>>> = HashMap::new();
     let mut veto: HashSet<String> = HashSet::new();
     for_each_type(unit, &mut |ty: &TypeDecl| {
         for m in &ty.members {
@@ -5097,13 +5232,16 @@ fn collect_noop_private_methods(ast: &mut JavaAst, unit: &CompilationUnit) {
                     Some(b) => ast.kind(*b) == NodeKind::Block && ast.children(*b).is_empty(),
                     None => false,
                 };
-                let ok = is_private && empty;
-                let entry = by_name
+                let cand = NoopCandidate {
+                    params: params.iter().map(|p| p.ty.clone()).collect(),
+                    noop: is_private && empty,
+                };
+                by_name
                     .entry(name.clone())
                     .or_default()
                     .entry(params.len())
-                    .or_insert(true);
-                *entry = *entry && ok;
+                    .or_default()
+                    .push(cand);
             }
         }
     });
@@ -5128,13 +5266,167 @@ fn collect_noop_private_methods(ast: &mut JavaAst, unit: &CompilationUnit) {
         if veto.contains(&name) {
             continue;
         }
-        let eligible: HashSet<usize> = arities
-            .into_iter()
-            .filter(|&(_, ok)| ok)
-            .map(|(k, _)| k)
-            .collect();
-        if !eligible.is_empty() {
-            ast.noop_private_methods.insert(name, eligible);
+        ast.noop_private_methods.insert(name, arities);
+    }
+}
+
+/// 未用单类型 import 清理（--dead-code 收尾）：简单名在全单元标识符
+/// 集合（AST 名字/类型 + 结构字符串含泛型实参）中零出现 → 删。
+/// on-demand（.*）/ static import 保守保留；误删只会在标识符收集
+/// 漏形式时发生——方向上宁可多保留。
+fn remove_unused_imports(ast: &JavaAst, unit: &mut CompilationUnit) -> usize {
+    use std::collections::HashSet;
+    let mut idents: HashSet<String> = HashSet::new();
+    // 1) AST 载荷标识符（名字 + 类型 + Raw 原文）
+    let mut roots: Vec<JavaId> = Vec::new();
+    for_each_type(unit, &mut |ty| collect_member_roots(ty, &mut roots));
+    for root in roots {
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            match ast.data(n) {
+                NodeData::VarDecl { name, ty } => {
+                    idents.insert(name.clone());
+                    collect_ty_idents(ty, &mut idents);
+                }
+                NodeData::VarRef { name } => {
+                    idents.insert(ast.sn(*name).to_string());
+                }
+                NodeData::Member { name } => {
+                    idents.insert(ast.sn(*name).to_string());
+                }
+                NodeData::MethodRef { name } => {
+                    let n = ast.sn(*name);
+                    for id in n.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+                        if !id.is_empty() {
+                            idents.insert(id.to_string());
+                        }
+                    }
+                }
+                NodeData::Label { name } => {
+                    idents.insert(name.clone());
+                }
+                NodeData::New { ty, .. } | NodeData::Cast { ty } => {
+                    collect_ty_idents(ty, &mut idents);
+                }
+                NodeData::Raw { text } => {
+                    for id in text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+                        if !id.is_empty() {
+                            idents.insert(id.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for &c in ast.children(n) {
+                stack.push(c);
+            }
+        }
+    }
+    // 2) 结构字符串（mods/注解原文、泛型参数、extends/implements/throws、
+    //    方法/类型名——字段/参数/返回类型）
+    for_each_type(unit, &mut |ty| {
+        collect_mods_idents(&ty.mods, &mut idents);
+        idents.insert(ty.name.clone());
+        for id in ty.ty_params.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+            if !id.is_empty() {
+                idents.insert(id.to_string());
+            }
+        }
+        for e in ty.extends.iter().chain(ty.implements.iter()) {
+            for id in e.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+                if !id.is_empty() {
+                    idents.insert(id.to_string());
+                }
+            }
+        }
+        for m in &ty.members {
+            match m {
+                Member::Field { mods, ty, declarators } => {
+                    collect_mods_idents(mods, &mut idents);
+                    collect_ty_idents(ty, &mut idents);
+                    for d in declarators {
+                        idents.insert(d.name.clone());
+                    }
+                }
+                Member::Method { mods, ret, name, params, throws, .. } => {
+                    collect_mods_idents(mods, &mut idents);
+                    collect_ty_idents(ret, &mut idents);
+                    idents.insert(name.clone());
+                    for p in params {
+                        collect_mods_idents(&p.mods, &mut idents);
+                        collect_ty_idents(&p.ty, &mut idents);
+                        idents.insert(p.name.clone());
+                    }
+                    for t in throws {
+                        for id in t.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+                            if !id.is_empty() {
+                                idents.insert(id.to_string());
+                            }
+                        }
+                    }
+                }
+                Member::Constructor { mods, name, params, throws, .. } => {
+                    collect_mods_idents(mods, &mut idents);
+                    idents.insert(name.clone());
+                    for p in params {
+                        collect_mods_idents(&p.mods, &mut idents);
+                        collect_ty_idents(&p.ty, &mut idents);
+                        idents.insert(p.name.clone());
+                    }
+                    for t in throws {
+                        for id in t.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+                            if !id.is_empty() {
+                                idents.insert(id.to_string());
+                            }
+                        }
+                    }
+                }
+                Member::Type(t) => {
+                    // 嵌套类型递归（for_each_type 已递归——这里不重复）
+                    let _ = t;
+                }
+                _ => {}
+            }
+        }
+    });
+    // 3) 保留判定
+    let before = unit.imports.len();
+    unit.imports.retain(|imp| {
+        if imp.contains('*') {
+            return true; // on-demand 无法证明
+        }
+        // static import 的简单名可能是方法名（VarRef 收集覆盖），同规则处理
+        let path = imp.trim_start_matches("static ").trim();
+        let simple = path.rsplit('.').next().unwrap_or(path).trim();
+        if simple.is_empty() || !simple.chars().next().is_some_and(|c| c.is_uppercase()) {
+            return true; // 非类型形态（方法/常量 static import 简单名小写起）→ 保守保留
+        }
+        idents.contains(simple)
+    });
+    before - unit.imports.len()
+}
+
+fn collect_ty_idents(t: &JType, out: &mut std::collections::HashSet<String>) {
+    match t {
+        JType::Ref(r) => {
+            for id in r.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+                if !id.is_empty() {
+                    out.insert(id.to_string());
+                }
+            }
+        }
+        JType::Array(inner) => collect_ty_idents(inner, out),
+        _ => {}
+    }
+}
+
+fn collect_mods_idents(mods: &str, out: &mut std::collections::HashSet<String>) {
+    // 注解原文（@SuppressWarnings(...)）——含参数里的类名引用
+    if mods.contains('@') {
+        for id in mods.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+            if !id.is_empty() {
+                out.insert(id.to_string());
+            }
         }
     }
 }

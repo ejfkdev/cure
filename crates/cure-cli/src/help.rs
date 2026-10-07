@@ -65,6 +65,7 @@ fn print_help_en() {
     println!("      --report             per-file rewrite statistics on stderr");
     println!("      --disable <rule>     disable a rule (repeatable; `cure rules` lists all)");
     println!("      --dead-code          opt-in: drop dead private methods/fields and no-op calls");
+    println!("      --jdk-home <path>    verify Class.forName targets against that JDK (default: java.base whitelist)");
     println!("      --strict             exit 1 on any parse error (default: warn)");
     println!("  -h, --help               this help");
     println!("  -V, --version            version and repository");
@@ -133,6 +134,7 @@ fn print_help_zh() {
     println!("      --report             stderr 打印逐文件改写统计");
     println!("      --disable <规则名>   禁用指定规则（可多次；`cure rules` 列出全部）");
     println!("      --dead-code          选配：删除零引用 private 方法/字段与空方法 no-op 调用");
+    println!("      --jdk-home <路径>    用该 JDK 精确验证 Class.forName 目标类（默认 java.base 白名单）");
     println!("      --strict             有解析错误 → 退出码 1（默认仅 stderr 提示）");
     println!("  -h, --help               本帮助");
     println!("  -V, --version            版本与仓库地址");

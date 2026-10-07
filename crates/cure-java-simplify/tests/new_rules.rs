@@ -1366,3 +1366,97 @@ fn dead_code_default_off() {
     assert!(out.contains("b(1);"), "{out}");
     assert!(out.contains("void b("), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// 子块截断 + Class.forName 假设 + 过载类型消解 + 未用 import
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sub_block_truncation_folds_label_prefix() {
+    // label 块内前缀完成（字段写 + forName 假设成功）→ 材料化；println
+    // 失败留在 rest；根层 x/y 死局部随根 splice 消失
+    let out = run_src(
+        "class A{static String f;static{int x=1;int y=2;lbl:{f=\"java.math.BigInteger\";Class.forName(f);System.out.println(f);}}static void m(){System.out.println(f);}}",
+    );
+    assert!(out.contains("f = \"java.math.BigInteger\";"), "{out}");
+    assert!(out.contains("Class.forName(\"java.math.BigInteger\");"), "{out}");
+    assert!(out.contains("System.out.println(f);"), "{out}");
+    assert!(!out.contains("int x = 1;"), "{out}");
+}
+
+#[test]
+fn class_forname_non_jdk_aborts() {
+    // 非 JDK 类名 → 不可假设 → forName 语句失败（保留原样）
+    let out = run_src(
+        "class A{static String f;static{int x=1;int y=2;lbl:{f=\"com.foo.Missing\";Class.forName(f);System.out.println(f);}}static void m(){System.out.println(f);}}",
+    );
+    assert!(out.contains("Class.forName(f);"), "{out}");
+    // 根前缀死局部仍被清除（x/y 与 rest 无关）
+    assert!(!out.contains("int x = 1;"), "{out}");
+}
+
+#[test]
+fn forname_unknown_class_name_aborts() {
+    // 非常量类名 → 不可判定 → 整段保守（含解密前的 f）
+    let out = run_src(
+        "class A{static String f;static{int x=1;int y=2;Class.forName(f);}}static void m(){System.out.println(f);}}",
+    );
+    assert!(out.contains("Class.forName(f);"), "{out}");
+}
+
+#[test]
+fn noop_call_type_resolves_overload() {
+    // bd.java 的 c 场景：private e(Hashtable) 空方法与 public e(String)
+    // 同元数；实参 h 静态类型 Hashtable → 唯一适用 private 空方法 → 删
+    let out = run_dead(
+        "class A{private static java.util.Hashtable h;static{h=new java.util.Hashtable();int x=1;int y=2;e(h);}private static void e(java.util.Hashtable q){}public static void e(String q){System.out.println(q);}}",
+    );
+    assert!(!out.contains("e(h);"), "{out}");
+    assert!(!out.contains("void e(java.util.Hashtable"), "{out}");
+    assert!(out.contains("void e(String"), "{out}");
+}
+
+#[test]
+fn noop_call_type_mismatch_kept() {
+    // 实参 String → 唯一适用的是 public 非空方法 → 调用保留
+    let out = run_dead(
+        "class A{static{int x=1;int y=2;e(\"s\");}private static void e(java.util.Hashtable q){}public static void e(String q){System.out.println(q);}}",
+    );
+    assert!(out.contains("e(\"s\");"), "{out}");
+}
+
+#[test]
+fn noop_call_null_arg_ambiguous_kept() {
+    // null 实参：两个引用形参候选都适用 → 歧义 → 保留
+    let out = run_dead(
+        "class A{static{int x=1;int y=2;e(null);}private static void e(java.util.Hashtable q){}public static void e(String q){System.out.println(q);}}",
+    );
+    assert!(out.contains("e(null);"), "{out}");
+}
+
+#[test]
+fn unused_import_removed_with_dead_field() {
+    // 死字段删除后其类型 import 不再被引用 → 删
+    let out = run_dead(
+        "import java.io.PrintWriter;class A{private PrintWriter w;int m(){return 1;}}",
+    );
+    assert!(!out.contains("PrintWriter"), "{out}");
+}
+
+#[test]
+fn used_import_kept() {
+    // 存活字段的类型 import 保留
+    let out = run_dead(
+        "import java.io.PrintWriter;class A{PrintWriter w;int m(){return 1;}}",
+    );
+    assert!(out.contains("import java.io.PrintWriter;"), "{out}");
+}
+
+#[test]
+fn generic_type_usage_keeps_import() {
+    // 泛型实参里的类型名（Ref 字符串内层）也算使用
+    let out = run_dead(
+        "import java.util.List;class A{java.util.Map<String, List> f;int m(){return 1;}}",
+    );
+    assert!(out.contains("import java.util.List;"), "{out}");
+}

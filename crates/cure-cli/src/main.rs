@@ -155,6 +155,8 @@ struct Options {
     report: bool,
     disabled: Vec<String>,
     dead_code: bool,
+    /// JDK 路径（Class.forName 存在性精确验证；未指定走 java.base 白名单）
+    jdk_home: Option<String>,
     strict: bool,
     stdin: bool,
     /// 工作线程数（0/None = 自动；见 worker_threads()）
@@ -197,6 +199,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         report: false,
         disabled: Vec::new(),
         dead_code: false,
+        jdk_home: None,
         strict: false,
         stdin: false,
         threads: 0,
@@ -224,6 +227,11 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--report" => opts.report = true,
             "--strict" => opts.strict = true,
             "--dead-code" => opts.dead_code = true,
+            "--jdk-home" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for --jdk-home")?;
+                opts.jdk_home = Some(v.clone());
+            }
             "-o" | "--output" => {
                 i += 1;
                 let v = args.get(i).ok_or("missing value for --output")?;
@@ -843,6 +851,9 @@ fn process_source(
         ..Default::default()
     };
 
+    if let Some(home) = &opts.jdk_home {
+        cure_java_simplify::set_jdk_home(std::path::Path::new(home));
+    }
     if !opts.format_only {
         let mut cfg = Config::default();
         for r in &opts.disabled {
