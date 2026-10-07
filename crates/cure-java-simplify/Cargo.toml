@@ -4,6 +4,7 @@ description = "Java simplification rules and facade over cure-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
 keywords = ["java", "deobfuscation", "simplification"]

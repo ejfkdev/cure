@@ -4,6 +4,7 @@ description = "CLI for cure: fault-tolerant Java simplifier/formatter (source in
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
 keywords = ["java", "deobfuscation", "formatter", "cli"]

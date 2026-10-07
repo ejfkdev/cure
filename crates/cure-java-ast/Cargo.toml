@@ -4,6 +4,7 @@ description = "Java AST (arena + NodeId + builder) with cure Lang implementation
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
 keywords = ["java", "ast", "arena"]
