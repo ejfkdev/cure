@@ -1052,3 +1052,43 @@ fn multiline_package_with_comments() {
     let back = parse(&printed);
     assert!(back.errors.is_empty(), "{:?}", back.errors);
 }
+
+// ---- 字符串编码还原（URL 解码 / 字段 init 根折叠）----
+
+#[test]
+fn url_decode_fold_visible_only() {
+    // 可见字符 → 还原
+    let out = run_src(r#"class A{String m(){return java.net.URLDecoder.decode("%E4%BD%A0%E5%A5%BD%2C+world%21", "UTF-8");}}"#);
+    assert!(out.contains("你好, world!"), "{out}");
+    // '+' → 空格
+    let out = run_src(r#"class A{String m(){return java.net.URLDecoder.decode("a+b", "UTF-8");}}"#);
+    assert!(out.contains("a b"), "{out}");
+    // 字段 init（根折叠路径）
+    let out = run_src(r#"class A{static String s = java.net.URLDecoder.decode("%41%42", "UTF-8");}"#);
+    assert!(out.contains("s = \"AB\""), "{out}");
+}
+
+#[test]
+fn url_decode_guards() {
+    // 控制字符 → 不转
+    let out = run_src(r#"class A{String m(){return java.net.URLDecoder.decode("%01%02", "UTF-8");}}"#);
+    assert!(out.contains("decode("), "{out}");
+    // 非法 % 序列 → 不转
+    let out = run_src(r#"class A{String m(){return java.net.URLDecoder.decode("%zz", "UTF-8");}}"#);
+    assert!(out.contains("decode("), "{out}");
+    // 非 UTF-8 charset → 不转
+    let out = run_src(r#"class A{String m(){return java.net.URLDecoder.decode("%41", "GBK");}}"#);
+    assert!(out.contains("decode("), "{out}");
+    // 孤立 UTF-8 字节 → 不转
+    let out = run_src(r#"class A{String m(){return java.net.URLDecoder.decode("%E4%BD", "UTF-8");}}"#);
+    assert!(out.contains("decode("), "{out}");
+}
+
+#[test]
+fn field_init_root_folds() {
+    // 字段 init 根折叠（引擎根 Replace 边界修复的受益者）
+    let out = run_src("class A{static int x=1+2;static long y=2L*3;static boolean b=true&&false;}");
+    assert!(out.contains("x = 3;"), "{out}");
+    assert!(out.contains("y = 6L;"), "{out}");
+    assert!(out.contains("b = false;"), "{out}");
+}

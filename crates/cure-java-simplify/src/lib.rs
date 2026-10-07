@@ -2360,6 +2360,130 @@ fn lit_debug_str(l: &Lit) -> String {
 //   （URL 解码器同理；解码字节须为合法 UTF-8）
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// URL 解码还原（混淆器 URL 编码字符串的逆操作）：
+//   URLDecoder.decode("%E4%BD%A0", "UTF-8") → "你"
+// 守卫：
+//   - 两个参数全字面量；UTF-8/Locale.CHINA 等常规字符集名（无 charset
+//     的单参形态按 UTF-8——JLS 规定 URLDecoder 无 charset 重载不存在，
+//     单参是 6 字节 UTF-8 缺省过时形态，保守拒绝）
+//   - 解码产物必须**全部可见**（控制字符/代理位不转——用户规则：
+//     不可见字符不转换）
+//   - 编码串 ≤ 8KB（超长解码性能保护——用户规则：特别长的跳过）
+//   - 解码失败（非法 % 序列/未知 charset）→ 保持原样
+// ---------------------------------------------------------------------------
+
+
+/// Member 节点的成员名（Sym → str）。
+fn member_name(ast: &JavaAst, m: JavaId) -> Option<String> {
+    match ast.data(m) {
+        NodeData::Member { name } => Some(ast.sn(*name).to_string()),
+        _ => None,
+    }
+}
+
+pub struct UrlDecodeFold;
+
+impl Rule<JavaAst> for UrlDecodeFold {
+    fn name(&self) -> &'static str {
+        "url_decode_fold"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Call]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        // 形态：URLDecoder.decode(s, charset)——callee 是 Member{decode}，
+        // 接收者是 VarRef/Member 链（校验末端名字）
+        let ch = lang.children(id).to_vec();
+        if ch.len() != 3 {
+            return None; // 只处理双参形态
+        }
+        let callee = ch[0];
+        if lang.kind(callee) != NodeKind::Member {
+            return None;
+        }
+        if member_name(lang, callee).as_deref() != Some("decode") {
+            return None;
+        }
+        // 接收者链：URLDecoder（Member{URLDecoder} 或 Member{net.URLDecoder}）
+        let recv = *lang.children(callee).first()?;
+        let recv_name = match lang.kind(recv) {
+            NodeKind::Member => member_name(lang, recv)?,
+            NodeKind::VarRef => lang.var_name(recv)?.to_string(),
+            _ => return None,
+        };
+        if !recv_name.ends_with("URLDecoder") {
+            return None;
+        }
+        let s_lit = match lang.literal(ch[1])? {
+            LitRef::Str(s) => s.to_string(),
+            _ => return None,
+        };
+        // charset：仅接受 "UTF-8"（其余保守拒绝）
+        let cs = match lang.literal(ch[2])? {
+            LitRef::Str(s) => s.to_string(),
+            _ => return None,
+        };
+        if cs != "UTF-8" {
+            return None;
+        }
+        // 超长跳过
+        if s_lit.len() > 8192 {
+            return None;
+        }
+        let decoded = url_decode(&s_lit)?;
+        // 可见性：控制字符/代理位 → 不转换
+        if decoded.chars().any(|c| {
+            c.is_control() || (c as u32) >= 0xD800 && (c as u32) <= 0xDFFF
+        }) {
+            return None;
+        }
+        let lit = lang.lit(Lit::Str(decoded));
+        Some(Edit::Replace { target: id, with: lit })
+    }
+}
+
+/// 手写 URL 解码（%XX + '+' → 空格），UTF-8 字节重组。
+/// 非法序列（%后非 hex、孤立 UTF-8 字节）→ None。
+fn url_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                if i + 3 > b.len() {
+                    return None;
+                }
+                let hi = hex_val(b[i + 1])?;
+                let lo = hex_val(b[i + 2])?;
+                out.push(hi * 16 + lo);
+                i += 3;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub struct Base64NewStringFold;
 
 impl Rule<JavaAst> for Base64NewStringFold {
@@ -4404,6 +4528,7 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(StrLenFold));
     rules.push(Box::new(LiteralEval));
     rules.push(Box::new(Base64NewStringFold));
+    rules.push(Box::new(UrlDecodeFold));
     rules.push(Box::new(CffRecover));
     rules.push(Box::new(StaticArrayIndexFold));
     rules.push(Box::new(ConstMethodInline));
@@ -4648,6 +4773,25 @@ fn simplify_member(ast: &mut JavaAst, m: &mut Member, cfg: &Config, total: &mut 
                 if let Some(init) = d.init {
                     let r = simplify(ast, init, cfg);
                     merge_report(total, r);
+                    // 根折叠：字段 init 节点就是 walk 根——Replace 无父
+                    // 槽可写（引擎既有边界），由本侧拿到新根回写声明
+                    //（static int x=1+2 曾永不折——本轮修复）
+                    let rules = default_java_rules();
+                    let mut cur: JavaId = init;
+                    for _ in 0..8 {
+                        match cure_engine::fold_root(ast, cur, &rules, cfg) {
+                            Some((new_root, name)) => {
+                                d.init = Some(new_root);
+                                cur = new_root;
+                                *total.by_rule.entry(name).or_insert(0) += 1;
+                                total.edits += 1;
+                                // 新根内部可能再折
+                                let r = simplify(ast, new_root, cfg);
+                                merge_report(total, r);
+                            }
+                            None => break,
+                        }
+                    }
                 }
             }
         }

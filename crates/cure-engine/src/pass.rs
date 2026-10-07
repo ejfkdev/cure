@@ -80,6 +80,41 @@ fn legalize_stmt_fold<L: Lang>(
     Some(Edit::Delete { node: parent })
 }
 
+
+/// 对「根即 Replace 目标」的提案求值：返回 (新根, 规则名)。
+///
+/// 引擎 pass 对 walk **根**的 Replace 无法应用（无父槽可写——字段
+/// init 场景：`static int x = 1+2` 的 init 节点就是根，Replace
+/// 找不到 parent.set_child）。本函数让门面（拥有容器结构的一方，
+/// 如 CompilationUnit 的字段声明）拿到新根自行回写，并循环到不动点。
+///
+/// 只接受 target == root 的 Replace；成本门槛与 pass 相同（严格正）。
+pub fn fold_root<L: Lang>(
+    lang: &mut L,
+    root: L::Id,
+    rules: &[Box<dyn Rule<L>>],
+    cfg: &Config,
+) -> Option<(L::Id, &'static str)> {
+    for rule in rules {
+        if !cfg.enabled(rule.name()) {
+            continue;
+        }
+        let snap = walk(lang, root);
+        let ctx = RewriteCtx { lang: &mut *lang, walk: &snap };
+        if let Some(edit) = rule.check(ctx, root) {
+            if let Edit::Replace { target, with } = edit {
+                if target == root {
+                    let red = Edit::Replace { target, with }.cost_reduction(lang);
+                    if red > 0 {
+                        return Some((with, rule.name()));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 对 `root`（通常是方法体 Block）运行规则集直到 fixed point。
 ///
 /// 终止性：每条被应用的编辑都严格降低总成本（`Edit::cost_reduction` 校验），
