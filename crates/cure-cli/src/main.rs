@@ -637,7 +637,10 @@ fn process_source(
 ) -> Result<FileResult, String> {
     let mut outcome = parse(src);
     let had_errors = !outcome.errors.is_empty();
-    let lines_before = src.lines().count();
+    // 行数统计延迟到需要时（--stats/--report）——lines() 迭代在 37 万文件
+    // 批处理下纯浪费（采样 Lines::next ~2%）
+    let need_lines = opts.stats || opts.report;
+    let lines_before = if need_lines { src.lines().count() } else { 0 };
 
     let mut result = FileResult {
         errored: had_errors,
@@ -668,7 +671,9 @@ fn process_source(
         }
     }
     let printed = print_unit(&outcome.ast, &outcome.unit);
-    result.lines_after = printed.lines().count();
+    if need_lines {
+        result.lines_after = printed.lines().count();
+    }
 
     if had_errors {
         eprintln!(

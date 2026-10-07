@@ -26,6 +26,11 @@ pub use cure_engine::Effect;
 /// arena 句柄。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct JavaId(pub u32);
+impl Default for JavaId {
+    fn default() -> Self {
+        JavaId(u32::MAX)
+    }
+}
 
 /// Java 类型（第一阶段的最小集合；`Ref` 存类型名字符串，泛型参数并入字符串）。
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -160,7 +165,111 @@ pub enum NodeData {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Node {
     pub data: NodeData,
-    pub children: Vec<JavaId>,
+    pub children: ChildList,
+}
+
+/// 子节点容器（内联优化）：≤3 个孩子零堆分配（AST 绝大多数节点——
+/// Binary/Assign=2、Member/MethodRef=1、VarDecl≤1、Literal=0……
+/// 37 万文件语料 malloc 采样的剩余大头是每节点一次 Vec 堆分配）；
+/// ≥4 溢出到堆。Block/Call 大参数列表溢出属预期路径。
+#[derive(Clone, Debug)]
+pub struct ChildList {
+    inline_len: u8,
+    inline: [JavaId; 3],
+    heap: Vec<JavaId>,
+}
+
+impl Default for ChildList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for ChildList {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl ChildList {
+    pub fn new() -> Self {
+        Self { inline_len: 0, inline: [JavaId::default(); 3], heap: Vec::new() }
+    }
+    pub fn from_vec(v: Vec<JavaId>) -> Self {
+        let n = v.len();
+        if n <= 3 {
+            let mut cl = Self::new();
+            for (i, id) in v.into_iter().enumerate() {
+                cl.inline[i] = id;
+            }
+            cl.inline_len = n as u8;
+            cl
+        } else {
+            Self { inline_len: 0, inline: [JavaId(0); 3], heap: v }
+        }
+    }
+    pub fn as_slice(&self) -> &[JavaId] {
+        if self.heap.is_empty() {
+            &self.inline[..self.inline_len as usize]
+        } else {
+            &self.heap
+        }
+    }
+    pub fn len(&self) -> usize {
+        if self.heap.is_empty() {
+            self.inline_len as usize
+        } else {
+            self.heap.len()
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// 按索引替换（保持同一形态）。
+    pub fn set(&mut self, index: usize, new: JavaId) {
+        if self.heap.is_empty() {
+            self.inline[index] = new;
+        } else {
+            self.heap[index] = new;
+        }
+    }
+    /// 移除一个孩子（内联区左移；堆走 Vec::remove）。
+    pub fn remove(&mut self, index: usize) {
+        if self.heap.is_empty() {
+            for i in index..self.inline_len as usize - 1 {
+                self.inline[i] = self.inline[i + 1];
+            }
+            self.inline_len -= 1;
+        } else {
+            self.heap.remove(index);
+            // 缩回 ≤3：搬回内联
+            if self.heap.len() <= 3 {
+                let v = std::mem::take(&mut self.heap);
+                *self = Self::from_vec(v);
+            }
+        }
+    }
+    /// 区间替换（Splice 语义：删 [index, index+remove) 插 insert）。
+    pub fn splice(&mut self, index: usize, remove: usize, insert: Vec<JavaId>) {
+        let new_len = self.len() - remove + insert.len();
+        if new_len <= 3 && self.heap.is_empty() {
+            // 纯内联区间的手工搬移
+            let mut result: Vec<JavaId> = self.as_slice().to_vec();
+            let end = (index + remove).min(result.len());
+            result.splice(index..end, insert);
+            *self = Self::from_vec(result);
+        } else {
+            // 堆路径：先物化成 Vec，操作，再回填
+            let mut v = std::mem::take(&mut self.heap);
+            if v.is_empty() {
+                v = self.as_slice().to_vec();
+                self.inline_len = 0;
+            }
+            let end = (index + remove).min(v.len());
+            v.splice(index..end, insert);
+            *self = Self::from_vec(v);
+        }
+    }
 }
 
 /// Java AST arena。只追加不回收，[`JavaId`] 永不失效。
@@ -327,7 +436,7 @@ impl JavaAst {
 
     fn push(&mut self, data: NodeData, children: Vec<JavaId>) -> JavaId {
         let id = JavaId(self.nodes.len() as u32);
-        self.nodes.push(Node { data, children });
+        self.nodes.push(Node { data, children: ChildList::from_vec(children) });
         id
     }
 
@@ -389,7 +498,7 @@ impl JavaAst {
     }
 
     pub fn children(&self, id: JavaId) -> &[JavaId] {
-        &self.nodes[id.0 as usize].children
+        self.nodes[id.0 as usize].children.as_slice()
     }
 
     // ---- builder：语句 ----
@@ -772,15 +881,13 @@ impl Lang for JavaAst {
     }
 
     fn set_child(&mut self, parent: JavaId, index: usize, new: JavaId) {
-        self.nodes[parent.0 as usize].children[index] = new;
+        self.nodes[parent.0 as usize].children.set(index, new);
     }
     fn remove_child(&mut self, parent: JavaId, index: usize) {
         self.nodes[parent.0 as usize].children.remove(index);
     }
     fn splice(&mut self, node: JavaId, index: usize, remove: usize, insert: Vec<JavaId>) {
-        let ch = &mut self.nodes[node.0 as usize].children;
-        let end = (index + remove).min(ch.len());
-        ch.splice(index..end, insert);
+        self.nodes[node.0 as usize].children.splice(index, remove, insert);
     }
 
     fn build_return(&mut self, value: Option<JavaId>) -> JavaId {
@@ -814,7 +921,7 @@ impl Lang for JavaAst {
         self.assign(target, value)
     }
     fn copy_subtree(&mut self, id: JavaId) -> JavaId {
-        let old_children = self.nodes[id.0 as usize].children.clone();
+        let old_children: Vec<JavaId> = self.nodes[id.0 as usize].children.as_slice().to_vec();
         let mut children = Vec::with_capacity(old_children.len());
         for c in old_children {
             children.push(self.copy_subtree(c));
@@ -829,7 +936,7 @@ impl Lang for JavaAst {
         }
         // 缓存未命中（结构不变量被破坏时）退化为按需递归
         let mut e = self.own_effect(id);
-        for &c in &self.nodes[id.0 as usize].children {
+        for &c in self.nodes[id.0 as usize].children.as_slice() {
             e = e.worst(self.effect(c));
         }
         e
@@ -1117,7 +1224,7 @@ impl Lang for JavaAst {
             for i in 0..n {
                 let id = JavaId(i);
                 let mut e = self.own_effect(id);
-                for &c in &self.nodes[i as usize].children {
+                for &c in self.nodes[i as usize].children.as_slice() {
                     e = e.worst(
                         self.effect_cache
                             .get(c.0 as usize)
@@ -1189,7 +1296,7 @@ impl Lang for JavaAst {
                         scopes.push(HashMap::new());
                         stack.push(Frame::PopScope);
                     }
-                    for &c in node.children.iter().rev() {
+                    for &c in node.children.as_slice().iter().rev() {
                         stack.push(Frame::Enter(c));
                     }
                     if let Action::Bind(n, t) = action {
@@ -1334,11 +1441,11 @@ impl JavaAst {
         let mut stmt_roots: Vec<JavaId> = Vec::new();
         while let Some(n) = stack.pop() {
             if self.kind(n) == NodeKind::Block {
-                for &c in &self.nodes[n.0 as usize].children {
+                for &c in self.nodes[n.0 as usize].children.as_slice() {
                     stmt_roots.push(c);
                 }
             }
-            for &c in &self.nodes[n.0 as usize].children {
+            for &c in self.nodes[n.0 as usize].children.as_slice() {
                 stack.push(c);
             }
         }
