@@ -1,6 +1,9 @@
 //! # cure CLI
 //!
-//! `cure` —— 容错式代码简化 / 格式化命令行工具。
+//! `cure` —— 容错式代码简化 / 格式化命令行工具。CLI 与引擎均语言无关，
+//! **当前实现的语言后端：Java**——新语言在 [`LANG_BACKENDS`] 登记一条
+//! （后缀 + 管线函数）即获得目录遍历 / 并行 / `--check` / `--diff` /
+//! `--stats` / 跨平台批量 I/O 的全部基础设施。
 //!
 //! - 输入：源码文件、目录（递归）、stdin
 //! - 单文件默认输出 stdout；目录默认输出到同级 `<目录名>-cure-out/`
@@ -22,8 +25,49 @@ mod cli_lang;
 mod help;
 mod io_batch;
 
-/// 当前引擎实际支持的语言后缀（小写、无点）。
-const SUPPORTED_EXTS: &[&str] = &["java"];
+/// 语言后端：一条「源 → 简化后源」的完整管线。
+struct LangBackend {
+    /// 语言名（诊断 / 帮助文本用）。
+    name: &'static str,
+    /// 源文件后缀（小写、无点）。目录遍历按它分类收集。
+    exts: &'static [&'static str],
+    /// 管线：parse → simplify → print（含容错语义与三检）。
+    process: fn(&str, &Options, Option<PathBuf>, &str) -> Result<FileResult, String>,
+}
+
+/// 已实现的语言后端注册表。新语言 = 追加一条登记（CLI/引擎本身语言无关）。
+const LANG_BACKENDS: &[LangBackend] = &[LangBackend {
+    name: "java",
+    exts: &["java"],
+    process: process_source,
+}];
+
+/// 后缀 → 后端（O(后端数)，无哈希）。
+fn backend_for_ext(ext: &str) -> Option<&'static LangBackend> {
+    LANG_BACKENDS.iter().find(|b| b.exts.contains(&ext))
+}
+
+/// 全部已实现后端的后缀并集（目录遍历的默认收集集）。
+fn supported_exts() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for b in LANG_BACKENDS {
+        for e in b.exts {
+            if !out.contains(e) {
+                out.push(e);
+            }
+        }
+    }
+    out
+}
+
+/// 当前已实现语言的清单描述（--ext 提示 / 帮助文本用）。
+fn lang_list() -> String {
+    LANG_BACKENDS
+        .iter()
+        .map(|b| format!("{}（.{}）", b.name, b.exts.join(", .")))
+        .collect::<Vec<_>>()
+        .join("、")
+}
 
 
 /// `cure ... | head` 之类：读者退出关闭管道时 std 的 println! 会以
@@ -214,24 +258,25 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     if opts.stdin && opts.output.is_none() && opts.in_place {
         return Err("stdin 模式不能与 -w 组合".into());
     }
-    // --ext 与受支持后缀求交集，提示不受支持的项
+    // --ext 与已实现语言的后缀求交集，提示不受支持的项
     if !opts.exts.is_empty() {
+        let supported = supported_exts();
         let unsupported: Vec<String> = opts
             .exts
             .iter()
-            .filter(|e| !SUPPORTED_EXTS.contains(&e.as_str()))
+            .filter(|e| !supported.contains(&e.as_str()))
             .cloned()
             .collect();
         if !unsupported.is_empty() {
             eprintln!(
-                "cure: 提示：后缀 {} 暂不受支持（当前支持：{}），已忽略",
+                "cure: 提示：后缀 {} 暂无已实现的语言后端（当前已实现：{}），已忽略",
                 unsupported.join(", "),
-                SUPPORTED_EXTS.join(", ")
+                lang_list()
             );
         }
-        opts.exts.retain(|e| SUPPORTED_EXTS.contains(&e.as_str()));
+        opts.exts.retain(|e| supported.contains(&e.as_str()));
         if opts.exts.is_empty() {
-            return Err("--ext 指定的后缀均不受支持".into());
+            return Err("--ext 指定的后缀均无已实现的语言后端".into());
         }
     }
     Ok(opts)
@@ -352,7 +397,7 @@ fn classify_file(p: &Path, exts: &[String], sources: &mut Vec<PathBuf>, others: 
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
     let wanted = exts.is_empty() || exts.contains(&ext);
-    if wanted && SUPPORTED_EXTS.contains(&ext.as_str()) {
+    if wanted && backend_for_ext(&ext).is_some() {
         sources.push(p.to_path_buf());
     } else {
         others.push(p.to_path_buf());
@@ -389,7 +434,7 @@ fn walk_files(
                 .map(|e| e.to_ascii_lowercase())
                 .unwrap_or_default();
             let wanted = exts.is_empty() || exts.contains(&ext);
-            if wanted && SUPPORTED_EXTS.contains(&ext.as_str()) {
+            if wanted && backend_for_ext(&ext).is_some() {
                 sources.push(p);
             } else {
                 others.push(p);
@@ -406,7 +451,9 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         std::io::stdin()
             .read_to_string(&mut src)
             .map_err(|e| format!("读取 stdin 失败: {e}"))?;
-        let r = process_source(&src, &opts, None, "<stdin>")?;
+        // stdin 无文件名/后缀：按注册表首个后端处理（多语言后可加 --lang 选择）
+        let backend = &LANG_BACKENDS[0];
+        let r = (backend.process)(&src, &opts, None, "<stdin>")?;
         return Ok(final_code_opts(r.changed, r.errored, &opts));
     }
 
@@ -447,7 +494,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             Some(default_out_root(dir)?)
         };
         let effective_exts: Vec<String> = if opts.exts.is_empty() {
-            SUPPORTED_EXTS.iter().map(|s| s.to_string()).collect()
+            supported_exts().into_iter().map(|s| s.to_string()).collect()
         } else {
             opts.exts.clone()
         };
@@ -545,7 +592,31 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         };
         let src = fs::read_to_string(&path)
             .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
-        let r = process_source(&src, &opts, None, &display)?;
+        // 按扩展名分派语言后端；无扩展名（管道临时文件等）回退首个
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let backend = if ext.is_empty() {
+            &LANG_BACKENDS[0]
+        } else if let Some(b) = backend_for_ext(&ext) {
+            b
+        } else {
+            return Err(match cli_lang::CliLang::detect() {
+                cli_lang::CliLang::Zh => format!(
+                    "{} 后缀 .{ext} 无已实现的语言后端（当前已实现：{}）",
+                    path.display(),
+                    lang_list()
+                ),
+                cli_lang::CliLang::En => format!(
+                    "{}: no language backend for .{ext} (implemented: {})",
+                    path.display(),
+                    lang_list()
+                ),
+            });
+        };
+        let r = (backend.process)(&src, &opts, None, &display)?;
         return Ok(final_code_opts(r.changed, r.errored, &opts));
     }
 
@@ -606,7 +677,14 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                                     continue;
                                 }
                             };
-                            let r = process_source(&src, &opts, out_path.clone(), &display)?;
+                            // 逐文件按后缀分派（多语言目录树混放时各自走各自管线）
+                            let ext = path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .map(|e| e.to_ascii_lowercase())
+                                .unwrap_or_default();
+                            let backend = backend_for_ext(&ext).unwrap_or(&LANG_BACKENDS[0]);
+                            let r = (backend.process)(&src, &opts, out_path.clone(), &display)?;
                             my.push((i, r));
                         }
                     }

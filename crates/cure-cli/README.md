@@ -6,8 +6,12 @@
 
 `cure` — the command-line front end of the
 [cure](https://github.com/ejfkdev/cure) simplification engine: a
-fault-tolerant, semantic-preserving Java simplifier/formatter that turns
-decompiled code back into something a human would have written.
+fault-tolerant, semantic-preserving code simplifier/formatter that turns
+decompiled code back into something a human would have written. The CLI is
+language-agnostic (**Java is the backend implemented today**) — a new
+language registers in `LANG_BACKENDS` (extensions + pipeline function) and
+inherits traversal, parallelism, `--check`/`--diff`/`--stats`, and the
+cross-platform batched I/O for free.
 
 ```bash
 cargo install cure-cli

@@ -7,8 +7,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Rust MSRV](https://img.shields.io/badge/rust-1.74%2B-orange)
 
-**cure** is a fault-tolerant, semantic-preserving code simplifier and formatter
-that turns decompiled Java back into something a human would have written.
+**cure** is a fault-tolerant, semantic-preserving code simplifier and
+formatter that turns decompiled code back into something a human would have
+written. The engine and CLI are language-agnostic — **Java is the backend
+implemented today**; the pipeline below shows the Java experience.
 
 ```java
 // decompiled input                          // after cure

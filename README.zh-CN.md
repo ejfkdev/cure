@@ -7,8 +7,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Rust MSRV](https://img.shields.io/badge/rust-1.74%2B-orange)
 
-**cure** 是容错式、语义保持的代码简化 / 格式化引擎，把反编译出来的 Java
-还原成「像人手写的」样子。
+**cure** 是容错式、语义保持的代码简化 / 格式化引擎，把反编译出来的代码
+还原成「像人手写的」样子。引擎与 CLI 均语言无关——**当前实现的语言
+后端：Java**；下文示例即 Java 后端的实际体验。
 
 ```java
 // 反编译输入                                 // cure 处理后

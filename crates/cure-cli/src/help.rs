@@ -15,11 +15,11 @@ pub(crate) fn print_help() {
 pub(crate) fn print_version() {
     match CliLang::detect() {
         CliLang::Zh => println!(
-            "cure {}（容错式 Java 简化/格式化器）\n{REPO_URL}",
+            "cure {}（容错式代码简化/格式化器；当前后端：java）\n{REPO_URL}",
             env!("CARGO_PKG_VERSION")
         ),
         CliLang::En => println!(
-            "cure {} — fault-tolerant Java simplifier/formatter\n{REPO_URL}",
+            "cure {} — fault-tolerant code simplifier/formatter (backend: java)\n{REPO_URL}",
             env!("CARGO_PKG_VERSION")
         ),
     }
@@ -27,8 +27,9 @@ pub(crate) fn print_version() {
 
 fn print_help_en() {
     let v = env!("CARGO_PKG_VERSION");
-    println!("cure {v} — fault-tolerant Java simplifier/formatter");
-    println!("Decompiled Java in, human-written-looking Java out (semantic-preserving).");
+    println!("cure {v} — fault-tolerant code simplifier/formatter");
+    println!("Language-agnostic engine; backend implemented today: Java —");
+    println!("decompiled Java in, human-written-looking Java out (semantic-preserving).");
     println!("{REPO_URL}  (MIT license)");
     println!();
     println!("Usage:");
@@ -38,6 +39,10 @@ fn print_help_en() {
     println!("  cure rules                         list all simplification rules");
     println!("  cure help [COMMAND]                this help, or one command's");
     println!("  cure version | -h | -V");
+    println!();
+    println!("Languages: java (this release). The CLI and engine are language-agnostic;");
+    println!("new backends register in LANG_BACKENDS and get the whole pipeline");
+    println!("(traversal, parallelism, --check/--diff/--stats, batched I/O).");
     println!();
     println!("Language: CURE_LANG=zh|en forces; otherwise auto-detected from the");
     println!("locale environment (on Windows: the system UI language).");
@@ -94,8 +99,9 @@ fn print_help_en() {
 
 fn print_help_zh() {
     let v = env!("CARGO_PKG_VERSION");
-    println!("cure {v} — 容错式 Java 简化/格式化器");
-    println!("反编译 Java 进，像人手写的 Java 出（语义保持）。");
+    println!("cure {v} — 容错式代码简化/格式化器");
+    println!("引擎语言无关；当前实现的后端：Java——反编译 Java 进，");
+    println!("像人手写的 Java 出（语义保持）。");
     println!("{REPO_URL}  (MIT 许可证)");
     println!();
     println!("用法:");
@@ -105,6 +111,10 @@ fn print_help_zh() {
     println!("  cure rules                        列出全部简化规则");
     println!("  cure help [子命令]                本帮助，或某子命令的帮助");
     println!("  cure version | -h | -V");
+    println!();
+    println!("语言后端: java（本版）。CLI 与引擎均语言无关——新语言在");
+    println!("LANG_BACKENDS 登记一条即获得全部基础设施（目录遍历/并行/");
+    println!("--check/--diff/--stats/批量 I/O）。");
     println!();
     println!("语言: CURE_LANG=zh|en 强制指定；否则按 locale 环境自动检测");
     println!("（Windows：系统 UI 语言）。");

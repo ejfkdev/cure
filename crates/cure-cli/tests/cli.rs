@@ -235,7 +235,7 @@ fn help_zh_follows_cure_lang() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("容错式 Java 简化/格式化器"))
+        .stdout(predicate::str::contains("容错式代码简化/格式化器"))
         .stdout(predicate::str::contains("示例:"));
 }
 
@@ -315,4 +315,27 @@ fn broken_pipe_exits_quietly() {
         .unwrap();
     assert!(out.status.success(), "pipe exit: {}", out.status);
     assert!(!String::from_utf8_lossy(&out.stderr).contains("failed printing"));
+}
+
+#[test]
+fn single_file_with_unimplemented_ext_is_clear_error() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path().join("foo.rs");
+    std::fs::write(&p, "fn main() {}").unwrap();
+    cure()
+        .env("CURE_LANG", "en")
+        .arg(&p)
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("no language backend"))
+        .stderr(predicate::str::contains("java"));
+    // 无扩展名的单文件：回退首个后端（Java 管线），不报错
+    let p2 = dir.path().join("noext");
+    std::fs::write(&p2, "class A{int m(){return 1;}}").unwrap();
+    cure()
+        .arg(&p2)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("return 1;"));
 }
