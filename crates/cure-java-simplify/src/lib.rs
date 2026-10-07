@@ -8,7 +8,7 @@
 mod vexec;
 
 use cure_engine::kind::{BinOp, UnOp};
-use cure_engine::{Config, Edit, Lang, LitRef, NodeKind, Report, RewriteCtx, Rule};
+use cure_engine::{Config, Edit, Effect, Lang, LitRef, NodeKind, Report, RewriteCtx, Rule};
 use cure_java_ast::{CompilationUnit, JavaAst, JavaId, JType, Lit, Member, NodeData, TypeDecl};
 
 // ---------------------------------------------------------------------------
@@ -3705,6 +3705,52 @@ impl Rule<JavaAst> for StaticArrayIndexFold {
 // 与同类字面量共享常量池实例 → == 身份比较亦保持。
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 空私有方法 no-op 调用删除：`e(c, b);` —— e 是空体 private 方法（收集
+// 期元数隔离已守卫过载与 varargs）→ 调用唯一可观察效果是实参求值。
+/// 实参效应 ≤ MayRead（VarRef/字面量/纯算术——字段读不抛不写；数组读
+// （MayThrow）/调用（Unknown）/赋值（MayWrite）一律保留）。
+// opt-in 生效：表由 simplify_unit 在 --dead-code 下填充。
+// ---------------------------------------------------------------------------
+
+pub struct NoopPrivateCall;
+
+impl Rule<JavaAst> for NoopPrivateCall {
+    fn name(&self) -> &'static str {
+        "noop_private_call"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::ExprStmt]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::ExprStmt {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        if ch.len() != 1 || lang.kind(ch[0]) != NodeKind::Call {
+            return None;
+        }
+        let call = ch[0];
+        let cch = lang.children(call).to_vec();
+        if cch.is_empty() || lang.kind(cch[0]) != NodeKind::VarRef {
+            return None; // 限定名调用（A.m / this.m）是别的方法解析域
+        }
+        let name = lang.var_name(cch[0])?.to_string();
+        let arity = cch.len() - 1;
+        let eligible = lang.noop_private_methods.get(&name)?;
+        if !eligible.contains(&arity) {
+            return None;
+        }
+        for &arg in &cch[1..] {
+            if lang.effect(arg) > Effect::MayRead {
+                return None;
+            }
+        }
+        Some(Edit::Delete { node: id })
+    }
+}
+
 pub struct ConstFieldPropagate;
 
 impl Rule<JavaAst> for ConstFieldPropagate {
@@ -4795,6 +4841,7 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(CffRecover));
     rules.push(Box::new(StaticArrayIndexFold));
     rules.push(Box::new(ConstFieldPropagate));
+    rules.push(Box::new(NoopPrivateCall));
     rules.push(Box::new(ConstMethodInline));
     rules.push(Box::new(TwrRecover));
     rules.push(Box::new(StringSwitchRecover));
@@ -4825,10 +4872,18 @@ pub fn simplify_unit(ast: &mut JavaAst, unit: &mut CompilationUnit, cfg: &Config
     for _cycle in 0..6 {
         let mut round = Report::default();
         collect_unit_consts(ast, unit);
+        // no-op 调用清理表（--dead-code 门控）：off 时清空——规则查询
+        // 空表自然不触发
+        if cfg.remove_dead_methods {
+            collect_noop_private_methods(ast, unit);
+        } else {
+            ast.noop_private_methods.clear();
+        }
         for ty in &mut unit.types {
             simplify_type(ast, ty, cfg, &mut round);
         }
         if cfg.remove_dead_methods {
+            round.edits += remove_dead_private_fields(ast, unit);
             round.edits += remove_dead_private_methods(ast, unit);
         }
         total.edits += round.edits;
@@ -4855,8 +4910,10 @@ pub fn simplify_unit(ast: &mut JavaAst, unit: &mut CompilationUnit, cfg: &Config
 //   - 仅 private（private 不可能被外部调用或被子类覆盖）；
 //   - 全单元零引用：Call 的 callee 名（Member 名/裸名）与 MethodRef 名，
 //     名字匹配不判签名——匹配只会导致"保留"，方向保守；
-//   - 名字与本单元其他声明（方法重载/字段）撞名 → 保留（混淆器单字母
-//     名高频撞名，保守不删）；
+//     （引用扫描是方法命名空间的完整覆盖：字段名与方法名解析域不相交
+//     （bd.java 字段 b 与方法 b 共存）；方法重载撞名但零调用 = 同名
+//     任何方法都未被调用，private 者可删——旧字段计数守卫曾误留
+//     bd 的 8 个空方法））；
 //   - 修饰符串含 @（注解方法，可能是框架入口）→ 保留；
 //   - 构造器不删（单例模式 private ctor 是活的）。
 // 反射调用无法静态排除 → opt-in 而非默认。
@@ -4864,47 +4921,45 @@ pub fn simplify_unit(ast: &mut JavaAst, unit: &mut CompilationUnit, cfg: &Config
 // ---------------------------------------------------------------------------
 
 fn remove_dead_private_methods(ast: &JavaAst, unit: &mut CompilationUnit) -> usize {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     let mut removed = 0usize;
     loop {
-        // 1) 全单元引用名（不可变借用阶段）
-        let mut referenced: HashSet<String> = HashSet::new();
+        // 1) 全单元引用（不可变借用阶段）：(名字, 实参个数) 精确到元数
+        //    （非 varargs 下元数=形参数是过载解析的硬约束——bd.java 的
+        //    public b(String)/b(String,Class,Class[]) 与 private 空
+        //    b(Hashtable,MessageDigest) 同名不同元数可分离）；
+        //    MethodRef（this::m）与同名 varargs 方法 → 元数不可判定，
+        //    名字整体否决。
+        let mut referenced: HashSet<(String, usize)> = HashSet::new();
+        let mut veto: HashSet<String> = HashSet::new();
         let mut roots: Vec<JavaId> = Vec::new();
         for_each_type(unit, &mut |ty| collect_member_roots(ty, &mut roots));
         for body in roots {
-            collect_call_names(ast, body, &mut referenced);
+            collect_call_arity_refs(ast, body, &mut referenced, &mut veto);
         }
-        // 2) 声明名字统计（重载/字段撞名判定）
-        let mut decl_counts: HashMap<String, usize> = HashMap::new();
         for_each_type(unit, &mut |ty| {
             for m in &ty.members {
-                match m {
-                    Member::Method { name, .. }
-                    | Member::Constructor { name, .. } => {
-                        *decl_counts.entry(name.clone()).or_insert(0) += 1;
+                if let Member::Method { name, params, .. } = m {
+                    if params.iter().any(|p| p.varargs) {
+                        veto.insert(name.clone());
                     }
-                    Member::Field { declarators, .. } => {
-                        for d in declarators {
-                            *decl_counts.entry(d.name.clone()).or_insert(0) += 1;
-                        }
-                    }
-                    _ => {}
                 }
             }
         });
-        // 3) 删除（可变借用阶段）
+        // 2) 删除（可变借用阶段）
         let mut changed = false;
         for_each_type_mut(unit, &mut |ty: &mut TypeDecl| {
             let before = ty.members.len();
             ty.members.retain(|m| {
-                if let Member::Method { mods, name, .. } = m {
+                if let Member::Method { mods, name, params, .. } = m {
                     let is_private = mods.split_whitespace().any(|w| w == "private");
                     let annotated = mods.contains('@');
                     let keep = !is_private
                         || annotated
-                        || referenced.contains(name)
-                        // 撞名（同名重载/字段）：名字引用无法区分指向 → 保留
-                        || decl_counts.get(name).copied().unwrap_or(0) > 1;
+                        // 自身 varargs：元数匹配不可靠 → 保留
+                        || params.iter().any(|p| p.varargs)
+                        || veto.contains(name)
+                        || referenced.contains(&(name.clone(), params.len()));
                     keep
                 } else {
                     true
@@ -4917,6 +4972,43 @@ fn remove_dead_private_methods(ast: &JavaAst, unit: &mut CompilationUnit) -> usi
         });
         if !changed {
             return removed;
+        }
+    }
+}
+
+/// (名字, 实参元数) 引用 + MethodRef/未知元数名字否决。
+fn collect_call_arity_refs(
+    ast: &JavaAst,
+    root: JavaId,
+    out: &mut std::collections::HashSet<(String, usize)>,
+    veto: &mut std::collections::HashSet<String>,
+) {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        match ast.data(id) {
+            NodeData::Call => {
+                let ch = ast.children(id).to_vec();
+                if let Some(&callee) = ch.first() {
+                    let name = match ast.data(callee) {
+                        NodeData::Member { name } | NodeData::VarRef { name } => {
+                            ast.sn(*name).to_string()
+                        }
+                        _ => String::new(),
+                    };
+                    if !name.is_empty() {
+                        out.insert((name, ch.len() - 1));
+                    }
+                }
+            }
+            NodeData::MethodRef { name } => {
+                if let Some(short) = ast.sn(*name).rsplit("::").next() {
+                    veto.insert(short.to_string());
+                }
+            }
+            _ => {}
+        }
+        for &c in ast.children(id) {
+            stack.push(c);
         }
     }
 }
@@ -4973,6 +5065,176 @@ fn collect_member_roots(ty: &TypeDecl, out: &mut Vec<JavaId>) {
 
 /// 子树内收集所有"被调用"的名字：Call 的 callee（Member 名 / 裸 VarRef 名）
 /// 与 MethodRef 名（`recv::name`）。名字匹配，不判签名。
+// ---------------------------------------------------------------------------
+// 空私有方法 no-op 调用清理 + 死私有字段删除（均 opt-in，--dead-code）
+// 与 remove_dead_private_methods 同一风险域（反射无法静态排除）。
+// ---------------------------------------------------------------------------
+
+/// 收集空私有方法：名字 → 可判空元数集合。
+/// 资格（全单元递归，同名同元数全部满足才收录）：
+///   - private（外部不可调用、不可被子类覆盖）；
+///   - 空体（Block 零语句——执行即返回，无任何效果）；
+///   - 非 varargs，且同名任意方法（含非同元数）都非 varargs
+///    （varargs 可吸收任意元数的调用——名字级一票否决）；
+///   - 修饰符串含 @（注解框架入口）→ 名字整体放弃。
+/// bd.java：public b(String, Class, Class[]) 与 private b(Hashtable,
+/// MessageDigest) 同名共存——元数隔离让 2 参调用可安全判定。
+fn collect_noop_private_methods(ast: &mut JavaAst, unit: &CompilationUnit) {
+    use std::collections::{HashMap, HashSet};
+    ast.noop_private_methods.clear();
+    // 名字 → (元数 → 是否全部 private+空体) + varargs/注解一票否决
+    let mut by_name: HashMap<String, HashMap<usize, bool>> = HashMap::new();
+    let mut veto: HashSet<String> = HashSet::new();
+    for_each_type(unit, &mut |ty: &TypeDecl| {
+        for m in &ty.members {
+            if let Member::Method { mods, name, params, body, .. } = m {
+                if mods.contains('@') || params.iter().any(|p| p.varargs) {
+                    veto.insert(name.clone());
+                    continue;
+                }
+                let is_private = mods.split_whitespace().any(|w| w == "private");
+                let empty = match body {
+                    Some(b) => ast.kind(*b) == NodeKind::Block && ast.children(*b).is_empty(),
+                    None => false,
+                };
+                let ok = is_private && empty;
+                let entry = by_name
+                    .entry(name.clone())
+                    .or_default()
+                    .entry(params.len())
+                    .or_insert(true);
+                *entry = *entry && ok;
+            }
+        }
+    });
+    // MethodRef（this::m / A::m）：绑定元数不可判定 → 名字否决
+    //（否则 no-op 调用删除先行，引用悬空）
+    let mut roots: Vec<JavaId> = Vec::new();
+    for_each_type(unit, &mut |ty| collect_member_roots(ty, &mut roots));
+    for root in roots {
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            if let NodeData::MethodRef { name } = ast.data(n) {
+                if let Some(short) = ast.sn(*name).rsplit("::").next() {
+                    veto.insert(short.to_string());
+                }
+            }
+            for &c in ast.children(n) {
+                stack.push(c);
+            }
+        }
+    }
+    for (name, arities) in by_name {
+        if veto.contains(&name) {
+            continue;
+        }
+        let eligible: HashSet<usize> = arities
+            .into_iter()
+            .filter(|&(_, ok)| ok)
+            .map(|(k, _)| k)
+            .collect();
+        if !eligible.is_empty() {
+            ast.noop_private_methods.insert(name, eligible);
+        }
+    }
+}
+
+/// 死私有字段删除：名字在全单元所有体内零值引用（VarRef 非 callee 位置
+/// + Member 名）→ 删声明符；字段的声明符 init 必须是字面量/字面量数组
+/// 或缺省（有副作用的 init 删不得——静态初始化顺序是可观察行为）。
+/// 命名空间隔离：Call 的 callee VarRef 是方法名不是字段名（bd.java 的
+/// 字段 e 与空方法 e 共存）；this.e / A.e 的成员名也计入引用。
+fn remove_dead_private_fields(ast: &JavaAst, unit: &mut CompilationUnit) -> usize {
+    use std::collections::HashSet;
+    let mut removed = 0usize;
+    // 1) 全单元字段名引用（值位置）
+    let mut referenced: HashSet<String> = HashSet::new();
+    let mut bodies: Vec<JavaId> = Vec::new();
+    for_each_type(unit, &mut |ty: &TypeDecl| {
+        for m in &ty.members {
+            match m {
+                Member::Method { body: Some(b), .. }
+                | Member::Constructor { body: Some(b), .. }
+                | Member::Initializer { body: b, .. } => bodies.push(*b),
+                Member::Field { declarators, .. } => {
+                    for d in declarators {
+                        if let Some(init) = d.init {
+                            bodies.push(init);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    for root in bodies {
+        // 栈携带 (节点, 是否为 Call 的 callee——方法命名空间，跳过)
+        let mut stack: Vec<(JavaId, bool)> = vec![(root, false)];
+        while let Some((n, is_callee)) = stack.pop() {
+            match ast.kind(n) {
+                NodeKind::VarRef if !is_callee => {
+                    if let Some(nm) = ast.var_name(n) {
+                        referenced.insert(nm.to_string());
+                    }
+                }
+                NodeKind::Member => {
+                    if let NodeData::Member { name: sym } = ast.data(n) {
+                        referenced.insert(ast.sn(*sym).to_string());
+                    }
+                }
+                _ => {}
+            }
+            if ast.kind(n) == NodeKind::Call {
+                let ch = ast.children(n).to_vec();
+                if let Some(&first) = ch.first() {
+                    stack.push((first, true));
+                }
+                for &c in &ch[1..] {
+                    stack.push((c, false));
+                }
+                continue;
+            }
+            for &c in ast.children(n) {
+                stack.push((c, false));
+            }
+        }
+    }
+    // 2) 删除（可变借用阶段；嵌套类型递归）：
+    //    先逐成员清理声明符（字面量 init 或无 init 且零引用），再删空成员
+    for_each_type_mut(unit, &mut |ty: &mut TypeDecl| {
+        for m in ty.members.iter_mut() {
+            if let Member::Field { mods, declarators, .. } = m {
+                let is_private = mods.split_whitespace().any(|w| w == "private");
+                let annotated = mods.contains('@');
+                if !is_private || annotated {
+                    continue;
+                }
+                let dead: Vec<bool> = declarators
+                    .iter()
+                    .map(|d| {
+                        let init_ok =
+                            d.init.map(|i| is_const_init(ast, i)).unwrap_or(true);
+                        init_ok && !referenced.contains(&d.name)
+                    })
+                    .collect();
+                let before = declarators.len();
+                let mut idx = 0usize;
+                declarators.retain(|_| {
+                    let keep = !dead[idx];
+                    idx += 1;
+                    keep
+                });
+                removed += before - declarators.len();
+            }
+        }
+        let before = ty.members.len();
+        ty.members
+            .retain(|m| !matches!(m, Member::Field { declarators, .. } if declarators.is_empty()));
+        removed += before - ty.members.len();
+    });
+    removed
+}
+
 fn collect_call_names(ast: &JavaAst, root: JavaId, out: &mut std::collections::HashSet<String>) {
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {

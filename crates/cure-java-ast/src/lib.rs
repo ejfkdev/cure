@@ -198,6 +198,11 @@ pub struct JavaAst {
     /// 与字面量种类精确匹配——过载解析/常量池身份不受影响）。
     /// 数组常量不进（只走下标折叠，整表引用不复制）。
     pub const_scalars: HashSet<String>,
+    /// 空私有方法（no-op 调用清理用）：名字 → 可判空的参数个数集合。
+    /// 同名同元数的所有方法（全单元递归）都必须 private + 空体 + 非
+    /// varargs；同名任意方法含 varargs → 该名整体放弃（调用可解析到它）。
+    /// 由 simplify_unit 填充（--dead-code 门控）。
+    pub noop_private_methods: HashMap<String, HashSet<usize>>,
     /// 可内联的单 return 方法：名字 → (参数名表, 返回表达式节点)。
     /// 由 simplify_unit 填充（解密 helper：d(0) → 方法体）。
     pub inline_methods: HashMap<String, (Vec<String>, JavaId)>,

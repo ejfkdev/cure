@@ -1234,3 +1234,135 @@ fn decl_init_final_propagates_and_array_index_folds() {
     );
     assert!(out.contains("println(\"tagq\");"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// --dead-code 扩展：死私有字段删除 + 空私有方法 no-op 调用清理
+// ---------------------------------------------------------------------------
+
+fn run_dead(src: &str) -> String {
+    let mut out = parse(src);
+    let cfg = Config { remove_dead_methods: true, ..Config::default() };
+    cure_java_simplify::simplify_unit(&mut out.ast, &mut out.unit, &cfg);
+    cure_java_print::print_unit(&out.ast, &out.unit)
+}
+
+#[test]
+fn dead_private_fields_removed() {
+    // e/x/writer：private + 零值引用 + 字面量/缺省 init → 删
+    let out = run_dead(
+        "class A{private static final boolean e=false;private static final String x=\"\";private static PrintWriter writer;private static int used=1;static void m(){System.out.println(used);}}",
+    );
+    assert!(!out.contains("boolean e"), "{out}");
+    assert!(!out.contains("String x"), "{out}");
+    assert!(!out.contains("PrintWriter writer"), "{out}");
+    assert!(out.contains("used"), "{out}");
+}
+
+#[test]
+fn referenced_field_kept_and_default_keeps_dead_fields() {
+    let src = "class A{private int dead=0;private int live=1;int m(){return live;}}";
+    let out = run_dead(src);
+    assert!(!out.contains("dead"), "{out}");
+    assert!(out.contains("live"), "{out}");
+    // 默认（无 --dead-code）：保守保留
+    let out2 = run_src(src);
+    assert!(out2.contains("dead"), "{out2}");
+}
+
+#[test]
+fn field_side_effectful_init_kept() {
+    // init 有副作用（调用）→ 静态初始化顺序可观察 → 保留
+    let out = run_dead(
+        "class A{private static Object o=System.getProperties();static void m(){}}",
+    );
+    assert!(out.contains("getProperties()"), "{out}");
+}
+
+#[test]
+fn field_method_name_collision_field_removed() {
+    // 字段 e 与方法 e 共存：callee VarRef 是方法命名空间 → 字段仍判死
+    let out = run_dead(
+        "class A{private static final boolean e=false;static void e(int q){}static void m(){e(1);}}",
+    );
+    assert!(!out.contains("boolean e"), "{out}");
+    assert!(out.contains("e(1);"), "{out}");
+}
+
+#[test]
+fn this_member_ref_keeps_field() {
+    // this.e 成员名引用 → 字段非死
+    let out = run_dead(
+        "class A{private static int e=0;int m(){return this.e;}}",
+    );
+    assert!(out.contains("e"), "{out}");
+}
+
+#[test]
+fn noop_private_calls_removed() {
+    // bd 模式：clinit 里对空私有方法的调用（实参字段读）→ 删；被调方法
+    // 随零引用由 remove_dead_private_methods 删除；非空方法调用保留
+    let out = run_dead(
+        "class A{private static java.util.Hashtable c;static{c=new java.util.Hashtable();int x=1;int y=2;b(c);g(c);}private static void b(java.util.Hashtable q){}private static void g(java.util.Hashtable q){System.out.println(q);}}",
+    );
+    assert!(!out.contains("b(c);"), "{out}");
+    assert!(out.contains("g(c);"), "{out}");
+    assert!(!out.contains("void b("), "{out}");
+    assert!(out.contains("void g("), "{out}");
+}
+
+#[test]
+fn noop_call_impure_arg_kept() {
+    // 实参有副作用（调用/数组读）→ 语句保留
+    let out = run_dead(
+        "class A{static int[] arr=new int[]{1};private static void b(int q){}static{int x=1;int y=2;b(arr[0]);}}",
+    );
+    assert!(out.contains("b(arr[0]);"), "{out}");
+}
+
+#[test]
+fn noop_call_overload_same_arity_kept() {
+    // 同名同元数非私有方法共存 → 元数隔离失效 → 调用与方法都保留
+    let out = run_dead(
+        "class A{private static void b(Object q){}public static void b(String q){}static{int x=1;int y=2;b((Object)null);}}",
+    );
+    assert!(out.contains("b((Object) null);"), "{out}");
+    assert!(out.contains("void b("), "{out}");
+}
+
+#[test]
+fn noop_call_varargs_vetoed() {
+    // 同名 varargs 方法吸收任意元数 → 名字否决 → 不删
+    let out = run_dead(
+        "class A{private static void b(int q){}static void b(int... q){}static{int x=1;int y=2;b(1);}}",
+    );
+    assert!(out.contains("b(1);"), "{out}");
+}
+
+#[test]
+fn noop_call_methodref_vetoed() {
+    // this::b 引用（元数不可判定）→ 名字否决
+    let out = run_dead(
+        "class A{private static void b(int q){}interface I{void r(int v);}I f(){return A::b;}static{int x=1;int y=2;b(1);}}",
+    );
+    assert!(out.contains("b(1);"), "{out}");
+}
+
+#[test]
+fn dead_method_arity_separation() {
+    // 零调用区分元数：private 2 参空方法删，public 1 参同名保留
+    //（public b(String) 未被单元内调用也保留——外部 API）
+    let out = run_dead(
+        "class A{private static void b(Object p,Object q){}public static String b(String s){return s;}static void m(){System.out.println(\"k\");}}",
+    );
+    assert!(!out.contains("(Object p, Object q)"), "{out}");
+    assert!(out.contains("String b(String s)"), "{out}");
+}
+
+#[test]
+fn dead_code_default_off() {
+    // 默认配置：空方法/调用一律保留（反射风险域 opt-in）
+    let src = "class A{private static void b(int q){}static{int x=1;int y=2;b(1);}}";
+    let out = run_src(src);
+    assert!(out.contains("b(1);"), "{out}");
+    assert!(out.contains("void b("), "{out}");
+}

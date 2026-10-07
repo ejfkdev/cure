@@ -64,7 +64,7 @@ fn print_help_en() {
     println!("      --stats              summary statistics (files/lines/rules)");
     println!("      --report             per-file rewrite statistics on stderr");
     println!("      --disable <rule>     disable a rule (repeatable; `cure rules` lists all)");
-    println!("      --dead-code          opt-in: drop private methods referenced nowhere");
+    println!("      --dead-code          opt-in: drop dead private methods/fields and no-op calls");
     println!("      --strict             exit 1 on any parse error (default: warn)");
     println!("  -h, --help               this help");
     println!("  -V, --version            version and repository");
@@ -132,7 +132,7 @@ fn print_help_zh() {
     println!("      --stats              汇总统计（文件数/行数/逐规则）");
     println!("      --report             stderr 打印逐文件改写统计");
     println!("      --disable <规则名>   禁用指定规则（可多次；`cure rules` 列出全部）");
-    println!("      --dead-code          选配：删除全单元零引用的 private 方法");
+    println!("      --dead-code          选配：删除零引用 private 方法/字段与空方法 no-op 调用");
     println!("      --strict             有解析错误 → 退出码 1（默认仅 stderr 提示）");
     println!("  -h, --help               本帮助");
     println!("  -V, --version            版本与仓库地址");
