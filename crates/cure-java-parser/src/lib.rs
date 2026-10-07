@@ -3346,11 +3346,39 @@ fn unescape_java_str(s: &str) -> String {
             Some('b') => out.push('\u{8}'),
             Some('r') => out.push('\r'),
             Some('f') => out.push('\u{c}'),
-            Some('0') => out.push('\0'),
             Some('s') => out.push(' '),
             Some('"') => out.push('"'),
             Some('\'') => out.push('\''),
             Some('\\') => out.push('\\'),
+            // 八进制转义（JLS 3.10.6/3.10.7）：\0..\377。
+            // \1 之前落到 Some(other) 双字符臂（'\'+'1'）→
+            // unescape_java_char 取首字符 92——差分抓获：'\1' 值
+            // 1 被解码成反斜杠
+            Some(d @ ('0'..='3')) => {
+                let mut v = d.to_digit(8).unwrap();
+                for _ in 0..2 {
+                    match chars.clone().next() {
+                        Some(d2 @ ('0'..='7')) => {
+                            v = v * 8 + d2.to_digit(8).unwrap();
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                if let Some(c) = char::from_u32(v) {
+                    out.push(c);
+                }
+            }
+            Some(d @ ('4'..='7')) => {
+                let mut v = d.to_digit(8).unwrap();
+                if let Some(d2 @ ('0'..='7')) = chars.clone().next() {
+                    v = v * 8 + d2.to_digit(8).unwrap();
+                    chars.next();
+                }
+                if let Some(c) = char::from_u32(v) {
+                    out.push(c);
+                }
+            }
             Some('u') => {
                 let hex: String = chars.by_ref().take(4).collect();
                 if let Ok(v) = u32::from_str_radix(&hex, 16) {

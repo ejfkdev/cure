@@ -86,6 +86,8 @@ pub(crate) struct Exec<'a> {
     /// 块作用域栈（每层 = 该块声明的名字键集合；退出弹层并清值）。
     /// 循环体的声明随迭代弹层——每轮重新声明不是遮蔽。
     scopes: Vec<Vec<u32>>,
+    /// 步数耗尽（见 budget_exhausted）。
+    exhausted: bool,
     /// 局部声明的窄域（名字键 → 2=char/3=byte/4=short；0=宽）。
     /// JLS 复合赋值隐式收窄：`byte b=100; b+=100` → (byte)200 = -56
     /// （javac 真值对拍抓获：vexec 曾输出 200）。
@@ -94,12 +96,20 @@ pub(crate) struct Exec<'a> {
 
 impl<'a> Exec<'a> {
     pub(crate) fn new(ast: &'a JavaAst) -> Self {
-        Exec { ast, steps: 0, vars: HashMap::new(), field_writes: Vec::new(), decl_order: Vec::new(), scopes: vec![Vec::new()], var_width: HashMap::new() }
+        Exec { ast, steps: 0, exhausted: false, vars: HashMap::new(), field_writes: Vec::new(), decl_order: Vec::new(), scopes: vec![Vec::new()], var_width: HashMap::new() }
+    }
+
+    /// 步数预算耗尽标志（规则据此放弃整段重写——中途状态不是
+    /// 收敛值，回写即捏造常量。差分抓获：2^31 次循环被截断后
+    /// i=142855/k=142863 当入口常量，违反 k−i=7 循环不变量）
+    pub(crate) fn budget_exhausted(&self) -> bool {
+        self.steps > MAX_STEPS
     }
 
     fn tick(&mut self) -> R<()> {
         self.steps += 1;
         if self.steps > MAX_STEPS {
+            self.exhausted = true;
             return Err(());
         }
         Ok(())

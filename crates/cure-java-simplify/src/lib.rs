@@ -838,12 +838,40 @@ impl Rule<JavaAst> for StaticExec {
                 Err(()) => break,
             }
         }
+        let rest = &stmts[prefix..];
+        // 步数预算耗尽：中途状态非收敛值——整段放弃（不回写任何常量）
+        if ex.budget_exhausted() {
+            return None;
+        }
+        // 截断守卫：前缀已写字段若在后半段再被赋值/读取 → 放弃整段。
+        // 「半途倾倒」陷阱：出口含不可求值调用时执行中止，顶层提升的
+        // 字段赋值与残留出口赋值构成 final 双重赋值；倾倒的循环状态
+        // （索引/边界/数组）来自不同字符串互不匹配 → AIOOBE
+        //（差分审查抓获 r/a4/a5/a3 四文件不可编译/必崩）
+        if prefix < stmts.len() {
+            let writes: Vec<u32> =
+                ex.field_writes().iter().map(|(k, _)| *k).collect();
+            if !writes.is_empty() {
+                for &k in &writes {
+                    if let Some(name) = lang.name_of_key(k) {
+                        let re_referenced = rest.iter().any(|&s| {
+                            cure_engine::analysis::subtree_contains(lang, s, |n| {
+                                lang.kind(n) == NodeKind::VarRef
+                                    && lang.var_name(n) == Some(name.as_str())
+                            })
+                        });
+                        if re_referenced {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
         if prefix < 3 {
             return None;
         }
         // ---- 逃逸分析：后半块句法引用的段内局部（含数组基）----
         // 逃逸局部必须材料化（否则删除前缀会丢失其值/数组内容）
-        let rest = &stmts[prefix..];
         let mut escaping: Vec<u32> = Vec::new();
         // 只考虑**存活**局部（前缀末仍在作用域）：循环体声明已随块弹出，
         // 后半段对同名者的引用属于**它们自己的**声明（bd.java 的 var682
@@ -965,23 +993,12 @@ fn materialize(lang: &mut JavaAst, v: &vexec::VVal) -> Option<(JavaId, Vec<JavaI
                 let node =
                     lang.new_array(JType::Ref("String".to_string()), 1, 0, vec![], Some(lit_arr));
                 Some((node, vec![]))
-            } else if arr.iter().all(|e| matches!(e, VVal::S(_) | VVal::Undef)) {
-                let n = arr.len() as i64;
-                let size = lang.lit(Lit::Int(n));
-                let node =
-                    lang.new_array(JType::Ref("String".to_string()), 1, 1, vec![size], None);
-                let mut extra = Vec::new();
-                for (i, e) in arr.iter().enumerate() {
-                    if let VVal::S(sv) = e {
-                        let idx = lang.lit(Lit::Int(i as i64));
-                        let val = lang.lit(Lit::Str(sv.clone()));
-                        let elem = lang.index(node, idx);
-                        extra.push(lang.assign(elem, val));
-                    }
-                }
-                Some((node, extra))
             } else {
-                None // 混合非字符串元素 → 不可材料化
+                // 部分填充（含 Undef 槽）：元素静态类型未知——
+                // new T[n] 的 T 无法从值推断（差分抓获：new int[5]
+                // 曾被物化成 new String[5]，类型损坏不可编译）。
+                // 保守放弃（整段重写回退）
+                None
             }
         }
         // Undef → 不可材料化（逃逸未初始化值可疑，放弃）

@@ -2937,6 +2937,16 @@ impl<L: Lang> Rule<L> for StoreKill {
             }
         }
         let (si, kill_assign) = killed_by?;
+        // 异常窗口守卫：被击杀点到击杀点之间的语句若可能抛（效果 >
+        // MayRead），异常路径会绕过击杀点直达 finally/catch——后者可能
+        // 在「中间值」状态读到本变量（finally-flag 恢复模式：
+        // v=true; setSoTimeout(1); v=false; finally{if(v)…}——差分
+        // 抓获：v=true 曾被杀，异常路径的恢复逻辑变死代码）
+        for &s in &stmts[idx + 1..si] {
+            if lang.effect(s) > Effect::MayRead {
+                return None;
+            }
+        }
 
         if is_decl {
             // 击杀赋值的值是字面量 → 提升进声明 init
