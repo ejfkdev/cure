@@ -3,8 +3,8 @@
 //! `cure` —— 容错式代码简化 / 格式化命令行工具。
 //!
 //! - 输入：源码文件、目录（递归）、stdin
-//! - 单文件默认输出 stdout；目录默认输出到同级 `<目录名>-cure/`（保持
-//!   内部目录结构），`-o` 可指定输出根，`-w` 原地覆写
+//! - 单文件默认输出 stdout；目录默认输出到同级 `<目录名>-cure-out/`
+//!   （保持内部目录结构），`-o` 可指定输出根，`-w` 原地覆写
 //! - 语法错误不阻断：错误区域原文保留，其余照常优化（`--strict` 时非零退出）
 //! - 多文件/目录自动多核并行（std::thread::scope）
 
@@ -18,47 +18,75 @@ use cure_java_parser::parse;
 use cure_java_print::print_unit;
 use cure_java_simplify::simplify_unit;
 
+mod cli_lang;
+mod help;
 mod io_batch;
 
 /// 当前引擎实际支持的语言后缀（小写、无点）。
 const SUPPORTED_EXTS: &[&str] = &["java"];
 
-const USAGE: &str = "\
-cure — 容错式代码简化 / 格式化工具
 
-用法:
-  cure [选项] <文件>...           处理源码文件（单个默认输出到 stdout）
-  cure [选项] <目录>              递归处理目录，输出到同级 <目录名>-cure/
-  cure [选项] -                   从 stdin 读取
-
-输出:
-  单文件             stdout（默认）；-o 指定文件
-  目录               同级 <目录名>-cure/（保持内部结构）；-o 指定输出根；
-                     -w 原地覆写；--check 只检查不写出
-
-选项:
-  -o, --output <路径>      输出路径（单文件=文件路径；目录=输出根目录）
-  -w, --write              原地覆写输入文件
-      --check              不写出内容；有可优化改写时退出码 2，否则 0
-      --ext <后缀列表>     只处理指定后缀（逗号或空格分隔，如 \"java\" 或
-                            \"java, js\"；默认处理全部受支持后缀）
-      --copy-other         目录模式：不受处理的文件原样拷入输出树
-      --diff               打印每个被改写文件的统一 diff（Myers 算法）
-      --stats              打印汇总统计（文件数/改写数/行数变化/逐规则）
-      --report             在 stderr 打印逐文件改写统计
-      --format-only        仅格式化，不做简化
-      --disable <规则名>   禁用指定规则（可多次）
-      --dead-code          删除全单元零引用的 private 方法（反射场景慎用）
-      --strict             有解析错误时退出码 1（默认仅 stderr 提示）
-  -j, --threads <N>       并行工作线程数（默认=CPU 核心数 × 1.5）
-  -h, --help               本帮助
-  -V, --version            版本
-
-退出码: 0 正常；1 --strict 且有解析错误；2 --check 且有改写 / 参数错误
-";
+/// `cure ... | head` 之类：读者退出关闭管道时 std 的 println! 会以
+/// "failed printing to stdout" panic（std 忽略 SIGPIPE）。恢复默认
+/// 处置（静默退出），和其他 CLI 行为一致。signal(2) 在 libc 里、std
+/// 已链接——直接 extern 声明，保持零运行时依赖（ddc 同款）。
+#[cfg(unix)]
+fn restore_sigpipe_default() {
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+#[cfg(not(unix))]
+fn restore_sigpipe_default() {}
 
 fn main() -> ExitCode {
+    restore_sigpipe_default();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 无参数：帮助即默认动作（stdout，退出 0）——ddc 约定
+    if args.is_empty() {
+        help::print_help();
+        return ExitCode::SUCCESS;
+    }
+    // help / version 作为首词——先于子命令分派与位置输入解释
+    //（`cure help <子命令>` 打印该子命令的帮助）
+    match args[0].as_str() {
+        "help" | "-h" | "--help" => {
+            match args.get(1).map(String::as_str) {
+                Some(topic) if !topic.starts_with('-') => {
+                    if topic == "rules" {
+                        help::print_rules_help();
+                    } else {
+                        match cli_lang::CliLang::detect() {
+                            cli_lang::CliLang::Zh => eprintln!(
+                                "cure: 未知帮助主题: {topic}（可用 `cure help`）"
+                            ),
+                            cli_lang::CliLang::En => eprintln!(
+                                "cure: unknown help topic: {topic} (try `cure help`)"
+                            ),
+                        }
+                        return ExitCode::from(2);
+                    }
+                }
+                _ => help::print_help(),
+            }
+            return ExitCode::SUCCESS;
+        }
+        "version" | "-V" | "--version" => {
+            help::print_version();
+            return ExitCode::SUCCESS;
+        }
+        // rules 子命令：规则目录（--disable 的取值参考；-h 同输出）
+        "rules" => {
+            help::print_rules_help();
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
     match run(&args) {
         Ok(code) => code,
         Err(msg) => {
@@ -126,12 +154,13 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     while i < args.len() {
         let a = &args[i];
         match a.as_str() {
+            // 兜底（首词路由已处理常见形态）：参数中间出现 -h 也给帮助
             "-h" | "--help" => {
-                print!("{USAGE}");
+                help::print_help();
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("cure {}", env!("CARGO_PKG_VERSION"));
+                help::print_version();
                 std::process::exit(0);
             }
             "-" => opts.stdin = true,
@@ -224,7 +253,7 @@ fn worker_threads(user: usize, jobs: usize) -> usize {
     n.min(jobs).max(1)
 }
 
-/// 目录模式默认输出根：输入目录的同级 `<名>-cure/`。
+/// 目录模式默认输出根：输入目录的同级 `<名>-cure-out/`。
 fn default_out_root(dir: &Path) -> Result<PathBuf, String> {
     let canon = dir
         .canonicalize()
@@ -235,8 +264,8 @@ fn default_out_root(dir: &Path) -> Result<PathBuf, String> {
         .ok_or("无法确定目录名")?;
     let parent = canon
         .parent()
-        .ok_or("输入目录没有父目录（无法生成 -cure 输出目录）")?;
-    Ok(parent.join(format!("{name}-cure")))
+        .ok_or("输入目录没有父目录（无法生成 -cure-out 输出目录）")?;
+    Ok(parent.join(format!("{name}-cure-out")))
 }
 
 /// 递归收集文件。跳过 `.git` 与输出根（防嵌套自吞）。
@@ -972,7 +1001,7 @@ mod tests {
         write(&root.join("b.java"), "class B{int m(){int x=0;return x;}}");
         let code = run(&[root.display().to_string()]).unwrap();
         assert_eq!(code, ExitCode::SUCCESS);
-        let out = root.parent().unwrap().join(format!("{}-cure", root.file_name().unwrap().to_str().unwrap()));
+        let out = root.parent().unwrap().join(format!("{}-cure-out", root.file_name().unwrap().to_str().unwrap()));
         let a = fs::read_to_string(out.join("src/com/x/a.java")).unwrap();
         assert!(a.contains(EXPECT_CONTAINS), "{a}");
         assert!(out.join("b.java").exists());
@@ -989,7 +1018,7 @@ mod tests {
         write(&root.join("docs/readme.md"), "hello");
         let code = run(&["--copy-other".into(), root.display().to_string()]).unwrap();
         assert_eq!(code, ExitCode::SUCCESS);
-        let out = root.parent().unwrap().join(format!("{}-cure", root.file_name().unwrap().to_str().unwrap()));
+        let out = root.parent().unwrap().join(format!("{}-cure-out", root.file_name().unwrap().to_str().unwrap()));
         assert_eq!(fs::read_to_string(out.join("docs/readme.md")).unwrap(), "hello");
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&out);
@@ -1002,7 +1031,7 @@ mod tests {
         let code = run(&["--check".into(), root.display().to_string()]).unwrap();
         assert_eq!(code, ExitCode::from(2));
         // 不写出
-        let out = root.parent().unwrap().join(format!("{}-cure", root.file_name().unwrap().to_str().unwrap()));
+        let out = root.parent().unwrap().join(format!("{}-cure-out", root.file_name().unwrap().to_str().unwrap()));
         assert!(!out.exists());
         let _ = fs::remove_dir_all(&root);
     }
@@ -1030,7 +1059,7 @@ mod tests {
         write(&root2.join("a.java"), SRC);
         let code = run(&["--ext".into(), ".JAVA, py".into(), root2.display().to_string()]).unwrap();
         assert_eq!(code, ExitCode::SUCCESS);
-        let out2 = root2.parent().unwrap().join(format!("{}-cure", root2.file_name().unwrap().to_str().unwrap()));
+        let out2 = root2.parent().unwrap().join(format!("{}-cure-out", root2.file_name().unwrap().to_str().unwrap()));
         assert!(fs::read_to_string(out2.join("a.java")).unwrap().contains(EXPECT_CONTAINS));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&root2);

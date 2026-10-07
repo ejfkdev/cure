@@ -201,3 +201,118 @@ fn real_invocation_via_command() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("cure "));
 }
+
+// ---- CLI v2（ddc 约定）：帮助路由 / 子命令 / 默认输出后缀 ----
+
+#[test]
+fn no_args_prints_help_and_exits_zero() {
+    cure()
+        .env("CURE_LANG", "en")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("https://github.com/ejfkdev/cure"))
+        .stdout(predicate::str::contains("Examples:"));
+}
+
+#[test]
+fn help_word_and_flag_are_equivalent() {
+    for arg in ["help", "-h", "--help"] {
+        cure()
+            .env("CURE_LANG", "en")
+            .arg(arg)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("cure"))
+            .stdout(predicate::str::contains("https://github.com/ejfkdev/cure"))
+            .stdout(predicate::str::contains("Examples:"));
+    }
+}
+
+#[test]
+fn help_zh_follows_cure_lang() {
+    cure()
+        .env("CURE_LANG", "zh")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("容错式 Java 简化/格式化器"))
+        .stdout(predicate::str::contains("示例:"));
+}
+
+#[test]
+fn version_word_and_flag() {
+    let want = format!("cure {}", env!("CARGO_PKG_VERSION"));
+    for arg in ["version", "-V", "--version"] {
+        cure()
+            .env("CURE_LANG", "en")
+            .arg(arg)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(want.as_str()))
+            .stdout(predicate::str::contains("https://github.com/ejfkdev/cure"));
+    }
+}
+
+#[test]
+fn rules_subcommand_lists_catalog() {
+    for args in [&["rules"][..], &["help", "rules"][..], &["rules", "-h"][..]] {
+        cure()
+            .env("CURE_LANG", "en")
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("simplification rules"))
+            .stdout(predicate::str::contains("const_fold_bin"))
+            .stdout(predicate::str::contains("cff_recover"))
+            // 默认/选配分组与 --disable 提示
+            .stdout(predicate::str::contains("Enabled by default"))
+            .stdout(predicate::str::contains("--disable"));
+    }
+}
+
+#[test]
+fn unknown_help_topic_is_usage_error() {
+    cure()
+        .env("CURE_LANG", "en")
+        .args(["help", "definitely-not-a-topic"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("unknown help topic"));
+}
+
+#[test]
+fn default_dir_output_suffix_is_cure_out() {
+    let parent = TempDir::new().unwrap();
+    let src = parent.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("A.java"), "class A{int m(){return 1;}}").unwrap();
+
+    cure()
+        .arg(&src)
+        .assert()
+        .success();
+
+    let out_root = parent.path().join("src-cure-out");
+    assert!(out_root.is_dir(), "默认输出根应为 {out_root:?}");
+    let out = out_root.join("A.java");
+    assert!(out.is_file());
+    assert_eq!(std::fs::read_to_string(&out).unwrap().trim_end(), "class A {\n    int m() {\n        return 1;\n    }\n}");
+    // 旧后缀不再产生
+    assert!(!parent.path().join("src-cure").exists());
+}
+
+#[test]
+fn broken_pipe_exits_quietly() {
+    use std::io::Write;
+    let dir = TempDir::new().unwrap();
+    let p = tmp_java(&dir, "A.java", "class A{int m(){int a=foo();int b=a;return b;}}");
+    // head 提前关闭管道：不应 panic（"failed printing to stdout"）
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{BIN} {:?} | head -1", p.as_os_str()))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "pipe exit: {}", out.status);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("failed printing"));
+}

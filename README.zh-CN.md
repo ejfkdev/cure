@@ -34,7 +34,7 @@ class B {                                     class B {
 - **三层语义验证** —— 属性测试（对拍玩具语言解释器）+ 差分测试（对拍
   真实 `javac`/`java` 运行）+ 语料库重解析/幂等检查。这三层在开发中
   实际抓到过真实 bug，不是摆设。
-- **49 条简化规则**（引擎通用 32 + Java 专属 17），含控制流扁平化
+- **54 条简化规则**（引擎通用 31 + Java 专属 23），含控制流扁平化
   还原、语句级 StringBuilder 链还原、XOR 噪声剥除、纯字面量 JDK 调用
   的部分求值（"虚拟执行"）。
 - **真实代码库规模** —— OpenJDK 全源码语料（371,674 文件 / 4.7 GB）
@@ -92,7 +92,11 @@ cure [选项] <文件.java>... | <目录> | -
 | `--strict` | 有解析错误 → 退出码 1 |
 
 目录模式递归处理、多核并行（动态取号队列，天然均衡大文件聚集），
-默认镜像到同级 `<目录名>-cure/`。
+默认镜像到同级 `<目录名>-cure-out/`。
+
+无参数运行 `cure` 直接打印帮助；`cure rules` 列出全部规则名
+（`--disable` 的取值）；帮助双语——`CURE_LANG=zh|en` 强制指定，
+否则按 locale 自动检测。完整选项见 `cure --help`。
 
 ## 语义验证体系（三层）
 
@@ -124,7 +128,7 @@ cure [选项] <文件.java>... | <目录> | -
 
 ## 规则清单
 
-**引擎通用（32）**：`paren_removal`、`const_condition`、`boolean_return`、
+**引擎通用（31）**：`paren_removal`、`const_condition`、`boolean_return`、
 `if_to_ternary`、`if_assign_ternary`、`if_else_empty`、`bool_compare`、
 `double_not`、`bool_not_fold`、`bool_short_circuit`、`not_compare`、
 `ternary_fold`、`ternary_bool`、`ternary_bool_op`、`const_fold_bin`
@@ -135,9 +139,9 @@ cure [选项] <文件.java>... | <目录> | -
 `decl_assign_merge`、`assign_propagation`（拷贝赋值内联，块内声明锚点
 防逃逸）、`store_kill`（支配路径击杀远距死存储/寄存器预声明）、
 `multi_use_copy`、`trailing_return`、`trailing_continue`（标签感知）、
-`dead_store`、选配 `unreachable_after_terminal`。
+`dead_store`、`store_kill`、double_neg_fold（`-(-lit)` 折叠）、block_flatten（无谓嵌套块塌平）、选配 `unreachable_after_terminal`。
 
-**Java 专属（17）**：`cast_simplify`、`self_compare`、
+**Java 专属（23）**：`cast_simplify`、`self_compare`、
 `string_builder_fold`、`box_unbox_chain`、`iterator_to_for_each`、
 `while_iterator_to_for_each`、`new_string_fold`、`loop_head_break`
 （含 do-while 形态）、`concat_value_of_drop`、
@@ -148,7 +152,7 @@ cure [选项] <文件.java>... | <目录> | -
 `Integer.parseInt`、`Math.abs/max/min`、`Character.isXxx/toXxx`、字面量
 数组下标、cast 字面量——**只在求值成功时折叠**，异常路径保持原样）、
 `base64_new_string_fold`、`cff_recover`（控制流扁平化还原）、
-`twr_recover` + `string_switch_recover`（反编译形态还原）。
+`twr_recover` + `string_switch_recover`（反编译形态还原）、new_string_char_array_fold（`new String(CHAR_ARRAY)`）、empty_finally_strip、try_unwrap_no_catch、static_array_index_fold（字面量数组下标）、const_method_inline（单 return helper 内联——解密器）、trailing_continue（标签感知尾 continue 删除）、
 
 ## 性能
 

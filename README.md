@@ -39,7 +39,7 @@ the same thing.
   `javac`/`java` runs, and whole-corpus re-parse/idempotency checks (details
   below). These layers caught real bugs during development; they are not
   decorative.
-- **49 simplification rules** (32 language-agnostic + 17 Java-specific),
+- **54 simplification rules** (31 language-agnostic + 23 Java-specific),
   including control-flow flattening recovery, statement-level
   `StringBuilder` chain recovery, XOR-noise removal, and partial evaluation
   ("virtual execution") of literal-only JDK calls.
@@ -101,7 +101,11 @@ cure [选项] <文件.java>... | <目录> | -
 
 Directory mode recurses, processes files in parallel (dynamic work queue,
 naturally load-balanced against clustered large files), and mirrors the tree
-into `<dir>-cure/` by default.
+into `<dir>-cure-out/` by default.
+
+`cure` with no arguments prints the help; `cure rules` lists every rule
+name (what `--disable` takes); help is bilingual — `CURE_LANG=zh|en` forces,
+otherwise the locale is auto-detected. Full option reference: `cure --help`.
 
 ## How correctness is verified
 
@@ -137,7 +141,7 @@ byte-identical output and preserved side-effect call sequences:
 
 ## Rule catalog
 
-**Engine (language-agnostic, 32):** `paren_removal`, `const_condition`,
+**Engine (language-agnostic, 31):** `paren_removal`, `const_condition`,
 `boolean_return`, `if_to_ternary`, `if_assign_ternary`, `if_else_empty`,
 `bool_compare`, `double_not`, `bool_not_fold`, `bool_short_circuit`,
 `not_compare`, `ternary_fold`, `ternary_bool`, `ternary_bool_op`,
@@ -149,9 +153,9 @@ concat constant merging `("a"+x)+"b"+"c" → "a"+x+"bc"`), `local_propagation`,
 block-scope declaration anchoring), `store_kill` (distant dead stores /
 register pre-declarations killed on the dominating path only),
 `multi_use_copy`, `trailing_return`, `trailing_continue` (label-aware),
-`dead_store`, opt-in `unreachable_after_terminal`.
+`dead_store`, `store_kill`, double_neg_fold (fold `-(-lit)`), block_flatten (unnecessary nested blocks collapse), opt-in `unreachable_after_terminal`.
 
-**Java-specific (17):** `cast_simplify`, `self_compare`,
+**Java-specific (23):** `cast_simplify`, `self_compare`,
 `string_builder_fold`, `box_unbox_chain`, `iterator_to_for_each`,
 `while_iterator_to_for_each`, `new_string_fold`, `loop_head_break` (incl.
 do-while shapes), `concat_value_of_drop`, `string_builder_statements`
@@ -163,7 +167,8 @@ be unwrapped: `(mark(5) ^ 0x5A) ^ 0x5A → mark(5)`), `str_len_fold`,
 `Character.isXxx/toXxx`, literal array indexing, cast literals — folds only
 when evaluation succeeds, never on the exception path),
 `base64_new_string_fold`, `cff_recover` (control-flow flattening recovery),
-`twr_recover` + `string_switch_recover` (decompiler-shape restoration).
+`twr_recover` + `string_switch_recover` (decompiler-shape restoration),
+new_string_char_array_fold (`new String(CHAR_ARRAY)`), empty_finally_strip, try_unwrap_no_catch, static_array_index_fold (literal array indexing), const_method_inline (single-return helper inlining — string decrypters), trailing_continue (label-aware tail continue removal).
 
 ## Performance
 
