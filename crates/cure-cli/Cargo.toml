@@ -4,6 +4,10 @@ description = "CLI for cure: fault-tolerant Java simplifier/formatter (source in
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["java", "deobfuscation", "formatter", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "cure"
@@ -19,11 +23,11 @@ io-uring = ["dep:io-uring"]
 io-uring = { version = "0.7", optional = true }
 
 [dependencies]
-cure-java-parser = { path = "../cure-java-parser" }
-cure-java-simplify = { path = "../cure-java-simplify" }
-cure-java-print = { path = "../cure-java-print" }
-cure-java-ast = { path = "../cure-java-ast" }
-cure-engine = { path = "../cure-engine" }
+cure-java-parser = { workspace = true }
+cure-java-simplify = { workspace = true }
+cure-java-print = { workspace = true }
+cure-java-ast = { workspace = true }
+cure-engine = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -4,11 +4,15 @@ description = "Java simplification rules and facade over cure-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["java", "deobfuscation", "simplification"]
+categories = ["development-tools"]
 
 [dependencies]
-cure-engine = { path = "../cure-engine" }
-cure-java-ast = { path = "../cure-java-ast" }
+cure-engine = { workspace = true }
+cure-java-ast = { workspace = true }
 
 [dev-dependencies]
-cure-java-print = { path = "../cure-java-print" }
-cure-java-parser = { path = "../cure-java-parser" }
+cure-java-print = { workspace = true }
+cure-java-parser = { workspace = true }

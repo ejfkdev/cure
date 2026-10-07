@@ -4,6 +4,10 @@ description = "Java AST (arena + NodeId + builder) with cure Lang implementation
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["java", "ast", "arena"]
+categories = ["data-structures"]
 
 [dependencies]
-cure-engine = { path = "../cure-engine" }
+cure-engine = { workspace = true }

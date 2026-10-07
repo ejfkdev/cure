@@ -4,6 +4,10 @@ description = "Canonical Java source printer / formatter over cure-java-ast"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["java", "formatter", "printer"]
+categories = ["development-tools"]
 
 [dependencies]
-cure-java-ast = { path = "../cure-java-ast" }
+cure-java-ast = { workspace = true }

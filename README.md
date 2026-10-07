@@ -1,194 +1,205 @@
 # cure
 
-语言无关的代码语义简化 / 规范化引擎（Rust）。
+**[English](README.md) | [简体中文](README.zh-CN.md)**
 
-目标：**在不改变程序语义的前提下**，把代码中冗余、重复、不自然的表达方式简化掉，
-使代码接近人类手写风格。服务于反编译器（jcdc / ddc 等），但不依赖任何具体反编译器；
-也可独立用于 AST 级别的代码清理与格式化。
+[![CI](https://github.com/ejfkdev/cure/actions/workflows/ci.yml/badge.svg)](https://github.com/ejfkdev/cure/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/cure-cli.svg)](https://crates.io/crates/cure-cli)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Rust MSRV](https://img.shields.io/badge/rust-1.74%2B-orange)
 
-不是 DCE、不是性能优化：默认不做死类/死方法删除，只做局部表达与控制流形态的规范化。
+**cure** is a fault-tolerant, semantic-preserving code simplifier and formatter
+that turns decompiled Java back into something a human would have written.
 
-## crate 划分（可按需单独引用）
-
-| crate | 职责 | 依赖 |
-|---|---|---|
-| `cure-engine` | 语言无关核心：`Lang` trait、Pattern 匹配、Rewrite 事务、Pass/fixed-point、成本模型、通用规则 | 无 |
-| `cure-java-ast` | Java AST（arena + NodeId）+ 编译单元/成员结构、builder、`Lang` 实现（副作用/类型/作用域分析） | engine |
-| `cure-java-parser` | **容错式** Java 源码解析器：语法错误跳过并原文保留，好代码照常解析 | ast |
-| `cure-java-print` | 规范格式化打印器（方法体 `print` / 整文件 `print_unit`，优先级最小括号） | ast |
-| `cure-java-simplify` | Java 规则 + `simplify`（方法体）/ `simplify_unit`（整文件）门面 | engine + ast |
-| `cure-cli` | `cure` 命令行：源码文件 → 简化 + 格式化 | 以上全部 |
-
-按需取用示例：
-
-- 只要"解析成 AST"：`cure-java-ast` + `cure-java-parser`。
-- 只要"格式化"：+ `cure-java-print`。
-- 只要"优化"：`cure-engine` + `cure-java-ast` + `cure-java-simplify`。
-- 全都要：用 CLI 或把五件套都引进去。
-
-## 设计要点
-
-- 语义保持是硬约束：任何 rewrite 必须通过语义检查（副作用、求值顺序、异常、类型），
-  且**成本严格下降**才被应用 ⇒ fixed-point 天然收敛，不会振荡。
-- 保守策略：语义未知（`Effect::Unknown`）一律不改写。
-- 通用规则写在 engine（只依赖 `Lang` 抽象），语言特有规则写在各自 crate。
-- 第一阶段范围：语句/表达式树层的 canonicalization；CFG 级 pass 与 DCE 不在本库。
-
-## 容错（fault tolerance）
-
-解析器**永不失败**：哪里坏跳哪里——
-
-- 坏语句 → `Raw` 节点**原文保真**；
-- 坏方法 → `Member::Raw`；坏顶层 → `unit.raws`；
-- 其余部分照常解析、**照常参与简化与格式化**；
-- 所有词法/语法错误带 1-based 行列号返回，可 `--strict` 升级为非零退出码。
-
-## CLI
-
-```text
-cure [选项] <文件.java>... | -
-  -w/--write          原地覆写
-  -o/--output <文件>  输出路径（默认 stdout）
-  --format-only       仅格式化
-  --check             干跑：有可优化改写 → 退出码 2
-  --report            stderr 打印逐规则统计
-  --disable <规则>    禁用指定规则
-  --strict            有解析错误 → 退出码 1
-  -j, --threads <N>   并行工作线程数（默认=CPU 核心数 × 1.5）
+```java
+// decompiled input                          // after cure
+class B {                                     class B {
+    void n() {                                    void n() {
+        int x = 1 + 2;                                System.out.println("y1");
+        boolean c = (x > 2) && true;              }
+        if (c) { System.out.println("y"+1); }  }
+        return;
+    }
+}
 ```
 
-### 并行度
+It is **not** dead-code elimination and **not** a minifier. It normalizes
+local expression and control-flow *shape*: folds constants and opaque
+predicates, inlines copies, dissolves compiler artifacts (register noise,
+builder chains, state-machine control-flow flattening), and prints the result
+in clean idiomatic formatting — while guaranteeing the program still means
+the same thing.
 
-多文件按动态取号队列并行（文件间独立，天然负载均衡——大文件聚集目录实测静态切片并行度仅 7.3×/18 核）。自动线程数 = **核心数 × 1.5**：18 核 37 万文件 5 轮实测 1:1 中位 17.3s、1.5× 16.0s（−7%，CPU 与内存持平）；P/E 核异构下超订让快核吸收慢核拖尾，2× 以上无增益。`-j N` 可显式覆盖。
+## Highlights
 
-### 大批量目录的 I/O 后端（跨平台）
+- **Fault-tolerant by design** — syntax errors never abort a run. Broken
+  regions are preserved verbatim; everything around them is still simplified
+  (`--strict` flips this to an error exit for CI use).
+- **Semantic preservation, verified in three layers** — property testing
+  against a toy-language interpreter, differential testing against real
+  `javac`/`java` runs, and whole-corpus re-parse/idempotency checks (details
+  below). These layers caught real bugs during development; they are not
+  decorative.
+- **49 simplification rules** (32 language-agnostic + 17 Java-specific),
+  including control-flow flattening recovery, statement-level
+  `StringBuilder` chain recovery, XOR-noise removal, and partial evaluation
+  ("virtual execution") of literal-only JDK calls.
+- **Scales to real codebases** — the full OpenJDK source corpus
+  (371,674 files, 4.7 GB) processes in ~15 s on an 18-core laptop, with
+  0 parse failures and 0 panics.
+- **Cross-platform I/O backends** — Linux builds can use batched
+  `io_uring` (3,483-file syscall trace: read calls 6,977 → 10, syscall time
+  −53%); macOS/Windows use a tuned thread pool. The default build stays
+  zero-runtime-dependency.
+- **Zero runtime dependencies** — only `std` (one optional feature-gated
+  Linux-only crate).
 
-多文件运行按「取号组 64 文件」批量读取；各平台后端自动选择（`crates/cure-cli/src/io_batch.rs`）：
-
-| 平台 | 后端 | 说明 |
-|------|------|------|
-| Linux（`--features io-uring`） | io_uring 批量链 | open/read/close 三阶段批量提交：3,483 文件实测 read syscall 6,977→10，syscall 总时长 −53%；冷缓存下内核预读可与 CPU 重叠。ring 不可用（老内核/seccomp 禁用）自动回退 std |
-| Linux 默认 / macOS / Windows | 线程池逐文件 | 默认构建零运行时依赖；macOS 无 io_uring（实测线程池聚合 ~1 GB/s 已近逐文件 syscall I/O 上限） |
+## Install
 
 ```bash
-cargo build --release                       # 默认：零依赖（任何平台）
-cargo build --release --features io-uring   # Linux：启用 io_uring 后端
+# from crates.io
+cargo install cure-cli
+
+# or a prebuilt binary from GitHub Releases
+curl -L https://github.com/ejfkdev/cure/releases/latest/download/cure-<target>.tar.gz | tar xz
+
+# or from source
+git clone https://github.com/ejfkdev/cure
+cargo install --path crates/cure-cli
 ```
+
+## Usage
 
 ```bash
 echo 'class A{int m(){int a=foo();int b=a;return b;}}' | cure -
-# → class A {
-#      int m() {
-#          return foo();
-#      }
-#  }
+```
+```java
+class A {
+    int m() {
+        return foo();
+    }
+}
 ```
 
-## 语义验证体系（三层）
+```text
+cure [选项] <文件.java>... | <目录> | -
+```
 
-| 层 | 手段 | 验证什么 |
+| Option | Meaning |
+|--------|---------|
+| `-o, --output <path>` | output file (single input) or output root (directory) |
+| `-w, --write` | rewrite inputs in place |
+| `--check` | dry run: exit code 2 if anything is rewritable, write nothing |
+| `-j, --threads <N>` | worker threads (default: CPU cores × 1.5) |
+| `--format-only` | format only, no simplification |
+| `--ext <list>` | restrict to given extensions (comma/space separated) |
+| `--copy-other` | directory mode: copy non-source files verbatim |
+| `--diff` | print unified diffs of every rewritten file |
+| `--stats` / `--report` | aggregate / per-file rewrite statistics |
+| `--disable <rule>` | disable a named rule (repeatable) |
+| `--dead-code` | opt-in: drop private methods referenced nowhere in the unit |
+| `--strict` | exit 1 on any parse error |
+
+Directory mode recurses, processes files in parallel (dynamic work queue,
+naturally load-balanced against clustered large files), and mirrors the tree
+into `<dir>-cure/` by default.
+
+## How correctness is verified
+
+| Layer | Method | Catches |
 |---|---|---|
-| 1. 属性测试 | 随机生成 toy 程序（80 个种子），解释器对拍**简化前后的返回值 + 调用副作用序列** | 引擎层语义保持（求值顺序/短路/副作用）+ fixed-point 幂等 |
-| 2. 差分测试 | 原版与简化版各自 `javac` 编译、`java` 运行，**stdout/退出码/异常签名必须一致**（12 组：溢出、NaN、除零异常、StringBuilder、迭代器、装箱、短路副作用…） | Java 全链路语义保持 |
-| 3. 语料库 | google-java-format 84 个真实文件跑全链路 | 鲁棒性（不 panic）、自洽性（输出可重新干净解析）、幂等性（第二轮 0 改写）+ 能力统计 |
+| 1. Property testing | Random toy programs (80 seeds); an interpreter compares return values **and** call/side-effect sequences** before vs. after | engine-level semantics: evaluation order, short-circuiting, side effects; fixed-point idempotency |
+| 2. Differential testing | Original and simplified versions each compiled by `javac` and run; stdout / exit code / exception signature must match byte-for-byte (12 families: overflow, NaN, division by zero, StringBuilder, iterators, boxing, short-circuit side effects, …) | full Java-language semantics |
+| 3. Corpora | 3,999 vendored real-world files in 12 auto-discovered suites + 5,596-file external mega-corpus + the 371k-file OpenJDK source corpus | robustness (no panics), self-consistency (output re-parses cleanly), idempotency (second pass = 0 rewrites) |
 
-`cargo test`：90 个测试。属性与差分测试在本轮开发中**实际抓到 3 个语义/解析 bug**（`x && true` 误折叠、`((Cast) x).method()` 后缀丢失、`new` 被当类型名）。
+`cargo test` runs 162 tests. Layers 1–2 caught three real semantic/parse bugs
+during development (`x && true` mis-fold, `((Cast) x).method()` postfix loss,
+`new` treated as a type name).
 
-## 规则清单
+### Adversarial case studies
 
-引擎通用（32）：paren_removal、const_condition、boolean_return、if_to_ternary、
-if_assign_ternary、if_else_empty、bool_compare、double_not、bool_not_fold、
-bool_short_circuit、not_compare、ternary_fold、ternary_bool、const_fold_bin、
-**cmp_const_fold**（`1 < 2 → true`，击穿不透明谓词）、self_assign、
-arith_identity、**arith_zero**、**bit_identity**、**arith_reassoc**（双异或/
-加减重结合/字符串拼接常量合并 `("a"+x)+"b"+"c" → "a"+x+"bc"`）、
-**ternary_bool_op**（`c ? a : false → c && a`）、
-local_propagation、**decl_assign_merge**、**assign_propagation**（拷贝赋值内联，
-块内声明锚点防逃逸；使用语句写排除：`target = use` 的 RHS 先于写求值）、
-**store_kill**（远距死存储/寄存器预声明清理：首个事件在**支配路径**上是写时
-击杀——字面量提升进 init / 剥 init / 删语句；条件分支、循环体、try 内的事件
-不算必经，副作用 init 永不丢），
-**multi_use_copy**（多用途拷贝传播：`x = y; …N 处读 x` → 全部替换为 y）、
-**trailing_return**（void 方法尾部裸 `return;` 删除）、
-**trailing_continue**（标签感知：循环体尾部 continue，标签指向本循环才删）、
-dead_store + 选配 unreachable_after_terminal。
+All of the following round-trip through `javac` differential testing with
+byte-identical output and preserved side-effect call sequences:
 
-Java 专属（17）：cast_simplify、self_compare、string_builder_fold、box_unbox_chain、
-iterator_to_for_each、while_iterator_to_for_each（支持 Cast/Paren 包裹的 next()）、
-new_string_fold、loop_head_break（`while(true){if(c)break;…}` + **do-while 形态**
-`do{if(c){REST;continue}else{break}}while(true)` + 正/负极性 continue/break 组合）、concat_value_of_drop、
-**string_builder_statements**（语句级 SB 链还原：重赋值+新变量混合形态
-`sb = sb.append(x); sb2 = sb.append(y); s = sb2.toString()` → `s = …拼接…`）、
-**xor_noise**（Java 语义下 XOR 操作数必为整型 → 含副作用调用也能剥
-`(mark(5) ^ 0x5A) ^ 0x5A → mark(5)`）、
-**str_len_fold**（`"abc".length() → 3`）、
-**literal_eval**（部分求值器/"虚拟执行"：纯 JDK 方法 + 全字面量实参 →
-编译期求值——`"HelloWorld".substring(0,5)`、`String.format("%s=%d",…)`、
-`Integer.parseInt("42")`、`Math.abs/max/min`、`Character.isXxx/toXxx/toString`、
-字面量数组下标 `{"a","b"}[1]`、cast 字面量 `(char)('a'+2) → 'c'`；
-**只在求值成功时折叠**——解析失败/越界/异常路径保持原样；
-不折 toUpperCase/toLowerCase（locale 敏感））、
-**base64_new_string_fold**（`new String(Base64.getDecoder().decode("aGVsbG8=")) → "hello"`，
-标准/URL 字母表，UTF-8 合法时折叠）、
-**cff_recover**（**控制流扁平化还原**：`while(true){switch(s)}` 状态机 →
-结构化控制流——线性链顺序拼接、菱形找公共后继 if/else{前缀}+单次续接、
-分支回环 → while(cond){体}、链内后向边 → while(true){后缀}；
-支持哨兵出口与 default: return 两种出口形态；嵌套条件/发散/外部跳转保守拒绝）。
-引擎侧 char 参与算术按 Java 语义提升为 int 折叠；Str+Char/Int/Long/Bool
-字面量拼接直接折成字符串（浮点除外——Double.toString 算法不保证逐位一致）。
-引擎侧 char 参与算术按 Java 语义提升为 int 折叠；Str+Char/Int/Long/Bool
-字面量拼接直接折成字符串（浮点除外——Double.toString 算法不保证逐位一致）。
+- **Combined obfuscation gauntlet** — cross-method string decrypter
+  (string-array + Base64 helper) × control-flow flattening state machine ×
+  register noise × opaque predicates × StringBuilder statement chains: 24
+  rewrites, non-blank lines 87 → 32 (−64%).
+- **Control-flow flattening recovery** (`cff_recover`) —
+  obfuscator.io/Allatori-style `while(true){switch(s)}` state machines
+  recovered into structured control flow: linear chains, diamonds, loops,
+  `default: return` exits. Unsafe shapes (state variable used after the
+  loop, unreachable cases) are conservatively rejected.
+- **Hard obfuscation** — multi-layer constant hiding, nested opaque
+  predicates, SB × `new String` × `valueOf` × scattered constants: 44
+  rewrites, non-blank lines 76 → 33 (−57%).
+- **Double toolchain** — obfuscated source → `javac` → d8 → ddc (register
+  artifacts) → cure: output matches the ddc and original versions.
 
-## 虚拟执行验证（tests/eval_obfuscation.rs）
+## Rule catalog
 
-混淆器把常量藏进方法调用（substring/format/parseInt/Base64/字符算术/
-字面量表/字符串杂项/Math/Character）——40 次改写，非空行 44 → 20（-55%），
-javac 差分逐字节一致。模式来源：obfuscator.io / javascript-obfuscator
-的 string-array 与字符串编码家族的 Java 等价形态（跨方法解密器与
-控制流扁平化需要过程间分析，暂不覆盖）。
+**Engine (language-agnostic, 32):** `paren_removal`, `const_condition`,
+`boolean_return`, `if_to_ternary`, `if_assign_ternary`, `if_else_empty`,
+`bool_compare`, `double_not`, `bool_not_fold`, `bool_short_circuit`,
+`not_compare`, `ternary_fold`, `ternary_bool`, `ternary_bool_op`,
+`const_fold_bin` (Java wrap-around i32/i64 + shift masking), `cmp_const_fold`
+(`1 < 2 → true`, breaks opaque predicates), `self_assign`, `arith_identity`,
+`arith_zero`, `bit_identity`, `arith_reassoc` (xor/add-sub reassoc; string
+concat constant merging `("a"+x)+"b"+"c" → "a"+x+"bc"`), `local_propagation`,
+`decl_assign_merge`, `assign_propagation` (copy-assignment inlining with
+block-scope declaration anchoring), `store_kill` (distant dead stores /
+register pre-declarations killed on the dominating path only),
+`multi_use_copy`, `trailing_return`, `trailing_continue` (label-aware),
+`dead_store`, opt-in `unreachable_after_terminal`.
 
-## 终极组合混淆验证（tests/gauntlet.rs）
+**Java-specific (17):** `cast_simplify`, `self_compare`,
+`string_builder_fold`, `box_unbox_chain`, `iterator_to_for_each`,
+`while_iterator_to_for_each`, `new_string_fold`, `loop_head_break` (incl.
+do-while shapes), `concat_value_of_drop`, `string_builder_statements`
+(statement-level SB chain recovery across reassignments and fresh variables),
+`xor_noise` (XOR operands are integral in Java, so side-effecting calls can
+be unwrapped: `(mark(5) ^ 0x5A) ^ 0x5A → mark(5)`), `str_len_fold`,
+`literal_eval` (partial evaluator: `"HelloWorld".substring(0,5)`,
+`String.format`, `Integer.parseInt`, `Math.abs/max/min`,
+`Character.isXxx/toXxx`, literal array indexing, cast literals — folds only
+when evaluation succeeds, never on the exception path),
+`base64_new_string_fold`, `cff_recover` (control-flow flattening recovery),
+`twr_recover` + `string_switch_recover` (decompiler-shape restoration).
 
-跨方法字符串解密器（string-array + Base64 helper）× CFF 状态机（体内含
-解密调用 + 寄存器噪声 + 不透明谓词）× SB 语句链 × 迭代器 × XOR 副作用包裹
-× 虚拟执行——全部叠在一个程序：**24 次改写、非空行 87 → 32（-64%）**，
-javac 差分逐字节一致（`d(0)+d(1)+"!"` → `println("super!")`，
-副作用 mark 调用序列完整保留）。
+## Performance
 
-## 控制流扁平化还原验证（tests/cff_obfuscation.rs）
+| Metric | Value |
+|---|---|
+| Full OpenJDK source corpus (371,674 files / 4.70 GB) | ~15 s, 18-core laptop (`--check`) |
+| Parallelism | dynamic work queue, default threads = cores × 1.5 (measured −7% vs 1:1 on heterogeneous P/E cores, CPU and RSS neutral) |
+| Linux batched I/O | `--features io-uring`: three-phase batched open→read→close; read syscalls 6,977 → 10 on a 3,483-file trace, syscall time −53% |
+| macOS/Windows I/O | thread-pool per-file reads, measured ~1 GB/s aggregate (near the per-file syscall ceiling) |
 
-obfuscator.io / Allatori 风格的状态机混淆——线性链（32 → 12 行）、菱形分叉
-（还原出 if/else 后继续被接力折叠成内联三元）、循环形态（`case 0: if(i<5)...`
-回环 → `while (i < 5) {...}`）、default: return 出口，全部 javac 差分逐字节一致；
-安全负例（状态变量循环后被使用 / 存在不可达 case）正确拒绝还原。
+## Architecture
 
-## 刁钻混淆验证（tests/hard_obfuscation.rs）
+```text
+cure-engine        language-agnostic core: patterns, rewrites, passes,
+                   fixed-point driver, cost model
+cure-java-ast      arena AST + NodeId + builder; implements the Lang trait
+cure-java-parser   fault-tolerant Java lexer/parser (byte-borrowed tokens,
+                   zero-copy source)
+cure-java-print    canonical Java printer/formatter
+cure-java-simplify Java rule pack + facade over cure-engine
+cure-cli           the `cure` binary: parallel pipeline, cross-platform
+                   batch I/O (io_uring / thread pool), directory mode
+```
 
-多层常量隐藏（声明链×异或对×位噪声×死赋值）、嵌套不透明谓词、循环混合断路+
-寄存器回拷、多层字符串混淆（SB×new String×valueOf×分散常量×length）、布尔旗标
-三元嵌套、迭代器+SB 语句链+continue 组合、副作用异或包裹——**44 次改写，
-非空行 76 → 33（-57%）**，javac 差分逐字节一致，副作用调用序列完整保留。
+The `Lang` trait is the language boundary: a second language frontend only
+needs to provide its own AST + parser + printer + rule pack on top of
+`cure-engine`.
 
-另有**双层数链路**（ddc_tools.rs 第二测）：刁钻混淆源 → javac（常量层被
-编译器折叠、结构性混淆存活）→ d8 → ddc（叠加寄存器伪影）→ cure：
-15 次改写，输出与 ddc/原始双重一致。
+## Status & roadmap
 
-## 去混淆验证
+- ✅ Java backend at production robustness: 371k-file corpus, 0 failures
+- ✅ 12 vendored corpora, three-layer verification, 162 tests
+- 🔜 Restoration rules V2 (reflective `addSuppressed` shapes, nested
+  two-resource try-with-resources)
+- 🔜 A second language to validate the `Lang` trait boundary
 
-- `tests/deobfuscate.rs`：模拟混淆器（不透明谓词/双异或/位噪声/布尔包装/
-  StringBuilder/装箱链/迭代器/死赋值/拆分声明/拷贝链/valueOf 包装/常量分散拼接）
-  → **29 次改写，非空行 -48%**，javac 差分逐字节一致，副作用调用序列保留；
-- `tests/real_tools.rs`：javac → **ProGuard** → **jadx** → cure → 编译运行，
-  输出与原始完全一致（jadx 去混淆较强，残留产物需要循环级数据流）；
-- `tests/ddc_tools.rs`：javac → d8 → **ddc** → cure → 编译运行，
-  **81 → 46 行（-44%）**，输出与 ddc 行为逐字节一致（ddc 产物是主目标素材：
-  寄存器拷贝/语句级 SB 链/while(true)+break 全部被还原）；
-- `tests/asc_tools.rs`：javac → d8 → zip APK → **ASC（androguard DAD）** → cure，
-  **65 → 37 行（-43%）**。DAD 去混淆最弱（类型推断错误、`class LDemo;` 描述符
-  泄漏、尾部 `return;`）——其输出本身无法通过 javac，本测试验证容错解析 0 错误
-  + 净化显著 + 输出自洽 + 幂等；DAD 自身的类型错误被原样保留（不发明类型）。
+## License
 
-## 参考
-
-MLIR Canonicalization / LLVM InstCombine（规则组织）、Vineflower（反编译器自然化规则）、
-egg / ast-grep / tree-sitter / google-java-format（本地 `/Users/e/Documents/github/` 下有源码可研读）。
+MIT — see [LICENSE](LICENSE). Release history in [CHANGELOG.md](CHANGELOG.md).

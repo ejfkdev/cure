@@ -1,0 +1,117 @@
+# 发版流程：推送 v* tag 触发。
+#   git tag v0.1.0 && git push origin v0.1.0
+# 1. 六平台编译 cure 二进制（Linux 启用 io_uring feature）
+# 2. 依序发布 workspace 全部 crate 到 crates.io（scripts/publish.sh）
+# 3. 汇总产物 + sha256 校验和，创建 GitHub Release（自动生成 notes）
+#
+# 前置：仓库 Settings → Secrets → CARGO_REGISTRY_TOKEN
+# （crates.io → Account Settings → API Tokens，scope: publish-new + publish-update）
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: io-uring
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            features: io-uring
+          - os: macos-13 # Intel runner
+            target: x86_64-apple-darwin
+            features: ""
+          - os: macos-latest # Apple Silicon
+            target: aarch64-apple-darwin
+            features: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: ""
+          - os: windows-latest # 交叉编译 ARM64 Windows（不可运行，仅产物）
+            target: aarch64-pc-windows-msvc
+            features: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release -p cure-cli --features ${{ matrix.features }} --target ${{ matrix.target }}
+          else
+            cargo build --release -p cure-cli --target ${{ matrix.target }}
+          fi
+      - name: Package (unix)
+        if: matrix.target != 'x86_64-pc-windows-msvc' && matrix.target != 'aarch64-pc-windows-msvc'
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          STAGE="cure-v${VERSION}-${{ matrix.target }}"
+          mkdir -p "${STAGE}"
+          cp "target/${{ matrix.target }}/release/cure" "${STAGE}/"
+          cp LICENSE README.md README.zh-CN.md "${STAGE}/"
+          tar czf "cure-v${VERSION}-${{ matrix.target }}.tar.gz" "${STAGE}"
+      - name: Package (windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc' || matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $VERSION = $env:GITHUB_REF_NAME.TrimStart('v')
+          $STAGE = "cure-v$VERSION-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force $STAGE | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/cure.exe" $STAGE
+          Copy-Item LICENSE,README.md,README.zh-CN.md $STAGE
+          Compress-Archive -Path $STAGE -DestinationPath "cure-v$VERSION-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: cure-v*-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  publish-crates:
+    name: publish (crates.io)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish workspace crates in dependency order
+        run: bash scripts/publish.sh
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  release:
+    name: create GitHub release
+    needs: [binaries, publish-crates]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        run: |
+          (cd dist && sha256sum cure-v* | tee checksums.sha256 > /dev/null)
+          gh release create "${GITHUB_REF_NAME}" dist/cure-v* dist/checksums.sha256 \
+            --title "cure ${GITHUB_REF_NAME}" \
+            --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

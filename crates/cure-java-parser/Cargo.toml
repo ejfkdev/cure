@@ -4,10 +4,14 @@ description = "Fault-tolerant Java source parser producing cure-java-ast"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["java", "parser", "fault-tolerant"]
+categories = ["parser-implementations"]
 
 [dependencies]
-cure-engine = { path = "../cure-engine" }
-cure-java-ast = { path = "../cure-java-ast" }
+cure-engine = { workspace = true }
+cure-java-ast = { workspace = true }
 
 [dev-dependencies]
-cure-java-print = { path = "../cure-java-print" }
+cure-java-print = { workspace = true }

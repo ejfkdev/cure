@@ -823,12 +823,12 @@ impl JavaAst {
             // null/this/数组/instanceof/数值布尔字面量：折叠不可能改变其 == 结果
             NodeData::Literal(_) | NodeData::This | NodeData::Super
             | NodeData::NewArray { .. } | NodeData::ArrayLit | NodeData::InstanceOf { .. } => false,
-            NodeData::VarRef { .. } => self.var_type(id).is_none_or(Self::type_maybe_string),
+            NodeData::VarRef { .. } => self.var_type(id).map_or(true, Self::type_maybe_string),
             NodeData::Cast { ty } => Self::type_maybe_string(ty),
             NodeData::Paren => self
                 .children(id)
                 .first()
-                .is_none_or(|&c| self.expr_maybe_string(c)),
+                .map_or(true, |&c| self.expr_maybe_string(c)),
             // 拼接：任一操作数 String ⇒ 结果 String；其余二元运算结果必为原始类型
             NodeData::Binary { op } if *op == BinOp::Add => {
                 self.children(id).iter().any(|&c| self.expr_maybe_string(c))
@@ -837,7 +837,7 @@ impl JavaAst {
             NodeData::Ternary => self
                 .children(id)
                 .get(1..)
-                .is_none_or(|cs| cs.iter().any(|&c| self.expr_maybe_string(c))),
+                .map_or(true, |cs| cs.iter().any(|&c| self.expr_maybe_string(c))),
             // Call/Member/Index/MethodRef/Raw/Unary/Lambda…：类型未知或引用 → 保守视为可能
             _ => true,
         }

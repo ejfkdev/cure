@@ -13,6 +13,17 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/ejfkdev/cure"
+homepage = "https://github.com/ejfkdev/cure"
+rust-version = "1.74"
+
+
+[workspace.dependencies]
+cure-engine = { path = "crates/cure-engine", version = "0.1.0" }
+cure-java-ast = { path = "crates/cure-java-ast", version = "0.1.0" }
+cure-java-parser = { path = "crates/cure-java-parser", version = "0.1.0" }
+cure-java-print = { path = "crates/cure-java-print", version = "0.1.0" }
+cure-java-simplify = { path = "crates/cure-java-simplify", version = "0.1.0" }
 
 [profile.release]
 lto = "fat"
