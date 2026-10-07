@@ -1460,3 +1460,32 @@ fn generic_type_usage_keeps_import() {
     );
     assert!(out.contains("import java.util.List;"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// import 使用分析的三个漏点（v/r/bd.java 差分抓获）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn import_used_by_class_literal_kept() {
+    // Foo.class 在表达式里是单个 VarRef（名字="Foo.class" 整串）
+    let out = run_dead(
+        "import java.util.List;class A{boolean m(Class c){return List.class.isAssignableFrom(c);}}",
+    );
+    assert!(out.contains("import java.util.List;"), "{out}");
+}
+
+#[test]
+fn import_used_by_instanceof_kept() {
+    let out = run_dead(
+        "import java.sql.SQLException;class A{boolean m(Object o){return o instanceof SQLException;}}",
+    );
+    assert!(out.contains("import java.sql.SQLException;"), "{out}");
+}
+
+#[test]
+fn import_used_by_catch_type_kept() {
+    let out = run_dead(
+        "import java.io.UnsupportedEncodingException;class A{String m(String s){try{return new String(s.getBytes(\"UTF-8\"));}catch(UnsupportedEncodingException e){return s;}}}",
+    );
+    assert!(out.contains("import java.io.UnsupportedEncodingException;"), "{out}");
+}

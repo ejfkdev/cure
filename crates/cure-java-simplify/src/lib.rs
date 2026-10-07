@@ -5289,7 +5289,15 @@ fn remove_unused_imports(ast: &JavaAst, unit: &mut CompilationUnit) -> usize {
                     collect_ty_idents(ty, &mut idents);
                 }
                 NodeData::VarRef { name } => {
-                    idents.insert(ast.sn(*name).to_string());
+                    // 表达式里的 Foo.class 是单个 VarRef（名字="Foo.class"
+                    // 整串）——按分隔符切出类型名（v.java List.class 抓获：
+                    // import 误删）
+                    let n = ast.sn(*name);
+                    for id in n.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+                        if !id.is_empty() {
+                            idents.insert(id.to_string());
+                        }
+                    }
                 }
                 NodeData::Member { name } => {
                     idents.insert(ast.sn(*name).to_string());
@@ -5307,6 +5315,19 @@ fn remove_unused_imports(ast: &JavaAst, unit: &mut CompilationUnit) -> usize {
                 }
                 NodeData::New { ty, .. } | NodeData::Cast { ty } => {
                     collect_ty_idents(ty, &mut idents);
+                }
+                NodeData::InstanceOf { ty, .. } => {
+                    collect_ty_idents(ty, &mut idents);
+                }
+                NodeData::Catch { ty_raw, .. } => {
+                    // catch (Type name)——异常类型原文
+                    for id in
+                        ty_raw.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$')
+                    {
+                        if !id.is_empty() {
+                            idents.insert(id.to_string());
+                        }
+                    }
                 }
                 NodeData::Raw { text } => {
                     for id in text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
