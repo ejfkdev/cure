@@ -56,6 +56,20 @@ cure [选项] <文件.java>... | -
   --strict            有解析错误 → 退出码 1
 ```
 
+### 大批量目录的 I/O 后端（跨平台）
+
+多文件运行按「取号组 64 文件」批量读取；各平台后端自动选择（`crates/cure-cli/src/io_batch.rs`）：
+
+| 平台 | 后端 | 说明 |
+|------|------|------|
+| Linux（`--features io-uring`） | io_uring 批量链 | open/read/close 三阶段批量提交：3,483 文件实测 read syscall 6,977→10，syscall 总时长 −53%；冷缓存下内核预读可与 CPU 重叠。ring 不可用（老内核/seccomp 禁用）自动回退 std |
+| Linux 默认 / macOS / Windows | 线程池逐文件 | 默认构建零运行时依赖；macOS 无 io_uring（实测线程池聚合 ~1 GB/s 已近逐文件 syscall I/O 上限） |
+
+```bash
+cargo build --release                       # 默认：零依赖（任何平台）
+cargo build --release --features io-uring   # Linux：启用 io_uring 后端
+```
+
 ```bash
 echo 'class A{int m(){int a=foo();int b=a;return b;}}' | cure -
 # → class A {

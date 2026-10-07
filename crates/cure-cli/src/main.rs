@@ -18,6 +18,8 @@ use cure_java_parser::parse;
 use cure_java_print::print_unit;
 use cure_java_simplify::simplify_unit;
 
+mod io_batch;
+
 /// 当前引擎实际支持的语言后缀（小写、无点）。
 const SUPPORTED_EXTS: &[&str] = &["java"];
 
@@ -287,14 +289,6 @@ fn walk_files_parallel(
     (sources, others)
 }
 
-/// 元数据长度预分配的单次读取（避开 read_to_string 的指数扩容多次 read）。
-fn read_file_fast(path: &Path) -> std::io::Result<String> {
-    let len = fs::metadata(path).map(|m| m.len() as usize + 1).unwrap_or(4096);
-    let mut buf = String::with_capacity(len);
-    fs::File::open(path)?.read_to_string(&mut buf)?;
-    Ok(buf)
-}
-
 fn classify_file(p: &Path, exts: &[String], sources: &mut Vec<PathBuf>, others: &mut Vec<PathBuf>) {
     let ext = p
         .extension()
@@ -521,28 +515,42 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 let shared = &shared;
                 s.spawn(move || {
                     let mut my: Vec<(usize, FileResult)> = Vec::new();
+                    // 每线程一个批量读取器：Linux+io-uring 特性下为 ring
+                    // 实例（按取号组 64 文件批量 open/read/close），其余
+                    // 平台退化为逐文件 fs::read_to_string（零开销占位）
+                    let mut reader = io_batch::BatchFileReader::new();
                     // 批量取号（64/次）：原子争用降 64×（37 万文件 × 16 线程
                     // 逐文件 fetch_add——采样 ~8% ulock_wait）
                     'grab: loop {
-                        let base = next.fetch_add(64, std::sync::atomic::Ordering::Relaxed);
-                        for i in base..(base + 64) {
-                            let Some(&(path, out_path, display)) = shared.get(i) else {
-                                break 'grab;
-                            };
-                            let display = if display.is_empty() {
+                        let base =
+                            next.fetch_add(io_batch::BATCH, std::sync::atomic::Ordering::Relaxed);
+                        let group: Vec<usize> = (base..base + io_batch::BATCH)
+                            .filter(|&i| i < shared.len())
+                            .collect();
+                        if group.is_empty() {
+                            break 'grab;
+                        }
+                        let paths: Vec<&Path> =
+                            group.iter().map(|&i| shared[i].0.as_path()).collect();
+                        // 非 UTF-8（ISO-8859-1/Cp1252 等编码测试文件）或读失败：
+                        // 告警跳过而非中止整个目录运行（spoon/javaparser 语料
+                        // 各含一个编码测试文件——曾让 5000+ 文件的运行整体失败）
+                        let contents = reader.read_batch(&paths);
+                        for (i, res) in group.into_iter().zip(contents) {
+                            let (path, out_path, display_raw) = shared[i];
+                            let display = if display_raw.is_empty() {
                                 path.display().to_string()
                             } else {
-                                display.to_string()
+                                display_raw.to_string()
                             };
-                            // 非 UTF-8（ISO-8859-1/Cp1252 等编码测试文件）或读失败：
-                            // 告警跳过而非中止整个目录运行（spoon/javaparser 语料
-                            // 各含一个编码测试文件——曾让 5000+ 文件的运行整体失败）
-                            // 元数据预分配：单次 read 系统调用（read_to_string 的
-                            // 指数扩容曾致每文件 ~7 次 read——采样 read 17%）
-                            let src = match fs::read_to_string(path) {
+                            let src = match res {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    eprintln!("cure: 读取 {} 失败（跳过）: {}", path.display(), e);
+                                    eprintln!(
+                                        "cure: 读取 {} 失败（跳过）: {}",
+                                        path.display(),
+                                        e
+                                    );
                                     continue;
                                 }
                             };

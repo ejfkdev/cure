@@ -9,6 +9,15 @@ license.workspace = true
 name = "cure"
 path = "src/main.rs"
 
+[features]
+# Linux io_uring 批量读后端（可选启用；默认构建保持零运行时依赖）。
+# 启用：cargo build --release --features io-uring（仅 Linux 生效，
+# 其他平台 feature 静默空转）。详见 src/io_batch.rs 顶部策略表。
+io-uring = ["dep:io-uring"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
+
 [dependencies]
 cure-java-parser = { path = "../cure-java-parser" }
 cure-java-simplify = { path = "../cure-java-simplify" }
