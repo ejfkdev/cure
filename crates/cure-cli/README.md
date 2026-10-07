@@ -28,8 +28,9 @@ Highlights:
   preserved verbatim while everything around them is simplified
   (`--strict` turns them into an error exit for CI).
 - **Directory mode** — recursive, parallel (dynamic work queue, threads =
-  CPU cores × 1.5), mirrors the tree into `<dir>-cure/`; 371,674-file corpus
-  (4.70 GB) in ~15 s on an 18-core laptop, 0 failures.
+  CPU cores × 1.5), mirrors the tree into `<dir>-cure/`; the 371,674-file OpenJDK
+  corpus (4.70 GB) in ~15 s / ~430 MiB peak RSS on an 18-core laptop
+  (`--check`), 0 failures.
 - **Cross-platform batch I/O** — optional Linux `io_uring` backend
   (`--features io-uring`; read syscalls 6,977 → 10 on a 3,483-file trace);
   macOS/Windows thread pool. Default build: zero runtime dependencies.

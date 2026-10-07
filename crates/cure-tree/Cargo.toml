@@ -12,5 +12,3 @@ categories = ["data-structures"]
 
 [dependencies]
 cure-engine = { workspace = true }
-
-[dev-dependencies]

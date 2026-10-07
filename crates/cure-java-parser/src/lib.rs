@@ -244,7 +244,7 @@ impl<'src> Parser<'src> {
     fn at_annotation_decl(&self) -> bool {
         self.at_punct("@") && matches!(&self.peek(1).tok, Tok::Ident(i) if *i == "interface")
     }
-    fn bump(&mut self) -> Token {
+    fn bump(&mut self) -> Token<'_> {
         let t = self.t[self.pos.min(self.t.len() - 1)].clone();
         if self.pos < self.t.len() - 1 {
             self.pos += 1;
@@ -1419,7 +1419,7 @@ impl<'src> Parser<'src> {
             self.bump();
             let label = match &self.tok().tok {
                 Tok::Ident(i) if !self.at_punct(";") => {
-                    let l = i.clone();
+                    let l = i.to_string();
                     self.bump();
                     Some(l)
                 }
@@ -1510,7 +1510,7 @@ impl<'src> Parser<'src> {
         if let Tok::Ident(_) = &self.tok().tok {
             if self.peek(1).is_punct(":") && !self.peek(2).text().starts_with(':') {
                 let name = match &self.tok().tok {
-                    Tok::Ident(i) => i.clone(),
+                    Tok::Ident(i) => i.to_string(),
                     _ => unreachable!(),
                 };
                 self.bump();
@@ -2305,7 +2305,7 @@ impl<'src> Parser<'src> {
                         .to_string();
                     let bind = match &self.tok().tok {
                         Tok::Ident(i) if !is_reserved_after_type(i) => {
-                            let b = i.clone();
+                            let b = i.to_string();
                             self.bump();
                             Some(b)
                         }
@@ -2316,7 +2316,7 @@ impl<'src> Parser<'src> {
                 }
                 let bind = match &self.tok().tok {
                     Tok::Ident(i) if !is_reserved_after_type(i) && *i != "when" => {
-                        let b = i.clone();
+                        let b = i.to_string();
                         self.bump();
                         Some(b)
                     }
@@ -2563,7 +2563,7 @@ impl<'src> Parser<'src> {
                         continue;
                     }
                     Tok::Ident(name) => {
-                        let n = name.clone();
+                        let n = name.to_string();
                         self.bump();
                         if self.at_punct("(") {
                             let args = self.call_args()?;
@@ -2598,7 +2598,7 @@ impl<'src> Parser<'src> {
                         }
                         match &self.tok().tok {
                             Tok::Ident(name) => {
-                                let n = name.clone();
+                                let n = name.to_string();
                                 self.bump();
                                 if self.at_punct("(") {
                                     let args = self.call_args()?;
@@ -2711,7 +2711,7 @@ impl<'src> Parser<'src> {
                     }
                     match &self.tok().tok {
                         Tok::Ident(m) => {
-                            let n = m.clone();
+                            let n = m.to_string();
                             self.bump();
                             name.push_str("::");
                             name.push_str(&n);

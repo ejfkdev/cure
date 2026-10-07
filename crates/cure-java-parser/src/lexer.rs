@@ -60,7 +60,7 @@ pub struct LexError {
     pub message: String,
 }
 
-pub fn lex(src: &str) -> (Vec<Token>, Vec<LexError>) {
+pub fn lex(src: &str) -> (Vec<Token<'_>>, Vec<LexError>) {
     let mut lx = Lexer {
         b: src.as_bytes(),
         s: src,

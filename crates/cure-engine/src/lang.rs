@@ -167,8 +167,9 @@ pub trait Lang {
 
     /// 负数值字面量的取反（`-(-lit)` 外层负消除）。宽度溢出时必须
     /// 返回 None 拒绝折叠（如 Java i32 的 `-(-2147483648)`）。
+    /// 默认实现按 i64 拒绝 `i64::MIN` 取反（防 debug panic / release 回绕）。
     fn fold_lit_neg(&mut self, v: i64, _wide: bool) -> Option<i64> {
-        Some(-v)
+        v.checked_neg()
     }
 
     /// 常量重结合合并：`(x op1 K1) op2 K2` 的常量合并结果。

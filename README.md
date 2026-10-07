@@ -111,7 +111,7 @@ into `<dir>-cure/` by default.
 | 2. Differential testing | Original and simplified versions each compiled by `javac` and run; stdout / exit code / exception signature must match byte-for-byte (12 families: overflow, NaN, division by zero, StringBuilder, iterators, boxing, short-circuit side effects, …) | full Java-language semantics |
 | 3. Corpora | 3,999 vendored real-world files in 12 auto-discovered suites + 5,596-file external mega-corpus + the 371k-file OpenJDK source corpus | robustness (no panics), self-consistency (output re-parses cleanly), idempotency (second pass = 0 rewrites) |
 
-`cargo test` runs 162 tests. Layers 1–2 caught three real semantic/parse bugs
+`cargo test` runs 170 tests. Layers 1–2 caught three real semantic/parse bugs
 during development (`x && true` mis-fold, `((Cast) x).method()` postfix loss,
 `new` treated as a type name).
 
@@ -167,12 +167,26 @@ when evaluation succeeds, never on the exception path),
 
 ## Performance
 
-| Metric | Value |
-|---|---|
-| Full OpenJDK source corpus (371,674 files / 4.70 GB) | ~15 s, 18-core laptop (`--check`) |
-| Parallelism | dynamic work queue, default threads = cores × 1.5 (measured −7% vs 1:1 on heterogeneous P/E cores, CPU and RSS neutral) |
-| Linux batched I/O | `--features io-uring`: three-phase batched open→read→close; read syscalls 6,977 → 10 on a 3,483-file trace, syscall time −53% |
-| macOS/Windows I/O | thread-pool per-file reads, measured ~1 GB/s aggregate (near the per-file syscall ceiling) |
+Release build, 18-core Apple Silicon laptop, warm page cache, default
+threads (cores × 1.5):
+
+| Workload | Files | Time | Peak RSS |
+|---|---|---|---|
+| Single file (stdin → stdout) | 1 | <10 ms | ~2 MiB |
+| Vendored test corpora | 3,999 | 0.6 s | ~110 MiB |
+| OpenJDK full source corpus, `--check` | 371,674 / 4.70 GB | 14.8 s | ~430 MiB |
+| OpenJDK full source corpus, output tree written | 371,674 / 4.70 GB | 27.5 s | ~430 MiB |
+
+The full-corpus runs execute parse → simplify → print for every file with
+**0 parse failures and 0 panics**.
+
+- Parallelism: dynamic work queue, default threads = cores × 1.5 (measured
+  −7% vs 1:1 on heterogeneous P/E cores; CPU and RSS neutral).
+- Linux batched I/O (`--features io-uring`): three-phase batched
+  open→read→close; read syscalls 6,977 → 10 on a 3,483-file trace, syscall
+  time −53%.
+- macOS/Windows I/O: thread-pool per-file reads, measured ~1 GB/s aggregate
+  (near the per-file syscall ceiling).
 
 ## Architecture
 
@@ -202,7 +216,7 @@ of `cure-engine` + `cure-tree` (see the ~100-line toy language in
 ## Status & roadmap
 
 - ✅ Java backend at production robustness: 371k-file corpus, 0 failures
-- ✅ 12 vendored corpora, three-layer verification, 162 tests
+- ✅ 12 vendored corpora, three-layer verification, 170 tests
 - 🔜 Restoration rules V2 (reflective `addSuppressed` shapes, nested
   two-resource try-with-resources)
 - 🔜 A second language to validate the `Lang` trait boundary
