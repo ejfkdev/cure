@@ -10,7 +10,7 @@
 //!
 //! arena 不变量：children 永远先于父节点入 arena（index 递增）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cure_engine::analysis::{subtree_metrics, TreeMetrics};
 use cure_engine::lang::ReassocOutcome;
@@ -194,6 +194,10 @@ pub struct JavaAst {
     /// 类级常量字段（static final 且字面量/字面量数组初始化、无写、无同名局部）
     /// → 初始化节点。由 simplify_unit 填充（跨方法解密的字符串表）。
     pub const_fields: HashMap<String, JavaId>,
+    /// 可安全做 VarRef → 字面量传播的常量字段名（标量字面量且声明类型
+    /// 与字面量种类精确匹配——过载解析/常量池身份不受影响）。
+    /// 数组常量不进（只走下标折叠，整表引用不复制）。
+    pub const_scalars: HashSet<String>,
     /// 可内联的单 return 方法：名字 → (参数名表, 返回表达式节点)。
     /// 由 simplify_unit 填充（解密 helper：d(0) → 方法体）。
     pub inline_methods: HashMap<String, (Vec<String>, JavaId)>,

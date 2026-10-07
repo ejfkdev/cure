@@ -793,6 +793,42 @@ fn print_equiv_inner(lang: &JavaAst, a: JavaId, b: JavaId) -> bool {
     ca.iter().zip(cb.iter()).all(|(&x, &y)| print_equiv_inner(lang, x, y))
 }
 
+/// rest 段是否对裸名字段**再赋值**：Assign/复合 Assign 的目标为该名的
+/// VarRef，或 ++/-- 操作数。数组元素写（name[i]=v，Assign 目标是 Index）
+/// 改内容不改绑定 → 不算。
+fn rest_reassigns_field(lang: &JavaAst, rest: &[JavaId], name: &str) -> bool {
+    for &root in rest {
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            match lang.kind(n) {
+                NodeKind::Assign => {
+                    let t = lang.children(n)[0];
+                    if lang.kind(t) == NodeKind::VarRef && lang.var_name(t) == Some(name) {
+                        return true;
+                    }
+                }
+                NodeKind::Unary => {
+                    if let NodeData::Unary { op } = lang.data(n) {
+                        if op.is_incdec() {
+                            let t = lang.children(n)[0];
+                            if lang.kind(t) == NodeKind::VarRef
+                                && lang.var_name(t) == Some(name)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for &c in lang.children(n) {
+                stack.push(c);
+            }
+        }
+    }
+    false
+}
+
 pub struct StaticExec;
 
 impl Rule<JavaAst> for StaticExec {
@@ -839,30 +875,36 @@ impl Rule<JavaAst> for StaticExec {
             }
         }
         let rest = &stmts[prefix..];
+        // 截断时第一遍解释器含失败语句的**部分效应**（中途字段写已记账、
+        // 块作用域未弹出）——不构成任何已完成前缀的状态。重放干净前缀：
+        // 已全部 Ok 的语句重跑必然收敛到同一状态。r/a4/a5/a3「半途倾倒」
+        // （倾倒出的中途字段赋值与出口残留赋值构成 final 双重赋值；循环
+        // 状态来自不同字符串互不匹配 → AIOOBE）的根因即此污染。
+        let ex = if prefix < stmts.len() {
+            let mut fresh = vexec::Exec::new(lang);
+            for &st in &stmts[..prefix] {
+                if !matches!(fresh.exec_stmt(st), Ok(vexec::Flow::Normal)) {
+                    return None; // 重放防回归保险：前缀语句在首遍均为 Normal
+                }
+            }
+            fresh
+        } else {
+            ex
+        };
         // 步数预算耗尽：中途状态非收敛值——整段放弃（不回写任何常量）
         if ex.budget_exhausted() {
             return None;
         }
-        // 截断守卫：前缀已写字段若在后半段再被赋值/读取 → 放弃整段。
-        // 「半途倾倒」陷阱：出口含不可求值调用时执行中止，顶层提升的
-        // 字段赋值与残留出口赋值构成 final 双重赋值；倾倒的循环状态
-        // （索引/边界/数组）来自不同字符串互不匹配 → AIOOBE
-        //（差分审查抓获 r/a4/a5/a3 四文件不可编译/必崩）
+        // 截断守卫：前缀已写字段若在后半段被**再赋值** → 放弃整段（与
+        // 材料化写构成 final 双重赋值，不可编译）。仅被**读取** → 放行：
+        // 材料化写恰好为该读供值（bd.java：前缀写 a="SHA-512"，出口段
+        // MessageDigest.getInstance(a) 读它）。数组元素写（name[i]=v）
+        // 改内容不改绑定 → 不算再赋值。
         if prefix < stmts.len() {
-            let writes: Vec<u32> =
-                ex.field_writes().iter().map(|(k, _)| *k).collect();
-            if !writes.is_empty() {
-                for &k in &writes {
-                    if let Some(name) = lang.name_of_key(k) {
-                        let re_referenced = rest.iter().any(|&s| {
-                            cure_engine::analysis::subtree_contains(lang, s, |n| {
-                                lang.kind(n) == NodeKind::VarRef
-                                    && lang.var_name(n) == Some(name.as_str())
-                            })
-                        });
-                        if re_referenced {
-                            return None;
-                        }
+            for (k, _) in ex.field_writes() {
+                if let Some(name) = lang.name_of_key(*k) {
+                    if rest_reassigns_field(lang, rest, &name) {
+                        return None;
                     }
                 }
             }
@@ -3281,50 +3323,44 @@ fn cff_structure(c: &mut CffCtx, mut path: Vec<(i64, Vec<JavaId>)>, mut flow: Fl
 /// 与单 return 方法体。
 pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
     ast.const_fields.clear();
+    ast.const_scalars.clear();
     ast.inline_methods.clear();
 
-    // 第一遍：所有体内对字段名的写与局部/参数同名 → 污染集合
-    let mut tainted: std::collections::HashSet<String> = Default::default();
+    // 第一遍（递归含嵌套类型——规则也处理嵌套类体内的 VarRef）：
+    // 遮蔽集（局部/参数同名声明）+ 全单元名字写计数 + 字段声明名计数。
+    // 写计数取代旧「写即除名」污染集：clinit 单写字面量路径需要知道
+    // 「写过几次」而不只是「写过没有」。
+    let mut shadowed: std::collections::HashSet<String> = Default::default();
+    let mut write_counts: std::collections::HashMap<String, u32> = Default::default();
+    let mut field_decls: std::collections::HashMap<String, u32> = Default::default();
     let mut bodies: Vec<JavaId> = Vec::new();
     for ty in &unit.types {
-        for m in &ty.members {
-            match m {
-                Member::Method { body: Some(b), params, .. }
-                | Member::Constructor { body: Some(b), params, .. } => {
-                    bodies.push(*b);
-                    for p in params {
-                        tainted.insert(p.name.clone());
-                    }
-                }
-                Member::Initializer { body, .. } => bodies.push(*body),
-                Member::Field { declarators, .. } => {
-                    for d in declarators {
-                        if let Some(init) = d.init {
-                            bodies.push(init);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        collect_bodies_recursive(ty, &mut bodies, &mut shadowed, &mut field_decls);
     }
-    // 污染扫描：字段写（含数组元素写/incdec）+ 局部同名声明（遮蔽）
+    // 写扫描：赋值目标子树全部名字（含数组元素写——改内容同样破坏
+    // 常量性）、++/-- 目标、Member 目标的成员名（this.a=x / A.a=x——
+    // this.a 可写静态字段，裸名计数看不见）。
     for &root in &bodies {
         let mut stack = vec![root];
         while let Some(n) = stack.pop() {
             if ast.kind(n) == NodeKind::VarDecl {
                 if let Some(nm) = ast.var_name(n) {
-                    tainted.insert(nm.to_string());
+                    shadowed.insert(nm.to_string());
                 }
             }
             match ast.data(n) {
                 NodeData::Assign { .. } => {
                     let t = ast.children(n)[0];
+                    if ast.kind(t) == NodeKind::Member {
+                        if let NodeData::Member { name: sym } = ast.data(t) {
+                            *write_counts.entry(ast.sn(*sym).to_string()).or_insert(0) += 1;
+                        }
+                    }
                     let mut ts = vec![t];
                     while let Some(x) = ts.pop() {
                         if ast.kind(x) == NodeKind::VarRef {
                             if let Some(nm) = ast.var_name(x) {
-                                tainted.insert(nm.to_string());
+                                *write_counts.entry(nm.to_string()).or_insert(0) += 1;
                             }
                         }
                         for &c in ast.children(x) {
@@ -3336,7 +3372,7 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
                     let t = ast.children(n)[0];
                     if ast.kind(t) == NodeKind::VarRef {
                         if let Some(nm) = ast.var_name(t) {
-                            tainted.insert(nm.to_string());
+                            *write_counts.entry(nm.to_string()).or_insert(0) += 1;
                         }
                     }
                 }
@@ -3348,21 +3384,66 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
         }
     }
 
-    // 第二遍：常量字段收集
+    // 第二遍：常量字段收集（声明初始化路径 + clinit 单写路径）
     for ty in &unit.types {
+        // 本类型自己的 clinit 顶层字面量赋值（静态初始化块材料化形态）
+        let mut own_lits: std::collections::HashMap<String, JavaId> = Default::default();
+        collect_own_clinit_lits(&ast, ty, &mut own_lits);
         for m in &ty.members {
-            if let Member::Field { mods, declarators, .. } = m {
-                if !mods.contains("final") {
-                    continue;
-                }
+            if let Member::Field { mods, ty: fty, declarators } = m {
+                let words: Vec<&str> = mods.split_whitespace().collect();
+                let is_static = words.contains(&"static");
+                let is_final = words.contains(&"final");
+                let is_private = words.contains(&"private");
                 for d in declarators {
-                    if let Some(init) = d.init {
-                        if is_const_init(&ast, init) && !tainted.contains(&d.name) {
-                            if ast.const_fields.contains_key(&d.name) {
-                                ast.const_fields.remove(&d.name);
-                            } else {
-                                ast.const_fields.insert(d.name.clone(), init);
+                    // 名字唯一性：全单元（含嵌套）恰一个同名字段声明。
+                    // 嵌套类同名字段遮蔽外层（或外层遮蔽嵌套）——名字
+                    // 全局的传播无法区分裸名解析指向哪个 → 双见即放弃。
+                    if field_decls.get(&d.name).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    let init = match d.init {
+                        Some(init) => {
+                            // 声明初始化路径：final + 字面量 + 无写 + 无遮蔽
+                            if !is_final
+                                || !is_const_init(&ast, init)
+                                || shadowed.contains(&d.name)
+                                || write_counts.get(&d.name).copied().unwrap_or(0) != 0
+                            {
+                                continue;
                             }
+                            init
+                        }
+                        None => {
+                            // clinit 单写路径：static final，或 static private
+                            //（非 final 必须 private——限定名跨类写 A.a=v 的
+                            // 目标是 Member 节点，名字计数对私有字段才无漏洞；
+                            // bd.java：static_exec 坍缩 106 段解密循环成
+                            // i = new String[]{…} / a = "SHA-512" 后经此路径
+                            // 成为常量）
+                            if !is_static
+                                || (!is_final && !is_private)
+                                || shadowed.contains(&d.name)
+                                || write_counts.get(&d.name).copied().unwrap_or(0) != 1
+                            {
+                                continue;
+                            }
+                            match own_lits.get(&d.name) {
+                                Some(&init) if is_const_init(&ast, init) => init,
+                                _ => continue,
+                            }
+                        }
+                    };
+                    // 同名二见 → 除名（跨类型保守去重，旧语义保持）
+                    if ast.const_fields.contains_key(&d.name) {
+                        ast.const_fields.remove(&d.name);
+                        ast.const_scalars.remove(&d.name);
+                    } else {
+                        let scalar_ok = scalar_lit_of(&ast, init)
+                            .map_or(false, |l| lit_type_matches_decl(fty, l));
+                        ast.const_fields.insert(d.name.clone(), init);
+                        if scalar_ok {
+                            ast.const_scalars.insert(d.name.clone());
                         }
                     }
                 }
@@ -3411,6 +3492,111 @@ fn is_const_init(ast: &JavaAst, init: JavaId) -> bool {
                 && ast.kind(ch[0]) == NodeKind::ArrayLit
                 && ast.children(ch[0]).iter().all(|&e| ast.kind(e) == NodeKind::Literal)
         }
+        _ => false,
+    }
+}
+
+/// 递归收集类型体内（含嵌套类型）：方法/构造器体、初始化块、字段初始化
+/// 表达式 → bodies；参数与局部声明名 → shadowed；字段声明名计数 →
+/// field_decls。
+fn collect_bodies_recursive(
+    ty: &TypeDecl,
+    bodies: &mut Vec<JavaId>,
+    shadowed: &mut std::collections::HashSet<String>,
+    field_decls: &mut std::collections::HashMap<String, u32>,
+) {
+    for m in &ty.members {
+        match m {
+            Member::Method { body: Some(b), params, .. }
+            | Member::Constructor { body: Some(b), params, .. } => {
+                bodies.push(*b);
+                for p in params {
+                    shadowed.insert(p.name.clone());
+                }
+            }
+            Member::Initializer { body, .. } => bodies.push(*body),
+            Member::Field { declarators, .. } => {
+                for d in declarators {
+                    *field_decls.entry(d.name.clone()).or_insert(0) += 1;
+                    if let Some(init) = d.init {
+                        bodies.push(init);
+                    }
+                }
+            }
+            Member::Type(t) => {
+                collect_bodies_recursive(t, bodies, shadowed, field_decls);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 本类型静态初始化块顶层 `name = <常量>` 赋值收集（static_exec 材料
+/// 化后的形态）。只看本类型自己的 clinit：嵌套类初始化块里的裸名赋值
+/// 指向嵌套自己的静态字段（或外层字段——由写计数+唯一性守卫兜底），
+/// 不能归因到外层声明。
+fn collect_own_clinit_lits(
+    ast: &JavaAst,
+    ty: &TypeDecl,
+    out: &mut std::collections::HashMap<String, JavaId>,
+) {
+    for m in &ty.members {
+        if let Member::Initializer { is_static: true, body } = m {
+            if ast.kind(*body) != NodeKind::Block {
+                continue;
+            }
+            for &st in ast.children(*body) {
+                let asg = match ast.kind(st) {
+                    NodeKind::ExprStmt => {
+                        let c = ast.children(st)[0];
+                        if ast.kind(c) == NodeKind::Assign {
+                            c
+                        } else {
+                            continue;
+                        }
+                    }
+                    NodeKind::Assign => st,
+                    _ => continue,
+                };
+                let ch = ast.children(asg).to_vec();
+                if ast.kind(ch[0]) != NodeKind::VarRef {
+                    continue;
+                }
+                let Some(nm) = ast.var_name(ch[0]) else { continue };
+                if is_const_init(ast, ch[1]) {
+                    out.insert(nm.to_string(), ch[1]);
+                }
+            }
+        }
+    }
+}
+
+/// 标量字面量提取（数组/复合形式 → None：只走下标折叠，不整表复制）。
+fn scalar_lit_of(ast: &JavaAst, init: JavaId) -> Option<cure_engine::kind::LitRef<'_>> {
+    if ast.kind(init) == NodeKind::Literal {
+        ast.literal(init)
+    } else {
+        None
+    }
+}
+
+/// 字面量种类与字段声明类型**精确匹配**：VarRef 的静态类型是声明类型，
+/// 字面量的类型是字面量种类——过载解析对此敏感（`final long L = 5` 的
+/// 5 是 int 字面量：m(L) 绑定 m(long)，m(5) 绑定 m(int)）。不匹配 →
+/// 拒绝传播（收集期一次性守卫，bd.java 的 String a/j/f 均精确匹配）。
+fn lit_type_matches_decl(fty: &JType, lit: cure_engine::kind::LitRef) -> bool {
+    use cure_engine::kind::LitRef;
+    match (fty, lit) {
+        (JType::Ref(r), LitRef::Str(_)) => {
+            let base = r.split('<').next().unwrap_or(r).trim();
+            base == "String" || base == "java.lang.String"
+        }
+        (JType::Char, LitRef::Char(_)) => true,
+        (JType::Bool, LitRef::Bool(_)) => true,
+        (JType::Int, LitRef::Int(_)) => true,
+        (JType::Long, LitRef::Long(_)) => true,
+        (JType::Float, LitRef::Float(_)) => true,
+        (JType::Double, LitRef::Double(_)) => true,
         _ => false,
     }
 }
@@ -3503,6 +3689,66 @@ impl Rule<JavaAst> for StaticArrayIndexFold {
             target: id,
             with: elem,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 常量字段标量传播：static final 字面量字段的 VarRef 读点 → 字面量。
+// 跨方法/跨语句常量传播（bd.java：a="SHA-512" → getInstance(a) 处内联）。
+// 守卫：
+//   - assign 目标（含复合/++/--）跳过：clinit 的原赋值 lhs 不能替换；
+//   - Call 的 callee 跳过：字段与方法是不同命名空间（bd.java 的字段 a
+//     与静态方法 a 共存，a(c, b) 是调用不是字段读）；
+//   - const_scalars 只收声明类型与字面量种类精确匹配的标量（收集期
+//     已守卫过载解析；数组常量只走下标折叠）。
+// 语义：intern() 常量（bd 的 a/j 即 new String(...).intern() 材料）
+// 与同类字面量共享常量池实例 → == 身份比较亦保持。
+// ---------------------------------------------------------------------------
+
+pub struct ConstFieldPropagate;
+
+impl Rule<JavaAst> for ConstFieldPropagate {
+    fn name(&self) -> &'static str {
+        "const_field_propagate"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::VarRef]
+    }
+    // 结构性规则：VarRef→Literal 节点数持平（成本模型不增不减）——
+    // 价值在语义透明（读点直接可读），非节点缩减
+    fn structural(&self) -> bool {
+        true
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let parent = ctx.parent(id);
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::VarRef {
+            return None;
+        }
+        let name = lang.var_name(id)?.to_string();
+        if !lang.const_scalars.contains(&name) {
+            return None;
+        }
+        if let Some(p) = parent {
+            let is_first = lang.children(p).first() == Some(&id);
+            match lang.kind(p) {
+                // 赋值目标（含复合赋值）：保留原赋值
+                NodeKind::Assign if is_first => return None,
+                NodeKind::Unary if is_first => {
+                    if let NodeData::Unary { op } = lang.data(p) {
+                        if op.is_incdec() {
+                            return None;
+                        }
+                    }
+                }
+                // 裸名调用 callee：方法名，不是字段读
+                NodeKind::Call if is_first => return None,
+                _ => {}
+            }
+        }
+        let init = *lang.const_fields.get(&name)?;
+        let lit = lang.copy_subtree(init);
+        Some(Edit::Replace { target: id, with: lit })
     }
 }
 
@@ -4548,6 +4794,7 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(UrlDecodeFold));
     rules.push(Box::new(CffRecover));
     rules.push(Box::new(StaticArrayIndexFold));
+    rules.push(Box::new(ConstFieldPropagate));
     rules.push(Box::new(ConstMethodInline));
     rules.push(Box::new(TwrRecover));
     rules.push(Box::new(StringSwitchRecover));

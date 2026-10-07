@@ -1092,3 +1092,145 @@ fn field_init_root_folds() {
     assert!(out.contains("y = 6L;"), "{out}");
     assert!(out.contains("b = false;"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// static_exec 截断守卫细化 + clinit 常量传播（bd.java 批评回应）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn clinit_single_write_private_static_propagates() {
+    // 非 final private static：clinit 恰一次字面量写 → 读点内联
+    let out = run_src(
+        "class A{private static String a;static{a=\"SHA\";int x=1;int y=2;}static void m(){System.out.println(a);}}",
+    );
+    assert!(out.contains("println(\"SHA\");"), "{out}");
+}
+
+#[test]
+fn clinit_dead_first_write_collapses_to_last() {
+    // 首写是死写（被第二写覆盖）→ store_kill 先删 → 剩唯一写 → 传播末值
+    let out = run_src(
+        "class A{private static String a;static{a=\"X\";a=\"Y\";int x=1;int y=2;}static void m(){System.out.println(a);}}",
+    );
+    assert!(out.contains("a = \"Y\";"), "{out}");
+    assert!(out.contains("println(\"Y\");"), "{out}");
+    assert!(!out.contains("\"X\""), "{out}");
+}
+
+#[test]
+fn clinit_write_in_method_no_propagation() {
+    // 方法内再写 → 计数 2 → 不传播
+    let out = run_src(
+        "class A{private static String a;static{a=\"X\";int x=1;int y=2;}static void m(){a=\"Y\";}static void n(){System.out.println(a);}}",
+    );
+    assert!(out.contains("println(a);"), "{out}");
+}
+
+#[test]
+fn clinit_read_only_rest_keeps_prefix_field_writes() {
+    // bd.java 模式：前缀写字段，rest 只读（requireNonNull(a) 读）→ 材料化
+    // 写恰好供值，读点随后传播。截断点 = 不可求值调用
+    let out = run_src(
+        "class A{private static String a;static{a=\"V\";int x=1;int y=2;java.util.Objects.requireNonNull(a);}static void m(){System.out.println(a);}}",
+    );
+    assert!(out.contains("a = \"V\";"), "{out}");
+    assert!(out.contains("requireNonNull(\"V\");"), "{out}");
+    assert!(out.contains("println(\"V\");"), "{out}");
+    // x/y 死局部随段重写消失
+    assert!(!out.contains("int x = 1;"), "{out}");
+}
+
+#[test]
+fn clinit_reassignment_in_rest_bails() {
+    // rest 再赋值前缀写的字段 → final 双重赋值不可编译 → 整段放弃；
+    // 双写也使常量传播失效（写计数 2）。x/y 是死局部，由 dead_decl
+    // 独立清除（不依赖 static_exec）
+    let out = run_src(
+        "class A{static String a;static{a=\"V\";int x=1;int y=2;java.util.Objects.requireNonNull(a);a=\"W\";}static void m(){System.out.println(a);}}",
+    );
+    assert!(out.contains("a = \"V\";"), "{out}");
+    assert!(out.contains("a = \"W\";"), "{out}");
+    assert!(out.contains("requireNonNull(a);"), "{out}");
+    assert!(out.contains("println(a);"), "{out}");
+}
+
+#[test]
+fn partial_statement_field_write_not_dumped() {
+    // 失败语句的**部分效应**不倾倒：字段写发生在中途失败的 try 体内
+    //（println 中止）——重放干净前缀后 field_writes 不含 a → 顶层不
+    // 产生与 try 内原写重复的材料化赋值（污染修复的回归锁定）
+    let out = run_src(
+        "class A{private static String a;static{int x=1;int y=2;int z=3;try{a=\"A\";System.out.println(a);}catch(Exception e){}}static void m(){System.out.println(a);}}",
+    );
+    // 恰一次赋值（try 内的原写）；污染形态会产生第二份顶层赋值
+    assert_eq!(out.matches("a = \"A\";").count(), 1, "{out}");
+    assert!(out.contains("try"), "{out}");
+    // a 写在 try 内（条件执行）→ clinit 路径要求顶层 → 不传播
+    assert!(out.contains("println(a);"), "{out}");
+}
+
+#[test]
+fn const_field_method_name_collision() {
+    // 字段 a 与方法 a 共存：调用点保留（方法命名空间），读点传播
+    let out = run_src(
+        "class A{private static String a;static{a=\"S\";int x=1;int y=2;}static void a(int q){}static void m(){a(1);System.out.println(a);}}",
+    );
+    assert!(out.contains("a(1);"), "{out}");
+    assert!(out.contains("println(\"S\");"), "{out}");
+}
+
+#[test]
+fn const_field_assign_target_preserved() {
+    // clinit 的原赋值 lhs 不被替换（否则 "S" = "S" 不可编译）
+    let out = run_src(
+        "class A{private static String a;static{a=\"S\";int x=1;int y=2;System.out.println(a);}}",
+    );
+    assert!(out.contains("a = \"S\";"), "{out}");
+    assert!(out.contains("println(\"S\");"), "{out}");
+}
+
+#[test]
+fn nested_class_write_blocks_private_propagation() {
+    // 嵌套类写外层 private static → 计数可见 → 不传播
+    let out = run_src(
+        "class A{private static String a;static{a=\"S\";int x=1;int y=2;}static class B{static void n(){a=\"T\";}}static void m(){System.out.println(a);}}",
+    );
+    assert!(out.contains("println(a);"), "{out}");
+}
+
+#[test]
+fn nested_same_name_field_blocks_propagation() {
+    // 嵌套类同名字段（遮蔽外层）→ 名字唯一性破坏 → 不传播
+    let out = run_src(
+        "class A{private static String a;static{a=\"S\";int x=1;int y=2;}static class B{String a;}static void m(){System.out.println(a);}}",
+    );
+    assert!(out.contains("println(a);"), "{out}");
+}
+
+#[test]
+fn type_mismatch_long_int_not_propagated() {
+    // final long L = 5：字面量是 int（m(L) 绑 m(long)，m(5) 绑 m(int)）
+    // → 类型不匹配 → 不传播
+    let out = run_src(
+        "class A{static final long L=5;static void m(){System.out.println(L);}}",
+    );
+    assert!(out.contains("println(L);"), "{out}");
+}
+
+#[test]
+fn this_a_write_blocks_propagation() {
+    // this.a = x 可写静态字段（合法但罕见）→ Member 目标计数 → 不传播
+    let out = run_src(
+        "class A{private static String a;static{a=\"S\";int x=1;int y=2;}void m(){this.a=\"T\";}static void n(){System.out.println(a);}}",
+    );
+    assert!(out.contains("println(a);"), "{out}");
+}
+
+#[test]
+fn decl_init_final_propagates_and_array_index_folds() {
+    // 声明初始化路径（final + 字面量）传播 + 数组下标折叠 → 拼接再折叠
+    let out = run_src(
+        "class A{static final String S=\"tag\";static final String[] T={\"p\",\"q\"};static void m(){System.out.println(S+T[1]);}}",
+    );
+    assert!(out.contains("println(\"tagq\");"), "{out}");
+}
