@@ -235,7 +235,7 @@ fn help_zh_follows_cure_lang() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("容错式代码简化/格式化器"))
+        .stdout(predicate::str::contains("代码简化 / 格式化器"))
         .stdout(predicate::str::contains("示例:"));
 }
 

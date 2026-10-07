@@ -27,13 +27,13 @@ pub(crate) fn print_version() {
 
 fn print_help_en() {
     let v = env!("CARGO_PKG_VERSION");
-    println!("cure {v} — fault-tolerant code simplifier/formatter");
-    println!("Language-agnostic engine; backend implemented today: Java —");
-    println!("decompiled Java in, human-written-looking Java out (semantic-preserving).");
+    println!("cure {v} — fault-tolerant, semantic-preserving code simplifier/formatter");
+    println!("Decompiled code in, human-written-looking code out.");
+    println!("Supported languages: java (implemented today; more to come).");
     println!("{REPO_URL}  (MIT license)");
     println!();
     println!("Usage:");
-    println!("  cure [OPTIONS] <file.java>...     files; single file → stdout by default");
+    println!("  cure [OPTIONS] <file>...           files; single file → stdout by default");
     println!("  cure [OPTIONS] <dir>...           directory (recursive, parallel)");
     println!("  cure [OPTIONS] -                   read stdin, write stdout");
     println!("  cure rules                         list all simplification rules");
@@ -92,20 +92,17 @@ fn print_help_en() {
     println!("  # tuning");
     println!("  cure -j 32 big-corpus/             # worker threads");
     println!("  cure --disable cff_recover src/    # turn one rule off");
-    println!();
-    println!("Performance: 371,674-file OpenJDK corpus (4.70 GB) — 14.8 s /");
-    println!("~430 MiB with --check, 27.5 s written out (18-core laptop).");
 }
 
 fn print_help_zh() {
     let v = env!("CARGO_PKG_VERSION");
-    println!("cure {v} — 容错式代码简化/格式化器");
-    println!("引擎语言无关；当前实现的后端：Java——反编译 Java 进，");
-    println!("像人手写的 Java 出（语义保持）。");
+    println!("cure {v} — 容错式、语义保持的代码简化 / 格式化器");
+    println!("反编译代码进，像人手写的代码出。");
+    println!("已支持语言：java（当前已实现；后续接入更多）。");
     println!("{REPO_URL}  (MIT 许可证)");
     println!();
     println!("用法:");
-    println!("  cure [选项] <文件.java>...        文件；单文件默认输出到 stdout");
+    println!("  cure [选项] <文件>...             文件；单文件默认输出到 stdout");
     println!("  cure [选项] <目录>...             目录（递归、并行）");
     println!("  cure [选项] -                     读 stdin、写 stdout");
     println!("  cure rules                        列出全部简化规则");
@@ -162,9 +159,6 @@ fn print_help_zh() {
     println!("  # 调优");
     println!("  cure -j 32 big-corpus/             # 指定线程数");
     println!("  cure --disable cff_recover src/    # 关掉某条规则");
-    println!();
-    println!("性能: 371,674 文件 OpenJDK 语料（4.70 GB）——--check 14.8 s / 峰值");
-    println!("~430 MiB，写出 27.5 s（18 核笔记本）。");
 }
 
 /// `cure rules` / `cure help rules`：规则目录。
