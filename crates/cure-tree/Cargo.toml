@@ -1,0 +1,16 @@
+[package]
+name = "cure-tree"
+description = "Generic arena-tree toolkit for cure language frontends: inline ChildList, name interning + node keys, region-event index (lazy rebuild), effect table rebuild"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["ast", "arena", "interning"]
+categories = ["data-structures"]
+
+[dependencies]
+cure-engine = { workspace = true }
+
+[dev-dependencies]

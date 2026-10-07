@@ -14,10 +14,11 @@ use std::collections::HashMap;
 
 use cure_engine::lang::ReassocOutcome;
 use cure_engine::Lang;
+pub use cure_tree::ChildList;
+use cure_tree::{EventStore, NameTable};
 
 // 本 crate 自用 + 供下游 crate（如 cure-java-print/parser）免依赖引擎直接使用
 pub use cure_engine::kind::{BinOp, LitRef, NodeKind, UnOp};
-use cure_engine::kind::{EventKind, RegionEvent};
 pub use cure_engine::Effect;
 
 // ---------------------------------------------------------------------------
@@ -166,7 +167,7 @@ pub enum NodeData {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Node {
     pub data: NodeData,
-    pub children: ChildList,
+    pub children: ChildList<JavaId>,
 }
 
 /// 符号（intern 名字 id）。VarRef/Member/MethodRef 的名字字段——
@@ -176,109 +177,6 @@ pub struct Node {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Sym(pub u32);
 
-/// 子节点容器（内联优化）：≤3 个孩子零堆分配（AST 绝大多数节点——
-/// Binary/Assign=2、Member/MethodRef=1、VarDecl≤1、Literal=0……
-/// 37 万文件语料 malloc 采样的剩余大头是每节点一次 Vec 堆分配）；
-/// ≥4 溢出到堆。Block/Call 大参数列表溢出属预期路径。
-#[derive(Clone, Debug)]
-pub struct ChildList {
-    inline_len: u8,
-    inline: [JavaId; 3],
-    heap: Vec<JavaId>,
-}
-
-impl Default for ChildList {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PartialEq for ChildList {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
-    }
-}
-
-impl ChildList {
-    pub fn new() -> Self {
-        Self { inline_len: 0, inline: [JavaId::default(); 3], heap: Vec::new() }
-    }
-    pub fn from_vec(v: Vec<JavaId>) -> Self {
-        let n = v.len();
-        if n <= 3 {
-            let mut cl = Self::new();
-            for (i, id) in v.into_iter().enumerate() {
-                cl.inline[i] = id;
-            }
-            cl.inline_len = n as u8;
-            cl
-        } else {
-            Self { inline_len: 0, inline: [JavaId(0); 3], heap: v }
-        }
-    }
-    pub fn as_slice(&self) -> &[JavaId] {
-        if self.heap.is_empty() {
-            &self.inline[..self.inline_len as usize]
-        } else {
-            &self.heap
-        }
-    }
-    pub fn len(&self) -> usize {
-        if self.heap.is_empty() {
-            self.inline_len as usize
-        } else {
-            self.heap.len()
-        }
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    /// 按索引替换（保持同一形态）。
-    pub fn set(&mut self, index: usize, new: JavaId) {
-        if self.heap.is_empty() {
-            self.inline[index] = new;
-        } else {
-            self.heap[index] = new;
-        }
-    }
-    /// 移除一个孩子（内联区左移；堆走 Vec::remove）。
-    pub fn remove(&mut self, index: usize) {
-        if self.heap.is_empty() {
-            for i in index..self.inline_len as usize - 1 {
-                self.inline[i] = self.inline[i + 1];
-            }
-            self.inline_len -= 1;
-        } else {
-            self.heap.remove(index);
-            // 缩回 ≤3：搬回内联
-            if self.heap.len() <= 3 {
-                let v = std::mem::take(&mut self.heap);
-                *self = Self::from_vec(v);
-            }
-        }
-    }
-    /// 区间替换（Splice 语义：删 [index, index+remove) 插 insert）。
-    pub fn splice(&mut self, index: usize, remove: usize, insert: Vec<JavaId>) {
-        let new_len = self.len() - remove + insert.len();
-        if new_len <= 3 && self.heap.is_empty() {
-            // 纯内联区间的手工搬移
-            let mut result: Vec<JavaId> = self.as_slice().to_vec();
-            let end = (index + remove).min(result.len());
-            result.splice(index..end, insert);
-            *self = Self::from_vec(result);
-        } else {
-            // 堆路径：先物化成 Vec，操作，再回填
-            let mut v = std::mem::take(&mut self.heap);
-            if v.is_empty() {
-                v = self.as_slice().to_vec();
-                self.inline_len = 0;
-            }
-            let end = (index + remove).min(v.len());
-            v.splice(index..end, insert);
-            *self = Self::from_vec(v);
-        }
-    }
-}
 
 /// Java AST arena。只追加不回收，[`JavaId`] 永不失效。
 #[derive(Default, Debug)]
@@ -298,29 +196,18 @@ pub struct JavaAst {
     /// 可内联的单 return 方法：名字 → (参数名表, 返回表达式节点)。
     /// 由 simplify_unit 填充（解密 helper：d(0) → 方法体）。
     pub inline_methods: HashMap<String, (Vec<String>, JavaId)>,
-    /// 事件索引清洁标记（B3 惰性重建）：invalidate_effect 清零；prepare
-    /// 走完重建置位。true 时 prepare 直接跳过 build_region_index 全树
-    /// walk（无失效 = 无需重建；编辑必经失效路径——立即/延迟两路都覆盖）。
-    /// 默认 false（derive）= 首次 prepare 必建全量。
-    events_clean: bool,
     /// String 引用身份比较缓存：(root, 结果)。prepare() 清空（树已变），
     /// 首次查询时计算——供 new String(lit) 等折叠守卫复用（每轮至多一次全扫）。
     string_identity: std::cell::Cell<Option<(JavaId, bool)>>,
-    /// 区域事件索引（使用索引）：语句级节点 → 子树事件序列（prepare 构建，
-    /// 编辑沿祖先失效）。供引擎 scan_region 快路径——遍历序与
-    /// scan_region 原递归严格一致（见 collect_region_events）。
-    region_events: Vec<Vec<cure_engine::kind::RegionEvent<JavaId, u32>>>,
-    /// 名字实化（intern）：名字 → u32 键。单元级持久、只增。
-    name_intern: HashMap<String, u32>,
-    /// Sym → 名字原文（符号表向量——sn() 翻译用）
-    sym_names: Vec<String>,
-    /// 节点的名字键（槽位=节点 id；KEY_NONE=无名）。prepare 增量扩展
-    /// （新节点 intern），既有节点键与其名字恒同——无需失效。
-    node_key: Vec<u32>,
+    /// 名字 intern 表 + 节点名字键（cure-tree `NameTable`；本语言
+    /// `Lang::NameKey = u32` intern id）。单元级持久、只增；prepare
+    /// 增量扩展新节点，既有节点键与其名字恒同。
+    names: NameTable,
+    /// 区域事件索引（cure-tree `EventStore`）：B3 惰性重建 + 编辑失效。
+    /// 供引擎 scan_region 快路径——收集器在 cure-tree，只依赖 Lang
+    /// 钩子，遍历序与引擎原递归严格一致。
+    events: EventStore<JavaId, u32>,
 }
-
-/// 无名节点的键。
-const KEY_NONE: u32 = u32::MAX;
 
 // ---------------------------------------------------------------------------
 // 编译单元 / 成员（签名层：签名保真、方法体进 arena）
@@ -1149,14 +1036,12 @@ impl Lang for JavaAst {
     }
 
     fn invalidate_effect(&mut self, id: JavaId) {
-        self.events_clean = false;
         if let Some(slot) = self.effect_cache.get_mut(id.0 as usize) {
             *slot = None;
         }
         // 事件索引同步失效：本节点子树若被改，其预计算事件已陈旧
-        if let Some(ev) = self.region_events.get_mut(id.0 as usize) {
-            ev.clear();
-        }
+        // （B3 脏标记 + 清空该槽——见 cure-tree EventStore）
+        self.events.invalidate(id.0 as usize);
     }
 
     fn debug_verify_events(&self, stmt: JavaId) {
@@ -1164,7 +1049,7 @@ impl Lang for JavaAst {
             return;
         }
         if let Some(indexed) = self.region_events(stmt) {
-            let fresh = self.collect_region_events(stmt);
+            let fresh = cure_tree::collect_region_events(self, stmt);
             // 比较（键+种类+节点）三元组序列
             let key = |e: &cure_engine::kind::RegionEvent<JavaId, u32>| {
                 (e.key, matches!(e.kind, cure_engine::kind::EventKind::Use), e.node.0)
@@ -1184,22 +1069,24 @@ impl Lang for JavaAst {
         &self,
         id: JavaId,
     ) -> Option<&[cure_engine::kind::RegionEvent<JavaId, u32>]> {
-        match self.region_events.get(id.0 as usize) {
-            // 空序列 = 未索引（非语句节点或已失效）→ None 走原递归
-            Some(v) if !v.is_empty() => Some(v),
-            _ => None,
+        // 空序列 = 未索引（非语句节点或已失效）→ None 走原递归
+        let v = self.events.slot(id.0 as usize);
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
         }
     }
 
     fn var_key(&self, id: JavaId) -> Option<u32> {
-        match self.node_key.get(id.0 as usize) {
-            Some(&k) if k != KEY_NONE => Some(k),
-            _ => None,
-        }
+        self.names.var_key(id.0 as usize)
     }
 
     fn node_index(&self, id: JavaId) -> usize {
         id.0 as usize
+    }
+    fn id_of_index(&self, idx: usize) -> JavaId {
+        JavaId(idx as u32)
     }
 
     fn is_opaque(&self, id: JavaId) -> bool {
@@ -1381,73 +1268,45 @@ impl Lang for JavaAst {
             PREPARE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             PREPARE_NODES.fetch_add(self.nodes.len(), std::sync::atomic::Ordering::Relaxed);
         }
-        // 名字键增量扩展：新节点 intern（既有节点键不变——名字与位置无关）
-        if self.node_key.len() < self.nodes.len() {
-            let base = self.node_key.len();
-            self.node_key.resize(self.nodes.len(), KEY_NONE);
-            for i in base..self.nodes.len() {
-                let id = JavaId(i as u32);
-                if let Some(name) = self.var_name(id).map(|n| n.to_string()) {
-                    let k = self.intern_name(&name);
-                    self.node_key[i] = k;
-                }
-            }
+        // 名字键增量扩展（cure-tree NameTable）：新节点 intern（既有节点
+        // 键不变——名字与位置无关）。名字先收集（&self 借用安全形态），
+        // 再批量扩展（&mut self.names）。
+        let n_nodes = self.nodes.len();
+        let key_slots = self.names.key_slots();
+        if key_slots < n_nodes {
+            let names: Vec<Option<String>> = (key_slots..n_nodes)
+                .map(|i| self.var_name(JavaId(i as u32)).map(|n| n.to_string()))
+                .collect();
+            self.names.extend_owned(key_slots, &names);
         }
         // 守卫缓存失效：树已变
         self.string_identity.set(None);
-        // 区域事件索引【惰性重建】（B3）：只重建**空条目**——被
-        // invalidate_effect 失效的语句、或新语句。未失效条目的事件是
-        // 子树局部的（与位置无关）。关键不变量：**一切**改树路径都必须
-        // 失效受影响语句的条目：
+        // 区域事件索引【惰性重建】（B3，cure-tree EventStore）：只重建
+        // **空条目**——被 invalidate_effect 失效的语句、或新语句。未失效
+        // 条目的事件是子树局部的（与位置无关）。关键不变量：**一切**改树
+        // 路径都必须失效受影响语句的条目：
         //   - 立即 Replace：目标祖先链 + with 子树中既有节点的**旧容器**
         //     祖先链（搬移——pass.rs 立即路径两处都做）
         //   - 队列编辑应用：同上（pass.rs deferred 应用后统一失效）
         // 违反不变量的后果：陈旧事件驱动错误决策（B2 教训：cff_diamond
         // 差分当场抓获）。性能背景：Types.java 上 prepare 每 pass 全量重建
         // = 726 倍冗余（37 万文件语料 prepare 占 57% 线程时间）。
-        if self.region_events.len() < self.nodes.len() {
-            self.region_events.resize(self.nodes.len(), Vec::new());
-        }
-        if self.events_clean {
+        self.events.resize(n_nodes);
+        if self.events.is_clean() {
             return;
         }
-        self.events_clean = true;
-        for sr in self.build_region_index(root) {
-            if self.region_events[sr.0 as usize].is_empty() {
-                let events = self.collect_region_events(sr);
-                self.region_events[sr.0 as usize] = events;
+        self.events.mark_clean();
+        for sr in cure_tree::stmt_roots(self, root) {
+            let idx = sr.0 as usize;
+            if self.events.slot(idx).is_empty() {
+                let events = cure_tree::collect_region_events(self, sr);
+                self.events.put(idx, events);
             }
         }
-        // ---- 效果表 ----
-        // 正常情况一轮升序扫描即可（children index < parent index 的
-        // 解析器不变量）。但 Edit::Replace 注入的新节点 append 在 arena
-        // 末尾、index 大于其（旧）父节点——单轮 sweep 会让父聚合到 Unknown
-        // 并污染祖先链。故迭代到不动点（违例深度有限，2 轮内收敛）。
-        self.effect_cache.clear();
-        self.effect_cache.resize(self.nodes.len(), None);
-        let n = self.nodes.len() as u32;
-        for _round in 0..4 {
-            let mut changed = false;
-            for i in 0..n {
-                let id = JavaId(i);
-                let mut e = self.own_effect(id);
-                for &c in self.nodes[i as usize].children.as_slice() {
-                    e = e.worst(
-                        self.effect_cache
-                            .get(c.0 as usize)
-                            .and_then(|x| *x)
-                            .unwrap_or(Effect::Unknown),
-                    );
-                }
-                if self.effect_cache[i as usize] != Some(e) {
-                    self.effect_cache[i as usize] = Some(e);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
+        // ---- 效果表（cure-tree rebuild_effects：不动点 sweep——
+        // children-先于-parent 索引序 + 注入节点违例多轮收敛）----
+        let effects = cure_tree::rebuild_effects(self, n_nodes);
+        self.effect_cache = effects;
 
         // ---- 变量类型（作用域栈）----
         self.var_types.clear();
@@ -1637,147 +1496,17 @@ impl JavaAst {
     /// 名字 → 实化键（持久表，只增；同名字恒同键）。
     /// intern 名字 → Sym（复用 name_intern 表 + sym_names 向量）。
     pub fn intern_sym(&mut self, name: &str) -> Sym {
-        let k = self.intern_name(name);
-        if self.sym_names.len() <= k as usize {
-            self.sym_names.resize(k as usize + 1, String::new());
-            self.sym_names[k as usize] = name.to_string();
-        }
-        Sym(k)
+        Sym(self.names.intern(name))
     }
 
     /// Sym → 名字原文。
     pub fn sn(&self, sym: Sym) -> &str {
-        self.sym_names
-            .get(sym.0 as usize)
-            .map(|s| s.as_str())
-            .unwrap_or("")
+        self.names.name(sym.0)
     }
 
-    fn intern_name(&mut self, name: &str) -> u32 {
-        if let Some(&k) = self.name_intern.get(name) {
-            return k;
-        }
-        let k = self.name_intern.len() as u32;
-        self.name_intern.insert(name.to_string(), k);
-        k
-    }
 
-    fn build_region_index(&mut self, root: JavaId) -> Vec<JavaId> {
-        // 语句级节点 = Block 的直接孩子（规则只对这些调用 scan_region）。
-        // 遍历整树，遇到 Block 就为其每个孩子收集事件。
-        let mut stack = vec![root];
-        let mut stmt_roots: Vec<JavaId> = Vec::new();
-        while let Some(n) = stack.pop() {
-            if self.kind(n) == NodeKind::Block {
-                for &c in self.nodes[n.0 as usize].children.as_slice() {
-                    stmt_roots.push(c);
-                }
-            }
-            for &c in self.nodes[n.0 as usize].children.as_slice() {
-                stack.push(c);
-            }
-        }
-        stmt_roots
-    }
 
-    /// 收集 `node` 子树的事件序列（顺序语义见模块注释；键取 node_key 预存），
-    /// **按键稳定排序**：同键内保持遍历序（scan_region 只消费键内序——
-    /// Use 的顺序、Write/Shadow 的命中，跨键顺序无关），查询侧可二分
-    /// 定位键区间、跳过全部非匹配事件。
-    fn collect_region_events(&self, node: JavaId) -> Vec<RegionEvent<JavaId, u32>> {
-        if cnt_prepare_on() {
-            COLLECT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let mut out = Vec::new();
-        let saw_raw = self.collect_events_into(node, &mut out);
-        if saw_raw {
-            // 含 Raw：不建索引（键排序分区看不见 Opaque 键）——置空走
-            // scan_region 递归路径，其 Raw 分支设 opaque → 规则保守拒绝
-            return Vec::new();
-        }
-        out.sort_by_key(|e| e.key);
-        out
-    }
 
-    fn key_of(&self, node: JavaId) -> u32 {
-        self.node_key.get(node.0 as usize).copied().unwrap_or(KEY_NONE)
-    }
-
-    /// 返回值：子树是否含 Raw（不可解析原文——读/写集不可证明）。
-    fn collect_events_into(&self, node: JavaId, out: &mut Vec<RegionEvent<JavaId, u32>>) -> bool {
-        match self.data(node) {
-            NodeData::Raw { .. } => {
-                out.push(RegionEvent { kind: EventKind::Opaque, node, key: KEY_NONE });
-                return true;
-            }
-            NodeData::New { anon_raw: Some(_), .. } => {
-                // 匿名类体原文：捕获变量读写不可见 → 整节点不透明
-                out.push(RegionEvent { kind: EventKind::Opaque, node, key: KEY_NONE });
-                return true;
-            }
-            NodeData::Assign { .. } => {
-                let ch = self.children(node);
-                if let Some(&t) = ch.first() {
-                    if self.kind(t) == NodeKind::VarRef {
-                        out.push(RegionEvent { kind: EventKind::Write, node: t, key: self.key_of(t) });
-                    }
-                }
-                if let Some(&v) = ch.get(1) {
-                    return self.collect_events_into(v, out);
-                }
-                false
-            }
-            NodeData::Unary { op } if op.is_incdec() => {
-                let ch = self.children(node);
-                if let Some(&t) = ch.first() {
-                    if self.kind(t) == NodeKind::VarRef {
-                        out.push(RegionEvent { kind: EventKind::Write, node: t, key: self.key_of(t) });
-                    }
-                }
-                false
-            }
-            NodeData::VarDecl { .. } => {
-                let k = self.key_of(node);
-                out.push(RegionEvent { kind: EventKind::Write, node, key: k });
-                out.push(RegionEvent { kind: EventKind::Shadow, node, key: k });
-                let mut raw = false;
-                for &c in self.children(node) {
-                    raw |= self.collect_events_into(c, out);
-                }
-                raw
-            }
-            NodeData::ForEach { .. } => {
-                let k = self.key_of(node);
-                out.push(RegionEvent { kind: EventKind::Write, node, key: k });
-                out.push(RegionEvent { kind: EventKind::Shadow, node, key: k });
-                let mut raw = false;
-                for &c in self.children(node) {
-                    raw |= self.collect_events_into(c, out);
-                }
-                raw
-            }
-            NodeData::Catch { .. } => {
-                let k = self.key_of(node);
-                out.push(RegionEvent { kind: EventKind::Shadow, node, key: k });
-                let mut raw = false;
-                for &c in self.children(node) {
-                    raw |= self.collect_events_into(c, out);
-                }
-                raw
-            }
-            NodeData::VarRef { .. } => {
-                out.push(RegionEvent { kind: EventKind::Use, node, key: self.key_of(node) });
-                false
-            }
-            _ => {
-                let mut raw = false;
-                for &c in self.children(node) {
-                    raw |= self.collect_events_into(c, out);
-                }
-                raw
-            }
-        }
-    }
 }
 
 static ENV_CACHED: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();

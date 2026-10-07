@@ -162,16 +162,22 @@ cure [选项] <文件.java>... | <目录> | -
 ## 架构
 
 ```text
-cure-engine        语言无关核心：模式、改写、pass、fixed-point 驱动、代价模型
-cure-java-ast      arena AST + NodeId + builder；实现 Lang trait
+cure-engine        语言无关核心：模式、改写、pass、fixed-point 驱动、代价模型、
+                   字面量折叠语义钩子
+cure-tree          通用 arena 树工具包（每个语言复用）：子节点内联容器、
+                   名字 intern + 节点键、区域事件索引（B3 惰性重建）、效果表重建
+cure-java-ast      Java NodeData + 签名层；基于 cure-tree 实现 Lang trait
 cure-java-parser   容错 Java 词法/解析器（token 全借用、源零拷贝）
 cure-java-print    规范化 Java 打印器/格式化器
 cure-java-simplify Java 规则包 + cure-engine 门面
 cure-cli           `cure` 二进制：并行管线、跨平台批量 I/O（io_uring/线程池）、目录模式
 ```
 
-`Lang` trait 是语言边界：接入第二语言只需在其上提供自己的 AST +
-parser + printer + 规则包。
+`Lang` trait 是语言边界。数值/字符串折叠语义全部走语言钩子
+（`fold_lit_bin` / `fold_lit_cmp` / `fold_lit_neg` / `reassoc_delta`）——
+引擎不硬编码任何语言的算术。接入第二语言只需在 `cure-engine` +
+`cure-tree` 之上提供自己的 AST + parser + printer + 规则包
+（见 `cure-tree/tests/kit.rs` 里 ~100 行的玩具语言）。
 
 ## 状态与路线
 

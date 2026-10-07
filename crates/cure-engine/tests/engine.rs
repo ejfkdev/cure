@@ -216,6 +216,9 @@ impl Lang for Toy {
     fn node_index(&self, id: Id) -> usize {
         id as usize
     }
+    fn id_of_index(&self, idx: usize) -> Id {
+        idx as u32
+    }
 }
 
 // ---------------------------------------------------------------------------

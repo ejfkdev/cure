@@ -33,6 +33,7 @@ fi
 # --- 依赖拓扑序（被依赖者在前）---
 CRATES=(
   cure-engine
+  cure-tree
   cure-java-ast
   cure-java-parser
   cure-java-print

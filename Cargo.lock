@@ -85,6 +85,7 @@ name = "cure-java-ast"
 version = "0.1.0"
 dependencies = [
  "cure-engine",
+ "cure-tree",
 ]
 
 [[package]]
@@ -111,6 +112,13 @@ dependencies = [
  "cure-java-ast",
  "cure-java-parser",
  "cure-java-print",
+]
+
+[[package]]
+name = "cure-tree"
+version = "0.1.0"
+dependencies = [
+ "cure-engine",
 ]
 
 [[package]]

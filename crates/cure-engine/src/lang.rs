@@ -20,6 +20,9 @@ pub trait Lang {
     type NameKey: Copy + Eq + Ord + Debug;
     /// 节点在语言 arena 中的稠密下标（供引擎位图/数组索引）。
     fn node_index(&self, id: Self::Id) -> usize;
+    /// `node_index` 的逆映射（下标 → Id）。cure-tree 工具包的线性
+    /// 扫描（效果表重建、名字键扩展）需要按 arena 下标遍历。
+    fn id_of_index(&self, idx: usize) -> Self::Id;
 
     // ---- 结构 ----
 

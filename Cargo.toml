@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/cure-engine",
+    "crates/cure-tree",
     "crates/cure-java-ast",
     "crates/cure-java-print",
     "crates/cure-java-simplify",
@@ -20,6 +21,7 @@ rust-version = "1.74"
 
 [workspace.dependencies]
 cure-engine = { path = "crates/cure-engine", version = "0.1.0" }
+cure-tree = { path = "crates/cure-tree", version = "0.1.0" }
 cure-java-ast = { path = "crates/cure-java-ast", version = "0.1.0" }
 cure-java-parser = { path = "crates/cure-java-parser", version = "0.1.0" }
 cure-java-print = { path = "crates/cure-java-print", version = "0.1.0" }

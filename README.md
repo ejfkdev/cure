@@ -178,8 +178,12 @@ when evaluation succeeds, never on the exception path),
 
 ```text
 cure-engine        language-agnostic core: patterns, rewrites, passes,
-                   fixed-point driver, cost model
-cure-java-ast      arena AST + NodeId + builder; implements the Lang trait
+                   fixed-point driver, cost model, literal-folding hooks
+cure-tree          generic arena-tree toolkit every language reuses:
+                   inline ChildList, name interning + node keys, region-event
+                   index (B3 lazy rebuild), effect table rebuild
+cure-java-ast      Java NodeData + signatures; implements the Lang trait
+                   on top of cure-tree
 cure-java-parser   fault-tolerant Java lexer/parser (byte-borrowed tokens,
                    zero-copy source)
 cure-java-print    canonical Java printer/formatter
@@ -188,9 +192,12 @@ cure-cli           the `cure` binary: parallel pipeline, cross-platform
                    batch I/O (io_uring / thread pool), directory mode
 ```
 
-The `Lang` trait is the language boundary: a second language frontend only
-needs to provide its own AST + parser + printer + rule pack on top of
-`cure-engine`.
+The `Lang` trait is the language boundary. Numeric/string folding semantics
+live behind language hooks (`fold_lit_bin` / `fold_lit_cmp` / `fold_lit_neg` /
+`reassoc_delta`) — the engine hardcodes no language's arithmetic. A second
+language frontend provides its own AST + parser + printer + rule pack on top
+of `cure-engine` + `cure-tree` (see the ~100-line toy language in
+`cure-tree/tests/kit.rs`).
 
 ## Status & roadmap
 
