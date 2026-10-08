@@ -150,6 +150,7 @@ pub fn parse(src: &str) -> ParseOutcome {
         ast: JavaAst::new(),
         in_case_label: false,
         param_dims_annos: false,
+        ty_dims_annos: false,
     };
     for e in lex_errs {
         p.errs.push(ParseError {
@@ -173,6 +174,9 @@ pub fn parse(src: &str) -> ParseOutcome {
 struct Parser<'src> {
     /// param_list 见到维度注解（供 member_rest 决定整方法 Raw）
     param_dims_annos: bool,
+    /// parse_type 见到**类型侧**维度注解（同 param_dims_annos 思路——
+    /// 供各调用方升级整段 Raw）
+    ty_dims_annos: bool,
 
     t: Vec<Token<'src>>,
     pos: usize,
@@ -1238,7 +1242,12 @@ impl<'src> Parser<'src> {
                 // 构造器参数维度注解：整成员 Raw 保真（同方法路径——
                 // 从构造器名前整段取文）
                 if self.param_dims_annos {
-                    let _ = self.sync_member();
+                    // 同方法路径的专用回退（不吞后续成员）
+                    let _ = self.throws_clause();
+                    if self.at_punct("{") {
+                        let _ = self.skip_balanced_braces();
+                    }
+                    self.eat(";");
                     let body = self
                         .text_of(ctor_start, self.t[self.pos.min(self.t.len() - 1)].start)
                         .trim()
@@ -1263,6 +1272,8 @@ impl<'src> Parser<'src> {
         // Raw 回退的整段取文起点）
         let member_start = self.cur_start();
         let ty = self.parse_type()?;
+        // 类型侧维度注解（int @A [] f——R18 BUG A）：整成员 Raw
+        let field_ty_annos = self.ty_dims_annos;
         let mut name = match &self.tok().tok {
             Tok::Ident(i) => {
                 let n = i.to_string();
@@ -1283,6 +1294,14 @@ impl<'src> Parser<'src> {
         // 堆叠**（@Nullable int array2 @Nullable [] @Nullable [] 三个各在
         // 维度位合法，提升成类型位三连非法））：整成员 Raw 保真——
         // 维度位注解无法在 Member 结构中表达，Raw 是唯一无损位
+        if field_ty_annos {
+            let _ = self.sync_member();
+            let body = self
+                .text_of(member_start, self.t[self.pos.min(self.t.len() - 1)].start)
+                .trim()
+                .to_string();
+            return Some(Member::Raw(format!("{mods}{ty_params} {body}")));
+        }
         {
             let (save, ann) = self.consume_dims_annotation_run();
             if !ann.is_empty()
@@ -1324,7 +1343,14 @@ impl<'src> Parser<'src> {
             //（返回类型前）整段取文——曾从当前位置取丢整个方法头
             //（checkNotNullContents3 的 `public static {` 残段实锤）
             if self.param_dims_annos {
-                let _ = self.sync_member();
+                // 专用回退（R18 BUG C：sync_member 只数 {} 且从当前位置
+                // 起会越过方法体吞掉**类内余下全部成员**）：依次越过
+                // throws 子句 + 方法体（平衡）+ 可选尾分号——止于成员界
+                let _ = self.throws_clause();
+                if self.at_punct("{") {
+                    let _ = self.skip_balanced_braces();
+                }
+                self.eat(";");
                 let body = self
                     .text_of(member_start, self.t[self.pos.min(self.t.len() - 1)].start)
                     .trim()
@@ -1363,9 +1389,16 @@ impl<'src> Parser<'src> {
                 break;
             }
             let mut d_dims = if declarators.is_empty() { first_extra } else { 0 };
+            let mut d_annos = false;
             loop {
-                // 维度间注解：String [] @B [] x（openjdk LocalVariables）
+                // 维度间/名后注解：String [] @B [] x / int a, b @A []——
+                // 后续声明符位的维度注解（R18 BUG B：曾静默丢弃）→
+                // 整成员 Raw
+                let pre = self.pos;
                 self.skip_mods_annotations();
+                if self.pos != pre && self.at_punct("[") && self.peek(1).is_punct("]") {
+                    d_annos = true;
+                }
                 if self.at_punct("[") && self.peek(1).is_punct("]") {
                     self.bump();
                     self.bump();
@@ -1373,6 +1406,15 @@ impl<'src> Parser<'src> {
                 } else {
                     break;
                 }
+            }
+            if d_annos {
+                // 回退到本声明符前，吞到字段结尾（;），整成员 Raw
+                let _ = self.sync_member();
+                let body = self
+                    .text_of(member_start, self.t[self.pos.min(self.t.len() - 1)].start)
+                    .trim()
+                    .to_string();
+                return Some(Member::Raw(format!("{mods}{ty_params} {body}")));
             }
             let init = if self.eat("=") {
                 match self.parse_expr(PREC_ASSIGN) {
@@ -1462,7 +1504,14 @@ impl<'src> Parser<'src> {
             // 维度间注解（T name @A []）追加文本（进 mods）
             let mut mods_suffix = String::new();
             let ty = match self.parse_type() {
-                Some(t) => t,
+                Some(t) => {
+                    // 类型侧维度注解（int @A [] x——R18 BUG A）：并入维度
+                    // 注解信号 → 整方法 Raw
+                    if self.ty_dims_annos {
+                        dims_annos_seen = true;
+                    }
+                    t
+                }
                 None => {
                     self.err_at("bad parameter type");
                     self.sync_param();
@@ -1629,6 +1678,7 @@ impl<'src> Parser<'src> {
 
     /// 解析类型（含数组后缀）；失败返回 None（调用方自行保存 pos 回滚）。
     fn parse_type(&mut self) -> Option<JType> {
+        self.ty_dims_annos = false;
         // 类型注解前缀（JSR 308：instanceof/泛型等类型位置的 @Anno(…)）——
         // **原文保留**并入 Ref 名（`<G> @A G m()` 的返回位置/instanceof 的
         // 纯 TYPE_USE 注解曾丢弃——TU 电池抓获）；基类型为原语时仍跳过
@@ -1663,9 +1713,16 @@ impl<'src> Parser<'src> {
             other => other,
         };
         loop {
-            // 维度间注解：String [] @B [] x（openjdk LocalVariables——
-            // 注解位于 [] 对之间，丢弃维度注解并入数组类型）
+            // 维度间注解：String [] @B [] x / **类型侧** int @A [] x
+            //（openjdk LocalVariables——注解位于 [] 对之间/之前）。维度位
+            // 注解无法在 JType 结构中表达（结构化提升使非可重复注解堆
+            // 非法——R17 教训）——**置信号** ty_dims_annos 供调用方升级
+            // 整段 Raw（R18 BUG A：六位类型侧曾静默丢弃）
+            let pre = self.pos;
             self.skip_mods_annotations();
+            if self.pos != pre && self.at_punct("[") && self.peek(1).is_punct("]") {
+                self.ty_dims_annos = true;
+            }
             if self.at_punct("[") && self.peek(1).is_punct("]") {
                 self.bump();
                 self.bump();
@@ -2201,6 +2258,11 @@ impl<'src> Parser<'src> {
         // 局部变量声明 vs 表达式语句（回溯判定）
         let save = self.pos;
         if let Some((ty, had_final)) = self.try_decl_prefix() {
+            // 类型侧维度注解（int @A [] x——R18 BUG A）：整句 Raw
+            if self.ty_dims_annos {
+                self.pos = save;
+                return self.raw_from(start);
+            }
             let mut first_name = match &self.tok().tok {
                 Tok::Ident(i) => {
                     let n = i.to_string();
@@ -2279,8 +2341,15 @@ impl<'src> Parser<'src> {
                     }
                 };
                 let mut d_extra = 0u32;
+                let mut d_annos = false;
                 loop {
+                    let pre = self.pos;
                     self.skip_mods_annotations();
+                    if self.pos != pre && self.at_punct("[") && self.peek(1).is_punct("]") {
+                        // 后续声明符维度注解（int a, b @A []——R18 BUG B）：
+                        // 整句 Raw
+                        d_annos = true;
+                    }
                     if self.at_punct("[") && self.peek(1).is_punct("]") {
                         self.bump();
                         self.bump();
@@ -2288,6 +2357,9 @@ impl<'src> Parser<'src> {
                     } else {
                         break;
                     }
+                }
+                if d_annos {
+                    return self.raw_from(start);
                 }
                 let had_eq = self.eat("=");
                 let init = if had_eq {
@@ -2482,6 +2554,35 @@ impl<'src> Parser<'src> {
             self.pos = det;
         }
         if let Some(ty) = self.parse_type() {
+            // for-each 类型侧维度注解（for (int @A [] fe : arr)——R18
+            // BUG A）：括号感知整句 Raw（复用经典 for 的注解回退）
+            if self.ty_dims_annos {
+                let mut depth = 0i32;
+                let mut g = 0usize;
+                while !self.at_eof() && g < 100_000 {
+                    g += 1;
+                    if self.at_punct("(") {
+                        depth += 1;
+                    } else if self.at_punct(")") {
+                        if depth == 0 {
+                            self.bump();
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    self.bump();
+                }
+                if self.at_punct("{") {
+                    let _ = self.skip_balanced_braces();
+                } else {
+                    let _ = self.sync_stmt();
+                }
+                let text = self
+                    .text_of(for_start, self.t[self.pos.min(self.t.len() - 1)].start)
+                    .trim()
+                    .to_string();
+                return self.ast.raw(&text);
+            }
             if let Tok::Ident(n) = &self.tok().tok {
                 let name = n.to_string();
                 self.bump();
@@ -2616,8 +2717,18 @@ impl<'src> Parser<'src> {
                         }
                     };
                     let mut d_extra = 0u32;
+                    let mut d_annos = false;
                     loop {
+                        let pre = self.pos;
                         self.skip_mods_annotations();
+                        if self.pos != pre
+                            && self.at_punct("[")
+                            && self.peek(1).is_punct("]")
+                        {
+                            // 后续声明符维度注解（int i, j @A []——R18
+                            // BUG B）：括号感知整句 Raw
+                            d_annos = true;
+                        }
                         if self.at_punct("[") && self.peek(1).is_punct("]") {
                             self.bump();
                             self.bump();
@@ -2625,6 +2736,33 @@ impl<'src> Parser<'src> {
                         } else {
                             break;
                         }
+                    }
+                    if d_annos {
+                        let mut depth = 0i32;
+                        let mut g = 0usize;
+                        while !self.at_eof() && g < 100_000 {
+                            g += 1;
+                            if self.at_punct("(") {
+                                depth += 1;
+                            } else if self.at_punct(")") {
+                                if depth == 0 {
+                                    self.bump();
+                                    break;
+                                }
+                                depth -= 1;
+                            }
+                            self.bump();
+                        }
+                        if self.at_punct("{") {
+                            let _ = self.skip_balanced_braces();
+                        } else {
+                            let _ = self.sync_stmt();
+                        }
+                        let text = self
+                            .text_of(for_start, self.t[self.pos.min(self.t.len() - 1)].start)
+                            .trim()
+                            .to_string();
+                        return self.ast.raw(&text);
                     }
                     let init2 = if self.eat("=") {
                         self.parse_expr(PREC_ASSIGN)

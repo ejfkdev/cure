@@ -2436,3 +2436,46 @@ fn unit_raws_visible_to_import_analysis() {
     );
     assert!(out.contains("import java.util.List;"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// 第 18 轮修复回归（类型侧/后续声明符维度注解 + BUG C 过吞）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn type_side_dims_annotations_all_positions() {
+    // R18 BUG A：类型侧维度注解（int @A [] x——R17 终形只盖名后位）：
+    // 字段/方法参数/构造器参数/局部/for-each → 整段 Raw 保真
+    let out = run_src(
+        "class T{@interface A{}int @A [] f3;void m3(int @A [] x){}T(int @A [] x){}void n(){int @A [] l3=null;for(int @A [] fe:new int[2][]){}}}",
+    );
+    // Raw 逐字（间隔随原文）——按语义片段断言
+    assert!(out.contains("@A [] f3;"), "{out}");
+    assert!(out.contains("m3(int @A [] x)"), "{out}");
+    assert!(out.contains("T(int @A [] x)"), "{out}");
+    assert!(out.contains("@A [] l3"), "{out}");
+    assert!(out.contains("int @A [] fe"), "{out}");
+}
+
+#[test]
+fn subsequent_declarator_dims_annotations_raw() {
+    // R18 BUG B：后续声明符维度注解（int a, b @A []——字段/局部/for 三位
+    // 曾静默丢弃）
+    let out = run_src(
+        "class T{@interface A{}int a1, b1 @A [];void n(){int la, lb @A [];for(int i, j @A [];;){break;}}}",
+    );
+    assert!(out.contains("b1 @A []"), "{out}");
+    assert!(out.contains("lb @A []"), "{out}");
+    assert!(out.contains("j @A []"), "{out}");
+}
+
+#[test]
+fn param_dims_annos_method_raw_not_over_swallow() {
+    // R18 BUG C：方法参数维度注解的整方法 Raw 曾用 sync_member 从当前
+    // 位置吞到类尾——类内余下成员全部并入同一 Raw（简化覆盖损失）
+    let out = run_src(
+        "class T{@interface A{}void m1(int x @A []){}int q(){return 1+1;}}",
+    );
+    // q() 照常折叠（不被吞进 m1 的 Raw）
+    assert!(out.contains("return 2;"), "{out}");
+    assert!(out.contains("int x @A []"), "{out}");
+}
