@@ -2157,3 +2157,51 @@ fn foreach_var_avoids_catch_param() {
     // 首形态（VarDecl e = it.next()）直接语句位——转换后 e2 不撞 catch e
     assert!(!out.contains("for (String e : list) {") || !out.contains("catch (Exception e)"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// 第 13 轮攻击回归：消费条件性（Lambda/Assert）+ 绑定可见域
+// ---------------------------------------------------------------------------
+
+#[test]
+fn foreach_lambda_deferred_consumption_refused() {
+    // T2d/T2f 抓获：() -> it.next() 传给从不调用的方法——lambda 延迟求值
+    // 被当「每轮无条件消费」折叠进 for-each（原 11 → 输出 3）
+    let out = run_src(
+        "class T{static int park(java.util.function.Supplier<?> s){return 0;}void m(java.util.List<String> list){java.util.Iterator<String> it=list.iterator();int n=0;while(it.hasNext()){park(()->it.next());n++;if(n>10){break;}}}}",
+    );
+    assert!(out.contains("while (it.hasNext())"), "{out}");
+}
+
+#[test]
+fn foreach_assert_consumption_refused() {
+    // T2e 抓获：assert 的条件仅在断言启用时求值（默认禁用 = 0 消费）
+    let out = run_src(
+        "class T{void m(java.util.List<String> list){java.util.Iterator<String> it=list.iterator();int n=0;while(it.hasNext()){assert it.next()!=null;n++;if(n>10){break;}}}}",
+    );
+    assert!(out.contains("while (it.hasNext())"), "{out}");
+}
+
+#[test]
+fn foreach_var_avoids_lambda_twr_instanceof_bindings() {
+    // T3a/T3c/T3d 抓获：lambda 形参（params_raw）/TWR 资源（close() 使
+    // 未读 var_decl 不可删）/instanceof 模式绑定——三形态绑定对名字
+    // 扫描不可见，for-each 变量 e 撞名输出不可编译
+    let out = run_src(
+        "class T{static int park(java.util.function.IntUnaryOperator s){return 0;}void m(java.util.List<String> list) throws Exception{java.util.Iterator<String> it=list.iterator();while(it.hasNext()){it.next();park(e->0);try(java.io.StringReader e=new java.io.StringReader(\"x\")){}Object o=\"y\";if(o instanceof String e){System.out.println(e);}}}}",
+    );
+    // 三绑定都在 body：e 被避让（e2/e3）；输出不再撞名
+    let fcount = out.matches("for (String e").count();
+    let ebinds = out.matches(" e").count();
+    assert!(fcount <= 1, "{out}");
+    // 关键断言：若发生了 for-each 转换，其变量名不在 e（撞名域）
+    if out.contains("for (String") {
+        let var = out
+            .lines()
+            .find(|l| l.contains("for (String"))
+            .and_then(|l| l.split("for (String ").nth(1))
+            .and_then(|r| r.split(" :").next())
+            .unwrap_or("");
+        assert_ne!(var.trim(), "e", "{out}");
+    }
+    let _ = ebinds;
+}

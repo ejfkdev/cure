@@ -555,6 +555,22 @@ fn subtree_has_binding(lang: &JavaAst, id: JavaId, name: &str) -> bool {
         match lang.data(n) {
             NodeData::Catch { name: cn, .. } if cn == name => return true,
             NodeData::ForEach { name: vn, .. } if vn == name => return true,
+            // Lambda 显式参数（params_raw 原文切分——T3a 抓获：park(e -> 0)
+            // 的未读形参曾使 for-each 变量 e 撞名）
+            NodeData::Lambda { params_raw } => {
+                for part in
+                    params_raw.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$')
+                {
+                    if part == name {
+                        return true;
+                    }
+                }
+            }
+            // instanceof 模式绑定（bind 属性非子节点——T3d）
+            NodeData::InstanceOf { bind: Some(b), .. } if b == name => return true,
+            // TWR 资源/普通声明（未读资源 var_decl 因 close() 副作用不可删
+            // 而存活到碰撞点——T3c；普通未读声明先行删除，此处保守命中无害）
+            NodeData::VarDecl { name: dn, .. } if dn == name => return true,
             _ => {}
         }
         for &c in lang.children(n) {
@@ -1728,6 +1744,11 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
                         | NodeKind::Catch
                         | NodeKind::Synchronized
                         | NodeKind::ForEach => return None,
+                        // Lambda 体：延迟求值（可能永不调用）——R13 T2d/
+                        // T2f 抓获：() -> it.next() 传给从不调的方法曾被
+                        // 折进 for-each 隐式消费（11→3）；Assert：仅在断言
+                        // 启用且到达时求值（默认禁用 = 0 消费）——T2e
+                        NodeKind::Lambda | NodeKind::Assert => return None,
                         _ => {} // Call 实参/New 实参/Assign/Cast/Paren/Index…
                     }
                     cur = par;
