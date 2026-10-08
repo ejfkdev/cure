@@ -1559,3 +1559,16 @@ fn lone_surrogate_concat_folds_correctly() {
     assert!(out.contains("\"\\uD800x\""), "{out}");
     assert!(out.contains("\"\\uD800\\uDFFF\""), "{out}");
 }
+
+#[test]
+fn escaping_alias_between_arrays_preserved() {
+    // o.java 抓获：var17/var39 双别名同一数组，材料化拆成独立字面量
+    // → rest 的就地解码写错数组。修复：同 Rc 只发一份字面量，其余以
+    // `var x = <首名>` 声明
+    let out = run_src(
+        "class A{static Object b;static{int x=1;int y=2;char[] v9=\"\\u0016$\".toCharArray();char[] var17=v9;char[] var39=v9;var39[0]=(char)(var39[0]^22);System.out.println(var39[0]);var39[1]=(char)(var39[1]^22);b=new String(var17);}}",
+    );
+    assert!(out.contains("var39 = var17"), "{out}");
+    let literals = out.matches("new char[]").count();
+    assert!(literals <= 1, "{out}");
+}

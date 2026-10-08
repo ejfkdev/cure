@@ -981,10 +981,37 @@ impl Rule<JavaAst> for StaticExec {
                     }
                 }
             }
-            // 逃逸局部（保持原声明序）：值不可材料化 → 放弃整段重写
+            // 逃逸局部（保持原声明序）：值不可材料化 → 放弃整段重写。
+            // 别名保持：同一数组（CA/SA 同 Rc）的多名只发一份字面量，其余
+            // 以 `var x = <首名>` 声明——o.java 抓获：var17/var39 双别名
+            // 被拆成独立数组，rest 的就地解码写错数组（正则被腐蚀）
+            let mut alias_first: std::collections::HashMap<usize, String> =
+                std::collections::HashMap::new();
             for (k, v) in &escaped_by_cut[j] {
                 let name = lang.name_of_key(*k)?;
-                let (val, mut extra) = materialize(lang, v)?;
+                let (val, mut extra) = match v {
+                    vexec::VVal::CA(a) => {
+                        let addr = std::rc::Rc::as_ptr(a) as usize;
+                        match alias_first.get(&addr) {
+                            Some(first) => (lang.var(first), vec![]),
+                            None => {
+                                alias_first.insert(addr, name.clone());
+                                materialize(lang, v)?
+                            }
+                        }
+                    }
+                    vexec::VVal::SA(a) => {
+                        let addr = std::rc::Rc::as_ptr(a) as usize;
+                        match alias_first.get(&addr) {
+                            Some(first) => (lang.var(first), vec![]),
+                            None => {
+                                alias_first.insert(addr, name.clone());
+                                materialize(lang, v)?
+                            }
+                        }
+                    }
+                    _ => materialize(lang, v)?,
+                };
                 let stmt = lang.var_decl(&name, JType::Var, Some(val));
                 insert.push(stmt);
                 insert.append(&mut extra);
