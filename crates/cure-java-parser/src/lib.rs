@@ -149,6 +149,7 @@ pub fn parse(src: &str) -> ParseOutcome {
         errs: Vec::new(),
         ast: JavaAst::new(),
         in_case_label: false,
+        param_dims_annos: false,
     };
     for e in lex_errs {
         p.errs.push(ParseError {
@@ -170,6 +171,9 @@ pub fn parse(src: &str) -> ParseOutcome {
 // ---------------------------------------------------------------------------
 
 struct Parser<'src> {
+    /// param_list 见到维度注解（供 member_rest 决定整方法 Raw）
+    param_dims_annos: bool,
+
     t: Vec<Token<'src>>,
     pos: usize,
     /// 借用源（无 \uXXXX 逃逸的文件零拷贝——曾 into_owned() 每文件
@@ -1227,9 +1231,20 @@ impl<'src> Parser<'src> {
         if let Tok::Ident(n) = &self.tok().tok {
             if *n == class_name && (self.peek(1).is_punct("(") || self.peek(1).is_punct("{")) {
                 let name = n.to_string();
+                let ctor_start = self.cur_start();
                 self.bump();
                 let compact = self.at_punct("{");
                 let params = if compact { Vec::new() } else { self.param_list() };
+                // 构造器参数维度注解：整成员 Raw 保真（同方法路径——
+                // 从构造器名前整段取文）
+                if self.param_dims_annos {
+                    let _ = self.sync_member();
+                    let body = self
+                        .text_of(ctor_start, self.t[self.pos.min(self.t.len() - 1)].start)
+                        .trim()
+                        .to_string();
+                    return Some(Member::Raw(format!("{mods}{ty_params} {body}")));
+                }
                 let throws = self.throws_clause();
                 let body = self.member_body();
                 return Some(Member::Constructor {
@@ -1244,7 +1259,9 @@ impl<'src> Parser<'src> {
             }
         }
 
-        // 字段或方法：Type name
+        // 字段或方法：Type name（member_start 记在类型前——维度注解
+        // Raw 回退的整段取文起点）
+        let member_start = self.cur_start();
         let ty = self.parse_type()?;
         let mut name = match &self.tok().tok {
             Tok::Ident(i) => {
@@ -1261,18 +1278,30 @@ impl<'src> Parser<'src> {
         // 的维度记入 first_extra 由声明符自带（曾 wrap 进 ty 又打印各声明符
         // 原始后缀 → `int f[], g[][]` 打成 `int[] f, g[][]` = g 三维，
         // Adv6 差分抓获：javac 读作 int[][][]）
-        // 名后/维度注解（int f @A1 @A2 []——R16 P0-3 抓获：曾静默丢弃）：
-        // 原文捕获并入 mods（位置前移至类型侧——JSR 308 等价形）
-        let dims_annos = {
+        // 名后/维度注解（int f @A1 @A2 [] / 交错 @A [] @B []——R16 P0-3
+        // 抓获曾静默丢弃；R17 P0-1 抓获 hoist 到 mods 会使**非可重复注解
+        // 堆叠**（@Nullable int array2 @Nullable [] @Nullable [] 三个各在
+        // 维度位合法，提升成类型位三连非法））：整成员 Raw 保真——
+        // 维度位注解无法在 Member 结构中表达，Raw 是唯一无损位
+        {
             let (save, ann) = self.consume_dims_annotation_run();
-            let keep = !ann.is_empty()
+            if !ann.is_empty()
                 && self.at_punct("[")
-                && self.peek(1).is_punct("]");
-            if !keep {
+                && self.peek(1).is_punct("]")
+            {
                 self.pos = save;
+                let _ = self.sync_member();
+                // 从类型 token 起整段取文（mods 前置）——曾从 save 起取
+                // 丢了已消费的 类型+名字（R17：InputAnnotationsOnArray
+                // 实锄件 `private @Nullable [];` 无名残段）
+                let body = self
+                    .text_of(member_start, self.t[self.pos.min(self.t.len() - 1)].start)
+                    .trim()
+                    .to_string();
+                return Some(Member::Raw(format!("{mods} {body}")));
             }
-            ann
-        };
+            self.pos = save;
+        }
         let first_extra = {
             let mut extra_dims = 0u16;
             loop {
@@ -1290,6 +1319,20 @@ impl<'src> Parser<'src> {
         if self.at_punct("(") {
             // 方法
             let params = self.param_list();
+            // 参数维度注解（R17 P0-1）：整方法 Raw 保真（维度位注解不可
+            // 结构化表达；hoist 使非可重复注解堆叠非法）。从 member_start
+            //（返回类型前）整段取文——曾从当前位置取丢整个方法头
+            //（checkNotNullContents3 的 `public static {` 残段实锤）
+            if self.param_dims_annos {
+                let _ = self.sync_member();
+                let body = self
+                    .text_of(member_start, self.t[self.pos.min(self.t.len() - 1)].start)
+                    .trim()
+                    .to_string();
+                // ty_params 在 member_start 之前已消费——拼回（曾丢
+                // `<T>` 使泛型方法悬空「找不到符号 T」）
+                return Some(Member::Raw(format!("{mods}{ty_params} {body}")));
+            }
             // C 风格数组返回后缀 int doSomething()[]（JavaConcepts 抓获：
             // 曾直接进 body 期待 → "expected method body"）
             let mut ret_dims = 0u16;
@@ -1372,15 +1415,8 @@ impl<'src> Parser<'src> {
             continue;
         }
         self.expect(";");
-        let mods = if dims_annos.is_empty() {
-            mods.to_string()
-        } else if mods.trim().is_empty() {
-            dims_annos
-        } else {
-            format!("{mods} {}", dims_annos)
-        };
         Some(Member::Field {
-            mods,
+            mods: mods.to_string(),
             ty,
             declarators,
         })
@@ -1399,6 +1435,11 @@ impl<'src> Parser<'src> {
     }
 
     fn param_list(&mut self) -> Vec<Param> {
+        // 维度注解信号（int x @A []——参数维度位注解无法在 Param 结构
+        // 表达：置位后 member_rest 以整方法 Raw 保真。R17 P0-1：hoist 到
+        // mods 使非可重复注解堆叠（@Nullable 参数位+维度位合法、提升
+        // 类型位连排非法）
+        let mut dims_annos_seen = false;
         let mut out = Vec::new();
         if !self.expect("(") {
             return out;
@@ -1522,6 +1563,7 @@ impl<'src> Parser<'src> {
             let mods = if mods_suffix.is_empty() {
                 mods
             } else {
+                dims_annos_seen = true;
                 // 连续注解间空格分隔；mods 为空时防前导空格（幂等——
                 // 二轮曾多一空格）
                 if mods.trim().is_empty() {
@@ -1541,6 +1583,7 @@ impl<'src> Parser<'src> {
                 break;
             }
         }
+        self.param_dims_annos = dims_annos_seen;
         out
     }
 
@@ -2490,16 +2533,45 @@ impl<'src> Parser<'src> {
                         String::new()
                     }
                 };
-                // 名后注解+维度（同局部声明 R16 P0 族）：整句 Raw 保真
+                // 名后注解+维度（同局部声明 R16 P0 族）：整句 Raw 保真。
+                // **专用回退**（R17 P0-2：raw_from 的 sync_stmt 在回滚位
+                //（for 括号内）以 depth-0 遇 `;` 即停——for 头第一分号就
+                // 断，空体丢失/后续语句被吸入循环体（M7rt 运行分歧实
+                // 错））：先越过 for 头闭括号（嵌套括号计数），再吞体块
+                // 或单语句
                 {
                     let (save, ann) = self.consume_dims_annotation_run();
-                    if !ann.is_empty() {
-                        if self.at_punct("[") && self.peek(1).is_punct("]") {
-                            self.pos = save;
-                            return self.raw_from(for_start);
-                        }
+                    if !ann.is_empty() && self.at_punct("[") && self.peek(1).is_punct("]") {
                         self.pos = save;
+                        // 越过 for 头：从当前位置平衡扫到 for 的 `)`
+                        let mut depth = 0i32;
+                        let mut g = 0usize;
+                        while !self.at_eof() && g < 100_000 {
+                            g += 1;
+                            if self.at_punct("(") {
+                                depth += 1;
+                            } else if self.at_punct(")") {
+                                if depth == 0 {
+                                    self.bump(); // for 头闭括号
+                                    break;
+                                }
+                                depth -= 1;
+                            }
+                            self.bump();
+                        }
+                        // 体：{…} 平衡 or 单语句 sync
+                        if self.at_punct("{") {
+                            let _ = self.skip_balanced_braces();
+                        } else {
+                            let _ = self.sync_stmt();
+                        }
+                        let text = self
+                            .text_of(for_start, self.t[self.pos.min(self.t.len() - 1)].start)
+                            .trim()
+                            .to_string();
+                        return self.ast.raw(&text);
                     }
+                    self.pos = save;
                 }
                 let mut extra = 0u32;
                 while self.at_punct("[") && self.peek(1).is_punct("]") {

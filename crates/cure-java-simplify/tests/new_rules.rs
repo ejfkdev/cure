@@ -2405,15 +2405,16 @@ fn receiver_diamond_refused() {
 
 #[test]
 fn multi_annotation_dims_all_positions() {
-    // R16 P0-1~4：连续注解 + 维度（param/field/局部/for-init 四位）——
-    // 单注解形态 R15 已修，连续注解曾断链/丢失/拆裂
+    // R16 P0-1~4 → R17 P0-1/P1-3 终形：维度位注解（参数/字段/局部/
+    // for-init）统一**整成员/整句 Raw 保真**——结构化提升会使非可重复
+    // 注解堆叠（@Nullable 三维度位合法、类型位连排非法——
+    // InputAnnotationsOnArray 实锤）且交错形态丢注解
     let out = run_src(
         "class T{@interface A1{}@interface A2{}void m(int x @A1 @A2 []){}int f @A1 @A2 [];void n(){int y @A1 @A2 []=null;}}",
     );
-    // 参数：注解入 mods（类型侧，JSR 等价）
-    assert!(out.contains("@A1 @A2 int[] x"), "{out}");
-    // 字段：注解入 mods
-    assert!(out.contains("@A1 @A2 int f[]"), "{out}");
+    // 参数→方法/字段：整成员 Raw（逐字）
+    assert!(out.contains("int x @A1 @A2 []"), "{out}");
+    assert!(out.contains("int f @A1 @A2 []"), "{out}");
     // 局部：整句 Raw 保真
     assert!(out.contains("int y @A1 @A2 []"), "{out}");
 }
