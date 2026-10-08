@@ -31,6 +31,34 @@ const MAX_STEPS: usize = 2_000_000;
 /// 字符串（及 char[]）长度预算：超过即跳过（特别长的串折叠无谓耗性能）。
 const MAX_STR_LEN: usize = 1 << 20;
 
+/// 值的嵌套结构中是否（直接或间接）引用目标数组（按 Rc 地址）。
+/// 带 visited 防环——输入本身可能已含环（防御性）。
+fn value_references_array(v: &VVal, target_addr: usize) -> bool {
+    let mut visited: std::collections::HashSet<usize> = Default::default();
+    fn walk(v: &VVal, target: usize, visited: &mut std::collections::HashSet<usize>) -> bool {
+        match v {
+            VVal::CA(_) => false, // CA 元素是 char 不嵌套
+            VVal::SA(a) => {
+                let addr = Rc::as_ptr(a) as usize;
+                if addr == target {
+                    return true;
+                }
+                if !visited.insert(addr) {
+                    return false; // 已走过的环
+                }
+                for e in a.borrow().iter() {
+                    if walk(e, target, visited) {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+    walk(v, target_addr, &mut visited)
+}
+
 /// 值域（足够覆盖解密机家族；浮点/引用语义一律 abort）。
 #[derive(Clone, Debug)]
 pub(crate) enum VVal {
@@ -404,6 +432,14 @@ impl<'a> Exec<'a> {
                         Ok(Flow::Normal)
                     }
                     VVal::SA(a) => {
+                        // 自引用数组环检测：把 v 存进 a 时若 a 已在 v 的
+                        // 结构里（netty MessageFormatterTest 的
+                        // cyclicA[0]=cyclicA）→ SA(Rc) 自包含 →
+                        // deep_snapshot/materialize 的递归展开无限栈溢出
+                        //（整文件崩溃）。拒绝该存储（保守 abort 段）
+                        if value_references_array(&v, Rc::as_ptr(&a) as usize) {
+                            return Err(());
+                        }
                         *a.borrow_mut().get_mut(i).ok_or(())? = v;
                         Ok(Flow::Normal)
                     }

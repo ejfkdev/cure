@@ -387,6 +387,119 @@ impl<'src> Parser<'src> {
     }
 
     /// 成员级恢复：跳过平衡区域直到 `;`（消费）或回到成员边界 `}`（不消费）。
+    /// 吞到当前 switch 块的收尾 `}`（不消耗 `}` 本身；由调用方的
+    /// 外层循环统一收）。风暴兜底用。
+    fn sync_to_block_end(&mut self) -> String {
+        let start = self.cur_start();
+        let mut depth = 0i32;
+        let mut guard = 0usize;
+        while !self.at_eof() && guard < STEP_GUARD {
+            guard += 1;
+            let t = self.tok().clone();
+            match &t.tok {
+                Tok::Punct("{") => depth += 1,
+                Tok::Punct("}") => {
+                    if depth <= 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            self.bump();
+        }
+        self.text_of(start, self.t[self.pos.saturating_sub(1)].end)
+    }
+
+    /// 局部类型声明探测（不动 self.pos）：跳过 abstract/final/注解后
+    /// 若是 class/interface/enum/record 的**声明形态**返回关键字的 pos。
+    /// record 的上下文关键字判定（后随 Ident + (/</{）与主路径一致。
+    fn find_local_type_decl(&self) -> Option<usize> {
+        let mut p = self.pos;
+        // 跳过修饰符
+        loop {
+            match &self.t.get(p).map(|t| &t.tok) {
+                Some(Tok::Ident(i)) if *i == "abstract" || *i == "final" => {
+                    p += 1;
+                }
+                Some(Tok::Punct(q)) if *q == "@" => {
+                    // @Anno / @Anno(...) / @a.b.C(...)
+                    p += 1;
+                    if let Some(Tok::Ident(_)) = &self.t.get(p).map(|t| &t.tok) {
+                        p += 1;
+                    }
+                    while let Some(Tok::Punct(q)) = &self.t.get(p).map(|t| &t.tok) {
+                        if *q != "." {
+                            break;
+                        }
+                        p += 1;
+                        if let Some(Tok::Ident(_)) = &self.t.get(p).map(|t| &t.tok) {
+                            p += 1;
+                        } else {
+                            return None;
+                        }
+                    }
+                    if let Some(Tok::Punct("(")) = &self.t.get(p).map(|t| &t.tok) {
+                        // 平衡扫描
+                        let mut depth = 0i32;
+                        loop {
+                            match &self.t.get(p).map(|t| &t.tok) {
+                                Some(Tok::Punct(q)) if *q == "(" => depth += 1,
+                                Some(Tok::Punct(q)) if *q == ")" => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        p += 1;
+                                        break;
+                                    }
+                                }
+                                Some(Tok::Eof) | None => return None,
+                                _ => {}
+                            }
+                            p += 1;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        // 类型关键字判定
+        match &self.t.get(p).map(|t| &t.tok) {
+            Some(Tok::Ident(k))
+                if *k == "class" || *k == "interface" || *k == "enum" =>
+            {
+                // 声明形态：后随 Ident（`enum e = ...` 的变量用法后随 = ;  排除）
+                if let Some(Tok::Ident(_)) = &self.t.get(p + 1).map(|t| &t.tok) {
+                    if !matches!(
+                        &self.t.get(p + 2).map(|t| &t.tok),
+                        Some(Tok::Punct(q)) if *q == "=" || *q == ";" || *q == ","
+                    ) {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            Some(Tok::Ident(k)) if *k == "record" => {
+                // record 是上下文关键字：Ident 后随 ( / < / {
+                if let Some(Tok::Ident(_)) = &self.t.get(p + 1).map(|t| &t.tok) {
+                    if matches!(
+                        &self.t.get(p + 2).map(|t| &t.tok),
+                        Some(Tok::Punct(q)) if *q == "(" || *q == "<" || *q == "{"
+                    ) {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn sync_member(&mut self) -> String {
         let start = self.cur_start();
         let mut depth = 0i32;
@@ -1474,6 +1587,88 @@ impl<'src> Parser<'src> {
                 self.ast.continue_(label.as_deref())
             };
         }
+        // 局部 record/class/interface/enum 声明（Java 16+ 局部类型——
+        // ES93GenericFlatVectorsReader 抓获：语句级解析曾落入表达式路径
+        // 产生 4M 错误风暴）。按 Raw 整段保真（类体语义不触碰）。
+        // 前导修饰符（abstract/final/注解——guava CompactLinkedHashMap
+        // 的 `abstract class Class3` 曾丢 abstract）一并并入原文
+        if let Some(type_kw_pos) = self.find_local_type_decl() {
+            let start = self.cur_start();
+            self.pos = type_kw_pos;
+            self.bump(); // 关键字
+            if self.at_punct("<") {
+                let _ = self.skip_balanced("<", ">");
+            }
+            if self.at_punct("(") {
+                let _ = self.skip_balanced("(", ")");
+            }
+            let mut guard = 0usize;
+            while !self.at_eof() && !self.at_punct("{") && guard < 100_000 {
+                guard += 1;
+                self.bump();
+            }
+            if self.at_punct("{") {
+                if let Some(_body) = self.skip_balanced_braces() {
+                    let end = self.t[self.pos - 1].end;
+                    let full = self.text_of(start, end);
+                    return self.ast.raw(full.trim());
+                }
+            }
+        }
+        if self.at_kw("record") || self.at_kw("class") || self.at_kw("interface")
+            || self.at_kw("enum")
+        {
+            let save = self.pos;
+            // record 需要后随 ( 或 Ident（record 也可能是变量名：
+            // `record record = ...` 合法）——用形态判定
+            // record 是**上下文关键字**：声明形态 = record Ident ( / < / {
+            //（DataSourceInventoryCounters 抓获：`record(counts, m);`
+            // 调用曾被误判成声明）。调用形态 peek(1) 是 `(` —— 直接排除
+            let is_type_decl = match &self.tok().tok {
+                Tok::Ident(_) if self.at_kw("record") => {
+                    matches!(&self.peek(1).tok, Tok::Ident(_))
+                        && matches!(
+                            &self.peek(2).tok,
+                            Tok::Punct("(") | Tok::Punct("<") | Tok::Punct("{")
+                        )
+                }
+                _ => {
+                    // class/interface/enum：后随 Ident 即类型声明（x = class …
+                    // 不合法；但 `enum` 作变量名后随 = / ; 时排除）
+                    matches!(&self.peek(1).tok, Tok::Ident(_))
+                        && !matches!(&self.peek(2).tok, Tok::Punct("=") | Tok::Punct(";") | Tok::Punct(","))
+                }
+            };
+            if is_type_decl {
+                let start = self.cur_start();
+                self.bump(); // 关键字
+                // 泛型/头/体整体吞（平衡大括号即类体）
+                if self.at_punct("<") {
+                    let _ = self.skip_balanced("<", ">");
+                }
+                // record 头 (…)
+                if self.at_punct("(") {
+                    let _ = self.skip_balanced("(", ")");
+                }
+                // implements/extends 列表扫到 {
+                let mut guard = 0usize;
+                while !self.at_eof() && !self.at_punct("{") && guard < 100_000 {
+                    guard += 1;
+                    self.bump();
+                }
+                if self.at_punct("{") {
+                    if let Some(body) = self.skip_balanced_braces() {
+                        let text = format!("{} {}", self.text_of(start, self.t[self.pos.saturating_sub(1)].end - body.len()), "");
+                        // 完整原文（含体）——重新取：start 到体末
+                        let _ = text;
+                        let end = self.t[self.pos - 1].end;
+                        let full = self.text_of(start, end);
+                        return self.ast.raw(full.trim());
+                    }
+                }
+                self.pos = save; // 形态不完整——回退按表达式解
+            }
+        }
         if self.at_kw("yield") {
             // switch 表达式块内的 yield：结构化节点（孩子 = 表达式——
             // Raw 曾使一切 AST 分析对 yield 体内引用全盲，
@@ -2111,6 +2306,7 @@ impl<'src> Parser<'src> {
         }
         let mut cases = Vec::new();
         let mut guard = 0usize;
+        let mut stall_pos = usize::MAX;
         loop {
             guard += 1;
             if guard > 100_000 || self.at_eof() {
@@ -2120,6 +2316,20 @@ impl<'src> Parser<'src> {
                 self.bump();
                 break;
             }
+            // 位置停滞后强制推进到块尾：case 解析失败但 sync 不动时空转
+            // 到 10 万次（ES 文件 100 行膨胀 10 万行的第二风暴源）。
+            // 推进由下方「垃圾 case」分支的 sync_stmt 承担；此处兜底
+            // 跳出（把剩余部分整体 raw）
+            if self.pos == stall_pos {
+                let start = self.cur_start();
+                let text = self.sync_to_block_end();
+                if !text.is_empty() {
+                    cases.push(self.ast.raw(&text));
+                }
+                let _ = start;
+                break;
+            }
+            stall_pos = self.pos;
             let mut labels = Vec::new();
             let mut is_default = false;
             if self.at_kw("case") {
@@ -2303,6 +2513,7 @@ impl<'src> Parser<'src> {
             } else {
                 self.expect(":");
                 let mut g2 = 0usize;
+                let mut last_pos = usize::MAX;
                 loop {
                     g2 += 1;
                     if g2 > STEP_GUARD || self.at_eof() {
@@ -2311,6 +2522,15 @@ impl<'src> Parser<'src> {
                     if self.at_kw("case") || self.at_kw("default") || self.at_punct("}") {
                         break;
                     }
+                    // **位置不动即跳出**：语句解析失败但 sync 未推进时
+                    // 旧行为空转到 STEP_GUARD（10 万次报错风暴 → 打印器
+                    // 产出 10 万个 /* bad case */——ES
+                    // InsertDefaultInnerTimeSeriesAggregate 曾 100 行膨胀
+                    // 成 10 万行）。跳到块尾让 Raw 保真接管
+                    if self.pos == last_pos {
+                        break;
+                    }
+                    last_pos = self.pos;
                     let s = self.parse_stmt();
                     if matches!(self.ast.data(s), &NodeData::Group) {
                         stmts.extend(self.ast.children(s).iter().copied());
