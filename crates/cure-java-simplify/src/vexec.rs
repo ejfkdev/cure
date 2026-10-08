@@ -342,6 +342,10 @@ impl<'a> Exec<'a> {
         // 声明窄化（char c = <int 字面量> 等）：I → char 域裁剪。
         // L 值按声明域截断（long 声明除外——保持）
         match (v, ty) {
+            // 拓宽方向（I → long）：int 字面量 init 的 long 声明曾存 I，
+            // 后续 g+1 在 i32 环绕（T6D/H1 抓获：2147483647+1 → -2147483648，
+            // 静默错值——收窄方向修了拓宽漏了）
+            (VVal::I(x), JType::Long) => VVal::L(x as i64),
             (VVal::I(x), JType::Char) => VVal::I(x as u16 as i32),
             (VVal::I(x), JType::Byte) => VVal::I(x as i8 as i32),
             (VVal::I(x), JType::Short) => VVal::I(x as i16 as i32),
@@ -416,6 +420,23 @@ impl<'a> Exec<'a> {
 
     /// 字段写（裸名 VarRef 未声明 → 记录为段输出；末值为准）。
     fn record_field_write_by_key(&mut self, k: u32, v: VVal) -> R<Flow> {
+        // long 字段的 I 值提升（G4 抓获：f=2147483647; f=f+1 曾按 i32
+        // 环绕——字段读回后无域提升）
+        let v = match v {
+            VVal::I(x) => {
+                let is_long = self
+                    .ast
+                    .name_of_key(k)
+                    .and_then(|n| self.ast.field_types.get(n.as_str()))
+                    .is_some_and(|t| matches!(t, JType::Long));
+                if is_long {
+                    VVal::L(x as i64)
+                } else {
+                    VVal::I(x)
+                }
+            }
+            other => other,
+        };
         if let Some(slot) = self.field_writes.iter_mut().find(|(n, _)| *n == k) {
             slot.1 = v;
         } else {

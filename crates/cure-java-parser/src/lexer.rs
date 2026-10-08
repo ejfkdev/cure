@@ -129,8 +129,11 @@ impl<'a> Lexer<'a> {
             }
             // 注释
             if c == b'/' && self.peek(1) == b'/' {
+                // 行终止符 = LF / CR / CRLF（JLS 3.4）——CR-only 文件的
+                // 行注释曾只认 LF，从头吞到 EOF：整文件内容静默丢失
+                //（Ops_cr.java 304,893 字节 → 1 字节，无告警）
                 while let Some(&c2) = self.b.get(self.pos) {
-                    if c2 == b'\n' {
+                    if c2 == b'\n' || c2 == b'\r' {
                         break;
                     }
                     self.bump();

@@ -41,6 +41,12 @@ impl<L: Lang> Rule<L> for ParenRemoval {
 // 常量条件：if (true) {A} [else B] → A；if (false) {A} else B → 删除
 // ---------------------------------------------------------------------------
 
+/// 语句自身是控制流终结（return/throw——break/continue 仅终结**块**，
+/// 不终结方法级后续；保守只认 return/throw）。
+fn self_is_terminal<L: Lang>(lang: &L, n: L::Id) -> bool {
+    matches!(lang.kind(n), NodeKind::Return | NodeKind::Throw)
+}
+
 pub struct ConstCondition;
 
 impl<L: Lang> Rule<L> for ConstCondition {
@@ -59,7 +65,11 @@ impl<L: Lang> Rule<L> for ConstCondition {
         let cond = *ch.first()?;
         match lang.literal(cond) {
             Some(LitRef::Bool(true)) => {
-                // then 分支必然执行：拼进父块（避免嵌套块）；非块父级则整体替换
+                // then 分支必然执行：拼进父块（避免嵌套块）；非块父级则整体替换。
+                // then 必然终结（return/throw 等）→ 后续兄弟不可达，须一并
+                // 删除——否则产出 `return 1; return 2;` 不可编译
+                //（InputArrayTrailingComma 抓获；unreachable_after_terminal
+                // 是 --dead-code 门控，默认模式依赖本规则自洽）
                 let then = ch.get(1).copied()?;
                 if let (Some(parent), Some(index)) = (walk.parent(id), walk.index(id)) {
                     if lang.kind(parent) == NodeKind::Block {
@@ -68,6 +78,19 @@ impl<L: Lang> Rule<L> for ConstCondition {
                         } else {
                             vec![then]
                         };
+                        let siblings = lang.children(parent).to_vec();
+                        let terminates = insert
+                            .iter()
+                            .any(|&s| self_is_terminal(lang, s));
+                        if terminates && index + 1 < siblings.len() {
+                            let remove = siblings.len() - index;
+                            return Some(Edit::Splice {
+                                node: parent,
+                                index,
+                                remove,
+                                insert,
+                            });
+                        }
                         return Some(Edit::Splice {
                             node: parent,
                             index,
@@ -299,7 +322,7 @@ impl<L: Lang> Rule<L> for BoolCompare {
         &[NodeKind::Binary]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
-        let RewriteCtx { lang, walk: _ } = ctx;
+        let RewriteCtx { lang, walk } = ctx;
         if lang.kind(id) != NodeKind::Binary {
             return None;
         }
@@ -322,7 +345,16 @@ impl<L: Lang> Rule<L> for BoolCompare {
             _ => return None,
         };
         if !lang.is_bool(x) {
-            return None;
+            // 条件位上下文松弛：if/while 的条件表达式必为 boolean
+            //（IteratorWildcard 抓获：`x == false` 的 x 是方法调用——
+            // 返回类型无类型信息即被拒）。仅当本节点恰是 If/While 的
+            // 条件孩子时放行
+            let in_cond = walk.parent(id).is_some_and(|p| {
+                matches!(lang.kind(p), NodeKind::If | NodeKind::While) && lang.children(p).first() == Some(&id)
+            });
+            if !in_cond {
+                return None;
+            }
         }
         // (op, lit) → 替换结果
         let neg = match (op, lit) {
@@ -617,7 +649,23 @@ impl<L: Lang> Rule<L> for AssignBackFold {
             if matches!(op, BinOp::Div | BinOp::Rem) && k == 0 {
                 return None;
             }
-            let lit = lang.build_int(k, false);
+            // long 域声明的 K 提升（H1 抓获：`long g=2147483647;
+            // g=g+1` 折成 int 字面量对 → i32 环绕 -2147483648，静默
+            // 错值）。init 若是 int 字面量也一并提升——保证 const_fold
+            // 走 i64 域
+            let lit = if lang.is_long_decl(id) {
+                lang.build_int(k, true)
+            } else {
+                lang.build_int(k, false)
+            };
+            let init = if lang.is_long_decl(id) {
+                match lang.literal(init) {
+                    Some(crate::kind::LitRef::Int(v)) => lang.build_int(v, true),
+                    _ => init,
+                }
+            } else {
+                init
+            };
             let merged = lang.build_bin(op, init, lit);
             // 声明原位换 init（Splice 孩子），语句删除
             return Some(Edit::Multi(vec![
@@ -824,16 +872,37 @@ impl<L: Lang> Rule<L> for LocalPropagation {
                 }
             }
         }
-        // null 字面量不得内联进调用接收者位（`null.setArgName(...)`
-        // 无法编译——差分审查抓获）；其余位置（赋值 RHS/声明 init）合法
+        // null 字面量不得内联进需要类型的表达式位：调用接收者
+        //（`null.setArgName(...)` 不可编译——差分审查抓获）；for-each
+        // 可迭代位（`for (T x : null)` 不适用）；数组访问基座（`null[0]`
+        // / `synchronized (null[0])` —— InputFullOfBlockComments/FooCasper
+        // 抓获）；字段/数组基座同理
         if matches!(lang.literal(value), Some(LitRef::Null)) {
-            // 接收者位：AST 形态 Call→Member→[recv]（VarRef 的父是
-            // Member）或 Call→[recv]（静态调用无此形态，防御保留）
-            if let Some(&(p, _)) = walk.parents.get(&use_id) {
-                let at_head = lang.children(p).first() == Some(&use_id);
-                if at_head && matches!(lang.kind(p), NodeKind::Member | NodeKind::Call) {
-                    return None;
+            let mut cur = use_id;
+            while let Some(&(p, _)) = walk.parents.get(&cur) {
+                let at_head = lang.children(p).first() == Some(&cur);
+                match lang.kind(p) {
+                    // null.m() / null[i]（Member 基座与 Index 基座）
+                    NodeKind::Member | NodeKind::Index if at_head => return None,
+                    // 静态调用 callee 位（防御）
+                    NodeKind::Call if at_head => return None,
+                    // for-each 可迭代位（ForEach 的第 1 个孩子 = iterable）
+                    NodeKind::ForEach => {
+                        let ch = lang.children(p);
+                        if ch.first() == Some(&cur) {
+                            return None;
+                        }
+                    }
+                    // synchronized (null…) 锁位（唯一孩子）
+                    NodeKind::Synchronized => {
+                        let ch = lang.children(p);
+                        if ch.len() == 1 && ch[0] == cur {
+                            return None;
+                        }
+                    }
+                    _ => {}
                 }
+                cur = p;
             }
         }
         // value 读到的名字键（写冲突兴趣集；reads 含 name 自身——一票否决）
@@ -851,6 +920,37 @@ impl<L: Lang> Rule<L> for LocalPropagation {
             if wb.uses.len() > uses_before {
                 use_stmt_idx = Some(index + 1 + off);
                 break; // 使用语句之后的写不参与冲突判定
+            }
+        }
+        // 字段读移动守卫：值中含**非局部** VarRef（可变字段——跨调用/跨
+        // 线程可变）：把读从声明点移动到使用点会改变读时机（d.java 抓获：
+        // `boolean var2 = b; for (a var1 : a()) { var1.i(); if (var2)… }` 折
+        // 成 if (b)——入口快照变成每次调用后现读，b 有跨文件写点）。
+        // 窗口内语句须全 Pure（无调用/无写/无读）。
+        // Call 的 callee VarRef 是方法名（不同命名空间）——不算字段读
+        if subtree_contains(&*lang, value, |n| {
+            if lang.kind(n) != NodeKind::VarRef || lang.is_local_var(n) {
+                return false;
+            }
+            // 仅**本单元声明的字段**（局部/参数/未解析名——如手工 AST
+            // 无作用域——不算）
+            if !lang.var_name(n).is_some_and(|nm| lang.is_field_name(nm)) {
+                return false;
+            }
+            let is_callee = match walk.parent(n) {
+                Some(p) => {
+                    matches!(lang.kind(p), NodeKind::Call) && lang.children(p).first() == Some(&n)
+                }
+                None => false,
+            };
+            !is_callee
+        }) {
+            if let Some(ui) = use_stmt_idx {
+                for &s in &stmts[index + 1..=ui] {
+                    if lang.effect(s) != Effect::Pure {
+                        return None;
+                    }
+                }
             }
         }
         // 声明删除前提：use 之后不得再出现对该名字的任何引用（读/写/遮蔽）。

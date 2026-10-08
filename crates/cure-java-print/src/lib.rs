@@ -308,6 +308,13 @@ impl<'a> Printer<'a> {
             if !t.members.is_empty() {
                 self.out.push(';');
             }
+        } else if !t.members.is_empty() && t.kind == TypeKind::Enum {
+            // 零常量 + 有成员：孤立 `;` 是 JLS 8.9 强制的枚举常量表终结
+            // 符（B24494875 抓获：`enum X { ; static … }` 曾丢分号不可
+            // 编译）——仅枚举（class 的孤立分号是合法冗余，删）
+            self.newline();
+            self.indent();
+            self.out.push(';');
         }
         for m in &t.members {
             self.newline();
@@ -403,15 +410,17 @@ impl<'a> Printer<'a> {
             }
             Member::Type(t) => self.type_decl(t),
             Member::Raw(text) => {
-                // 原文区域：首行对齐当前缩进，续行保持
+                // 原文区域：仅**首行**挂当前缩进，续行按原文（续行再叠
+                // ind 逐轮漂移——同语句级 Raw 的修复）
                 let ind = INDENT.repeat(self.level);
                 let mut first = true;
                 for line in text.lines() {
+                    let is_first_line = first;
                     if !first {
                         self.out.push('\n');
                     }
                     first = false;
-                    if !line.trim().is_empty() {
+                    if !line.trim().is_empty() && is_first_line {
                         self.out.push_str(&ind);
                     }
                     self.out.push_str(line.trim_end());
@@ -443,16 +452,30 @@ impl<'a> Printer<'a> {
         match ast.data(id) {
             NodeData::Block => unreachable!(),
             NodeData::Empty => {}
+            NodeData::Yield => {
+                self.indent();
+                self.out.push_str("yield ");
+                if let Some(&e) = ast.children(id).first() {
+                    self.expr(e, prec::ASSIGN);
+                }
+                self.out.push(';');
+            }
             NodeData::Raw { text } => {
                 let ind = INDENT.repeat(self.level);
                 let mut first = true;
                 for line in text.lines() {
+                    let is_first_line = first;
                     if !first {
                         self.out.push('\n');
                     }
                     first = false;
                     if !line.trim().is_empty() {
-                        self.out.push_str(&ind);
+                        // 仅**首行**挂当前缩进；续行按原文——捕获原文的
+                        // 续行前导空白若再叠 ind 会逐轮漂移永不收敛
+                        //（219/3999 文件幂等失败，5.5%）
+                        if is_first_line {
+                            self.out.push_str(&ind);
+                        }
                     }
                     self.out.push_str(line.trim_end());
                 }
@@ -467,8 +490,11 @@ impl<'a> Printer<'a> {
                 self.expr(ch[0], prec::ASSIGN);
                 self.out.push(';');
             }
-            NodeData::VarDecl { name, ty } => {
+            NodeData::VarDecl { name, ty, final_mod } => {
                 self.indent();
+                if *final_mod {
+                    self.out.push_str("final ");
+                }
                 self.out.push_str(&ty_str(ty));
                 self.out.push(' ');
                 self.out.push_str(name);
@@ -672,7 +698,10 @@ impl<'a> Printer<'a> {
     fn resource(&mut self, id: JavaId) {
         let ast = self.ast;
         match ast.data(id) {
-            NodeData::VarDecl { name, ty } => {
+            NodeData::VarDecl { name, ty, final_mod } => {
+                if *final_mod {
+                    self.out.push_str("final ");
+                }
                 self.out.push_str(&ty_str(ty));
                 self.out.push(' ');
                 self.out.push_str(name);
@@ -733,6 +762,16 @@ impl<'a> Printer<'a> {
             self.out.push_str(" -> ");
             if stmt_ids.len() == 1 && ast.data(stmt_ids[0]) == &NodeData::Block {
                 self.block_body(stmt_ids[0]);
+            } else if stmt_ids.len() == 1
+                && matches!(ast.data(stmt_ids[0]), NodeData::ExprStmt)
+                && stmt_is_switch(ast, stmt_ids[0])
+            {
+                // 嵌套 switch 表达式体：换行 + 当前层级完整打印
+                //（level:0 子打印机曾把内层 case 全部拍平到列 0）
+                self.level += 1;
+                self.newline();
+                self.stmt(stmt_ids[0]);
+                self.level -= 1;
             } else if stmt_ids.len() == 1 {
                 // 内联渲染单语句（无前导缩进）
                 let mut sp = Printer {
@@ -765,9 +804,14 @@ impl<'a> Printer<'a> {
                 first = false;
                 self.out.push_str("case ");
                 self.out.push_str(&label_text(l));
+                // 组合标签：`case null, default:`（labels 非空时 default
+                // 是尾标签）
+                if *is_default && label_ids.last() == Some(&l) {
+                    self.out.push_str(", default");
+                }
                 self.out.push(':');
             }
-            if *is_default {
+            if *is_default && label_ids.is_empty() {
                 self.out.push_str("default:");
             }
             self.level += 1;
@@ -819,7 +863,7 @@ impl<'a> Printer<'a> {
     /// `with_type=false` 时 VarDecl 只输出名字（`int i = 0, j = 1` 的后续项）。
     fn for_header_part(&mut self, id: JavaId, with_type: bool) {
         let ast = self.ast;
-        if let NodeData::VarDecl { name, ty } = ast.data(id) {
+        if let NodeData::VarDecl { name, ty, .. } = ast.data(id) {
             if with_type {
                 self.out.push_str(&ty_str(ty));
                 self.out.push(' ');
@@ -1294,6 +1338,16 @@ fn push_escaped(out: &mut String, c: char) {
         }
         c => out.push(c),
     }
+}
+
+/// ExprStmt 是否包裹 switch（箭头 case 的嵌套 switch 表达式体）。
+fn stmt_is_switch(ast: &JavaAst, stmt: JavaId) -> bool {
+    if let NodeData::ExprStmt = ast.data(stmt) {
+        if let Some(&inner) = ast.children(stmt).first() {
+            return ast.kind(inner) == NodeKind::Switch;
+        }
+    }
+    false
 }
 
 fn escape_char(c: char) -> String {

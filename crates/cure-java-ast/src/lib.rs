@@ -105,8 +105,11 @@ pub enum NodeData {
     /// kind() 映射为 Block（引擎规则透明），但语义上不引入词法作用域。
     Group,
     Empty,
+    /// `yield expr;`（switch 表达式产出）。孩子 [expr]。
+    Yield,
+
     ExprStmt,
-    VarDecl { name: String, ty: JType },
+    VarDecl { name: String, ty: JType, final_mod: bool },
     Assign { op: Option<BinOp> },
     If,
     While,
@@ -240,6 +243,11 @@ pub struct JavaAst {
     /// 字段声明类型表（名字 → JType；同名二见移除）——调用点实参静态
     /// 类型解析用（VarRef 解析不到局部时查字段）。collect_unit_consts 填充。
     pub field_types: HashMap<String, JType>,
+    /// 本单元声明了名为 String/StringBuilder 的类型（遮蔽 java.lang——
+    /// new String("x") 折叠/字符串链折叠在该单元全部拒绝。探针 T4a/b
+    /// 抓获：`class String{…}` 同文件时 new String 折叠产出不可编译或
+    /// 静默错值）。collect_unit_consts 每轮重算。
+    pub unit_shadows_lang: bool,
     /// final 字段名集合（同名二见移除——保守）。static_exec 截断守卫
     /// 用：前缀字段写被 rest 再赋值时，仅 final 才放弃（非 final 的
     /// 材料化写是死写，语义恒等、可编译）。
@@ -410,6 +418,7 @@ impl JavaAst {
         match &self.nodes[id.0 as usize].data {
             NodeData::Block | NodeData::Group => NodeKind::Block,
             NodeData::Empty => NodeKind::Empty,
+            NodeData::Yield => NodeKind::Yield,
             NodeData::ExprStmt => NodeKind::ExprStmt,
             NodeData::VarDecl { .. } => NodeKind::VarDecl,
             NodeData::Assign { .. } => NodeKind::Assign,
@@ -471,10 +480,23 @@ impl JavaAst {
         self.push(NodeData::ExprStmt, vec![e])
     }
     pub fn var_decl(&mut self, name: &str, ty: JType, init: Option<JavaId>) -> JavaId {
+        self.var_decl_final(name, ty, init, false)
+    }
+    /// final 局部声明（JLS 4.12.4：case 标签常量的必要条件——
+    /// final 局部删除曾致 `case ARRAY_BOUND:` 失去常量性不可编译，
+    /// LargeFile.java 抓获）。
+    pub fn var_decl_final(
+        &mut self,
+        name: &str,
+        ty: JType,
+        init: Option<JavaId>,
+        final_mod: bool,
+    ) -> JavaId {
         self.push(
             NodeData::VarDecl {
                 name: name.into(),
                 ty,
+                final_mod,
             },
             init.into_iter().collect(),
         )
@@ -527,6 +549,9 @@ impl JavaAst {
             },
             vec![iterable, body],
         )
+    }
+    pub fn yield_(&mut self, expr: JavaId) -> JavaId {
+        self.push(NodeData::Yield, vec![expr])
     }
     pub fn ret(&mut self, value: Option<JavaId>) -> JavaId {
         self.push(NodeData::Return, value.into_iter().collect())
@@ -1236,7 +1261,7 @@ impl Lang for JavaAst {
             }
             NodeData::For { .. } | NodeData::ForEach { .. } | NodeData::If => Effect::MayRead,
             NodeData::While | NodeData::DoWhile => Effect::MayRead,
-            NodeData::Return => Effect::MayThrow,
+            NodeData::Return | NodeData::Yield => Effect::MayThrow,
             NodeData::Throw => Effect::MayThrow,
             NodeData::Assert => Effect::MayThrow,
             NodeData::Synchronized => Effect::MayWrite,
@@ -1374,6 +1399,9 @@ impl Lang for JavaAst {
             _ => None,
         }
     }
+    fn is_field_name(&self, name: &str) -> bool {
+        self.field_types.contains_key(name)
+    }
     fn payload_equal(&self, a: JavaId, b: JavaId) -> bool {
         // 字面量：值级比较（NumRaw 的 0x1F 与 Int 的 31 值等可折——
         // data 全等会退化成原文等）
@@ -1479,7 +1507,7 @@ impl JavaAst {
                     }
                     let action = match &node.data {
                         NodeData::Block | NodeData::For { .. } | NodeData::Try => Action::Scope,
-                        NodeData::VarDecl { name, ty } => {
+                        NodeData::VarDecl { name, ty, .. } => {
                             scopes.last_mut().unwrap().insert(name.clone(), ty.clone());
                             Action::None
                         }

@@ -202,6 +202,34 @@ impl<'src> Parser<'src> {
     }
     /// final 与注解的任意交错前缀（`@A final @B C c`——JSR 308 + 模式修饰）。
     /// 注解/修饰不进节点：类型注解无运行时语义；声明位置另有各自建模。
+    /// 同 skip_mods_annotations，但报告是否跳过了 `final`。
+    fn skip_mods_annotations_final(&mut self) -> bool {
+        let mut saw_final = false;
+        loop {
+            if self.at_kw("final") {
+                saw_final = true;
+                self.bump();
+                continue;
+            }
+            if self.at_punct("@") {
+                self.bump();
+                self.bump();
+                while self.at_punct(".")
+                    && matches!(self.peek(1).tok, Tok::Ident(_))
+                {
+                    self.bump();
+                    self.bump();
+                }
+                if self.at_punct("(") {
+                    self.skip_balanced("(", ")");
+                }
+                continue;
+            }
+            break;
+        }
+        saw_final
+    }
+
     fn skip_mods_annotations(&mut self) {
         loop {
             if self.at_kw("final") {
@@ -1447,17 +1475,19 @@ impl<'src> Parser<'src> {
             };
         }
         if self.at_kw("yield") {
-            // switch 表达式块内的 yield：原文保真（语义不触碰）。
-            // yield 也可作方法名（openjdk T8326204：yield((Map) null, 2) 是
-            // 调用）——解析出非 `;` 收尾即回退按表达式语句重解
-            let start = self.cur_start();
+            // switch 表达式块内的 yield：结构化节点（孩子 = 表达式——
+            // Raw 曾使一切 AST 分析对 yield 体内引用全盲，
+            // InputUnusedLocalVariableSwitchExpression 抓获：++line 在
+            // yield switch 内，逃逸/死码分析看不见 → line 声明被删）。
+            // yield 也可作方法名（openjdk T8326204：yield((Map) null, 2)
+            // 是调用）——解析出非 `;` 收尾即回退按表达式语句重解
             let save = self.pos;
             let err_len = self.errs.len();
             self.bump();
-            if self.parse_expr(PREC_ASSIGN).is_some() && self.eat(";") {
-                let end = self.t[self.pos - 1].end;
-                let text = self.text_of(start, end).trim().to_string();
-                return self.ast.raw(&text);
+            if let Some(e) = self.parse_expr(PREC_ASSIGN) {
+                if self.eat(";") {
+                    return self.ast.yield_(e);
+                }
             }
             // 回退：试探期间的诊断一并回滚（T8326204 曾泄漏 1 错误）
             self.pos = save;
@@ -1535,7 +1565,7 @@ impl<'src> Parser<'src> {
         }
         // 局部变量声明 vs 表达式语句（回溯判定）
         let save = self.pos;
-        if let Some(ty) = self.try_decl_prefix() {
+        if let Some((ty, had_final)) = self.try_decl_prefix() {
             let mut first_name = match &self.tok().tok {
                 Tok::Ident(i) => {
                     let n = i.to_string();
@@ -1631,7 +1661,7 @@ impl<'src> Parser<'src> {
             self.expect(";");
             if decls.len() == 1 {
                 let (n, t, i) = &decls[0];
-                return self.ast.var_decl(n, t.clone(), i.clone());
+                return self.ast.var_decl_final(n, t.clone(), i.clone(), had_final);
             }
             // 多声明符 → 合成 Group（无作用域）：语句列表处就地展开；
             // 逃逸到打印时按同缩进无括号输出。绝不能用 Block——那是词法
@@ -1639,7 +1669,7 @@ impl<'src> Parser<'src> {
             // 零用途 DeadStore 误删逃逸变量，对抗差分抓获）。
             let stmts = decls
                 .iter()
-                .map(|(n, t, i)| self.ast.var_decl(n, t.clone(), i.clone()))
+                .map(|(n, t, i)| self.ast.var_decl_final(n, t.clone(), i.clone(), had_final))
                 .collect();
             return self.ast.group(stmts);
         }
@@ -1664,21 +1694,23 @@ impl<'src> Parser<'src> {
 
     /// 尝试判定"局部变量声明"前缀（类型 + 名字）。成功则消费类型与名字之前的
     /// token（名字不消费，由调用方处理），失败回滚。
-    fn try_decl_prefix(&mut self) -> Option<JType> {
+    fn try_decl_prefix(&mut self) -> Option<(JType, bool)> {
         let save = self.pos;
         // var x = ...（上下文关键字）
         if self.at_kw("var") {
             if let Tok::Ident(_) = &self.peek(1).tok {
                 let t = JType::Var;
                 self.bump();
-                return Some(t);
+                return Some((t, false));
             }
             return None;
         }
         // final/注解交错前缀（@A final C c / final @A C c——GJF testdata
         // TryWithResources 抓获：TWR 资源头注解须按声明解析，误入表达式
-        // 解析会风暴）
-        self.skip_mods_annotations();
+        // 解析会风暴）。final 的存在记入 ctx（JLS 4.12.4：case 标签常量
+        // 的必要条件——final 曾被静默丢弃，`case ARRAY_BOUND:` 失常量性
+        // 不可编译，LargeFile.java 抓获）
+        let had_final = self.skip_mods_annotations_final();
         let ty = self.parse_type();
         if ty.is_none() {
             self.pos = save;
@@ -1686,10 +1718,12 @@ impl<'src> Parser<'src> {
         }
         let ty = ty.unwrap();
         match &self.tok().tok {
+            // 返回 (类型, 是否 final)
+            
             // instanceof is by no means a valid declaration name (k instanceof String was once judged
             // as the declaration "type k, name instanceof" — jdk-sources SignatureUtil:
             // case EDDSA -> k instanceof EdECPrivateKey ? … storm root cause)
-            Tok::Ident(i) if *i != "instanceof" => Some(ty),
+            Tok::Ident(i) if *i != "instanceof" => Some((ty, had_final)),
             _ => {
                 self.pos = save;
                 None
@@ -1833,7 +1867,7 @@ impl<'src> Parser<'src> {
                     self.skip_balanced("(", ")");
                 }
             }
-            if let Some(ty) = self.try_decl_prefix() {
+            if let Some((ty, had_final)) = self.try_decl_prefix() {
                 // 声明式 init：`int i = 0, j = 1`（后续声明符无类型 token）
                 let name = match &self.tok().tok {
                     Tok::Ident(i) => {
@@ -1975,7 +2009,7 @@ impl<'src> Parser<'src> {
                 }
                 self.pos = save;
                 if is_decl {
-                    if let Some(ty) = self.try_decl_prefix() {
+                    if let Some((ty, had_final)) = self.try_decl_prefix() {
                         let name = match &self.tok().tok {
                             Tok::Ident(i) => {
                                 let n = i.to_string();
@@ -2092,6 +2126,14 @@ impl<'src> Parser<'src> {
                 self.bump();
                 self.in_case_label = true;
                 loop {
+                    // 组合标签尾：`case null, default:`（Java 21 JLS 14.11.1）
+                    // ——default 关键字收尾（SwitchDouble 抓获：曾拆成
+                    // `case null:` + `case default:` 不可编译）
+                    if self.at_kw("default") {
+                        self.bump();
+                        is_default = true;
+                        break;
+                    }
                     // 标签头修饰：final/注解可修饰整个模式标签（case final
                     // Pair<I>(…)——checkstyle BindingWithModifiers）——跳过并入
                     // 原文保真
@@ -2239,6 +2281,17 @@ impl<'src> Parser<'src> {
             if arrow {
                 if self.at_punct("{") {
                     stmts.push(self.parse_block_raw());
+                } else if self.at_kw("switch") {
+                    // 箭头体是 switch 表达式（case 1 -> switch (b) {…}）：
+                    // 按表达式解析（先消耗关键字——parse_switch 期待
+                    // paren_expr 上下文；语句形态会吞 case 体的语句语义）。
+                    // 语句表达式形态带分号（JLS 15.28 switch 表达式可作
+                    // 表达式语句——checkstyle 语料 `…};` 实形）
+                    self.bump();
+                    let e = self.parse_switch();
+                    self.eat(";");
+                    let es = self.ast.expr_stmt(e);
+                    stmts.push(es);
                 } else {
                     let s = self.parse_stmt();
                     if matches!(self.ast.data(s), &NodeData::Group) {
@@ -2503,7 +2556,7 @@ impl<'src> Parser<'src> {
             // 曾只在 `.` 之后（x.<T>m() 形态），无点前缀永不进入）
             if self.at_punct("<") {
                 let save_lt = self.pos;
-                if self.type_args_raw().is_some() {
+                if let Some(ta_text) = self.type_args_raw() {
                     // 可选数组维度（Class<?>[]::new——jdk-sources 拷问）：
                     // 维度并入方法引用名（打印机维度在 :: 前）
                     let mut dims = String::new();
@@ -2514,6 +2567,12 @@ impl<'src> Parser<'src> {
                     }
                     if self.at_punct("::") {
                         self.bump();
+                        // 显式类型实参（Main::<String>new——JLS 15.13）：
+                        // 上方链头 type_args_raw 已消费 <TA>（文本在
+                        // ta_text——曾丢弃致 GitHubBug309 的 r11 语句
+                        // 静默消失/ArrayList::<String>new 丢 TA）。
+                        // 并入方法引用名保往返
+                        let ta = ta_text.clone();
                         let m = match &self.tok().tok {
                             Tok::Ident(m) => m.to_string(),
                             _ => String::new(),
@@ -2524,9 +2583,9 @@ impl<'src> Parser<'src> {
                         // 打印约定：无维度时纯方法名（打印机自打 ::）；带维度
                         // 时 "[]::m"（维度在 :: 前——打印机按 find("::") 切分）
                         let name = if dims.is_empty() {
-                            format!("{m}")
+                            format!("{ta}{m}")
                         } else {
-                            format!("{dims}::{m}")
+                            format!("{dims}::{ta}{m}")
                         };
                         e = self.ast.method_ref(e, &name);
                         continue;
@@ -2773,10 +2832,12 @@ impl<'src> Parser<'src> {
                         n
                     }
                     Tok::Punct("<") => {
-                        let _ = self.type_args_raw();
+                        // Main::<String>new（JLS 15.13 显式类型实参）：
+                        // 文本并入方法引用名保往返（曾丢弃——MR2 抓获）
+                        let ta = self.type_args_raw().unwrap_or_default();
                         match &self.tok().tok {
                             Tok::Ident(i) => {
-                                let n = i.to_string();
+                                let n = format!("{ta}{i}");
                                 self.bump();
                                 n
                             }
@@ -2908,7 +2969,13 @@ impl<'src> Parser<'src> {
             Some(ty) => {
                 if self.at_punct(")") {
                     let nxt = self.peek(1);
-                    if starts_unary_operand(nxt) {
+                    // 一元 +/- 仅对**原始类型** cast 放行：(short) -1 是
+                    // 无歧义 cast；引用类型的 (a) - b 与减法不可静态分辨
+                    //（SwitchCharCast 抓获：case (short) -0x7FFF 曾被解析
+                    // 成 short - 0x7FFF 二元减法，输出不可编译）
+                    let prim_sign = matches!(ty, JType::Byte | JType::Short | JType::Int | JType::Long | JType::Char | JType::Float | JType::Double)
+                        && matches!(nxt.tok, Tok::Punct(p) if p == "-" || p == "+");
+                    if starts_unary_operand(nxt) || prim_sign {
                         self.bump(); // )
                         Some(ty)
                     } else {
@@ -3175,8 +3242,39 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_new(&mut self) -> Option<JavaId> {
-        // new Type<...>(args) [anon] | new Type[size…] [init]
+        // new [TypeArguments] Type<...>(args) [anon] | new Type[size…] [init]
+        // 构造器显式类型实参在类型名**之前**（JLS 15.9——generic_ctors.java
+        // 抓获：`new <String>Object()` 曾解析失败致字段声明拆裂）。TA
+        // 并入类型名原文保往返（`<String>Object` 作为 Ref 名打印原样）
+        let ta = if self.at_punct("<") {
+            self.type_args_raw().unwrap_or_default()
+        } else {
+            String::new()
+        };
+        // 类型注解前缀（new @A @B Integer(…)——JLS 15.9 注解可修饰
+        // new 的类型；AnnotationsApplied/InputAnnotationOnSameLine 抓获：
+        // 注解致字段初始化器解析拆裂）。原文并入类型名保往返
+        let anno = if self.at_punct("@") {
+            let start = self.cur_start();
+            self.skip_mods_annotations();
+            let text = self.text_of(start, self.cur_start());
+            text.trim().to_string()
+        } else {
+            String::new()
+        };
         let ty = self.parse_type_base()?;
+        let mut prefix = format!("{ta}{anno}");
+        if !prefix.is_empty() && !prefix.ends_with(' ') {
+            prefix.push(' ');
+        }
+        let ty = if !prefix.is_empty() {
+            match ty {
+                JType::Ref(n) => JType::Ref(format!("{prefix}{n}")),
+                other => other,
+            }
+        } else {
+            ty
+        };
         if self.at_punct("(") {
             let args = self.call_args()?;
             let anon_raw = if self.at_punct("{") {
@@ -3285,7 +3383,19 @@ fn wrap_dims(ty: JType, n: u32) -> JType {
 fn num_lit(text: &str) -> Lit {
     let t = text.replace('_', "");
     let lower = t.to_ascii_lowercase();
-    let (core, suffix) = if lower.ends_with("l") {
+    // hex/binary 前缀优先判定：0x7F 的 f/d/e/E 是**十六进制数字**——
+    // 后缀与浮点判定曾把 hex 误入浮点路径（parse 失败落哨兵
+    // Double(0.0)→ 两个不同 hex 字面量被判值等 → ternary_fold 删除
+    // 活分支（UnicodeEncoder 字节序/SSL 记录头掩码，SSLEngineInputRecord
+    // 抓获：isShort ? 0x7F : 0x3F 曾折成 0x7F）
+    let is_radix = lower.starts_with("0x") || lower.starts_with("0b");
+    let (core, suffix) = if is_radix {
+        if lower.ends_with("l") {
+            (&t[..t.len() - 1], "l")
+        } else {
+            (&t[..], "")
+        }
+    } else if lower.ends_with("l") {
         (&t[..t.len() - 1], "l")
     } else if lower.ends_with("f") {
         (&t[..t.len() - 1], "f")
@@ -3294,12 +3404,16 @@ fn num_lit(text: &str) -> Lit {
     } else {
         (&t[..], "")
     };
-    let is_float_lit = core.contains('.')
-        || core.contains('e')
-        || core.contains('E')
-        || ((core.starts_with("0x") || core.starts_with("0X")) && core.contains('p'))
-        || suffix == "f"
-        || suffix == "d";
+    let is_float_lit = if is_radix {
+        // hex 浮点唯一形态：0x1.8p1（含 p）；二进制无浮点字面量
+        lower.contains('p')
+    } else {
+        core.contains('.')
+            || core.contains('e')
+            || core.contains('E')
+            || suffix == "f"
+            || suffix == "d"
+    };
     if !is_float_lit {
         let radix = if core.starts_with("0x") || core.starts_with("0X") {
             16

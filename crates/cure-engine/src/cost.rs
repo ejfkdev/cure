@@ -13,7 +13,7 @@ pub fn default_weight(kind: NodeKind) -> u64 {
         Binary | Unary | Break | Continue => 3,
         Member | Index | ExprStmt => 3,
         Block | ArrayLit | Ternary | Cast => 4,
-        Return | Call => 4,
+        Return | Yield | Call => 4,
         If | While | DoWhile | Throw | New => 6,
         Assign => 8,
         For | ForEach => 8,

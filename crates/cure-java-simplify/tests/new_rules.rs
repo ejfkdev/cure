@@ -402,9 +402,11 @@ fn decl_assign_merge_rule() {
     assert!(run_src("class A{int m(){int x; x = 5; return x;}}").contains("return 5;"));
     // 合并 + 传播 + 常量折叠连锁：y = x + 1（x=1 单用途）→ return 2;
     assert!(run_src("class A{int m(){int x; x = 1; int y; y = x + 1; return y;}}").contains("return 2;"));
-    // value 引用声明自身（未初始化读）→ 不合并
+    // value 引用声明自身（未初始化读）→ 不合并（P2 尾随赋值即返回
+    // 会折成 `return y + 1;`——求值序保持：单次读旧值单次加——对
+    // 非法输入等价垃圾，对合法输入（y 先有值）恒等）
     let out = run_src("class A{int m(){int y; y = y + 1; return y;}}");
-    assert!(out.contains("y = y + 1;"), "{out}");
+    assert!(out.contains("return y + 1;") || out.contains("y = y + 1;"), "{out}");
 }
 
 #[test]
@@ -1691,9 +1693,10 @@ fn ternary_equal_branch_respects_type_payloads() {
         "class A{Object m(boolean c){return c?new int[1]:new long[1];}}",
     );
     assert!(out4.contains("new int[1] : new long[1]"), "{out4}");
-    // 值等但原文不同的 NumRaw/Int 组合：既有保守行为是不折（允许）
+    // 值等但原文不同的 NumRaw/Int 组合：hex 解析修复后 0x1F ≡ 31
+    //（值等）→ 折叠（旧行为的「不折」是 hex 误解析哨兵的副作用）
     let out5 = run_src("class A{int m(boolean c){return c?0x1F:31;}}");
-    assert!(out5.contains("return c ? 0x1F : 31;") || out5.contains("return 31;"), "{out5}");
+    assert!(out5.contains("return 0x1F;") || out5.contains("return 31;"), "{out5}");
 }
 
 // ---------------------------------------------------------------------------

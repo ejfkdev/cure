@@ -184,6 +184,12 @@ pub trait Lang {
     fn payload_equal(&self, _a: Self::Id, _b: Self::Id) -> bool {
         true
     }
+    /// 名字是否是本单元声明的字段（字段读的可移动性判定——局部/参数
+    /// 不可被调用改变，字段可以）。默认 false（名字未声明 → 当作可移动，
+    /// 手工构建的 AST 无作用域解析时不会误伤）。
+    fn is_field_name(&self, _name: &str) -> bool {
+        false
+    }
     /// 赋值运算（`=` 之外的复合赋值也在此表达；None 表示简单赋值）。
     fn assign_op(&self, _id: Self::Id) -> Option<BinOp> {
         None

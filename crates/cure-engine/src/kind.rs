@@ -15,6 +15,8 @@ pub enum NodeKind {
     Block,
     /// 空语句 `;`，无 children。
     Empty,
+    /// `yield expr;`（switch 表达式块内的产出语句）。
+    Yield,
     /// `[expr]`
     ExprStmt,
     /// 局部变量声明，children: `[(init)?]`，名字由 `Lang::var_name` 提供。
@@ -103,6 +105,7 @@ impl NodeKind {
         match self {
             NodeKind::Block => 0,
             NodeKind::Empty => 1,
+            NodeKind::Yield => 2,
             NodeKind::ExprStmt => 2,
             NodeKind::VarDecl => 3,
             NodeKind::Assign => 4,
@@ -145,7 +148,7 @@ impl NodeKind {
     }
 
     /// slot 的上界（分派表定容用）。
-    pub const SLOT_COUNT: usize = 41;
+    pub const SLOT_COUNT: usize = 42;
 }
 
 impl NodeKind {
