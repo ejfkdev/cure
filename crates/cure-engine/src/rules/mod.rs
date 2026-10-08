@@ -939,6 +939,10 @@ impl<L: Lang> Rule<L> for LocalPropagation {
                     NodeKind::Member | NodeKind::Index if at_head => return None,
                     // 静态调用 callee 位（防御）
                     NodeKind::Call if at_head => return None,
+                    // instanceof 被测式（R14 族 C 抓获：`Object o = 3.5f;
+                    // o instanceof Double` 曾内联成 `3.5f instanceof Double`
+                    // ——基元模式预览语法不可编译）
+                    NodeKind::InstanceOf if at_head => return None,
                     // for-each 可迭代位（ForEach 的第 1 个孩子 = iterable）
                     NodeKind::ForEach => {
                         let ch = lang.children(p);

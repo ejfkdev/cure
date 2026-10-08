@@ -591,3 +591,28 @@ fn all_blank_block_prints_single_line() {
     let p2 = fmt(&p1);
     assert_eq!(p1, p2, "not idempotent");
 }
+
+#[test]
+fn for_semicolon_form_keeps_keyword_idempotent() {
+    // R14 族 D：`for ;` 的 expect("(") 失败路径曾从 ; 起取 Raw 丢 for
+    // → 孤儿 ; 二轮消失
+    let p1 = fmt("class D{void m(){for ;}}");
+    let p2 = fmt(&p1);
+    assert_eq!(p1, p2, "not idempotent: {p1}");
+}
+
+#[test]
+fn case_region_open_paren_garbage_bounded() {
+    // R14 族 E：case 区 `foo(` 开括号垃圾——界内同步（到下一 case/
+    // default/`}` 止），不吞后续 case 与 switch 闭括号（括号平衡保持
+    // 输入原状）；`return r` 留在方法内
+    let src = "class P{int m(int x){int r=0;switch(x){foo(case 1:r=1;break;default:r=2;}return r;}}";
+    let p = parse(src);
+    let printed = cure_java_print::print_unit(&p.ast, &p.unit);
+    assert!(printed.contains("return r;"), "{printed}");
+    let o = printed.matches('(').count();
+    let c = printed.matches(')').count();
+    let so = src.matches('(').count();
+    let sc = src.matches(')').count();
+    assert!(o - c == so - sc, "paren balance changed: {o}/{c} vs {so}/{sc}");
+}

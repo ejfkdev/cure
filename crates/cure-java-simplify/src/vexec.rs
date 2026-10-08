@@ -120,6 +120,11 @@ pub(crate) struct Exec<'a> {
     /// JLS 复合赋值隐式收窄：`byte b=100; b+=100` → (byte)200 = -56
     /// （javac 真值对拍抓获：vexec 曾输出 200）。
     var_width: HashMap<u32, u8>,
+    /// 局部声明类型（名字键 → JType）：逃逸局部材料化按**原声明类型**
+    /// 恢复——`Object o = i + j` 曾材料化成 `var o = 3`（var 推断 int →
+    /// 接收位不可解引用——R14 族 A 抓获：R13 的接收位守卫只在
+    /// LocalPropagation，vexec 物化路径同型破坏未覆盖）
+    decl_tys: HashMap<u32, JType>,
     /// 执行效应日志（按发生序）：字段写与不透明 Class.forName 假设。
     /// 材料化按日志序重放——语句位置/顺序与原执行一致。
     effect_log: Vec<EffectEvent>,
@@ -157,7 +162,7 @@ pub(crate) enum EffectEvent {
 
 impl<'a> Exec<'a> {
     pub(crate) fn new(ast: &'a JavaAst) -> Self {
-        Exec { ast, steps: 0, exhausted: false, vars: HashMap::new(), field_writes: Vec::new(), decl_order: Vec::new(), scopes: vec![Vec::new()], var_width: HashMap::new(), effect_log: Vec::new(), opaque_fields: Default::default(), try_depth: 0 }
+        Exec { ast, steps: 0, exhausted: false, vars: HashMap::new(), field_writes: Vec::new(), decl_order: Vec::new(), scopes: vec![Vec::new()], var_width: HashMap::new(), effect_log: Vec::new(), opaque_fields: Default::default(), try_depth: 0, decl_tys: HashMap::new() }
     }
 
     /// 步数预算耗尽标志（规则据此放弃整段重写——中途状态不是
@@ -220,6 +225,7 @@ impl<'a> Exec<'a> {
                     _ => 0,
                 };
                 self.var_width.insert(k, w);
+                self.decl_tys.insert(k, ty.clone());
                 self.vars.insert(k, v);
                 self.decl_order.push(k);
                 self.scopes.last_mut().unwrap().push(k);
@@ -1134,6 +1140,9 @@ impl<'a> Exec<'a> {
     }
     /// 局部声明域（var_width：2=char/3=byte/4=short/5=long/0=宽或未知）。
     /// 逃逸材料化按域恢复声明类型与字面量种类。
+    pub(crate) fn var_decl_ty(&self, k: u32) -> Option<JType> {
+        self.decl_tys.get(&k).cloned()
+    }
     pub(crate) fn var_domain(&self, k: u32) -> u8 {
         self.var_width.get(&k).copied().unwrap_or(0)
     }
@@ -1293,6 +1302,7 @@ impl<'a> Exec<'a> {
             effect_log: self.effect_log.clone(),
             opaque_fields: self.opaque_fields.clone(),
             try_depth: self.try_depth,
+            decl_tys: self.decl_tys.clone(),
         }
     }
     fn deep_restore(&mut self, s: Snap) {
@@ -1313,6 +1323,7 @@ impl<'a> Exec<'a> {
         self.effect_log = s.effect_log;
         self.opaque_fields = s.opaque_fields;
         self.try_depth = s.try_depth;
+        self.decl_tys = s.decl_tys;
     }
 
     /// 前缀遍历（子块截断核心）：逐语句执行，遇失败语句时若它是
@@ -1632,6 +1643,7 @@ struct Snap {
     effect_log: Vec<EffectEvent>,
     opaque_fields: std::collections::HashSet<u32>,
     try_depth: usize,
+    decl_tys: HashMap<u32, JType>,
 }
 
 /// 深拷贝一个值（别名保持：seen 以 Rc 地址识别同一数组）。

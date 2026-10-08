@@ -434,6 +434,43 @@ impl<'src> Parser<'src> {
         text.trim().to_string()
     }
 
+    /// case 区垃圾的**界内**同步：到下一个 case/default/`}`（depth 0，
+    /// 不消费）或 EOF 止——括号平衡计数内吞，越界闭括号停（不消费）。
+    /// R14 族 E：sync_stmt 的 `;` 终止条件对开括号垃圾越界（吞后续
+    /// case 与 switch 闭括号）。
+    fn sync_case_region(&mut self) -> String {
+        let start = self.cur_start();
+        let mut depth = 0i32;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > 100_000 || self.at_eof() {
+                break;
+            }
+            if depth == 0
+                && (self.at_kw("case")
+                    || self.at_kw("default")
+                    || self.at_punct("}"))
+            {
+                break;
+            }
+            match &self.tok().tok {
+                Tok::Punct("(") | Tok::Punct("[") | Tok::Punct("{") => depth += 1,
+                Tok::Punct(")") | Tok::Punct("]") | Tok::Punct("}") => {
+                    if depth == 0 {
+                        break; // 越界闭括号——停不消费
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            self.bump();
+        }
+        self.text_of(start, self.t[self.pos.min(self.t.len() - 1)].start)
+            .trim()
+            .to_string()
+    }
+
     /// 成员级恢复：跳过平衡区域直到 `;`（消费）或回到成员边界 `}`（不消费）。
     /// 吞到当前 switch 块的收尾 `}`（不消耗 `}` 本身；由调用方的
     /// 外层循环统一收）。风暴兜底用。
@@ -2098,8 +2135,9 @@ impl<'src> Parser<'src> {
         // 输出 `(int $i = 0;; …)` 顶层残句不可解析（R13 P0-1 抓获）
         let for_start = self.t[self.pos - 1].start;
         if !self.expect("(") {
-            let text = self.sync_stmt();
-            return self.ast.raw(&text);
+            // raw_from 含 for 关键字（R14 族 D 抓获：`for ;` 曾从 ; 起取
+            // Raw 丢 for → 孤儿 ; 二轮消失非幂等）
+            return self.raw_from(for_start);
         }
         // for-each 判定（先跳过 final 与**注解**——for (@Anno int i : a)
         // 是合法形态；注解原文丢弃（容错优先），否则解析风暴）
@@ -2664,12 +2702,13 @@ impl<'src> Parser<'src> {
                 self.bump();
                 is_default = true;
             } else {
-                // case 区外的垃圾 → 原文。闭括号等**不消费失败位**（sync
-                // 停在 depth-0 闭括号）：单 token raw + 强制推进——否则
-                // 上层 stall 兜底把剩余语句整体吞进一个 raw（R13c 的
-                // m.put/unmodifiableMap 丢失即此）
+                // case 区外的垃圾 → 原文（**case 界内**同步——到下一个
+                // case/default/`}` 止；R14 族 E 抓获：`foo(` 开括号垃圾曾
+                // 使 sync_stmt 越界吞掉后续 case 与 switch 闭括号——括号
+                // 不平衡、语句移位）。闭括号等不消费失败位：单 token raw
+                // + 强制推进（防 stall 兜底整体吞——R13c 的 m.put 丢失）
                 let pos_before = self.pos;
-                let text = self.sync_stmt();
+                let text = self.sync_case_region();
                 if self.pos == pos_before && !self.at_eof() && !self.at_punct("}") {
                     let ts = self.cur_start();
                     let te = self.tok().end;

@@ -963,7 +963,7 @@ impl Rule<JavaAst> for StaticExec {
         };
         // 每层逃逸局部：decl_order[decl_start .. 更深层 decl_start] 中
         // 存活且名字被该层以下剩余引用者。值先取出。
-        let mut escaped_by_cut: Vec<Vec<(u32, vexec::VVal, u8)>> = Vec::new();
+        let mut escaped_by_cut: Vec<Vec<(u32, vexec::VVal, u8, JType)>> = Vec::new();
         for (j, cut) in run.cuts.iter().enumerate() {
             let range_end = if j == 0 {
                 decl_order.len()
@@ -971,7 +971,7 @@ impl Rule<JavaAst> for StaticExec {
                 run.cuts[j - 1].decl_start
             };
             let rest_j = run.rest_for_cut(j);
-            let mut esc: Vec<(u32, vexec::VVal, u8)> = Vec::new();
+            let mut esc: Vec<(u32, vexec::VVal, u8, JType)> = Vec::new();
             for &k in &decl_order[cut.decl_start.min(range_end)..range_end] {
                 if ex.var_value(k).is_none() {
                     continue; // 已随作用域弹出——非存活局部
@@ -988,6 +988,9 @@ impl Rule<JavaAst> for StaticExec {
                         k,
                         ex.var_value(k).cloned().unwrap_or(vexec::VVal::Undef),
                         ex.var_domain(k),
+                        // 原声明类型：引用声明（装箱语义）材料化必须原样
+                        // 恢复——var 推断基本类型使接收位不可解引用
+                        ex.var_decl_ty(k).unwrap_or(JType::Var),
                     ));
                 }
             }
@@ -1111,7 +1114,7 @@ impl Rule<JavaAst> for StaticExec {
             // 被拆成独立数组，rest 的就地解码写错数组（正则被腐蚀）
             let mut alias_first: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::new();
-            for (k, v, dom) in &escaped_by_cut[j] {
+            for (k, v, dom, dty) in &escaped_by_cut[j] {
                 let name = lang.name_of_key(*k)?;
                 let (val, mut extra) = match v {
                     vexec::VVal::CA(a) => {
@@ -1169,7 +1172,17 @@ impl Rule<JavaAst> for StaticExec {
                             (JType::Long, lit)
                         }
                     }
-                    (_, lit) => (JType::Var, lit),
+                    // 引用声明（Object/接口等）按原类型恢复（装箱在赋值
+                    // 位合法——R14 族 A：`Object o = i + j` 曾发 var o = 3
+                    // → o.hashCode() 不可解引用）。基本类型声明保持 var
+                    //（与推断同型）
+                    (_, lit) => {
+                        if matches!(dty, JType::Ref(_)) {
+                            (dty.clone(), lit)
+                        } else {
+                            (JType::Var, lit)
+                        }
+                    }
                 };
                 let stmt = lang.var_decl(&name, ty, Some(val));
                 insert.push(stmt);

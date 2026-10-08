@@ -2237,3 +2237,39 @@ fn raw_abstractset_receiver_refused() {
     );
     assert!(out.contains("java.util.AbstractSet s = mk();"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// 第 14 轮修复回归（装箱三入口 + for ; + case 界内同步）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn vexec_materialization_restores_ref_decl_type() {
+    // R14 族 A 抓获：`Object o = i + j; o.hashCode()` 的 vexec 逃逸材料化
+    // 曾发 `var o = 3`（var 推断 int → 接收位不可解引用）。装箱在赋值位
+    // 合法——材料化必须恢复原声明类型
+    let out = run_src(
+        "class T{static java.util.List<String> out=new java.util.ArrayList<>();static{int i=1,j=2;Object o=i+j;out.add(\"h\"+o.hashCode());}}",
+    );
+    assert!(out.contains("Object o = 3;"), "{out}");
+}
+
+#[test]
+fn boxing_receiver_call_member_index_forms() {
+    // R14 族 B/终审 P0-2：Ternary/Cast/Instanceof/装箱名声明+调用值
+    //（s.charAt(0) 等基本返回调用）
+    let out = run_src(
+        "class T{String m(String s,boolean c,Object x){Object o=c?'a':'b';o.hashCode();Character ch=s.charAt(0);return ch.toString();}}",
+    );
+    assert!(out.contains("o.hashCode()"), "{out}");
+    assert!(out.contains("ch.toString()"), "{out}");
+}
+
+#[test]
+fn instanceof_operand_primitive_refused() {
+    // R14 族 C/终审 P0-3：`Object x = i; x instanceof Integer j` 的
+    // 42 内联到 instanceof 被测位——基元模式预览语法不可编译
+    let out = run_src(
+        "class T{void m(){Integer i=42;Object x=i;if(x instanceof Integer j){System.out.println(j);}}}",
+    );
+    assert!(out.contains("x instanceof Integer j"), "{out}");
+}

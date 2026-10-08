@@ -1764,6 +1764,32 @@ impl JavaAst {
             ),
             // 算术/逻辑一元二元：结果必为基本类型
             NodeData::Unary { .. } | NodeData::Binary { .. } => true,
+            // 三元：结果可为基本类型（R14 族 B 抓获：`Object o = true ?
+            // 'a' : 'b'; o.hashCode()` 曾内联成 'a'.hashCode() 不可解引用）
+            // ——含引用臂的保守拒绝（过度面小）
+            NodeData::Ternary { .. } => true,
+            // 基本类型 cast：(int) 'a' 结果 int——引用 cast 保守同拒
+            NodeData::Cast { .. } => true,
+            // instanceof：结果恒 boolean
+            NodeData::InstanceOf { .. } => true,
+            // 装箱类型声明 + 调用/成员/下标值（返回类型未知——s.charAt(0)
+            // 等基本返回调用内联进接收位丢装箱——R14 终审 P0-2 抓获：
+            // `Character c = s.charAt(0); return c.toString()` 曾产出
+            // `s.charAt(0).toString()` 无法取消引用 char）。装箱名精确
+            // 匹配，非装箱引用类型（Foo f = m(); f.x()）不受限
+            NodeData::Call { .. } | NodeData::Member { .. } | NodeData::Index { .. } => {
+                match self.data(decl) {
+                    NodeData::VarDecl { ty: JType::Ref(n), .. } => {
+                        let boxed = [
+                            "Character", "Integer", "Long", "Boolean", "Double",
+                            "Float", "Byte", "Short", "Number", "AtomicInteger",
+                            "AtomicLong",
+                        ];
+                        n.rsplit('.').next().is_some_and(|b| boxed.contains(&b))
+                    }
+                    _ => false,
+                }
+            }
             _ => false,
         }
     }
