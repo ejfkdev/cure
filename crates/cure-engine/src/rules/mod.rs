@@ -10,6 +10,7 @@ use crate::kind::{BinOp, LitRef, NodeKind, UnOp};
 use crate::pattern::{matches, Pat};
 use crate::rule::{Edit, RewriteCtx, Rule};
 use crate::lang::{Lang, ReassocOutcome};
+use crate::walk::Walk;
 
 // ---------------------------------------------------------------------------
 // 括号消除：Paren(x) → x（纯分组节点，删除永远安全）
@@ -41,10 +42,21 @@ impl<L: Lang> Rule<L> for ParenRemoval {
 // 常量条件：if (true) {A} [else B] → A；if (false) {A} else B → 删除
 // ---------------------------------------------------------------------------
 
-/// 语句自身是控制流终结（return/throw——break/continue 仅终结**块**，
-/// 不终结方法级后续；保守只认 return/throw）。
+/// 语句自身终结其所在**语句列表**的后续（return/throw/yield 终结方法/块，
+/// break/continue 终结所在块——JLS 14.21 语义）。
+/// javac 对 `if (true) 终结语句` 后跟语句有「条件编译豁免」——后续按可达
+/// 处理；剥掉 if 壳后豁免消失，同列表后续变硬不可达（javac 拒绝）。
 fn self_is_terminal<L: Lang>(lang: &L, n: L::Id) -> bool {
-    matches!(lang.kind(n), NodeKind::Return | NodeKind::Throw)
+    matches!(
+        lang.kind(n),
+        NodeKind::Return | NodeKind::Throw | NodeKind::Break | NodeKind::Continue | NodeKind::Yield
+    )
+}
+
+/// 子树是否含 switch 表达式产出（yield）。折叠丢弃含 yield 的分支会
+/// 缩小产出集 → switch 表达式静态类型改变（var 推断随之破坏）。
+fn contains_yield<L: Lang>(lang: &L, n: L::Id) -> bool {
+    subtree_contains(&*lang, n, |x| lang.kind(x) == NodeKind::Yield)
 }
 
 pub struct ConstCondition;
@@ -66,37 +78,61 @@ impl<L: Lang> Rule<L> for ConstCondition {
         match lang.literal(cond) {
             Some(LitRef::Bool(true)) => {
                 // then 分支必然执行：拼进父块（避免嵌套块）；非块父级则整体替换。
-                // then 必然终结（return/throw 等）→ 后续兄弟不可达，须一并
+                // then 必然终结（return/break 等）→ 后续兄弟不可达，须一并
                 // 删除——否则产出 `return 1; return 2;` 不可编译
                 //（InputArrayTrailingComma 抓获；unreachable_after_terminal
                 // 是 --dead-code 门控，默认模式依赖本规则自洽）
                 let then = ch.get(1).copied()?;
+                // R15 P0-1（o4 形态）抓获：被丢弃的 else 含 yield → switch
+                // 表达式产出集缩小 → 静态类型变化（var 推断破坏）→ 拒绝
+                if let Some(&els) = ch.get(2) {
+                    if contains_yield(&*lang, els) {
+                        return None;
+                    }
+                }
+                let insert: Vec<L::Id> = if lang.kind(then) == NodeKind::Block {
+                    lang.children(then).to_vec()
+                } else {
+                    vec![then]
+                };
+                let terminates = insert.iter().any(|&s| self_is_terminal(lang, s));
                 if let (Some(parent), Some(index)) = (walk.parent(id), walk.index(id)) {
                     if lang.kind(parent) == NodeKind::Block {
-                        let insert: Vec<L::Id> = if lang.kind(then) == NodeKind::Block {
-                            lang.children(then).to_vec()
-                        } else {
-                            vec![then]
-                        };
                         let siblings = lang.children(parent).to_vec();
-                        let terminates = insert
-                            .iter()
-                            .any(|&s| self_is_terminal(lang, s));
-                        if terminates && index + 1 < siblings.len() {
-                            let remove = siblings.len() - index;
-                            return Some(Edit::Splice {
-                                node: parent,
-                                index,
-                                remove,
-                                insert,
-                            });
+                        let remove = if terminates && index + 1 < siblings.len() {
+                            siblings.len() - index
+                        } else {
+                            1
+                        };
+                        // R15 P0-1（o3 同类）抓获：删除的尾随兄弟含 yield →
+                        // 产出集缩小 → 静态类型变化 → 拒绝
+                        if remove > 1
+                            && siblings[index + 1..]
+                                .iter()
+                                .any(|&s| contains_yield(&*lang, s))
+                        {
+                            return None;
                         }
                         return Some(Edit::Splice {
                             node: parent,
                             index,
-                            remove: 1,
+                            remove,
                             insert,
                         });
+                    }
+                    // R15 P0-3（UnreachableVar）抓获：case 组（标签后的
+                    // 语句序列）中整体替换时，then 终结且 if 后还有尾随
+                    // 语句 → 折叠使尾随不可达（JLS 14.21 条件编译豁免
+                    // 消失）。case 组中声明的作用域覆盖整个 switch 块
+                    //（删 `int i=1` 会断 `default: i=2` 引用）——无法安全
+                    // 删除，唯一安全动作是拒绝折叠。其余非块父级（if/while
+                    // 等控制体的唯一语句孩子、else 分支、do-while 条件）
+                    // 不存在尾随语句——照常替换。
+                    if lang.kind(parent) == NodeKind::Case && terminates {
+                        let siblings = lang.children(parent).to_vec();
+                        if index + 1 < siblings.len() {
+                            return None;
+                        }
                     }
                 }
                 Some(Edit::Replace {
@@ -106,6 +142,13 @@ impl<L: Lang> Rule<L> for ConstCondition {
             }
             Some(LitRef::Bool(false)) => {
                 // else 分支必然执行：保留之；无 else（或空 else）才可整删
+                // R15 P0-1（o3 形态）抓获：then 分支整体被丢弃（换 else 或
+                // 删除）——含 yield 则 switch 表达式产出集缩小 → 静态类型
+                // 变化（var 推断破坏）→ 拒绝
+                let then = *ch.get(1)?;
+                if contains_yield(&*lang, then) {
+                    return None;
+                }
                 let els = ch.get(2).copied();
                 if let (Some(parent), Some(index)) = (walk.parent(id), walk.index(id)) {
                     if lang.kind(parent) == NodeKind::Block {
@@ -1400,6 +1443,21 @@ impl<L: Lang> Rule<L> for NotCompare {
 //           c ? a : a → a（c 的求值被丢弃，需 effect ≤ MayRead）
 // ---------------------------------------------------------------------------
 
+/// 折臂敏感位：从 `id` 向上穿过 Paren/Ternary（类型透明链），最终落在
+/// **推断声明**（Java 10 `var`）的 init 上 → true。var 的静态类型由整个
+/// init 表达式推断（三元 = lub(两臂)）——折臂改类型。其余容器（实参/
+/// 二元操作数/Cast/λ 体）的静态类型由外层结构决定，内层折臂不影响推断。
+fn in_inferred_var_init<L: Lang>(lang: &L, walk: &Walk<L>, mut id: L::Id) -> bool {
+    while let Some(&(p, _)) = walk.parents.get(&id) {
+        match lang.kind(p) {
+            NodeKind::Paren | NodeKind::Ternary => id = p,
+            NodeKind::VarDecl => return lang.is_inferred_decl(p),
+            _ => return false,
+        }
+    }
+    false
+}
+
 pub struct TernaryFold;
 
 impl<L: Lang> Rule<L> for TernaryFold {
@@ -1410,17 +1468,32 @@ impl<L: Lang> Rule<L> for TernaryFold {
         &[NodeKind::Ternary]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
-        let RewriteCtx { lang, walk: _ } = ctx;
+        let RewriteCtx { lang, walk } = ctx;
         if lang.kind(id) != NodeKind::Ternary {
             return None;
         }
         let ch = lang.children(id);
         let (c, a, b) = (*ch.first()?, *ch.get(1)?, *ch.get(2)?);
         match lang.literal(c) {
-            Some(LitRef::Bool(true)) => return Some(Edit::Replace { target: id, with: a }),
-            Some(LitRef::Bool(false)) => return Some(Edit::Replace { target: id, with: b }),
+            // R15 P0-1（ClassNotFoundExceptionDueToPrunedCodeTest o1/o2）
+            // 抓获：`var o1 = false ? new Object(){} : null` 曾折成
+            // `var o1 = null`——var 推断从匿名类类型变 null 类型，
+            // `o1 == o1` 不可编译。推断声明 init 位（类型透明链上）
+            // 拒绝折臂。
+            Some(LitRef::Bool(true)) => {
+                if !in_inferred_var_init(&*lang, walk, id) {
+                    return Some(Edit::Replace { target: id, with: a });
+                }
+            }
+            Some(LitRef::Bool(false)) => {
+                if !in_inferred_var_init(&*lang, walk, id) {
+                    return Some(Edit::Replace { target: id, with: b });
+                }
+            }
             _ => {}
         }
+        // c ? a : a：两臂结构全同 → 折叠不改变静态类型（lub(a,a)=a），
+        // var init 位同样安全
         if crate::analysis::structurally_equal(&*lang, a, b) && lang.effect(c) <= Effect::MayRead {
             return Some(Edit::Replace { target: id, with: a });
         }

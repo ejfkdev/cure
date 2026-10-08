@@ -2273,3 +2273,128 @@ fn instanceof_operand_primitive_refused() {
     );
     assert!(out.contains("x instanceof Integer j"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// 第 15 轮修复回归（var 推断 / 数组基座 / JLS 14.21 / catch 依据 / diamond）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn var_ternary_fold_refused() {
+    // R15 P0-1（ClassNotFoundExceptionDueToPrunedCodeTest o1/o2 抓获）：
+    // `var o1 = false ? new Object(){} : null` 曾折成 `var o1 = null`
+    // ——var 推断从匿名类类型变 null 类型。折臂必须拒绝。
+    let out = run_src(
+        "class T{void m(){var o1=false?new Object(){}:null;Runnable r=()->System.out.println(o1==o1);r.run();var o2=true?null:new Object(){};r=()->System.out.println(o2==o2);r.run();}}",
+    );
+    assert!(out.contains("var o1 = false ? new Object() {} : null;"), "{out}");
+    assert!(out.contains("var o2 = true ? null : new Object() {};"), "{out}");
+}
+
+#[test]
+fn var_switch_yield_branch_kept() {
+    // R15 P0-1（o3/o4 形态）：switch 表达式产出集决定其静态类型——
+    // if(false)/if(true) 折叠丢弃含 yield 的分支会缩小产出集 → var
+    // 推断类型改变（`var o3 = … yield null` 不可编译）
+    let out = run_src(
+        "class T{void m(){var o3=switch(0){default->{if(false)yield new Object(){};else yield null;}};System.out.println(o3);var o4=switch(0){default->{if(true)yield null;else yield new Object(){};}};System.out.println(o4);}}",
+    );
+    assert!(out.contains("if (false)"), "{out}");
+    assert!(out.contains("yield new Object() {};"), "{out}");
+    assert!(out.contains("if (true)"), "{out}");
+}
+
+#[test]
+fn explicit_type_ternary_still_folds() {
+    // 正例：显式类型声明吸收折臂类型变化——折叠照常发生
+    let out = run_src(
+        "class T{void m(){Object o=false?new Object(){}:null;System.out.println(o==o);}}",
+    );
+    assert!(out.contains("Object o = null;"), "{out}");
+}
+
+#[test]
+fn var_identical_arm_ternary_still_folds() {
+    // 正例：`c ? a : a` 两臂结构全同 → lub(a,a)=a 折叠不改变 var 推断类型
+    let out = run_src("class T{void m(boolean c){var x=c?\"a\":\"a\";System.out.println(x);}}");
+    assert!(!out.contains("?"), "{out}");
+    assert!(out.contains("System.out.println(\"a\");"), "{out}");
+}
+
+#[test]
+fn array_base_newarray_parenthesized() {
+    // R15 P0-2（T8357653b 抓获）：`b2 = new B[1]` 内联进 `b2[0]` 基座
+    // 曾打印 `new B[1][0]`（重解析为多维创建）。非泛型数组允许内联，
+    // 打印必须括号：`(new Q[1])[0]`
+    let out = run_src(
+        "class Q{String f(){return \"x\";}}class T{void m(){Q[] a=new Q[1];String s=a[0].f();System.out.println(s);}}",
+    );
+    assert!(out.contains("(new Q[1])[0].f()"), "{out}");
+}
+
+#[test]
+fn array_base_generic_decl_inlin_refused() {
+    // R15 P0-2 续：`B<?>[] b2 = new B[1]`——声明元素带实参、new 为 raw，
+    // 内联进 `b2[0]` 基座使元素变 raw B → rett() 擦除返回 Object。
+    // 拒绝内联，保留声明
+    let out = run_src(
+        "class T{class A<X>{class B<W>{public X rett(){return null;}}}class C extends A<String>{{B<?>[] b2=new B[1];String s2=b2[0].rett();System.out.println(s2);}}}",
+    );
+    assert!(out.contains("B<?>[] b2 = new B[1];"), "{out}");
+    assert!(out.contains("b2[0].rett()"), "{out}");
+}
+
+#[test]
+fn if_true_break_in_case_group_kept() {
+    // R15 P0-3（UnreachableVar 抓获）：case 组内 `if (true) break;`
+    // 折叠会使其后语句失去 JLS 14.21 条件编译豁免变硬不可达；组内声明
+    // 作用域跨 case 无法安全删除 → 拒绝折叠
+    let out = run_src(
+        "class T{void m(int c){switch(c){case 1:if(true)break;int i=1;default:i=2;System.out.println(i);}}}",
+    );
+    assert!(out.contains("if (true)"), "{out}");
+    assert!(out.contains("int i = 1;"), "{out}");
+}
+
+#[test]
+fn if_true_break_block_trailing_deleted() {
+    // 正例（终结判定扩展到 break/continue）：块父级内 `if (true) break;`
+    // 折叠并删除不可达尾随语句（曾产出 `break; foo();` 不可编译）
+    let out = run_src(
+        "class T{void m(boolean c){while(c){if(true)break;foo();}}void foo(){}}",
+    );
+    assert!(out.contains("break;"), "{out}");
+    assert!(!out.contains("foo();"), "{out}");
+}
+
+#[test]
+fn receiver_new_type_mismatch_refused() {
+    // R15 P0-4（CloneableProblem 抓获）：`I a0 = new C(); a0.clone()`——
+    // 接收者静态类型从 I（clone() throws CloneNotSupportedException）
+    // 变 C（无 throws）→ catch 失去可抛依据。拒绝内联
+    let out = run_src(
+        "interface I{Object clone() throws CloneNotSupportedException;}class C implements I{public Object clone(){return null;}}class T{Object m(){try{I a0=new C();return a0.clone();}catch(CloneNotSupportedException e){return null;}}}",
+    );
+    assert!(out.contains("I a0 = new C();"), "{out}");
+    assert!(out.contains("a0.clone()"), "{out}");
+}
+
+#[test]
+fn receiver_new_same_name_still_inlines() {
+    // 正例：同名构造（Foo f = new Foo(); f.m()）静态类型不变——照常内联
+    let out = run_src(
+        "class F{void bar(){}}class T{void m(){F f=new F();f.bar();}}",
+    );
+    assert!(out.contains("new F().bar()"), "{out}");
+}
+
+#[test]
+fn receiver_diamond_refused() {
+    // R15 P0-5（MethodRefToInner 抓获）：diamond 推断依赖赋值目标
+    //（List<String>），内联进接收位退化为无目标推断 → Stream<Object>，
+    // 构造器引用 Object 无法转 String。拒绝内联
+    let out = run_src(
+        "class TS{TS(String s){}}class T{void m(){java.util.List<String> l=new java.util.ArrayList<>();l.stream().forEach(TS::new);}}",
+    );
+    assert!(out.contains("List<String> l = new java.util.ArrayList<>();"), "{out}");
+    assert!(out.contains("l.stream()"), "{out}");
+}

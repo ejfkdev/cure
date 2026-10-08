@@ -1249,7 +1249,12 @@ impl<'a> Printer<'a> {
             }
             NodeData::NewArray { ty, dims, sized } => {
                 let ch = ast.children(id);
-                let need = prec::POSTFIX < min_prec;
+                // 后缀位一律括号：数组创建的 `[]` 维度与后缀 `[下标]` 同处
+                // 后缀优先级、无分隔会整体重解析为多维创建（T8357653b
+                // 抓获：`b2 = new B[1]` 内联进 `b2[0]` 基座曾打印
+                // `new B[1][0]`——B[][] 丢失 rett()）。`(new B[1])[0]` 正确；
+                // `.clone()` 位加括号无副作用
+                let need = prec::POSTFIX <= min_prec;
                 if need {
                     self.out.push('(');
                 }

@@ -893,6 +893,16 @@ impl JavaAst {
 // Lang 实现
 // ---------------------------------------------------------------------------
 
+/// 类型名的基名（剥泛型实参 + 取最后点分段）：`List<String>` → `List`、
+/// `java.util.Map<K,V>` → `Map`。接收位类型绑定守卫用（同名构造视为
+/// 静态类型一致；注解/显式类型实参前缀的罕见形态不匹配 → 保守拒绝）。
+fn type_base_name(n: &str) -> &str {
+    let no_args = match n.find('<') {
+        Some(i) => &n[..i],
+        None => n,
+    };
+    no_args.rsplit('.').next().unwrap_or(no_args)
+}
 
 // ---------------------------------------------------------------------------
 // JLS 整数折叠辅助（从 cure-engine 迁入——数值语义归属语言侧）
@@ -1377,35 +1387,60 @@ impl Lang for JavaAst {
         let is_receiver = matches!(use_parent, Some(p) if {
             matches!(self.data(p), NodeData::Member { .. }) && use_at_head
         });
-        if !is_receiver {
-            return false;
-        }
-        // 装箱丢失（R13 P0-2）：引用声明 + 基本类型值——接收位无装箱转换
-        if self.receiver_boxing_unsound(decl, value) {
-            return true;
-        }
-        // 声明类型为 **已知泛型的 raw 引用**（无类型实参——擦除成员解析）：
-        // var 推断/显式带实参/非泛型/未知外部类型不触发（保守——未知名
-        // 保持传播，与修复前行为一致）
-        let raw_ref = match self.data(decl) {
-            NodeData::VarDecl { ty: JType::Ref(n), .. } => {
-                !n.contains('<')
-                    && n.rsplit('.').next().is_some_and(|base| {
-                        self.raw_generic_names.contains(base)
-                    })
+        if is_receiver {
+            // 装箱丢失（R13 P0-2）：引用声明 + 基本类型值——接收位无装箱转换
+            if self.receiver_boxing_unsound(decl, value) {
+                return true;
             }
-            _ => false,
-        };
-        if !raw_ref {
-            return false;
-        }
-        // init 静态类型可能**带泛型**：调用（返回类型未知）或带实参 new
-        match self.data(value) {
-            NodeData::Call => true,
-            NodeData::New { ty, .. } => {
-                matches!(ty, JType::Ref(n) if n.contains('<'))
+            // New 值接收位类型绑定守卫（R15 终审 P0-4/P0-5 抓获）：
+            // (a) diamond（`new ArrayList<>()`）——类型推断依赖赋值目标，
+            //     脱离赋值位内联进接收位退化为无目标推断
+            //     （MethodRefToInner 抓获：`List<String> l = new ArrayList<>();
+            //     l.stream().forEach(TestString::new)` → Stream<Object>，
+            //     构造器引用 Object 无法转 String）；
+            // (b) 构造类型基名 ≠ 声明类型基名——接收者静态类型改变，方法
+            //     绑定与 throws 子句随之改变（CloneableProblem 抓获：
+            //     `A a0 = new CloneableProblem(0); a0.clone()` 内联后
+            //     A.clone() 的 CloneNotSupportedException 不再可抛，catch 失据）。
+            if self.receiver_new_type_unsound(decl, value) {
+                return true;
             }
-            _ => false,
+            // 声明类型为 **已知泛型的 raw 引用**（无类型实参——擦除成员解析）：
+            // var 推断/显式带实参/非泛型/未知外部类型不触发（保守——未知名
+            // 保持传播，与修复前行为一致）
+            let raw_ref = match self.data(decl) {
+                NodeData::VarDecl { ty: JType::Ref(n), .. } => {
+                    !n.contains('<')
+                        && n.rsplit('.').next().is_some_and(|base| {
+                            self.raw_generic_names.contains(base)
+                        })
+                }
+                _ => false,
+            };
+            if !raw_ref {
+                return false;
+            }
+            // init 静态类型可能**带泛型**：调用（返回类型未知）或带实参 new
+            match self.data(value) {
+                NodeData::Call => true,
+                NodeData::New { ty, .. } => {
+                    matches!(ty, JType::Ref(n) if n.contains('<'))
+                }
+                _ => false,
+            }
+        } else {
+            // 数组访问基座（Index 的 child 0）：new 数组值的元素类型绑定
+            // 守卫（R15 终审 P0-2 续，T8357653b 抓获）——声明元素带泛型
+            // 实参（`B<?>[] b2 = new B[1]`）时内联进 `b2[0]` 基座使元素
+            // 从 B<?> 变 raw B，成员解析走擦除（rett() 返回 Object →
+            // `String s2 = …` 赋值失败）。元素名须**全串**一致（含实参），
+            // 维度须与声明嵌套一致；var 推断声明恒安全
+            if matches!(use_parent, Some(p) if {
+                matches!(self.data(p), NodeData::Index { .. }) && use_at_head
+            }) {
+                return self.index_base_newarray_unsound(decl, value);
+            }
+            false
         }
     }
 
@@ -1735,6 +1770,66 @@ impl JavaAst {
     /// `(+c).getClass()` / 常量传播折成 `65.getClass()`——int 接收者
     /// 不可解引用；装箱转换只发生在赋值/传参位，接收位无转换）。
     /// 字符串字面量/引用变量合法（`"a".length()`）。
+    /// 接收位 `new` 值的类型可靠性（R15 终审 P0-4/P0-5）：diamond 无目标
+    /// 推断不可靠；构造类型基名 ≠ 声明类型基名（接口/父类型声明的实现类
+    /// 构造）→ 接收者静态类型改变 → 方法绑定/throws 子句可能改变 →
+    /// 不可靠。同名构造（`Foo f = new Foo(); f.m()`）与 var 推断声明
+    ///（推断类型即 init 类型）保持传播。
+    fn receiver_new_type_unsound(&self, decl: JavaId, value: JavaId) -> bool {
+        let NodeData::New { ty, .. } = self.data(value) else {
+            return false;
+        };
+        let decl_ty = match self.data(decl) {
+            NodeData::VarDecl { ty, .. } => ty,
+            _ => return false,
+        };
+        // var：推断类型 == init 静态类型——New 与之恒等（含 diamond：
+        // `var l = new ArrayList<>()` 本就按无目标推断）
+        if matches!(decl_ty, JType::Var) {
+            return false;
+        }
+        let name = match ty {
+            JType::Ref(n) => n.as_str(),
+            // 非引用构造类型（不可能出现在合法 new；防御拒绝）
+            _ => return true,
+        };
+        // diamond：推断依赖赋值目标——接收位无目标
+        if name.ends_with("<>") {
+            return true;
+        }
+        match decl_ty {
+            JType::Ref(d) => type_base_name(d) != type_base_name(name),
+            // 声明为数组/基元却以类构造为 init——恒不可靠（防御）
+            _ => true,
+        }
+    }
+
+    /// 数组访问基座（`b2[0]` 的 b2 位）`new` 数组值的元素类型可靠性
+    /// （R15 终审 P0-2 续，T8357653b 抓获）：声明元素类型与 new 的元素
+    /// 类型须**全串一致**（含泛型实参——`B<?>[] b2 = new B[1]` 内联使
+    /// b2[0] 从 B<?> 变 raw B → 成员解析擦除化），维度数须与声明嵌套
+    /// 一致。var 推断声明（推断类型即 init 类型）恒安全。
+    fn index_base_newarray_unsound(&self, decl: JavaId, value: JavaId) -> bool {
+        let NodeData::NewArray { ty, dims, .. } = self.data(value) else {
+            return false;
+        };
+        let decl_ty = match self.data(decl) {
+            NodeData::VarDecl { ty, .. } => ty,
+            _ => return false,
+        };
+        if matches!(decl_ty, JType::Var) {
+            return false;
+        }
+        // 声明的数组嵌套层数 + 最内元素类型（Ref 全串含泛型实参）
+        let mut elem: &JType = decl_ty;
+        let mut nest = 0u16;
+        while let JType::Array(inner) = elem {
+            elem = inner.as_ref();
+            nest += 1;
+        }
+        nest != *dims || *elem != *ty
+    }
+
     fn receiver_boxing_unsound(&self, decl: JavaId, value: JavaId) -> bool {
         let declared_ref = match self.data(decl) {
             NodeData::VarDecl { ty, .. } => ty.is_ref(),
