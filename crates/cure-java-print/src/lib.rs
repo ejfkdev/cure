@@ -103,6 +103,10 @@ pub const INDENT: &str = "    ";
 pub fn print_unit(ast: &JavaAst, unit: &CompilationUnit) -> String {
     let mut out = String::new();
     if let Some(pkg) = &unit.package {
+        if !unit.package_annotations.is_empty() {
+            out.push_str(&unit.package_annotations);
+            out.push('\n');
+        }
         out.push_str(&format!("package {pkg};\n\n"));
     }
     for imp in &unit.imports {

@@ -842,6 +842,32 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         // 对事件索引不可见——bd.java 差分抓获：load 被替换而 store
         // 目标残留，输出引用已删除的变量。
         let name_str = lang.var_name(id)?.to_string();
+        // **λ 捕获守卫**（jOOQ Tools.hasAmbiguousNames 抓获：`Set names =
+        // new HashSet<>(); return anyMatch(fields, f -> !names.add(...))`
+        // 曾被内联成 `f -> !new HashSet<>().add(...)`——每次谓词新建
+        // Set，add 恒 true，重名检测恒 false）→ 拒绝传播
+        {
+            let mut captured = false;
+            for &st in &stmts[index + 1..] {
+                // λ 体内引用 x → 捕获（延迟/多次求值——内联 init 改变
+                // 求值次数与状态共享）
+                if subtree_contains(&*lang, st, |n| {
+                    if lang.kind(n) == NodeKind::Lambda {
+                        return subtree_contains(&*lang, n, |m| {
+                            lang.kind(m) == NodeKind::VarRef
+                                && lang.var_name(m) == Some(name_str.as_str())
+                        });
+                    }
+                    false
+                }) {
+                    captured = true;
+                    break;
+                }
+            }
+            if captured {
+                return None;
+            }
+        }
         let syntactic_refs = count_name_refs(&*lang, &stmts[index + 1..], &name_str);
         if syntactic_refs != 1 {
             return None;

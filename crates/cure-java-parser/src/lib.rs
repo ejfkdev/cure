@@ -709,10 +709,14 @@ impl<'src> Parser<'src> {
             // 类型声明（带注解/修饰符）
             let mods_start = self.cur_start();
             let mods = self.modifiers();
-            // package-info：注解（如 @SuppressWarnings("doclint:…")）后跟
-            // package——修饰符吞掉注解后落回循环顶由 package 分支处理
-            //（jdk-sources java/net/package-info.java 抓获）
+            // package-info：注解（如 @NullMarked）后跟 package——注解
+            // 吞掉后落回循环顶由 package 分支处理，注解原文挂到
+            // unit.package_annotations（149 文件曾静默丢弃）
             if self.at_kw("package") {
+                if !mods.is_empty() {
+                    let ann = mods.trim().to_string();
+                    unit.package_annotations = ann;
+                }
                 continue;
             }
             // 值类（JDK 28 预览）：public final value class X —— value 并入
@@ -1318,18 +1322,28 @@ impl<'src> Parser<'src> {
 
     /// 解析类型（含数组后缀）；失败返回 None（调用方自行保存 pos 回滚）。
     fn parse_type(&mut self) -> Option<JType> {
-        // 类型注解前缀（JSR 308：instanceof/new/泛型等类型位置的 @Anno(…)）——
-        // 跳过不进类型名（语义等价；spoon Pozole 的 instanceof 前注解抓获：
-        // 曾使 parse_type 直接失败 → 表达式风暴）
+        // 类型注解前缀（JSR 308：instanceof/泛型等类型位置的 @Anno(…)）——
+        // **原文保留**并入 Ref 名（`<G> @A G m()` 的返回位置/instanceof 的
+        // 纯 TYPE_USE 注解曾丢弃——TU 电池抓获）；基类型为原语时仍跳过
+        //（原语类型注解无处安放——罕见形态，维持跳过）。spoon Pozole 的
+        // instanceof 前注解曾使 parse_type 直接失败 → 表达式风暴（此处
+        // 兼容历史行为：无注解路径完全不变）
+        let mut prefix = String::new();
         while self.at_punct("@") {
+            let s = self.cur_start();
             self.bump(); // @
             self.bump(); // 注解名
             if self.at_punct("(") {
                 self.skip_balanced("(", ")");
             }
+            prefix.push_str(self.text_of(s, self.cur_start()).trim());
+            prefix.push(' ');
         }
         let base = self.parse_type_base()?;
-        let mut ty = base;
+        let mut ty = match base {
+            JType::Ref(name) if !prefix.is_empty() => JType::Ref(format!("{prefix}{name}")),
+            other => other,
+        };
         loop {
             // 维度间注解：String [] @B [] x（openjdk LocalVariables——
             // 注解位于 [] 对之间，丢弃维度注解并入数组类型）
@@ -2607,8 +2621,32 @@ impl<'src> Parser<'src> {
                 while self.at_kw("static") {
                     self.bump();
                 }
-                self.skip_mods_annotations();
                 let pat_start = self.cur_start();
+                // 注解捕获（instanceof @A String s 的类型注解 / @A final @B C
+                // 的模式注解——GJF I588 / checkstyle BindingWithModifiers）：
+                // 原文并入类型名保往返（曾整体跳过丢弃——TU 电池抓获）；
+                // final 与注解交错容忍。static 为 javac 拒绝的垃圾修饰
+                //（openjdk NoModifiersOnBinding 负向测试）——容忍跳过
+                //（容错优先，输出仍合法）
+                let mut anno_prefix = String::new();
+                loop {
+                    if self.at_kw("final") {
+                        self.bump();
+                        continue;
+                    }
+                    if self.at_punct("@") {
+                        let s = self.cur_start();
+                        self.bump(); // @
+                        self.bump(); // 注解名
+                        if self.at_punct("(") {
+                            self.skip_balanced("(", ")");
+                        }
+                        anno_prefix.push_str(self.text_of(s, self.cur_start()).trim());
+                        anno_prefix.push(' ');
+                        continue;
+                    }
+                    break;
+                }
                 // 括号化模式：o instanceof (String s)（openjdk Parenthesized）——
                 // 整体并入 Ref 原文（含可选绑定/when）
                 if self.at_punct("(") {
@@ -2624,7 +2662,12 @@ impl<'src> Parser<'src> {
                     lhs = self.ast.instance_of(lhs, JType::Ref(text), None);
                     continue;
                 }
-                let ty = self.parse_type()?;
+                let mut ty = self.parse_type()?;
+                if !anno_prefix.is_empty() {
+                    if let JType::Ref(n) = ty {
+                        ty = JType::Ref(format!("{anno_prefix}{n}"));
+                    }
+                }
                 if self.at_punct("(") {
                     // instanceof record 模式：x instanceof ColoredPoint(int a,
                     // _, _)（Java 21，checkstyle 抓获）——模式整体并入 Ref 名
@@ -2935,13 +2978,23 @@ impl<'src> Parser<'src> {
                     }
                     Tok::Punct("<") => {
                         // 显式泛型方法调用 x.<T>name(...)（GJF 常见形态）：
-                        // 类型实参原文丢弃（语义由方法决议决定），方法名照常接；
-                        // 类型引用带类型实参后接 ::（List<@A String>::size——
-                        // PMD FullTypeAnnotations）：并入方法引用名原文
-                        if std::env::var("CURE_DBG_LT").is_ok() { eprintln!("[lt] enter, tok={:?}", self.tok().tok); }
-                        if self.type_args_raw().is_none() {
-                            break;
+                        // **类型实参加 witness 保留**（并入 callee Member 名——
+                        // 推断上下文的 witness 是 javac 必需：PathUtils 抓获
+                        // `Stream.<Path>empty().collect(c)` 曾丢 witness 后
+                        // CAP#1 推断失败不可编译）；类型引用带类型实参后接 ::
+                        //（List<@A String>::size）：并入方法引用名原文
+                        let ta_text = self.type_args_raw();
+                        if std::env::var("CURE_DBG_LT").is_ok() {
+                            eprintln!(
+                                "[lt] enter, ta={:?} tok_after={:?}",
+                                ta_text,
+                                self.tok().tok
+                            );
                         }
+                        let ta = match ta_text {
+                            Some(t) => t,
+                            None => break,
+                        };
                         if std::env::var("CURE_DBG_LT").is_ok() { eprintln!("[lt] after ta, tok={:?}", self.tok().tok); }
                         if self.at_punct("::") {
                             self.bump();
@@ -2952,14 +3005,22 @@ impl<'src> Parser<'src> {
                             if !m.is_empty() {
                                 self.bump();
                             }
-                            let name = format!("{m}");
+                            let name = format!("{ta}{m}");
                             e = self.ast.method_ref(e, &name);
                             continue;
                         }
                         match &self.tok().tok {
                             Tok::Ident(name) => {
-                                let n = name.to_string();
+                                // witness 保留：x.<T>m(...) → callee Member
+                                // 名拼成 "<T>m"——打印 `x.<T>m(...)`。
+                                // witness 是 javac 泛型推断的必需实参
+                                //（Stream.<Path>empty().collect(c) 曾丢后
+                                // CAP#1 推断失败不可编译——PathUtils 抓获）
+                                let n = format!("{ta}{name}");
                                 self.bump();
+                                if std::env::var("CURE_DBG_LT").is_ok() {
+                                    eprintln!("[lt-ident] n={:?}", n);
+                                }
                                 if self.at_punct("(") {
                                     let args = self.call_args()?;
                                     let m = self.ast.member(e, &n);
@@ -3186,15 +3247,9 @@ impl<'src> Parser<'src> {
     fn try_cast_type(&mut self) -> Option<JType> {
         let save = self.pos;
         self.bump(); // (
-        // 类型注解前缀（(@Anno String) x——JSR 308）：跳过注解原文
-        //（spoon Castings.java 高频；不跳会导致 cast 判定失败 → 风暴）
-        while self.at_punct("@") {
-            self.bump(); // @
-            self.bump(); // 注解名
-            if self.at_punct("(") {
-                self.skip_balanced("(", ")");
-            }
-        }
+        // 类型注解前缀（(@Anno String) x——JSR 308）：parse_type 捕获进
+        // Ref 名保真（spoon Castings.java 高频；曾跳过致注解丢失——TU 电池
+        // 抓获）
         let mut ty = self.parse_type();
         // cast 数组维度与注解交错：(int @A []) a——注解位于维度间
         //（openjdk LintCast/DotClass 拷问）；维度并入类型
@@ -3563,12 +3618,19 @@ impl<'src> Parser<'src> {
             }
             return Some(self.ast.new_(ty, args));
         }
-        if self.at_punct("[") {
+        if self.at_punct("[") || self.at_punct("@") {
             let mut sizes = Vec::new();
             let mut sized = 0u16;
             let mut dims = 0u16;
             let mut init = None;
-            while self.at_punct("[") {
+            loop {
+                // 维度间注解（new int @A [3] / new int [3] @A [4]——JSR 308）：
+                // 跳过（与 parse_type 维度注解策略一致）；TU 电池抓获：曾使
+                // parse_new 直接失败 → 整语句区域跳过
+                self.skip_mods_annotations();
+                if !self.at_punct("[") {
+                    break;
+                }
                 self.bump();
                 if self.at_punct("]") {
                     self.bump();

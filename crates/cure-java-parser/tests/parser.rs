@@ -351,3 +351,70 @@ class B {
         out.errors
     );
 }
+
+// ---------------------------------------------------------------------------
+// 显式类型实参（type witness）与 JSR 308 类型使用位置注解——保往返
+// ---------------------------------------------------------------------------
+
+#[test]
+fn type_witness_roundtrip() {
+    // 泛型方法调用 witness 是 javac 推断必需实参（Stream.<Path>empty()
+    // 曾丢后 CAP#1 推断失败不可编译——PathUtils 抓获）
+    let src = r#"
+import java.util.*;
+import java.util.stream.*;
+class W {
+    List<String> a = Collections.<String>emptyList();
+    java.util.List<String> b() {
+        return java.util.Collections.<String>unmodifiableList(new ArrayList<String>());
+    }
+    Stream<String> c() {
+        return Stream.<String>empty();
+    }
+    Object d() {
+        return this.<String>gen();
+    }
+    <T> T gen() {
+        return null;
+    }
+}
+"#;
+    let out = fmt(src);
+    assert!(out.contains("Collections.<String>emptyList()"), "{out}");
+    assert!(out.contains("java.util.Collections.<String>unmodifiableList("), "{out}");
+    assert!(out.contains("Stream.<String>empty()"), "{out}");
+    assert!(out.contains("this.<String>gen()"), "{out}");
+}
+
+#[test]
+fn type_use_annotations_roundtrip() {
+    // JSR 308：返回位置/类型参数 bound/cast/instanceof 模式的纯 TYPE_USE
+    // 注解保留（曾丢弃）；new 数组维度注解跳过（parse_type 维度策略）
+    let src = r#"
+class T {
+    @interface U { }
+    @U String ret() {
+        return null;
+    }
+    <G extends @U Object> @U G generic(G g) {
+        return g;
+    }
+    Object c(Object o) {
+        return (@U String) o;
+    }
+    boolean i(Object o) {
+        return o instanceof @U String s && s.length() > 0;
+    }
+    int[] n() {
+        return new int @U [3];
+    }
+}
+"#;
+    let out = fmt(src);
+    assert!(out.contains("@U String ret()"), "{out}");
+    assert!(out.contains("<G extends @U Object> @U G generic(G g)"), "{out}");
+    assert!(out.contains("(@U String) o"), "{out}");
+    assert!(out.contains("instanceof @U String s"), "{out}");
+    // 维度注解跳过但表达式必须可解析（曾 "bad new expression" 区域跳过）
+    assert!(out.contains("new int[3]"), "{out}");
+}

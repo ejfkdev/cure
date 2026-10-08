@@ -383,6 +383,9 @@ pub struct TypeDecl {
 pub struct CompilationUnit {
     /// package 名（不含 `package`/`;`）。
     pub package: Option<String>,
+    /// package 声明前的包级注解原文（package-info.java 的 @NullMarked /
+    /// @Deprecated——149 文件曾静默丢弃，RUNTIME 保留期改变整包契约）。
+    pub package_annotations: String,
     /// import 项原文（如 `java.util.List` / `static x.y.*`）。
     pub imports: Vec<String>,
     pub types: Vec<TypeDecl>,

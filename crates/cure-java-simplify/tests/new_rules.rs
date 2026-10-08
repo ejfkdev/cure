@@ -1886,3 +1886,57 @@ fn dead_code_blind_refs_cover_raw_and_annotations() {
     );
     assert!(out3.contains("work"), "{out3}");
 }
+
+// ---------------------------------------------------------------------------
+// 死代码盲扫盲区（第 10 轮代理审计三根因）：
+// @interface Member::Raw / Lambda params_raw / 裸 @MethodSource 约定
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dead_code_blind_refs_cover_annotation_raw_bodies() {
+    // @interface 成员整段 Raw：其中引用的类型/方法/字段对句法扫描不可见
+    //（junit5 Timeout 抓获：`TimeUnit unit() default TimeUnit.SECONDS;`
+    // 使 import 误删悬空 28 文件；Raw 体内私有成员引用误删）
+    let out = run_dead(
+        "import java.util.concurrent.TimeUnit;\n@interface T{TimeUnit unit() default TimeUnit.SECONDS;}\nclass UsesIt{}",
+    );
+    assert!(out.contains("import java.util.concurrent.TimeUnit;"), "{out}");
+    // Raw 体内引用的私有方法/字段保留；零引用的仍删除（不过保守）
+    let out2 = run_dead(
+        "class A{private static int helper(int x){return x;}private static final int MAGIC=42;private static final int DEAD=7;@interface R{class Inner{int g(){return helper(3)+MAGIC;}}}}",
+    );
+    assert!(out2.contains("helper"), "{out2}");
+    assert!(out2.contains("MAGIC"), "{out2}");
+    assert!(!out2.contains("DEAD"), "{out2}");
+}
+
+#[test]
+fn dead_code_lambda_param_type_keeps_import() {
+    // Lambda 显式参数类型（params_raw 载荷）——auto MoreStreams 抓获：
+    // `import java.util.Map` 曾因 (Map.Entry<K,V> e) 不可见被误删
+    let out = run_dead(
+        "import java.util.Map;\nclass L{Object m(){java.util.function.Function<Map.Entry<String,Integer>,Integer> f=e->e.getValue();return f;}}",
+    );
+    assert!(out.contains("import java.util.Map;"), "{out}");
+}
+
+#[test]
+fn dead_code_bare_methodsource_keeps_factory() {
+    // 裸 @MethodSource（无实参，简单名或全限定名）——JUnit5 按测试方法
+    // 自身名字解析工厂（junit5 BeforeAndAfterSuiteTests 抓获：工厂误删
+    // 运行时解析失败）；具名实参形态走 mods 切分不受影响
+    let out = run_dead(
+        "class T{@org.junit.jupiter.params.provider.MethodSource void t(int x){}private static java.util.stream.Stream<org.junit.jupiter.params.Arguments> t(){return java.util.stream.Stream.of();}}",
+    );
+    assert!(out.contains("private static java.util.stream.Stream<org.junit.jupiter.params.Arguments> t()"), "{out}");
+    // 简单名裸形态同守
+    let out2 = run_dead(
+        "class T{@MethodSource void t(int x){}private static Object t(){return null;}}",
+    );
+    assert!(out2.contains("private static Object t()"), "{out2}");
+    // 无注解同名工厂：正常删除（守卫不扩散）
+    let out3 = run_dead(
+        "class T{void t(int x){}private static Object t(){return null;}}",
+    );
+    assert!(!out3.contains("private static Object t()"), "{out3}");
+}

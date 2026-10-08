@@ -380,6 +380,17 @@ impl<'a> Lexer<'a> {
             is_float = true;
             self.bump();
         } else if self.peek(0) == b'.'
+            && matches!(
+                self.peek(1),
+                b'+' | b'-' | b'*' | b'/' | b'%' | b'}' | b'=' | b'<' | b'>' | b'&' | b'|' | b'^'
+            )
+        {
+            // 尾点浮点后跟运算符/闭花括号（`3./2` / `{…, 3.}`——SymmLQTest
+            // 抓获：白名单外曾读成 int 3 → 3./2 折成整数除法 1，
+            // before 1.5 → after 1 值错）
+            is_float = true;
+            self.bump();
+        } else if self.peek(0) == b'.'
             && (self.peek(1) | 0x20) == b'e'
             && (self.peek(2).is_ascii_digit()
                 || ((self.peek(2) == b'+' || self.peek(2) == b'-')

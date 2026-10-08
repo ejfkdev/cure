@@ -871,6 +871,22 @@ impl Rule<JavaAst> for StaticExec {
         //（JDK 类）假设成功，作为不透明副作用进 effect_log 重放。
         let mut ex = vexec::Exec::new(lang);
         let run = ex.run_prefix(&stmts).ok()?;
+        if std::env::var("CURE_DBG_P1").is_ok() {
+            eprintln!(
+                "[P1-se] run ok: cuts={} total_completed={} budget={} log_len={} root_cut=({},{}) events={:?}",
+                run.cuts.len(),
+                run.cuts.iter().map(|c| c.completed).sum::<usize>(),
+                ex.budget_exhausted(),
+                ex.effect_log().len(),
+                run.cuts.last().map(|c| c.log_start).unwrap_or(0),
+                run.cuts.last().map(|c| c.log_end).unwrap_or(0),
+                ex.effect_log().iter().map(|e| match e {
+                    vexec::EffectEvent::FieldWrite(_) => "FW",
+                    vexec::EffectEvent::ClassLoad { .. } => "CL",
+                    vexec::EffectEvent::OpaqueFieldWrite { .. } => "OFW",
+                }).collect::<Vec<_>>()
+            );
+        }
         // 步数预算耗尽：中途状态非收敛值——整段放弃（不回写任何常量）
         if ex.budget_exhausted() {
             return None;
@@ -990,6 +1006,47 @@ impl Rule<JavaAst> for StaticExec {
                         let tgt = lang.var(&name);
                         insert.push(lang.assign(tgt, val));
                         insert.append(&mut extra);
+                    }
+                    vexec::EffectEvent::OpaqueFieldWrite { k, stmt, call, args } => {
+                        if std::env::var("CURE_DBG_P1").is_ok() {
+                            eprintln!("[P1-mat] OpaqueFieldWrite entered k={}", k);
+                        }
+                        // 屏障重放：`name = <原调用子树，可求值实参代常量>`。
+                        // 实参逐个求值——VVal::S/I/L/B → 字面量替换；
+                        // 不可求值（Undef/数组）→ 保留原子树（语义不触碰）。
+                        // 副作用 = 原调用在原位置执行——求值序保持
+                        let name = lang.name_of_key(*k)?;
+                        // 参数守卫（方法根：字段名撞参数名 → 放弃）
+                        if lang.is_param_name(&name) {
+                            return None;
+                        }
+                        let cch = lang.children(*call).to_vec();
+                        let mut new_args: Vec<JavaId> = Vec::new();
+                        for (i, &arg) in cch.iter().enumerate().skip(1) {
+                            let val = args.get(i - 1).cloned().flatten();
+                            let replaced = match val {
+                                Some(vexec::VVal::S(t)) => Some(lang.lit(Lit::Str(t))),
+                                Some(vexec::VVal::I(x)) => Some(lang.lit(Lit::Int(x as i64))),
+                                Some(vexec::VVal::L(x)) => Some(lang.lit(Lit::Long(x))),
+                                Some(vexec::VVal::B(b)) => Some(lang.lit(Lit::Bool(b))),
+                                _ => None,
+                            };
+                            new_args.push(replaced.unwrap_or_else(|| lang.copy_subtree(arg)));
+                        }
+                        let callee = *lang.children(*call).first()?;
+                        let callee_copy = lang.copy_subtree(callee);
+                        let mut ch = vec![callee_copy];
+                        ch.extend(new_args);
+                        let new_call = lang.clone_node(*call, ch);
+                        let new_stmt = if lang.kind(*stmt) == NodeKind::ExprStmt {
+                            lang.clone_node(*stmt, vec![new_call])
+                        } else {
+                            new_call
+                        };
+                        // 赋值重放：name = <调用>
+                        let tgt = lang.var(&name);
+                        let assign = lang.assign(tgt, new_stmt);
+                        insert.push(assign);
                     }
                     vexec::EffectEvent::ClassLoad { stmt, call, name } => {
                         // 重放为「try { 原语句(字面量实参) } catch (Exception
@@ -1119,6 +1176,9 @@ impl Rule<JavaAst> for StaticExec {
                 remove: cut.completed,
                 insert,
             });
+        }
+        if std::env::var("CURE_DBG_P1").is_ok() {
+            eprintln!("[P1-se] edits={} (empty→reject)", edits.len());
         }
         if edits.is_empty() {
             return None;
@@ -3693,6 +3753,15 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
                 if ch.len() == 1 && ast.kind(ch[0]) == NodeKind::Return {
                     if let Some(&expr) = ast.children(ch[0]).first() {
                         if params.len() <= 3
+                            // 匿名类体：参数替换盲区（体内 return rms 的
+                            // rms 是参数——内联后自由引用悬空——
+                            // EvaluationRmsCheckerTest 抓获：16 文件输出
+                            // 不可编译）→ 拒绝
+                            && !subtree_has_anon(&ast, expr)
+                            // varargs 形参：单实参直通 `array(arg)` 的
+                            // 内联丢 `new T[]{arg}` 包装——junit5 131 处
+                            // 断言恒败 → 拒绝
+                            && !params.iter().any(|p| p.varargs)
                             && !subtree_calls_self(&ast, expr, name)
                             // 类型敏感守卫：字面量替换会改变形参位置的静态类型
                             // （switch 模式选择器 / instanceof 被测式 / Raw 不
@@ -3872,6 +3941,19 @@ fn subtree_has_type_sensitive(ast: &JavaAst, root: JavaId) -> bool {
         match ast.kind(n) {
             NodeKind::Switch | NodeKind::InstanceOf | NodeKind::Raw => return true,
             _ => {}
+        }
+        for &c in ast.children(n) {
+            stack.push(c);
+        }
+    }
+    false
+}
+
+fn subtree_has_anon(ast: &JavaAst, root: JavaId) -> bool {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if let NodeData::New { anon_raw: Some(_), .. } = ast.data(n) {
+            return true;
         }
         for &c in ast.children(n) {
             stack.push(c);
@@ -5514,6 +5596,12 @@ fn collect_all_blind_refs(
                 NodeData::NewArray { ty, .. } => {
                     collect_ty_idents(ty, &mut out);
                 }
+                // Lambda 显式参数类型（(Map.Entry<K, V> entry) -> ——params_raw
+                // 是载荷字符串孩子不走）：auto MoreStreams 抓获——
+                // `import java.util.Map` 曾因 lambda 参数类型不可见被误删
+                NodeData::Lambda { params_raw } => {
+                    split_into(params_raw, &mut out);
+                }
                 _ => {}
             }
             for &c in ast.children(n) {
@@ -5532,13 +5620,20 @@ fn collect_all_blind_refs(
         split_into(&ty.header, &mut out);
         for m in &ty.members {
             match m {
-                Member::Method { mods, ty_params, params, .. }
-                | Member::Constructor { mods, ty_params, params, .. } => {
+                Member::Method { mods, name, ty_params, params, .. }
+                | Member::Constructor { mods, name, ty_params, params, .. } => {
                     collect_mods_idents_all(mods, &mut out);
                     split_into(ty_params, &mut out);
                     for p in params {
                         collect_mods_idents_all(&p.mods, &mut out);
                         collect_ty_idents(&p.ty, &mut out);
+                    }
+                    // 裸 @MethodSource（无实参）——JUnit5 约定：测试方法自身
+                    // 名字即工厂方法名（junit5 BeforeAndAfterSuiteTests /
+                    // commons-io IOUtilsTest 抓获：工厂误删运行时
+                    // MethodSource 解析失败）
+                    if has_bare_methodsource(mods) {
+                        out.insert(name.clone());
                     }
                 }
                 Member::Field { mods, declarators, .. } => {
@@ -5548,6 +5643,15 @@ fn collect_all_blind_refs(
                 }
                 Member::Type(t) => {
                     let _ = t; // for_each_type 已递归
+                }
+                // @interface 成员整段 Raw（annotation 成员无专用节点）：
+                // 其中的类型/常量/方法引用对一切句法扫描不可见
+                //（junit5 Timeout 抓获：`TimeUnit unit() default TimeUnit
+                // .SECONDS;` 曾使 import java.util.concurrent.TimeUnit
+                // 误删悬空 28 文件；AnnoCaller 复现：Raw 体内调用的
+                // 私有方法/字段曾误删）
+                Member::Raw(text) => {
+                    split_into(text, &mut out);
                 }
                 _ => {}
             }
@@ -5565,6 +5669,41 @@ fn collect_mods_idents_all(mods: &str, out: &mut std::collections::HashSet<Strin
             out.insert(id.to_string());
         }
     }
+}
+
+/// mods 中是否出现**裸** `@MethodSource`（注解名后不接 `(`——简单名或
+/// 全限定名均可：`@MethodSource` / `@org.junit.jupiter.params.provider
+/// .MethodSource`）。
+/// JUnit5 约定：无实参的 @MethodSource 按测试方法自身名字解析工厂——
+/// 该名字必须按「已引用」处理（具名实参 `@MethodSource("name")` 的
+/// 名字已由 mods 切分覆盖）。
+fn has_bare_methodsource(mods: &str) -> bool {
+    let hay = mods.as_bytes();
+    const NEEDLE: &[u8] = b"MethodSource";
+    let mut i = 0usize;
+    while let Some(p) = mods[i..].find("MethodSource") {
+        let at = i + p;
+        let end = at + NEEDLE.len();
+        // 前驱须为 @ 或 .（排除 MyMethodSource 类内嵌匹配）；
+        // 后继不得是标识符续字符（排除后缀内嵌）
+        let prev_ok = at == 0
+            || !(hay[at - 1].is_ascii_alphanumeric()
+                || hay[at - 1] == b'_'
+                || hay[at - 1] == b'$');
+        let next_ident =
+            end < hay.len() && (hay[end].is_ascii_alphanumeric() || hay[end] == b'_' || hay[end] == b'$');
+        if prev_ok && !next_ident {
+            let mut j = end;
+            while j < hay.len() && hay[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= hay.len() || hay[j] != b'(' {
+                return true;
+            }
+        }
+        i = end;
+    }
+    false
 }
 
 /// JVM/库按名反射调用的回调方法（序列化机制等）——零句法调用者是

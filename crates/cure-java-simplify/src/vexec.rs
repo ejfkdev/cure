@@ -123,6 +123,8 @@ pub(crate) struct Exec<'a> {
     /// 执行效应日志（按发生序）：字段写与不透明 Class.forName 假设。
     /// 材料化按日志序重放——语句位置/顺序与原执行一致。
     effect_log: Vec<EffectEvent>,
+    /// 屏障穿越字段集（OpaqueFieldWrite 的目标——值 Undef，参与运算 → abort）
+    opaque_fields: std::collections::HashSet<u32>,
 }
 
 /// 执行效应（材料化重放的单位）。
@@ -134,11 +136,22 @@ pub(crate) enum EffectEvent {
     ///（副作用 = 类初始化；重放为原语句 + 字面量实参）。
     /// stmt/call 是原节点 id（材料化时克隆改造）。
     ClassLoad { stmt: JavaId, call: JavaId, name: String },
+    /// 裸名字段 = <不透明调用>(实参) 屏障（P1 简化空间——探针实验证明
+    /// a3/a5/a4/r 的解密级联被这类语句截断，替换后 -3,060 行/-53.4%）。
+    /// 语义：字段值不可知 → Undef；副作用 = 原调用执行。材料化重放为
+    /// 「name = <原调用子树，可求值实参代常量>」。stmt/call 原节点 id，
+    /// k = 字段名字键，args = 已求值实参（None = 不可求值保留原文）。
+    OpaqueFieldWrite {
+        k: u32,
+        stmt: JavaId,
+        call: JavaId,
+        args: Vec<Option<VVal>>,
+    },
 }
 
 impl<'a> Exec<'a> {
     pub(crate) fn new(ast: &'a JavaAst) -> Self {
-        Exec { ast, steps: 0, exhausted: false, vars: HashMap::new(), field_writes: Vec::new(), decl_order: Vec::new(), scopes: vec![Vec::new()], var_width: HashMap::new(), effect_log: Vec::new() }
+        Exec { ast, steps: 0, exhausted: false, vars: HashMap::new(), field_writes: Vec::new(), decl_order: Vec::new(), scopes: vec![Vec::new()], var_width: HashMap::new(), effect_log: Vec::new(), opaque_fields: Default::default() }
     }
 
     /// 步数预算耗尽标志（规则据此放弃整段重写——中途状态不是
@@ -215,6 +228,14 @@ impl<'a> Exec<'a> {
                 match op {
                     Some(op) => self.exec_compound_assign(target, value, op),
                     None => {
+                        // P1 屏障穿越：`裸名字段 = <未知调用>(实参)` 且实参
+                        // 全部可求值 → 原语句保留为不透明副作用、字段值置
+                        // Undef-不透明、**继续执行**（a3/a5/a4/r 的解密
+                        // 级联被这类出口语句截断——探针 -3,060 行/-53.4%）
+                        if let Some(ev) = self.try_opaque_field_barrier(s, target, value)? {
+                            self.effect_log.push(ev);
+                            return Ok(Flow::Normal);
+                        }
                         let v = self.eval(value)?;
                         self.store(target, v)
                     }
@@ -700,6 +721,11 @@ impl<'a> Exec<'a> {
             NodeData::Literal(l) => self.of_lit(l),
             NodeData::VarRef { .. } => {
                 let k = self.key(id)?;
+                // P1 不透明字段：屏障穿越写入的字段值不可知——参与任何
+                // 运算/下标/条件判定 → abort（保守）
+                if self.opaque_fields.contains(&k) {
+                    return Err(());
+                }
                 match self.vars.get(&k) {
                     Some(VVal::Undef) => Err(()),
                     Some(v) => Ok(v.clone()),
@@ -709,6 +735,9 @@ impl<'a> Exec<'a> {
                         if let Some((_, v)) =
                             self.field_writes.iter().find(|(n, _)| *n == k)
                         {
+                            if matches!(v, VVal::Undef) {
+                                return Err(()); // 不透明
+                            }
                             return Ok(v.clone());
                         }
                         Err(())
@@ -1071,6 +1100,85 @@ impl<'a> Exec<'a> {
     /// 自带 → 假设成功（不抛）。类初始化副作用保留：以 effect_log 记录，
     /// 材料化时重放为「原语句 + 字面量实参」。仅值被丢弃的语句位置；
     /// 表达式位置的返回值不可表示 → Err（保守 abort）。
+    /// P1 屏障检测：`target = <Call>(实参...)`——target 是**裸名**（未
+    /// 声明 = 字段）、call 是未知调用（eval_call 会 Err 的形态）、全部
+    /// 实参可求值（Literal 直接过 / 其余 eval 成功）。返回事件供日志
+    /// 重放；字段值记 Undef（不透明——参与运算即 abort，见 eval 的
+    /// opaque_fields 检查）。**表达式位置**的未知调用仍 abort（只有
+    /// 语句位置的整句赋值才穿越——副作用边界清晰）。
+    #[allow(clippy::too_many_arguments)]
+    fn try_opaque_field_barrier(
+        &mut self,
+        stmt: JavaId,
+        target: JavaId,
+        value: JavaId,
+    ) -> R<Option<EffectEvent>> {
+        // target 必须是裸名（未声明 → 字段写语境）
+        if self.ast.kind(target) != NodeKind::VarRef {
+            return Ok(None);
+        }
+        let k = match self.key(target) {
+            Ok(k) => k,
+            Err(()) => return Ok(None),
+        };
+        // 已声明局部 → 普通赋值路径
+        if self.scopes.iter().any(|sc| sc.contains(&k)) {
+            return Ok(None);
+        }
+        // value 必须是 Call（未知调用——否则走普通路径）
+        if self.ast.kind(value) != NodeKind::Call {
+            return Ok(None);
+        }
+        // Class.forName 已有专门路径
+        let callee = match self.ast.children(value).first().copied() {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        if let NodeData::Member { name } = self.ast.data(callee) {
+            if self.ast.sn(*name) == "forName" {
+                return Ok(None);
+            }
+        }
+        // 先试整条求值——成功的是**已知调用**（new String(...).intern()
+        // 等 String 白名单），走普通赋值路径（BR1 抓获：b 曾被误判屏障
+        // 导致材料化丢失）
+        if self.eval(value).is_ok() {
+            return Ok(None);
+        }
+        // 全部实参求值（Literal 直接过；失败 → 不是屏障——保守 abort）
+        let ch = self.ast.children(value).to_vec();
+        if ch.is_empty() {
+            return Ok(None);
+        }
+        let mut args: Vec<Option<VVal>> = Vec::new();
+        for &arg in &ch[1..] {
+            if self.ast.kind(arg) == NodeKind::Literal {
+                // 字面量实参：保留 None——重放时 copy 原子树（精确原文）
+                args.push(None);
+                continue;
+            }
+            match self.eval(arg) {
+                Ok(v) => args.push(Some(v)),
+                Err(()) => return Ok(None), // 不可求值实参 → 拒绝穿越
+            }
+        }
+        // 屏障确认：字段值 Undef（不透明）+ 字段写记账
+        if std::env::var("CURE_DBG_P1").is_ok() {
+            let nm = self.ast.name_of_key(k).unwrap_or_default();
+            eprintln!("[P1] barrier fired: field={:?} args={:?}", nm, args.len());
+        }
+        self.opaque_fields.insert(k);
+        // 直接记账不进 effect_log（record_field_write_by_key 会 push
+        // FieldWrite 事件——材料化循环先遇 FW(Undef) → materialize(Undef)
+        // → None 提前退出整个重写。OFW 事件自身承载重放）
+        if let Some(slot) = self.field_writes.iter_mut().find(|(n, _)| *n == k) {
+            slot.1 = VVal::Undef;
+        } else {
+            self.field_writes.push((k, VVal::Undef));
+        }
+        Ok(Some(EffectEvent::OpaqueFieldWrite { k, stmt, call: value, args }))
+    }
+
     fn try_class_forname(&mut self, stmt: JavaId, call: JavaId) -> R<bool> {
         if self.ast.kind(call) != NodeKind::Call {
             return Ok(false);
@@ -1132,6 +1240,7 @@ impl<'a> Exec<'a> {
             scopes: self.scopes.clone(),
             var_width: self.var_width.clone(),
             effect_log: self.effect_log.clone(),
+            opaque_fields: self.opaque_fields.clone(),
         }
     }
     fn deep_restore(&mut self, s: Snap) {
@@ -1150,6 +1259,7 @@ impl<'a> Exec<'a> {
         self.scopes = s.scopes;
         self.var_width = s.var_width;
         self.effect_log = s.effect_log;
+        self.opaque_fields = s.opaque_fields;
     }
 
     /// 前缀遍历（子块截断核心）：逐语句执行，遇失败语句时若它是
@@ -1405,6 +1515,7 @@ struct Snap {
     scopes: Vec<Vec<u32>>,
     var_width: HashMap<u32, u8>,
     effect_log: Vec<EffectEvent>,
+    opaque_fields: std::collections::HashSet<u32>,
 }
 
 /// 深拷贝一个值（别名保持：seen 以 Rc 地址识别同一数组）。
