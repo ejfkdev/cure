@@ -379,6 +379,17 @@ impl<'a> Lexer<'a> {
             // 终结符/后缀，不是成员访问——jdk-sources StackMoveTest）
             is_float = true;
             self.bump();
+        } else if self.peek(0) == b'.'
+            && (self.peek(1) | 0x20) == b'e'
+            && (self.peek(2).is_ascii_digit()
+                || ((self.peek(2) == b'+' || self.peek(2) == b'-')
+                    && self.peek(3).is_ascii_digit()))
+        {
+            // 整数.指数（2.e-7 / 1.E+3——commons-math 抓获：尾点分支
+            // 白名单不含 e/E → 2 与 .e-7 撕裂成 2.e - 7 二元减法，
+            // 值错 + 触发 EigenDecompositionTest 2M 错误风暴）
+            is_float = true;
+            self.bump();
         }
         let _ = &is_float;
         // 指数：e 后跟数字，或符号后跟数字（1.5e-3 / 1E+10）
