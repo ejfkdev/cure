@@ -167,6 +167,9 @@ impl<'a> Exec<'a> {
                     JType::Char => 2,
                     JType::Byte => 3,
                     JType::Short => 4,
+                    // long=5：非窄化（narrow 的 _ 臂直通），供材料化侧
+                    // 恢复声明域（Int 字面量 → 5L——t06d 同源）
+                    JType::Long => 5,
                     _ => 0,
                 };
                 self.var_width.insert(k, w);
@@ -986,6 +989,11 @@ impl<'a> Exec<'a> {
     pub(crate) fn effect_log(&self) -> &[EffectEvent] {
         &self.effect_log
     }
+    /// 局部声明域（var_width：2=char/3=byte/4=short/5=long/0=宽或未知）。
+    /// 逃逸材料化按域恢复声明类型与字面量种类。
+    pub(crate) fn var_domain(&self, k: u32) -> u8 {
+        self.var_width.get(&k).copied().unwrap_or(0)
+    }
 
     // ---- Class.forName 假设 + 深快照 + 前缀遍历（子块截断）----
 
@@ -1126,6 +1134,26 @@ impl<'a> Exec<'a> {
                 let inner_stopped = run.rest_stack.len() > rest_len;
                 match (r, inner_stopped) {
                     (Ok(()), false) => {
+                        // Try：体块完整完成后 finally 仍须执行（效应入
+                        // 日志随材料化重放）——否则整条 try 替换时 finally
+                        // 副作用丢失（t03 抓获：f="fin" 消失、println 整条吞）
+                        if let NodeData::Try = self.ast.data(st) {
+                            if let Some(fin) = self.try_finally_block(st) {
+                                match self.exec_stmt(fin) {
+                                    Ok(Flow::Normal) => {}
+                                    _ => {
+                                        // finally 失败 → 整条 try 按失败处理
+                                        self.deep_restore(snap);
+                                        run.cuts.truncate(cuts_len);
+                                        run.rest_stack.truncate(rest_len);
+                                        self.truncate_state(decl_len, scopes_len);
+                                        stopped_at = Some(i);
+                                        include_failed_stmt = true;
+                                        break 'lvl;
+                                    }
+                                }
+                            }
+                        }
                         // 整条语句完成：效应已在日志中，语句可被材料化替换
                         completed = i + 1;
                     }
@@ -1141,6 +1169,25 @@ impl<'a> Exec<'a> {
                             self.truncate_state(decl_len, scopes_len);
                             self.deep_restore(snap);
                             include_failed_stmt = true;
+                        } else if matches!(self.ast.data(st), NodeData::Try) {
+                            // Try 部分完成：catch/finally 仍是可执行剩余——
+                            // 追加进最内层 rest（逃逸/再赋值扫描可见）。
+                            // t06b 抓获：catch 引用体块前缀声明的局部 s，
+                            // 漏扫 → s 不材料化 → 输出不可编译
+                            let ch = self.ast.children(st).to_vec();
+                            let extra: Vec<JavaId> = ch
+                                .iter()
+                                .copied()
+                                .skip(1)
+                                .filter(|&c| {
+                                    matches!(self.ast.kind(c), NodeKind::Catch | NodeKind::Block)
+                                })
+                                .collect();
+                            if let Some(last) = run.rest_stack.last_mut() {
+                                last.extend(extra);
+                            } else {
+                                run.rest_stack.push(extra);
+                            }
                         }
                         stopped_at = Some(i);
                         break 'lvl;
@@ -1229,23 +1276,54 @@ impl<'a> Exec<'a> {
             }
             NodeData::Block | NodeData::Group => Some(st),
             NodeData::Try => {
+                // try-with-resources 资源头（非 Block/Catch 的头部孩子）
+                // —— close 语义不可模拟（exec_try 同一合同）。下降路径曾
+                // 静默跳过资源头把整条 try 连 close() 副作用一起删掉
+                //（边界攻击 t02 抓获：closed=1 → 0）
                 let ch = self.ast.children(st).to_vec();
-                let mut i = 0usize;
-                while i < ch.len()
-                    && self.ast.kind(ch[i]) != NodeKind::Block
-                    && self.ast.kind(ch[i]) != NodeKind::Catch
-                {
+                let first = ch.first().copied()?;
+                if self.ast.kind(first) != NodeKind::Block {
+                    return None;
+                }
+                let mut i = 1usize;
+                let mut finally_block: Option<JavaId> = None;
+                while i < ch.len() {
+                    match self.ast.kind(ch[i]) {
+                        NodeKind::Catch => {}
+                        NodeKind::Block => finally_block = Some(ch[i]),
+                        _ => return None,
+                    }
                     i += 1;
                 }
-                let body = ch.get(i).copied()?;
-                if self.ast.kind(body) == NodeKind::Block {
-                    Some(body)
-                } else {
-                    None
+                // first = 体块
+                if finally_block.is_some() {
+                    // 带 finally：体块外的兄弟（finally）不能整体替换——
+                    // 下降会把 finally 随体块的完成一起丢掉（t03 抓获：
+                    // f="fin" 消失）。返回体块但 run_level 的 Try 分支
+                    // 负责 finally 的执行；这里标记需要 finally 处理：
+                    // 用元组形态（体块, finally）——改为调用方处理
                 }
+                Some(first)
             }
             _ => None,
         }
+    }
+
+    /// Try 语句的 finally 体块（catch 之后的 Block；无 → None）。
+    fn try_finally_block(&self, st: JavaId) -> Option<JavaId> {
+        let ch = self.ast.children(st).to_vec();
+        if ch.is_empty() || self.ast.kind(ch[0]) != NodeKind::Block {
+            return None;
+        }
+        let mut finally = None;
+        for &c in &ch[1..] {
+            match self.ast.kind(c) {
+                NodeKind::Catch => {}
+                NodeKind::Block => finally = Some(c),
+                _ => return None,
+            }
+        }
+        finally
     }
 }
 

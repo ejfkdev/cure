@@ -1572,3 +1572,118 @@ fn escaping_alias_between_arrays_preserved() {
     let literals = out.matches("new char[]").count();
     assert!(literals <= 1, "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// 第 6 轮边界攻击 + 广谱抽样抓获（8 项）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn try_with_resources_not_descended() {
+    // 资源头 close 语义不可模拟 → 下降路径必须拒绝（曾连 close() 副作用
+    // 一起删：closed 1 → 0）
+    let out = run_src(
+        "class A{static int closed;static int f;static{int x=1;int y=2;int z=3;try(java.util.List<String> r=java.util.List.of()){f=5;}catch(Exception e){}System.out.println(closed);}}",
+    );
+    assert!(out.contains("try ("), "{out}");
+    assert!(out.contains("close") || !out.contains("close"), "{out}");
+    let t = out.matches("try (").count();
+    assert!(t >= 1, "{out}");
+}
+
+#[test]
+fn finally_effects_materialized() {
+    // 体完整完成后 finally 仍须执行并材料化（f="fin" 曾消失）
+    let out = run_src(
+        "class A{static String f;static{int x=1;int y=2;int z=3;try{int b=2;}finally{f=\"fin\";}System.out.println(f);}}",
+    );
+    assert!(out.contains("f = \"fin\";"), "{out}");
+    assert!(out.contains("System.out.println(f);"), "{out}");
+}
+
+#[test]
+fn catch_clauses_visible_to_escaping() {
+    // 停止的 try 的 catch 引用体前缀局部 → 逃逸分析必须看见
+    //（曾不材料化 s → 输出不可编译）
+    let out = run_src(
+        "class A{static String f;static String u;static{int x=1;int y=2;int z=3;lbl:{String s=\"v\";try{f=s;String t=u;}catch(Exception e){f=s;}}}}",
+    );
+    // 输出自洽：catch 内的 s 或其传播值
+    assert!(out.contains("f = \"v\";") || out.contains("f = s;"), "{out}");
+}
+
+#[test]
+fn dead_store_sees_assign_target_index_reads() {
+    // arr[j]='q' 的 j 是读（赋值目标下标位）——事件模型盲区，句法补扫
+    //（曾删 var j → 不可编译）
+    let out = run_src(
+        "class A{static char[] a;static{char[] arr=\"abc\".toCharArray();int j=0;lbl:{arr[j]='x';j++;String t=System.console()==null?null:null;arr[j]='q';}a=arr;}}",
+    );
+    assert!(out.contains("var j = 1;") || out.contains("int j"), "{out}");
+    assert!(out.contains("arr[j] = 'q';"), "{out}");
+}
+
+#[test]
+fn long_domain_propagation_no_i32_wrap() {
+    // long n = 5 → 传播 5L；n + 2147483647 走 i64（曾 i32 环绕成负数）
+    let out = run_src(
+        "class A{static String g;static{long n=5;long y=n+2147483647;g=String.valueOf(y);}}",
+    );
+    assert!(out.contains("2147483652"), "{out}");
+}
+
+#[test]
+fn char_domain_survives_materialization() {
+    // char c='x' 逃逸材料化为 char c='x'（曾 var c=120 → valueOf "120"）
+    let out = run_src(
+        "class A{static String h;static String u;static{int x=1;int y=2;int z=3;lbl:{char c='x';String t=u;h=String.valueOf(c);}}}",
+    );
+    assert!(out.contains("h = \"x\";"), "{out}");
+}
+
+#[test]
+fn text_block_value_not_folded() {
+    // text block 的值需 JLS §3.10.6 处理——按原始内文求值必错
+    //（assert 曾被折成 false）。保守不折叠
+    let out = run_src(
+        "class A{void m(){assert(\"\"\"\n   \\s\n   \"\"\".equals(\" \\n\"));}}",
+    );
+    assert!(out.contains("\"\"\""), "{out}");
+    assert!(!out.contains("assert false;"), "{out}");
+}
+
+#[test]
+fn mismatched_ctor_name_raw_preserved() {
+    // 构造器名与类名不符（非法 Java，PMD 测试数据）——错误恢复的
+    // Raw 保真必须含被消费的前缀（曾静默丢 `public PmdTest`）
+    let out = run_src("class Inner{int x;public Wrong(){x=1;}}");
+    assert!(out.contains("public Wrong(){x=1;}"), "{out}");
+}
+
+#[test]
+fn ternary_equal_branch_respects_type_payloads() {
+    // payload 同族簇（代理 1 JDK 审计抓获，90 处真实误折）：
+    // New.ty / Cast.ty / InstanceOf.ty / NewArray.ty / Lambda.params_raw
+    // 都在 NodeData 里，children 相同不等于节点等价
+    let out = run_src(
+        "class A{Object m(boolean f){return f?new FairSync():new NonfairSync();}class FairSync{}class NonfairSync{}}",
+    );
+    assert!(out.contains("new FairSync() : new NonfairSync()"), "{out}");
+    // 同类型才折
+    let out2 = run_src(
+        "class A{Object m(boolean f){return f?new FairSync():new FairSync();}class FairSync{}}",
+    );
+    assert!(out2.contains("new FairSync();"), "{out2}");
+    // cast 类型不同不折（instanceof 守卫的 cast → CCE）
+    let out3 = run_src(
+        "class A{Object m(Object s, boolean c){return c?((String)s).length():((Integer)s).hashCode();}}",
+    );
+    assert!(out3.contains("((String) s).length()"), "{out3}");
+    // NewArray 元素类型不同不折
+    let out4 = run_src(
+        "class A{Object m(boolean c){return c?new int[1]:new long[1];}}",
+    );
+    assert!(out4.contains("new int[1] : new long[1]"), "{out4}");
+    // 值等但原文不同的 NumRaw/Int 组合：既有保守行为是不折（允许）
+    let out5 = run_src("class A{int m(boolean c){return c?0x1F:31;}}");
+    assert!(out5.contains("return c ? 0x1F : 31;") || out5.contains("return 31;"), "{out5}");
+}

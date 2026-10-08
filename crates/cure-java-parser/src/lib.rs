@@ -808,8 +808,15 @@ impl<'src> Parser<'src> {
             match self.member_rest(&mmods, &name) {
                 Some(m) => members.push(m),
                 None => {
+                    // 前缀必须在 sync_member() **之前**取——它消费失败点之后
+                    // 的全部残余，之后再取 cur_start 会抓成整段（调试锁定）。
+                    // 前缀 = 成员起点到失败点（已消费的 mods/类型名）——
+                    // 曾用 text_of(mstart, mstart) 恒空串把 `public PmdTest`
+                    // 静默丢掉（ParserCornerCases18 抓获：「保留原文」承诺
+                    // 被打破，输出 () { … }）
+                    let prefix = self.text_of(mstart, self.cur_start());
                     let text = self.sync_member();
-                    members.push(Member::Raw(self.text_of(mstart, mstart) + &text));
+                    members.push(Member::Raw(prefix + &text));
                 }
             }
         }

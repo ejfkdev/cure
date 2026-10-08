@@ -772,6 +772,15 @@ impl<L: Lang> Rule<L> for LocalPropagation {
                 _ => return None,
             }
         }
+        // long 域声明 + int 字面量 init：按 i32 域传播会让后续算术在
+        // i32 环绕（`long n = 5; n + 2147483647` 曾折成 -2147483644，
+        // 正确值 2147483652——边界攻击 t06d 抓获）。就地转 Long 字面量
+        //（5L）传播，const_fold 走 i64 域
+        if lang.is_long_decl(id) {
+            if let Some(LitRef::Int(v)) = lang.literal(value) {
+                value = lang.build_int(v, true);
+            }
+        }
 
         // 扫描 decl 之后的区域（用途/遮蔽全区间；写冲突窗口见下）。
         // 句法引用计数兜底事件盲区：赋值目标内的读（t[k]=… 的 t）
@@ -1648,6 +1657,16 @@ impl<L: Lang> Rule<L> for DeadStore {
             // 只判**本名字**的读/写（watch 集即本名字）；Raw 区域不可证明
             if w0.opaque || !w0.uses.is_empty() || w0.wrote(name_key0) || w0.shadowed {
                 return None;
+            }
+            // 句法补扫：事件模型对赋值**目标子树**的读失明（arr[j]='q'
+            // 的 j 不产生 Use 事件——传播类规则同源问题第三次现身）。
+            // 零用途判死前句法计数目标位置的下标读
+            for &s in &stmts[idx + 1..] {
+                if subtree_contains(&*lang, s, |n| {
+                    lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name.as_str())
+                }) {
+                    return None;
+                }
             }
             if lang.effect(first_value) > Effect::MayRead {
                 return None;

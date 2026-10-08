@@ -178,6 +178,30 @@ pub struct Node {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Sym(pub u32);
 
+/// Lit 值级相等（payload_equal 用；TextBlock 无值语义 → false）。
+fn lit_value_eq(x: &Lit, y: &Lit) -> bool {
+    fn r(l: &Lit) -> Option<cure_engine::kind::LitRef<'_>> {
+        Some(match l {
+            Lit::Bool(b) => LitRef::Bool(*b),
+            Lit::Int(v) => LitRef::Int(*v),
+            Lit::Long(v) => LitRef::Long(*v),
+            Lit::Float(v) => LitRef::Float(*v),
+            Lit::Double(v) => LitRef::Double(*v),
+            Lit::Char(c) => LitRef::Char(*c),
+            Lit::Str(s) => LitRef::Str(s.as_str()),
+            Lit::NumRaw { val, .. } => match val {
+                NumVal::Int(v) => LitRef::Int(*v),
+                NumVal::Long(v) => LitRef::Long(*v),
+                NumVal::Float(v) => LitRef::Float(*v),
+                NumVal::Double(v) => LitRef::Double(*v),
+            },
+            Lit::Null => LitRef::Null,
+            Lit::TextBlock(_) => return None,
+        })
+    }
+    matches!(r(x), Some(rx) if Some(rx) == r(y))
+}
+
 /// 同名同元数方法候选（no-op 调用消解用）。
 #[derive(Clone, Debug)]
 pub struct NoopCandidate {
@@ -1268,6 +1292,9 @@ impl Lang for JavaAst {
         matches!(self.data(decl), NodeData::VarDecl { ty: JType::Char, .. })
     }
 
+    fn is_long_decl(&self, decl: JavaId) -> bool {
+        matches!(self.data(decl), NodeData::VarDecl { ty: JType::Long, .. })
+    }
     fn is_wide_decl(&self, decl: JavaId) -> bool {
         // 窄类型（byte/short/char）复合赋值含隐式收窄：delta 折回声明
         // 会产出超域非法常量或丢静态类型（char 99 → println 打数字）
@@ -1298,7 +1325,13 @@ impl Lang for JavaAst {
                 Lit::Float(v) => LitRef::Float(*v),
                 Lit::Double(v) => LitRef::Double(*v),
                 Lit::Char(c) => LitRef::Char(*c),
-                Lit::Str(s) | Lit::TextBlock(s) => LitRef::Str(s),
+                Lit::Str(s) => LitRef::Str(s),
+                // TextBlock 的**值**需完整 JLS §3.10.6 处理（附加缩进
+                // 剥离 + 行尾空白剔除 + \s 转义——InputJava14EscapedS
+                // 抓获：按原始内文求值把 assert 折成 false）。存的是原文
+                //（往返保真），值语义未实现 → 保守不当作字面量（折叠拒
+                // 绝；打印路径不经过 literal()）
+                Lit::TextBlock(_) => return None,
                 Lit::NumRaw { val, .. } => match val {
                     NumVal::Int(v) => LitRef::Int(*v),
                     NumVal::Long(v) => LitRef::Long(*v),
@@ -1324,6 +1357,14 @@ impl Lang for JavaAst {
             NodeData::MethodRef { name } => Some(self.sn(*name)),
             _ => None,
         }
+    }
+    fn payload_equal(&self, a: JavaId, b: JavaId) -> bool {
+        // 字面量：值级比较（NumRaw 的 0x1F 与 Int 的 31 值等可折——
+        // data 全等会退化成原文等）
+        if let (NodeData::Literal(x), NodeData::Literal(y)) = (self.data(a), self.data(b)) {
+            return lit_value_eq(x, y);
+        }
+        self.data(a) == self.data(b)
     }
     fn assign_op(&self, id: JavaId) -> Option<BinOp> {
         match self.data(id) {

@@ -142,6 +142,9 @@ pub trait Lang {
     /// （`b += K` ≡ `b = (byte)(b + K)`）——把 delta 折回声明会产出
     /// 非法（超域常量）或变义（丢静态类型：`char ch = 99` 内联进
     /// println 打数字而非字符）的字面量。默认 true（宽域语言）。
+    fn is_long_decl(&self, _decl: Self::Id) -> bool {
+        false
+    }
     fn is_wide_decl(&self, _decl: Self::Id) -> bool {
         true
     }
@@ -171,6 +174,15 @@ pub trait Lang {
     /// 相等 → ternary_fold 删除活分支，Types.java Rewriter.high 抓获）。
     fn member_name(&self, _id: Self::Id) -> Option<&str> {
         None
+    }
+    /// 节点**负载**等价（NodeData 中的非孩子字段：New.ty/anon_raw、
+    /// Cast.ty、InstanceOf.ty/bind、Lambda.params_raw、VarDecl.ty 等）。
+    /// structurally_equal 用——负载不比较曾把 `cond ? new FairSync() :
+    /// new NonfairSync()`（参数相同、类型不同）判相等折叠：JDK 语料
+    /// 90 处真实误折（ReentrantReadWriteLock 锁公平性、DirectByteBuffer
+    /// 字节序、instanceof 守卫 cast → CCE，5 例运行时行为改变证实）。
+    fn payload_equal(&self, _a: Self::Id, _b: Self::Id) -> bool {
+        true
     }
     /// 赋值运算（`=` 之外的复合赋值也在此表达；None 表示简单赋值）。
     fn assign_op(&self, _id: Self::Id) -> Option<BinOp> {

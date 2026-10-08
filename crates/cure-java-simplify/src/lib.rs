@@ -905,7 +905,7 @@ impl Rule<JavaAst> for StaticExec {
         };
         // 每层逃逸局部：decl_order[decl_start .. 更深层 decl_start] 中
         // 存活且名字被该层以下剩余引用者。值先取出。
-        let mut escaped_by_cut: Vec<Vec<(u32, vexec::VVal)>> = Vec::new();
+        let mut escaped_by_cut: Vec<Vec<(u32, vexec::VVal, u8)>> = Vec::new();
         for (j, cut) in run.cuts.iter().enumerate() {
             let range_end = if j == 0 {
                 decl_order.len()
@@ -913,7 +913,7 @@ impl Rule<JavaAst> for StaticExec {
                 run.cuts[j - 1].decl_start
             };
             let rest_j = run.rest_for_cut(j);
-            let mut esc: Vec<(u32, vexec::VVal)> = Vec::new();
+            let mut esc: Vec<(u32, vexec::VVal, u8)> = Vec::new();
             for &k in &decl_order[cut.decl_start.min(range_end)..range_end] {
                 if ex.var_value(k).is_none() {
                     continue; // 已随作用域弹出——非存活局部
@@ -926,7 +926,11 @@ impl Rule<JavaAst> for StaticExec {
                     })
                 });
                 if referenced {
-                    esc.push((k, ex.var_value(k).cloned().unwrap_or(vexec::VVal::Undef)));
+                    esc.push((
+                        k,
+                        ex.var_value(k).cloned().unwrap_or(vexec::VVal::Undef),
+                        ex.var_domain(k),
+                    ));
                 }
             }
             escaped_by_cut.push(esc);
@@ -987,7 +991,7 @@ impl Rule<JavaAst> for StaticExec {
             // 被拆成独立数组，rest 的就地解码写错数组（正则被腐蚀）
             let mut alias_first: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::new();
-            for (k, v) in &escaped_by_cut[j] {
+            for (k, v, dom) in &escaped_by_cut[j] {
                 let name = lang.name_of_key(*k)?;
                 let (val, mut extra) = match v {
                     vexec::VVal::CA(a) => {
@@ -1012,7 +1016,33 @@ impl Rule<JavaAst> for StaticExec {
                     }
                     _ => materialize(lang, v)?,
                 };
-                let stmt = lang.var_decl(&name, JType::Var, Some(val));
+                // 声明域恢复：JType::Var 丢失 char/byte/short/long 的
+                // 静态类型（v13 抓获：char c='x' 物化成 var c=120，
+                // valueOf(c) 折成 "120"；long 同源折 i32）。char 域的
+                // I 值发 Char 字面量；long 域的 I 值发 5L
+                let (ty, val) = match (*dom, val) {
+                    (2, lit) if lang.kind(lit) == NodeKind::Literal => {
+                        if let Some(LitRef::Int(v)) = lang.literal(lit) {
+                            match u32::try_from(v).ok().and_then(char::from_u32) {
+                                Some(c) => (JType::Char, lang.lit(Lit::Char(c))),
+                                None => (JType::Char, lit),
+                            }
+                        } else {
+                            (JType::Char, lit)
+                        }
+                    }
+                    (3, lit) => (JType::Byte, lit),
+                    (4, lit) => (JType::Short, lit),
+                    (5, lit) if lang.kind(lit) == NodeKind::Literal => {
+                        if let Some(LitRef::Int(v)) = lang.literal(lit) {
+                            (JType::Long, lang.build_int(v, true))
+                        } else {
+                            (JType::Long, lit)
+                        }
+                    }
+                    (_, lit) => (JType::Var, lit),
+                };
+                let stmt = lang.var_decl(&name, ty, Some(val));
                 insert.push(stmt);
                 insert.append(&mut extra);
             }

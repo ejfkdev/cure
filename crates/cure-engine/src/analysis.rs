@@ -124,6 +124,13 @@ pub fn structurally_equal<L: Lang>(lang: &L, a: L::Id, b: L::Id) -> bool {
     if lang.member_name(a) != lang.member_name(b) {
         return false;
     }
+    // 节点负载（New.ty/anon_raw、Cast.ty、InstanceOf.ty/bind、
+    // Lambda.params_raw 等）：children 相同但类型不同曾判相等——
+    // `cond ? new FairSync() : new NonfairSync()` 90 处误折
+    //（JDK 语料，5 例运行时行为改变证实）
+    if !lang.payload_equal(a, b) {
+        return false;
+    }
     match (lang.literal(a), lang.literal(b)) {
         (Some(x), Some(y)) if x == y => {}
         (None, None) => {}
