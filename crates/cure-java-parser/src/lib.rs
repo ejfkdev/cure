@@ -261,6 +261,35 @@ impl<'src> Parser<'src> {
     /// 候选 `when` 是**绑定名**还是守卫关键字的判形：绑定名后必须紧跟
     /// when(守卫)/:/->/,（`case Integer when when when >= 0 ->`——中间
     /// when 是绑定，其后是守卫 when；若后随运算符则候选是守卫键）。
+    /// 维度前的注解序列（int x @A1 @A2 []——维度间/名后注解）：
+    /// 消费**整段**注解并返回原文；无注解返回空串。调用方须随后判定
+    /// 是否跟 `[]`（非 `[]` 时自行回滚 pos）。
+    fn consume_dims_annotation_run(&mut self) -> (usize, String) {
+        let save = self.pos;
+        let start = self.cur_start();
+        let mut text = String::new();
+        while self.at_punct("@") {
+            let s_ = self.cur_start();
+            self.bump(); // @
+            self.bump(); // 注解名
+            while self.at_punct(".") {
+                if matches!(self.peek(1).tok, Tok::Ident(_)) {
+                    self.bump();
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+            if self.at_punct("(") {
+                self.skip_balanced("(", ")");
+            }
+            text.push_str(self.text_of(s_, self.cur_start()).trim());
+            text.push(' ');
+        }
+        let _ = start;
+        (save, text.trim().to_string())
+    }
+
     fn when_is_bind_form(&self) -> bool {
         matches!(
             &self.peek(1).tok,
@@ -1232,6 +1261,18 @@ impl<'src> Parser<'src> {
         // 的维度记入 first_extra 由声明符自带（曾 wrap 进 ty 又打印各声明符
         // 原始后缀 → `int f[], g[][]` 打成 `int[] f, g[][]` = g 三维，
         // Adv6 差分抓获：javac 读作 int[][][]）
+        // 名后/维度注解（int f @A1 @A2 []——R16 P0-3 抓获：曾静默丢弃）：
+        // 原文捕获并入 mods（位置前移至类型侧——JSR 308 等价形）
+        let dims_annos = {
+            let (save, ann) = self.consume_dims_annotation_run();
+            let keep = !ann.is_empty()
+                && self.at_punct("[")
+                && self.peek(1).is_punct("]");
+            if !keep {
+                self.pos = save;
+            }
+            ann
+        };
         let first_extra = {
             let mut extra_dims = 0u16;
             loop {
@@ -1331,8 +1372,15 @@ impl<'src> Parser<'src> {
             continue;
         }
         self.expect(";");
+        let mods = if dims_annos.is_empty() {
+            mods.to_string()
+        } else if mods.trim().is_empty() {
+            dims_annos
+        } else {
+            format!("{mods} {}", dims_annos)
+        };
         Some(Member::Field {
-            mods: mods.to_string(),
+            mods,
             ty,
             declarators,
         })
@@ -1456,7 +1504,12 @@ impl<'src> Parser<'src> {
                         self.skip_balanced("(", ")");
                     }
                     let ann = self.text_of(as_, self.cur_start()).trim().to_string();
+                    // 连续注解序列（int x @A1 @A2 []——R16 P0-1 抓获：吞一
+                    // 个注解后立即查 []，第二个 @ 处 break 成孤儿使参数列
+                    // 表闭合错乱）；注解间空格分隔
                     mods_suffix.push_str(&ann);
+                    mods_suffix.push(' ');
+                    continue;
                 }
                 if self.at_punct("[") && self.peek(1).is_punct("]") {
                     self.bump();
@@ -1469,7 +1522,13 @@ impl<'src> Parser<'src> {
             let mods = if mods_suffix.is_empty() {
                 mods
             } else {
-                format!("{mods}{mods_suffix}")
+                // 连续注解间空格分隔；mods 为空时防前导空格（幂等——
+                // 二轮曾多一空格）
+                if mods.trim().is_empty() {
+                    mods_suffix.trim().to_string()
+                } else {
+                    format!("{mods} {}", mods_suffix.trim())
+                }
             };
             out.push(Param {
                 mods,
@@ -2112,6 +2171,19 @@ impl<'src> Parser<'src> {
                 return self.expr_stmt_fallback(start);
             }
             let name0 = first_name.take().unwrap();
+            // 名后注解+维度（int x @A1 @A2 []——R16 P0-2 抓获：曾断在 @ 使
+            // 声明拆裂残体孤儿）：注解序列 + [] 一起 → 整句 Raw 保真
+            //（VarDecl 无注解槽，Raw 是唯一无损位）
+            {
+                let (save, ann) = self.consume_dims_annotation_run();
+                if !ann.is_empty() {
+                    if self.at_punct("[") && self.peek(1).is_punct("]") {
+                        self.pos = save;
+                        return self.raw_from(start);
+                    }
+                    self.pos = save; // 非维度注解——回滚走原路径
+                }
+            }
             let mut extra = 0u32;
             while self.at_punct("[") && self.peek(1).is_punct("]") {
                 self.bump();
@@ -2418,6 +2490,17 @@ impl<'src> Parser<'src> {
                         String::new()
                     }
                 };
+                // 名后注解+维度（同局部声明 R16 P0 族）：整句 Raw 保真
+                {
+                    let (save, ann) = self.consume_dims_annotation_run();
+                    if !ann.is_empty() {
+                        if self.at_punct("[") && self.peek(1).is_punct("]") {
+                            self.pos = save;
+                            return self.raw_from(for_start);
+                        }
+                        self.pos = save;
+                    }
+                }
                 let mut extra = 0u32;
                 while self.at_punct("[") && self.peek(1).is_punct("]") {
                     self.bump();

@@ -310,7 +310,33 @@ impl<'a> Printer<'a> {
         if !t.enum_constants.is_empty() {
             self.newline();
             self.indent();
-            self.out.push_str(&t.enum_constants.join(", "));
+            // 分隔符感知 join：孤立逗号常量（`enum G { A, , B }`——
+            // R15 的逗号 item 与 join 分隔符叠加成 ,, 且逐轮 +1
+            // 增生——R16 P1-5）不重复加分隔符
+            let mut out = String::new();
+            let mut need_sep = false;
+            let mut after_comma = false;
+            for c in &t.enum_constants {
+                if c == "," {
+                    // 孤立逗号：前置一个分隔符（若需要）后逐字输出
+                    if need_sep && !out.is_empty() {
+                        out.push_str(", ");
+                    }
+                    out.push(',');
+                    need_sep = false;
+                    after_comma = true;
+                    continue;
+                }
+                if need_sep {
+                    out.push_str(", ");
+                } else if after_comma {
+                    out.push(' ');
+                }
+                out.push_str(c);
+                need_sep = true;
+                after_comma = false;
+            }
+            self.out.push_str(&out);
             if !t.members.is_empty() {
                 self.out.push(';');
             }

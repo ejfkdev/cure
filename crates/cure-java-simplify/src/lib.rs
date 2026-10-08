@@ -5796,6 +5796,12 @@ fn collect_all_blind_refs(
             }
         }
     }
+    // 1.6) 顶层 raw 区（unit.raws——破损输入的保真残段）：其文本中的
+    // 类型/名字引用对一切句法扫描不可见（BuilderSimpleOnRecord 抓获：
+    // `<T> {…List<T> l…}` 残段内的 List 曾不可见 → import 误删悬空）
+    for r in &unit.raws {
+        split_into(r, &mut out);
+    }
     // 2) 结构层：成员 mods 注解实参 / 枚举常量原文 / 方法级 ty_params /
     //    record 组件头
     for_each_type(unit, &mut |ty: &TypeDecl| {
@@ -6254,6 +6260,15 @@ fn remove_unused_imports(ast: &JavaAst, unit: &mut CompilationUnit) -> usize {
     //      「使用的名字」超集方向，直接并入）
     for name in collect_all_blind_refs(ast, unit) {
         idents.insert(name);
+    }
+    // 1.6) 顶层 raw 区（unit.raws）：残段文本中的类型引用（同上——
+    // 曾不可见使 List 误删）
+    for r in &unit.raws {
+        for id in r.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+            if !id.is_empty() {
+                idents.insert(id.to_string());
+            }
+        }
     }
     // 2) 结构字符串（mods/注解原文、泛型参数、extends/implements/throws、
     //    方法/类型名——字段/参数/返回类型）

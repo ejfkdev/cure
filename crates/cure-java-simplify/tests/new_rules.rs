@@ -2398,3 +2398,40 @@ fn receiver_diamond_refused() {
     assert!(out.contains("List<String> l = new java.util.ArrayList<>();"), "{out}");
     assert!(out.contains("l.stream()"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// 第 16 轮修复回归（多注解维度族 + 枚举逗号 + unit.raws 盲区）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_annotation_dims_all_positions() {
+    // R16 P0-1~4：连续注解 + 维度（param/field/局部/for-init 四位）——
+    // 单注解形态 R15 已修，连续注解曾断链/丢失/拆裂
+    let out = run_src(
+        "class T{@interface A1{}@interface A2{}void m(int x @A1 @A2 []){}int f @A1 @A2 [];void n(){int y @A1 @A2 []=null;}}",
+    );
+    // 参数：注解入 mods（类型侧，JSR 等价）
+    assert!(out.contains("@A1 @A2 int[] x"), "{out}");
+    // 字段：注解入 mods
+    assert!(out.contains("@A1 @A2 int f[]"), "{out}");
+    // 局部：整句 Raw 保真
+    assert!(out.contains("int y @A1 @A2 []"), "{out}");
+}
+
+#[test]
+fn enum_double_comma_no_growth() {
+    // R16 P1-5：孤立逗号常量与 join 分隔符叠加逐轮 +1 增生
+    let p1 = run_src("enum G{A, , B}");
+    let p2 = run_src(&p1);
+    assert_eq!(p1, p2, "not idempotent: {p1}");
+}
+
+#[test]
+fn unit_raws_visible_to_import_analysis() {
+    // R16 P1-6：顶层 raw 残段（unit.raws）中的类型引用曾对 import 分析
+    // 不可见 → 使用中的 List 被误删
+    let out = run_dead(
+        "import java.util.List;\nclass A{int m(){return 1;}}\n<T> { private List<T> x; }\n",
+    );
+    assert!(out.contains("import java.util.List;"), "{out}");
+}
