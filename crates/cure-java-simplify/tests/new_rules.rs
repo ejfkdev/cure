@@ -2205,3 +2205,35 @@ fn foreach_var_avoids_lambda_twr_instanceof_bindings() {
     }
     let _ = ebinds;
 }
+
+// ---------------------------------------------------------------------------
+// 第 13 轮终审修复回归（P0-2 装箱接收位 / P0-3 raw 泛型白名单补）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn primitive_boxing_receiver_not_propagated() {
+    // R13 P0-2 抓获：`Object o = +c; o.getClass()` 常量传播/内联到接收位
+    // 丢装箱转换——`(+c).getClass()` / `65.getClass()` int 不可解引用
+    let out = run_src(
+        "class T{Object m(char c,int i){Object o=+c;Object p=i;return o.getClass().getSimpleName()+p.getClass().getSimpleName();}}",
+    );
+    assert!(out.contains("o.getClass()"), "{out}");
+    assert!(out.contains("p.getClass()"), "{out}");
+    assert!(!out.contains("65.getClass()"), "{out}");
+    // 基本类型字面量常量传播到接收位同样拒绝
+    let out2 = run_src(
+        "class T{final char c='A';Object m(){Object o=+c;return o.getClass().getSimpleName();}}",
+    );
+    assert!(out2.contains("o.getClass()"), "{out2}");
+}
+
+#[test]
+fn raw_abstractset_receiver_refused() {
+    // R13 P0-3 抓获：`AbstractSet s = mk(); s.add(o)`——mk() 返回带泛型
+    // AbstractSet<String>，raw 接收位内联后 javac CAP#1/不兼容类型。
+    // 白名单补 AbstractSet 等（R12 攻击代理建议 + T3k 实锤）
+    let out = run_src(
+        "class T{static java.util.AbstractSet<String> mk(){return null;}void m(Object o){java.util.AbstractSet s=mk();s.add(o);}}",
+    );
+    assert!(out.contains("java.util.AbstractSet s = mk();"), "{out}");
+}

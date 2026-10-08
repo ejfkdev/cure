@@ -839,6 +839,13 @@ impl<'a> Printer<'a> {
         for &c in &ch[1..] {
             self.newline();
             self.indent();
+            // case 区垃圾的 Raw 兄弟（破损 for 头残骸等——R13 P0-1）：
+            // 按语句打印（Raw 首行挂当前缩进），曾打 /* bad case */ 吞
+            // 语句内容
+            if !matches!(self.ast.data(c), &NodeData::Case { .. }) {
+                self.stmt(c);
+                continue;
+            }
             self.case(c);
         }
         self.level -= 1;
@@ -930,7 +937,10 @@ impl<'a> Printer<'a> {
 
     fn block_body(&mut self, id: JavaId) {
         let children = self.ast.children(id).to_vec();
-        if children.is_empty() {
+        // 全空（无孩子或全为无输出语句——const_condition 把 if(true); 换
+        // 成 Empty 残留）：单行 {}。多行形态重解析后孩子被丢弃 → 非幂等
+        //（EmptyStatementComments R13 P1 抓获：一轮多行、二轮单行）
+        if children.is_empty() || children.iter().all(|&s| self.stmt_is_blank(s)) {
             self.out.push_str("{}");
             return;
         }

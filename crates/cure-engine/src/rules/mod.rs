@@ -913,12 +913,24 @@ impl<L: Lang> Rule<L> for LocalPropagation {
                 return None;
             }
         }
-        // null 字面量不得内联进需要类型的表达式位：调用接收者
-        //（`null.setArgName(...)` 不可编译——差分审查抓获）；for-each
-        // 可迭代位（`for (T x : null)` 不适用）；数组访问基座（`null[0]`
-        // / `synchronized (null[0])` —— InputFullOfBlockComments/FooCasper
-        // 抓获）；字段/数组基座同理
-        if matches!(lang.literal(value), Some(LitRef::Null)) {
+        // null 字面量**与基本类型字面量**不得内联进需要引用类型的表达式
+        // 位：调用接收者（`null.setArgName(...)` / `65.getClass()`——后者
+        // R13 P0-2 抓获：`Object o = +c; o.getClass()` 常量传播产出
+        // `65.getClass()` 非法 Java）；for-each 可迭代位；数组访问基座
+        //（`null[0]`）；字段/数组基座同理。字符串字面量接收者合法
+        //（`"a".length()`）不在拒绝域
+        if matches!(
+            lang.literal(value),
+            Some(
+                LitRef::Null
+                    | LitRef::Int(_)
+                    | LitRef::Long(_)
+                    | LitRef::Float(_)
+                    | LitRef::Double(_)
+                    | LitRef::Char(_)
+                    | LitRef::Bool(_)
+            )
+        ) {
             let mut cur = use_id;
             while let Some(&(p, _)) = walk.parents.get(&cur) {
                 let at_head = lang.children(p).first() == Some(&cur);

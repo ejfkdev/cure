@@ -2093,7 +2093,10 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_for(&mut self) -> JavaId {
-        let for_start = self.cur_start();
+        // for_start 含 `for` 关键字（parse_stmt 已 bump——cur_start 在
+        // `(` 上；pos-1 即关键字 token）。破损回退的 Raw 若丢关键字，
+        // 输出 `(int $i = 0;; …)` 顶层残句不可解析（R13 P0-1 抓获）
+        let for_start = self.t[self.pos - 1].start;
         if !self.expect("(") {
             let text = self.sync_stmt();
             return self.ast.raw(&text);
@@ -2150,7 +2153,7 @@ impl<'src> Parser<'src> {
                             self.bump();
                         }
                         let header = self.text_of(for_start, self.t[self.pos - 1].end);
-                        let mut text = format!("for {header}");
+                        let mut text = header;
                         if self.at_punct("{") {
                             if let Some(b) = self.skip_balanced_braces() {
                                 text.push(' ');
@@ -2325,7 +2328,13 @@ impl<'src> Parser<'src> {
                 break;
             }
         }
-        self.expect(")");
+        if !self.expect(")") {
+            // for 头破损（三半分号等非法形态——after-ecj 残骸 R13 P0-1）：
+            // 部分构造的 For + 孤儿残句曾使循环体语句丢失、类尾成员移位
+            // 顶层、非幂等。整段 Raw 保真（sync 到 `;`/语句边界；体块作
+            // 兄弟语句另行解析，类结构不破坏）
+            return self.raw_from(for_start);
+        }
         let body = self.stmt_or_block();
         // steps 存的是 ExprStmt，解包成裸表达式（For 头部打印不带分号）
         let steps_bare: Vec<JavaId> = steps
@@ -2655,8 +2664,20 @@ impl<'src> Parser<'src> {
                 self.bump();
                 is_default = true;
             } else {
-                // case 区外的垃圾 → 原文
+                // case 区外的垃圾 → 原文。闭括号等**不消费失败位**（sync
+                // 停在 depth-0 闭括号）：单 token raw + 强制推进——否则
+                // 上层 stall 兜底把剩余语句整体吞进一个 raw（R13c 的
+                // m.put/unmodifiableMap 丢失即此）
+                let pos_before = self.pos;
                 let text = self.sync_stmt();
+                if self.pos == pos_before && !self.at_eof() && !self.at_punct("}") {
+                    let ts = self.cur_start();
+                    let te = self.tok().end;
+                    let t2 = self.text_of(ts, te).trim().to_string();
+                    cases.push(self.ast.raw(&t2));
+                    self.bump();
+                    continue;
+                }
                 cases.push(self.ast.raw(&text));
                 continue;
             }

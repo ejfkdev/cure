@@ -559,3 +559,35 @@ fn empty_case_statement_dropped_for_idempotency() {
     let p2 = fmt(&p1);
     assert_eq!(p1, p2, "not idempotent");
 }
+
+// ---------------------------------------------------------------------------
+// 第 13 轮终审修复回归（R13c 破损 for 头 / P1 空体）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn malformed_for_header_recovery_bounded() {
+    // R13 P0-1（after-ecj 三半分号 for）：错误有界 + 幂等 + 类结构不破坏
+    //（成员不移位、循环体语句不丢）
+    let src = "class C{int t=1;C(int t){this.t=t;}static int f(java.util.List<String> k){java.util.Map<String,String> m=new java.util.LinkedHashMap<String,String>();for(int $i=0;;($i<k.size());$i++)m.put(k.get($i),k.get($i));m=java.util.Collections.unmodifiableMap(m);return m.size();}}";
+    let p = parse(src);
+    assert!(p.errors.len() < 10, "runaway: {} errors", p.errors.len());
+    let printed = cure_java_print::print_unit(&p.ast, &p.unit);
+    assert!(printed.contains("C(int t)"), "member displaced: {printed}");
+    let reparsed = parse(&printed);
+    assert!(reparsed.errors.len() < 10, "reparse: {}", reparsed.errors.len());
+    assert_eq!(
+        printed,
+        cure_java_print::print_unit(&reparsed.ast, &reparsed.unit),
+        "not idempotent"
+    );
+}
+
+#[test]
+fn all_blank_block_prints_single_line() {
+    // R13 P1（EmptyStatementComments）：const_condition 把 if(true); 换成
+    // Empty 残留——全空块多行形态重解析丢孩子 → 非幂等
+    let src = "class A{void m1(){if(true);if(true);}}";
+    let p1 = fmt(src);
+    let p2 = fmt(&p1);
+    assert_eq!(p1, p2, "not idempotent");
+}

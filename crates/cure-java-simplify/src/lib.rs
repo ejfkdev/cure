@@ -3685,6 +3685,13 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
             "Queue", "Deque", "ArrayDeque", "Vector", "Stack", "Enumeration",
             "Callable", "Future", "Supplier", "Function", "BiFunction", "Consumer",
             "Predicate", "UnaryOperator", "BinaryOperator", "UnmodifiableList",
+            // 第 13 轮 P0-3 补充（R12 攻击代理建议 + T3k 实锤）：
+            "AbstractSet", "AbstractCollection", "AbstractQueue", "Spliterator",
+            "EnumMap", "EnumSet", "PriorityQueue", "DelayQueue", "LinkedBlockingQueue",
+            "LinkedTransferQueue", "ConcurrentLinkedQueue", "ConcurrentSkipListMap",
+            "ConcurrentSkipListSet", "CopyOnWriteArrayList", "CopyOnWriteArraySet",
+            "ArrayBlockingQueue", "SynchronousQueue", "ThreadLocal", "Reference",
+            "SoftReference", "WeakReference", "AtomicReference", "AtomicStampedReference",
         ]
         .iter()
         .map(|x| x.to_string())

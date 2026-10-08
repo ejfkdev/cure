@@ -1353,6 +1353,18 @@ impl Lang for JavaAst {
         matches!(self.data(decl), NodeData::VarDecl { ty: JType::Char, .. })
     }
 
+    fn is_long_decl(&self, decl: JavaId) -> bool {
+        matches!(self.data(decl), NodeData::VarDecl { ty: JType::Long, .. })
+    }
+    fn is_wide_decl(&self, decl: JavaId) -> bool {
+        // 窄类型（byte/short/char）复合赋值含隐式收窄：delta 折回声明
+        // 会产出超域非法常量或丢静态类型（char 99 → println 打数字）
+        !matches!(
+            self.data(decl),
+            NodeData::VarDecl { ty: JType::Byte | JType::Short | JType::Char, .. }
+        )
+    }
+
     fn receiver_propagation_unsound(
         &self,
         decl: JavaId,
@@ -1367,6 +1379,10 @@ impl Lang for JavaAst {
         });
         if !is_receiver {
             return false;
+        }
+        // 装箱丢失（R13 P0-2）：引用声明 + 基本类型值——接收位无装箱转换
+        if self.receiver_boxing_unsound(decl, value) {
+            return true;
         }
         // 声明类型为 **已知泛型的 raw 引用**（无类型实参——擦除成员解析）：
         // var 推断/显式带实参/非泛型/未知外部类型不触发（保守——未知名
@@ -1391,18 +1407,6 @@ impl Lang for JavaAst {
             }
             _ => false,
         }
-    }
-
-    fn is_long_decl(&self, decl: JavaId) -> bool {
-        matches!(self.data(decl), NodeData::VarDecl { ty: JType::Long, .. })
-    }
-    fn is_wide_decl(&self, decl: JavaId) -> bool {
-        // 窄类型（byte/short/char）复合赋值含隐式收窄：delta 折回声明
-        // 会产出超域非法常量或丢静态类型（char 99 → println 打数字）
-        !matches!(
-            self.data(decl),
-            NodeData::VarDecl { ty: JType::Byte | JType::Short | JType::Char, .. }
-        )
     }
 
     fn bin_op(&self, id: JavaId) -> Option<BinOp> {
@@ -1725,6 +1729,45 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 impl JavaAst {
+    /// 局部传播到成员访问接收位的**装箱丢失**检查：声明为引用类型 +
+    /// 值是基本类型形态（原始字面量/基本类型变量/算术一元二元——
+    /// R13 P0-2 抓获：`Object o = +c; o.getClass()` 曾内联成
+    /// `(+c).getClass()` / 常量传播折成 `65.getClass()`——int 接收者
+    /// 不可解引用；装箱转换只发生在赋值/传参位，接收位无转换）。
+    /// 字符串字面量/引用变量合法（`"a".length()`）。
+    fn receiver_boxing_unsound(&self, decl: JavaId, value: JavaId) -> bool {
+        let declared_ref = match self.data(decl) {
+            NodeData::VarDecl { ty, .. } => ty.is_ref(),
+            _ => false,
+        };
+        if !declared_ref {
+            return false;
+        }
+        match self.data(value) {
+            NodeData::Literal(
+                Lit::Int(_) | Lit::Long(_) | Lit::Float(_) | Lit::Double(_) | Lit::Bool(_)
+                | Lit::Char(_),
+            ) => true,
+            // 基本类型变量（var_type 解析参数/局部声明类型）
+            NodeData::VarRef { .. } => matches!(
+                self.var_type(value),
+                Some(
+                    JType::Int
+                        | JType::Long
+                        | JType::Byte
+                        | JType::Short
+                        | JType::Char
+                        | JType::Float
+                        | JType::Double
+                        | JType::Bool
+                )
+            ),
+            // 算术/逻辑一元二元：结果必为基本类型
+            NodeData::Unary { .. } | NodeData::Binary { .. } => true,
+            _ => false,
+        }
+    }
+
     /// 名字 → 实化键（持久表，只增；同名字恒同键）。
     /// intern 名字 → Sym（复用 name_intern 表 + sym_names 向量）。
     pub fn intern_sym(&mut self, name: &str) -> Sym {
