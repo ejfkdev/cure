@@ -616,3 +616,17 @@ fn case_region_open_paren_garbage_bounded() {
     let sc = src.matches(')').count();
     assert!(o - c == so - sc, "paren balance changed: {o}/{c} vs {so}/{sc}");
 }
+
+
+#[test]
+fn local_decl_raw_with_array_initializer() {
+    // R19 P0-1：局部声明整句 Raw 遇数组初始化器被 sync_stmt 的 depth-0
+    // `{` 拦腰截断（其后重解析成块——括号消解、尾分号被吞）。
+    // raw_local_decl：`=` 之后的 `{` 是初始化器 → 平衡吞
+    let out = fmt(
+        "class M{@interface A{}void m(){int @A [] a={1,2};int b @A []=new int[]{3};int c,d @A []={4};}}",
+    );
+    assert!(out.contains("int @A [] a={1,2};"), "{out}");
+    assert!(out.contains("int b @A []=new int[]{3};"), "{out}");
+    assert!(out.contains("int c,d @A []={4};"), "{out}");
+}

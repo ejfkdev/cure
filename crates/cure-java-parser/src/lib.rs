@@ -466,6 +466,50 @@ impl<'src> Parser<'src> {
     // ---- 恢复 ----
 
     /// 从 `byte_start` 起做语句级恢复，返回覆盖整条残缺语句的原文。
+    /// 局部声明整句 Raw 的专用回退（R19 P0-1：sync_stmt 在 depth-0 `{`
+    /// 截断——数组初始化器 `= {…}` / `= new T[]{…}` 被当块边界拦腰截断，
+    /// 其后重解析成块语句：括号消解、尾分号被吞 → 输出不可编译——
+    /// TypeAnnotationPositionTest 实锤）。语义：**`=` 之后**的 depth-0
+    /// `{` 是初始化器 → 平衡吞；`=` 之前的 `{` 才是块边界（停不消费，
+    /// 原 sync 语义）；`;` 消费止。
+    fn raw_local_decl(&mut self, byte_start: usize) -> JavaId {
+        let mut depth = 0i32;
+        let mut after_eq = false;
+        let mut guard = 0usize;
+        while !self.at_eof() && guard < 100_000 {
+            guard += 1;
+            let t = self.tok().clone();
+            let is_p = |p: &str| {
+                matches!(&t.tok, Tok::Punct(q) if *q == p)
+            };
+            if is_p("{") {
+                if depth == 0 && !after_eq {
+                    break; // 块边界
+                }
+                let _ = self.skip_balanced_braces(); // 初始化器
+                continue;
+            }
+            if is_p("(") || is_p("[") {
+                depth += 1;
+            } else if is_p(")") || is_p("]") {
+                depth -= 1;
+            } else if is_p("=") && depth == 0 {
+                after_eq = true;
+            } else if is_p(";") && depth == 0 {
+                self.bump();
+                break;
+            }
+            self.bump();
+        }
+        let end = self.t[self.pos.min(self.t.len() - 1)].start;
+        let text = self.text_of(byte_start, end).trim().to_string();
+        if text.is_empty() {
+            self.ast.empty()
+        } else {
+            self.ast.raw(&text)
+        }
+    }
+
     fn raw_from(&mut self, byte_start: usize) -> JavaId {
         let _ = self.sync_stmt();
         let end = self.t[self.pos.min(self.t.len() - 1)].start;
@@ -2259,9 +2303,10 @@ impl<'src> Parser<'src> {
         let save = self.pos;
         if let Some((ty, had_final)) = self.try_decl_prefix() {
             // 类型侧维度注解（int @A [] x——R18 BUG A）：整句 Raw
+            //（raw_local_decl：= {…} 初始化器感知——R19 P0-1）
             if self.ty_dims_annos {
                 self.pos = save;
-                return self.raw_from(start);
+                return self.raw_local_decl(start);
             }
             let mut first_name = match &self.tok().tok {
                 Tok::Ident(i) => {
@@ -2284,7 +2329,7 @@ impl<'src> Parser<'src> {
                 if !ann.is_empty() {
                     if self.at_punct("[") && self.peek(1).is_punct("]") {
                         self.pos = save;
-                        return self.raw_from(start);
+                        return self.raw_local_decl(start);
                     }
                     self.pos = save; // 非维度注解——回滚走原路径
                 }
@@ -2308,7 +2353,7 @@ impl<'src> Parser<'src> {
             let init0 = self.wrap_decl_init_array(init0, &ty0);
             if had_eq && init0.is_none() {
                 // `int x = ;` 这类残缺：整条语句原文保真
-                return self.raw_from(start);
+                return self.raw_local_decl(start);
             }
             decls.push((name0, ty0, init0));
             // 后续声明符 `, name [= init]`
@@ -2359,7 +2404,7 @@ impl<'src> Parser<'src> {
                     }
                 }
                 if d_annos {
-                    return self.raw_from(start);
+                    return self.raw_local_decl(start);
                 }
                 let had_eq = self.eat("=");
                 let init = if had_eq {
@@ -2368,7 +2413,7 @@ impl<'src> Parser<'src> {
                     None
                 };
                 if had_eq && init.is_none() {
-                    return self.raw_from(start);
+                    return self.raw_local_decl(start);
                 }
                 // 后续声明符维度**相加**（JLS 14.4：声明类型 + 声明符自带
                 // C 风格维度——`int[] p, q[][]` 的 q = int[3]——A5e 抓获：
