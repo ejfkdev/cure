@@ -532,12 +532,29 @@ impl<'a> Lexer<'a> {
         self.bump();
         self.bump();
         self.bump(); // """
-        // 吃掉紧跟的换行
-        if self.peek(0) == b'\r' {
-            self.bump();
-        }
-        if self.peek(0) == b'\n' {
-            self.bump();
+        // JLS 3.10.6：开定界符到**首个行终止符**之间的内容（须为空白）
+        // 整体丢弃，内容自终止符后开始（lombok TextBlocks 抓获：开行
+        // 尾随空白曾进入内容——打印再插 \n 后值漂移 len=0→len=1）。
+        // 标准形态（定界符直跟换行）行为不变。
+        loop {
+            match self.peek(0) {
+                0 => break, // EOF（b 非空切片时 0 亦为内容字节——极罕见
+                // 形态交给闭合判定路径兜底；此循环上限为首个终止符）
+                b'\r' => {
+                    self.bump();
+                    if self.peek(0) == b'\n' {
+                        self.bump();
+                    }
+                    break;
+                }
+                b'\n' => {
+                    self.bump();
+                    break;
+                }
+                _ => {
+                    self.bump(); // 首行字符（JLS 限定空白——容错丢弃）
+                }
+            }
         }
         let content_start = self.pos;
         let mut closed = false;

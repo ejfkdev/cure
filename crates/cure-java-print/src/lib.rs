@@ -86,6 +86,7 @@ fn un_symbol(op: UnOp) -> &'static str {
     match op {
         UnOp::Not => "!",
         UnOp::Neg => "-",
+        UnOp::Plus => "+",
         UnOp::BitNot => "~",
         UnOp::PreInc | UnOp::PostInc => "++",
         UnOp::PreDec | UnOp::PostDec => "--",
@@ -551,11 +552,12 @@ impl<'a> Printer<'a> {
                 let body = *ch.last().unwrap();
                 let mut idx = 0;
                 self.out.push_str("for (");
+                let multi = *inits as usize > 1;
                 for k in 0..*inits as usize {
                     if k > 0 {
                         self.out.push_str(", ");
                     }
-                    self.for_header_part(ch[idx], k == 0);
+                    self.for_header_part(ch[idx], k == 0, multi);
                     idx += 1;
                 }
                 self.out.push_str("; ");
@@ -865,14 +867,34 @@ impl<'a> Printer<'a> {
 
     /// for 头部的初始化段（VarDecl 无分号 / 表达式）。
     /// `with_type=false` 时 VarDecl 只输出名字（`int i = 0, j = 1` 的后续项）。
-    fn for_header_part(&mut self, id: JavaId, with_type: bool) {
+    /// `multi`：多声明符头——共享类型只打**基类型**（JLS 14.14 声明符各
+    /// 自带 C 风格维度），各声明符名后跟自己的 `[]`（ExoticJava 抓获：
+    /// `for (int i = 10, j[] = {20}; …)` 的 j 维度曾丢失，`for (int k[] =
+    /// new int[2], l = 0)` 的首声明符维度曾并入共享类型感染 l → 均不可
+    /// 编译）。
+    fn for_header_part(&mut self, id: JavaId, with_type: bool, multi: bool) {
         let ast = self.ast;
         if let NodeData::VarDecl { name, ty, .. } = ast.data(id) {
+            let mut depth = 0u32;
+            let mut base = ty;
+            while let JType::Array(inner) = base {
+                depth += 1;
+                base = inner;
+            }
             if with_type {
-                self.out.push_str(&ty_str(ty));
+                if multi {
+                    self.out.push_str(&ty_str(base));
+                } else {
+                    self.out.push_str(&ty_str(ty));
+                }
                 self.out.push(' ');
             }
             self.out.push_str(name);
+            if multi {
+                for _ in 0..depth {
+                    self.out.push_str("[]");
+                }
+            }
             if let Some(&init) = ast.children(id).first() {
                 self.out.push_str(" = ");
                 let init = decl_init_expr(ast, ty, init);
@@ -1002,11 +1024,18 @@ impl<'a> Printer<'a> {
                     };
                     let amb_neg = *op == UnOp::Neg
                         && (matches!(ast.data(ch[0]), NodeData::Unary { op: UnOp::Neg }) || neg_lit);
-                    if amb_neg {
+                    // 一元 + 的二义对：`+ +x` 裸拼成 `++x` 前置自增；`+ ++x`
+                    // 裸拼 `+++x` 同理。操作数侧以括号隔开（与 amb_neg 同法）
+                    let amb_plus = *op == UnOp::Plus
+                        && matches!(
+                            ast.data(ch[0]),
+                            NodeData::Unary { op: UnOp::Plus | UnOp::PreInc | UnOp::PostInc }
+                        );
+                    if amb_neg || amb_plus {
                         self.out.push('(');
                     }
                     self.expr(ch[0], prec::UNARY);
-                    if amb_neg {
+                    if amb_neg || amb_plus {
                         self.out.push(')');
                     }
                 }

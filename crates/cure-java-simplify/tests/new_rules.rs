@@ -2036,3 +2036,71 @@ fn p1_barrier_still_works_outside_try() {
     assert!(out.contains("Other.opaque(3)"), "{out}");
     assert!(!out.contains("int y"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// 第 11 轮语义/往返代理修复回归
+// ---------------------------------------------------------------------------
+
+#[test]
+fn new_string_identity_not_collapsed() {
+    // mockito MatchersTest 抓获：new String("x") 折叠成驻留字面量 →
+    // assertNotSame(one,two) 身份坍缩恒败。vexec 裸 New 拒绝（intern 展开
+    // 保解密模式）
+    let out = run_src(
+        "class T{void m(){Object one=new String(\"1243\");Object two=new String(\"1243\");if(one==two){throw new RuntimeException(\"same\");}}}",
+    );
+    assert!(out.contains("new String(\"1243\")"), "{out}");
+    // intern 形态照常折叠（bd/ferns 解密模式）
+    let out2 = run_src(
+        "class T{static String r;static{r=new String(\"ab\").intern();}}",
+    );
+    assert!(out2.contains("\"ab\""), "{out2}");
+}
+
+#[test]
+fn const_method_inline_overload_blind() {
+    // javapoet TypeSpec 抓获：同名 varargs 重载使非 varargs 单 return 体
+    // 盲内联到错误重载（String 字面量绑进 CodeBlock 形参）
+    let out = run_src(
+        "class T{static class B{int f(){return 1;}}private B a(String f,Object... args){return new B();}private B a(B b){return b;}int m(){return a(\"\").f();}}",
+    );
+    assert!(out.contains("a(\"\")"), "{out}");
+}
+
+#[test]
+fn local_propagation_raw_receiver_refused() {
+    // mockito ReturningDefaultValuesTest 抓获：raw List 接收位内联后
+    // javac CAP#1 硬错（raw 擦除收 Object vs 泛型收 T）
+    let out = run_src(
+        "class T{interface M{java.util.List list();}void m(M mock){java.util.List list=mock.list();list.add(\"test\");}}",
+    );
+    assert!(out.contains("java.util.List list = mock.list();"), "{out}");
+    // 非泛型接收位照常传播
+    let out2 = run_src(
+        "class T{static class B{int x(){return 1;}}static B make(){return new B();}int m(){B b=make();return b.x();}}",
+    );
+    assert!(out2.contains("return make().x();"), "{out2}");
+}
+
+#[test]
+fn foreach_bare_next_statement_dropped() {
+    // lombok ConfigurationKeysLoader 抓获：裸 it.next(); 替换成 e; 不是
+    // 合法语句——应整条删除（for-each 隐式消费）
+    let out = run_src(
+        "class T{void m(java.util.List<String> list){java.util.Iterator<String> it=list.iterator();while(it.hasNext()){try{it.next();}catch(Exception ignore){}}}}",
+    );
+    assert!(!out.contains("; e;"), "{out}");
+    assert!(!out.contains("e;\n"), "{out}");
+    assert!(out.contains("for (String e : list)"), "{out}");
+}
+
+#[test]
+fn static_exec_try_window_barrier_refused() {
+    // P1g/P1h 攻击抓获：try 语境屏障重放裸赋值丢异常窗口（输入 caught|3
+    // → 输出 EIIE）。已修（try_depth 拒绝）——此处再锚定输出结构保真
+    let out = run_src(
+        "class T{static String r;static int k;static{k=2;try{r=opaque(1);}catch(RuntimeException e){r=\"caught\";}k=k+1;}static String opaque(int i){throw new RuntimeException(\"boom\");}}",
+    );
+    assert!(out.contains("catch"), "{out}");
+    assert!(out.contains("k = k + 1") || out.contains("k = 3") || out.contains("k = 2"), "{out}");
+}

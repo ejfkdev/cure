@@ -229,6 +229,10 @@ pub enum UnOp {
     Not,
     Neg,
     BitNot,
+    /// 一元 `+`（数值提升——char/byte/short 提升 int；装箱类型改变
+    /// `Object o = +c` → Integer 而非 Character）。恒等但**静态类型敏感**，
+    /// 不可丢弃。
+    Plus,
     /// `++x`（读+写）
     PreInc,
     PreDec,

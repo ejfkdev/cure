@@ -418,3 +418,87 @@ class T {
     // 维度注解跳过但表达式必须可解析（曾 "bad new expression" 区域跳过）
     assert!(out.contains("new int[3]"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// 第 11 轮代理修复回归（for-init 维度/文本块首行/一元+/catch final/
+// 限定段注解/失控循环/语句注解）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn for_init_multi_declarator_cstyle_dims() {
+    // ExoticJava 抓获：j 的 [] 曾丢失；k 的 [] 曾并入共享类型感染 l
+    let out = fmt("class A{void m(){for (int i = 10, j[] = {20}; i < 5; i++, j[0]++){}for (int k[] = new int[2], l = 0; l < 2; l++){}for (int a = 1, b = 2, c[] = {3}; a < 1; a++){}for (int s[] = new int[1]; s[0] < 3; s[0]++){}}}");
+    assert!(out.contains("for (int i = 10, j[] = {20}; i < 5; i++, j[0]++)"), "{out}");
+    assert!(out.contains("for (int k[] = new int[2], l = 0; l < 2; l++)"), "{out}");
+    assert!(out.contains("for (int a = 1, b = 2, c[] = {3}; a < 1; a++)"), "{out}");
+    assert!(out.contains("for (int[] s = new int[1]; s[0] < 3; s[0]++)"), "{out}");
+}
+
+#[test]
+fn text_block_first_line_discard() {
+    // lombok TextBlocks 抓获：开行尾随空白曾进入内容——打印再插 \n 值漂移
+    // （javac len=0 → cure 往返 len=1）。JLS 3.10.6：开定界符到首个行终止
+    // 符的内容整体丢弃
+    let src = "class A{String ex4 = \"\"\"   \n\t\t\"\"\";String std = \"\"\"\nabc\n\"\"\";}";
+    let out = fmt(src);
+    assert!(out.contains("\"\"\"\n\t\t\"\"\""), "{out}");
+    assert!(out.contains("\"\"\"\nabc\n\"\"\""), "{out}");
+}
+
+#[test]
+fn unary_plus_retained() {
+    // 数值提升即语义：Object o = +c 装箱 Integer 而非 Character（第 11 轮
+    // 代理抓获曾直接丢弃）
+    let out = fmt("class A{Object o = +'c';int i = +5;int j = + +5;int q(int x){return +x;}}");
+    assert!(out.contains("+'c'"), "{out}");
+    assert!(out.contains("+5"), "{out}");
+    assert!(out.contains("+(+5)"), "{out}");
+    assert!(out.contains("return +x;"), "{out}");
+}
+
+#[test]
+fn catch_param_final_retained() {
+    // mockito 5 + lombok 21 文件抓获：catch 形参 final 曾丢弃（方法形参
+    // /局部 final 保留——仅 catch 位失守）
+    let out = fmt("class A{void m(){try{x();}catch (final Exception e){}}void x(){}}");
+    assert!(out.contains("catch (final Exception e)"), "{out}");
+}
+
+#[test]
+fn qualified_segment_type_annotation_retained() {
+    // Outer.@NonNull Inner——JSR 308 段级注解曾丢弃
+    let out = fmt("class A{Outer.@NonNull Inner f;class Outer{class Inner{}}@interface NonNull{}}");
+    assert!(out.contains("Outer.@NonNull Inner f;"), "{out}");
+}
+
+#[test]
+fn qualified_statement_annotation_no_false_error() {
+    // @lombok.Cleanup 语句级限定注解：曾假报 unexpected token（内容保真
+    // 但错误计数污染）
+    let out = parse("class A{void m(){@lombok.Cleanup java.io.Writer w = null;}}");
+    assert!(
+        out.errors.is_empty(),
+        "unexpected errors: {:?}",
+        out.errors
+    );
+}
+
+#[test]
+fn no_runaway_error_loop_on_malformed_for() {
+    // lombok after-ecj 残骸抓获：for 双分号曾 4M 错误/529MB 原位自旋
+    //（sync_stmt 停在闭括号不消费 + 块循环无停滞守卫）
+    let out = parse("class A{void m(){for (int i=0;; (i<10); i++) {System.out.println(i);}}}");
+    assert!(
+        out.errors.len() < 10,
+        "runaway: {} errors",
+        out.errors.len()
+    );
+    // 输出可重解析（幂等基础）：同样有界错误
+    let printed = cure_java_print::print_unit(&out.ast, &out.unit);
+    let reparsed = parse(&printed);
+    assert!(
+        reparsed.errors.len() < 10,
+        "reparse runaway: {} errors",
+        reparsed.errors.len()
+    );
+}

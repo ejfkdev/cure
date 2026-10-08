@@ -164,6 +164,22 @@ pub trait Lang {
         false
     }
 
+    /// 局部传播到**成员访问接收位**是否类型不可靠：声明的静态类型与
+    /// init 表达式的静态类型在成员解析上可能不等价（Java raw 泛型：
+    /// `List l = m(); l.add("x")` 的 raw 擦除收 Object，内联成
+    /// `m().add("x")` 后按泛型收 CAP#1 → javac 硬错——mockito
+    /// ReturningDefaultValuesTest 抓获）。仅接收位敏感（实参位 raw↔
+    /// 泛型双向兼容）。默认 false（无 raw 泛型的语言）。
+    fn receiver_propagation_unsound(
+        &self,
+        _decl: Self::Id,
+        _value: Self::Id,
+        _use_parent: Option<Self::Id>,
+        _use_at_head: bool,
+    ) -> bool {
+        false
+    }
+
     fn bin_op(&self, id: Self::Id) -> Option<BinOp>;
     fn un_op(&self, id: Self::Id) -> Option<UnOp>;
     fn literal(&self, id: Self::Id) -> Option<LitRef<'_>>;

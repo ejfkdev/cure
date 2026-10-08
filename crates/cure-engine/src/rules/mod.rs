@@ -898,6 +898,21 @@ impl<L: Lang> Rule<L> for LocalPropagation {
                 }
             }
         }
+        // raw 泛型接收位守卫（Lang 钩子）：声明的静态类型与 init 的静态
+        // 类型在成员解析上不等价（Java raw `List l = m(); l.add("x")`
+        // 内联后 CAP#1 硬错——mockito 抓获）。使用位的父/头信息由
+        // walk 提供（Lang 侧无父指针）
+        {
+            let (up, head) = match walk.parents.get(&use_id) {
+                Some(&(p, _)) => {
+                    (Some(p), lang.children(p).first() == Some(&use_id))
+                }
+                None => (None, false),
+            };
+            if lang.receiver_propagation_unsound(id, value, up, head) {
+                return None;
+            }
+        }
         // null 字面量不得内联进需要类型的表达式位：调用接收者
         //（`null.setArgName(...)` 不可编译——差分审查抓获）；for-each
         // 可迭代位（`for (T x : null)` 不适用）；数组访问基座（`null[0]`

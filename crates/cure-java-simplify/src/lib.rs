@@ -1703,6 +1703,36 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
             };
             let e_ref = lang.var(e_name);
             let foreach = lang.for_each(e_name, e_ty, iterable, body);
+            // 语句位置的裸 it.next();（ExprStmt 内容全体 = 该调用）——
+            // 替换成 e; 不是合法语句（ConfigurationKeysLoader 抓获）；
+            // for-each 已隐式消费元素 → 整条 ExprStmt 删除
+            let wrapped_parent = parent_of_recv(lang, body, wrapped);
+            if lang.kind(wrapped_parent) == NodeKind::ExprStmt
+                && *lang.children(wrapped_parent).first().unwrap_or(&wrapped) == wrapped
+            {
+                let stmt_block = parent_of_recv(lang, body, wrapped_parent);
+                if let Some(si) = lang
+                    .children(stmt_block)
+                    .iter()
+                    .position(|&c| c == wrapped_parent)
+                {
+                    return Some(Edit::Multi(vec![
+                        Edit::Splice {
+                            node: stmt_block,
+                            index: si,
+                            remove: 1,
+                            insert: vec![],
+                        },
+                        Edit::Splice {
+                            node: parent,
+                            index: idx,
+                            remove: 1,
+                            insert: vec![foreach],
+                        },
+                        Edit::Delete { node: decl },
+                    ]));
+                }
+            }
             return Some(Edit::Multi(vec![
                 Edit::Replace {
                     target: replace_target,
@@ -3548,6 +3578,38 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
     ast.inline_methods.clear();
     ast.field_types.clear();
     ast.final_fields.clear();
+    // 已知泛型简单名（raw 接收位传播守卫用）：单元内带 ty_params 的
+    // 类型 + 常见 JDK/库泛型
+    ast.raw_generic_names = {
+        let mut m: std::collections::HashSet<String> = [
+            "List", "ArrayList", "LinkedList", "Collection", "Set", "HashSet",
+            "TreeSet", "LinkedHashSet", "Map", "HashMap", "TreeMap", "LinkedHashMap",
+            "Hashtable", "SortedMap", "SortedSet", "NavigableMap", "NavigableSet",
+            "Iterable", "Iterator", "ListIterator", "Comparator", "Optional",
+            "Stream", "Class", "Comparable", "Entry", "AbstractList", "AbstractMap",
+            "WeakHashMap", "IdentityHashMap", "ConcurrentHashMap", "ConcurrentMap",
+            "Queue", "Deque", "ArrayDeque", "Vector", "Stack", "Enumeration",
+            "Callable", "Future", "Supplier", "Function", "BiFunction", "Consumer",
+            "Predicate", "UnaryOperator", "BinaryOperator", "UnmodifiableList",
+        ]
+        .iter()
+        .map(|x| x.to_string())
+        .collect();
+        fn collect_generics(ty: &TypeDecl, m: &mut std::collections::HashSet<String>) {
+            if !ty.ty_params.trim().is_empty() {
+                m.insert(ty.name.clone());
+            }
+            for mem in &ty.members {
+                if let Member::Type(t) = mem {
+                    collect_generics(t, m);
+                }
+            }
+        }
+        for ty in &unit.types {
+            collect_generics(ty, &mut m);
+        }
+        m
+    };
     ast.unit_shadows_lang = {
         fn decl_shadows(ty: &TypeDecl) -> bool {
             if ty.name == "String" || ty.name == "StringBuilder" {
@@ -3739,6 +3801,20 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
     // UIAction.accept 抓获：protected 单 return 方法被子类覆写，
     // this.m(实参) 被内联成常量 → 虚分派破坏，XEmbeddedFrame 的
     // traverseOut @Override 整段副作用丢失）
+    // **同名方法全单元计数**：重载存在（含被下方守卫拒绝的 varargs/匿名
+    // 体形态——它们不落 insert 分支故旧 contains_key/remove 对撞失效）时
+    // 名字整体否决——调用点无法静态分辨目标重载（javapoet TypeSpec 抓获：
+    // anonymousClassBuilder("") 曾被绑定进 anonymousClassBuilder(CodeBlock)
+    // 单 return 体 → javac 不兼容类型）
+    let mut method_name_count: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for_each_type(unit, &mut |ty: &TypeDecl| {
+        for m in &ty.members {
+            if let Member::Method { name, .. } = m {
+                *method_name_count.entry(name.clone()).or_insert(0) += 1;
+            }
+        }
+    });
     for ty in &unit.types {
         for m in &ty.members {
             if let Member::Method { mods, name, params, body: Some(b), .. } = m {
@@ -3769,13 +3845,10 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
                             // javac 拒绝（Adv6 差分抓获）。混淆 helper（纯算
                             // 术/字符串体）不受影响。
                             && !subtree_has_type_sensitive(&ast, expr)
+                        && method_name_count.get(name).copied() == Some(1)
                         {
                             let ps: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
-                            if ast.inline_methods.contains_key(name) {
-                                ast.inline_methods.remove(name);
-                            } else {
-                                ast.inline_methods.insert(name.clone(), (ps, expr));
-                            }
+                            ast.inline_methods.insert(name.clone(), (ps, expr));
                         }
                     }
                 }

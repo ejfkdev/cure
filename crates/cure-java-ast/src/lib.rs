@@ -261,6 +261,10 @@ pub struct JavaAst {
     /// 抓获：`class String{…}` 同文件时 new String 折叠产出不可编译或
     /// 静默错值）。collect_unit_consts 每轮重算。
     pub unit_shadows_lang: bool,
+    /// 已知为**泛型**的类型简单名（单元内带 ty_params 的类型 + 常见
+    /// JDK 泛型库类）。raw 引用（无类型实参）这些名字时，接收位传播
+    /// 改变成员解析（raw 擦除 vs 泛型形参——CAP#1 编译错）。
+    pub raw_generic_names: std::collections::HashSet<String>,
     /// final 字段名集合（同名二见移除——保守）。static_exec 截断守卫
     /// 用：前缀字段写被 rest 再赋值时，仅 final 才放弃（非 final 的
     /// 材料化写是死写，语义恒等、可编译）。
@@ -1347,6 +1351,46 @@ impl Lang for JavaAst {
 
     fn is_char_decl(&self, decl: JavaId) -> bool {
         matches!(self.data(decl), NodeData::VarDecl { ty: JType::Char, .. })
+    }
+
+    fn receiver_propagation_unsound(
+        &self,
+        decl: JavaId,
+        value: JavaId,
+        use_parent: Option<JavaId>,
+        use_at_head: bool,
+    ) -> bool {
+        // 使用位必须是成员访问接收者（Member 的 child 0）——实参位
+        // raw↔泛型双向兼容（unchecked），不敏感
+        let is_receiver = matches!(use_parent, Some(p) if {
+            matches!(self.data(p), NodeData::Member { .. }) && use_at_head
+        });
+        if !is_receiver {
+            return false;
+        }
+        // 声明类型为 **已知泛型的 raw 引用**（无类型实参——擦除成员解析）：
+        // var 推断/显式带实参/非泛型/未知外部类型不触发（保守——未知名
+        // 保持传播，与修复前行为一致）
+        let raw_ref = match self.data(decl) {
+            NodeData::VarDecl { ty: JType::Ref(n), .. } => {
+                !n.contains('<')
+                    && n.rsplit('.').next().is_some_and(|base| {
+                        self.raw_generic_names.contains(base)
+                    })
+            }
+            _ => false,
+        };
+        if !raw_ref {
+            return false;
+        }
+        // init 静态类型可能**带泛型**：调用（返回类型未知）或带实参 new
+        match self.data(value) {
+            NodeData::Call => true,
+            NodeData::New { ty, .. } => {
+                matches!(ty, JType::Ref(n) if n.contains('<'))
+            }
+            _ => false,
+        }
     }
 
     fn is_long_decl(&self, decl: JavaId) -> bool {

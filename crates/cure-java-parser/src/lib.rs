@@ -1394,14 +1394,28 @@ impl<'src> Parser<'src> {
                     if self.at_punct(".") {
                         if self.peek(1).is_punct("@") {
                             // 段间注解：Map.@NonNull Entry（JSR 308 段级——
-                            // PMD FullTypeAnnotations 抓获；注解丢弃，段并入名）
+                            // PMD FullTypeAnnotations 抓获；注解原文并入名保
+                            // 往返，打印 `Map.@NonNull Entry`——第 11 轮代理
+                            // 抓获曾丢弃）
+                            let seg_start = self.cur_start();
                             self.bump(); // .
+                            let anno_start = self.cur_start();
                             self.skip_mods_annotations();
+                            let anno_text = self.text_of(anno_start, self.cur_start()).trim().to_string();
                             if let Tok::Ident(seg) = &self.tok().tok {
                                 let seg = seg.to_string();
                                 self.bump();
-                                name.push('.');
-                                name.push_str(&seg);
+                                // 注解跨行/多注解时归一为单空格分隔
+                                let text = self
+                                    .text_of(seg_start, self.t[self.pos - 1].end)
+                                    .trim()
+                                    .to_string();
+                                let normalized = if anno_text.contains('\n') {
+                                    format!(".{} {}", anno_text, seg)
+                                } else {
+                                    text
+                                };
+                                name.push_str(&normalized);
                             } else {
                                 break;
                             }
@@ -1511,7 +1525,22 @@ impl<'src> Parser<'src> {
                 self.bump();
                 break;
             }
+            let pos_before = self.pos;
             let s = self.parse_stmt();
+            // 停滞守卫：残缺语句起点是闭括号等**不消费失败位**（sync_stmt
+            // 停在闭括号防吞外层收尾）→ 单 token Raw 保真 + 强制推进 1 步
+            //（曾原位自旋 STEP_GUARD=2M 轮：4M 错误/529MB——lombok after-ecj
+            // `for (…;; (…); …)` 残骸抓获；保 Raw 使输出逐字保真且幂等）
+            if self.pos == pos_before && !self.at_punct("}") && !self.at_eof() {
+                let tok_start = self.cur_start();
+                let tok_end = self.tok().end;
+                let text = self.text_of(tok_start, tok_end).trim().to_string();
+                if !text.is_empty() {
+                    children.push(self.ast.raw(&text));
+                }
+                self.bump();
+                continue;
+            }
             // Group（多声明符等）就地展开为兄弟语句
             if matches!(self.ast.data(s), &NodeData::Group) {
                 children.extend(self.ast.children(s).iter().copied());
@@ -1537,6 +1566,17 @@ impl<'src> Parser<'src> {
         if self.at_punct("@") {
             self.bump();
             self.bump(); // 注解名
+            // 限定名后缀（@lombok.Cleanup 语句级限定注解）：跳过 .seg 段
+            // 防假警告（曾遇 . 即败——lombok Cleanup 抓获：4 文件假报
+            // unexpected token，内容虽保真但错误计数污染）
+            while self.at_punct(".") {
+                if matches!(self.peek(1).tok, Tok::Ident(_)) {
+                    self.bump();
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
             if self.at_punct("(") {
                 self.skip_balanced("(", ")");
             }
@@ -2313,10 +2353,12 @@ impl<'src> Parser<'src> {
                 if guard > 10_000 {
                     break;
                 }
+                // catch 形参 final 保留（mockito 5 + lombok 21 文件抓获：
+                // 曾丢弃——风格保真；start 前移到 final 之前使 ty_raw 含它）
+                let start = self.cur_start();
                 while self.at_kw("final") {
                     self.bump();
                 }
-                let start = self.cur_start();
                 if self.parse_type().is_none() {
                     self.err_at("bad catch type");
                     break;
@@ -2832,15 +2874,10 @@ impl<'src> Parser<'src> {
             Tok::Punct("-") => Some(UnOp::Neg),
             Tok::Punct("++") => Some(UnOp::PreInc),
             Tok::Punct("--") => Some(UnOp::PreDec),
-            Tok::Punct("+") => Some(UnOp::Neg), // 一元 + 用 Neg 占位，实际直接忽略
+            Tok::Punct("+") => Some(UnOp::Plus),
             _ => None,
         };
         if let Some(op) = prefix {
-            if t.is_punct("+") {
-                // 一元 + 无语义（数值提升），直接丢弃
-                self.bump();
-                return self.parse_unary();
-            }
             self.bump();
             // 负数字面量：-1 / -1.5 直接折叠为字面量（常量规则的规范化形态）
             if t.is_punct("-") {

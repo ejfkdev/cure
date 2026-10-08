@@ -813,6 +813,9 @@ impl<'a> Exec<'a> {
                     (UnOp::Not, VVal::B(b)) => Ok(VVal::B(!b)),
                     (UnOp::Neg, VVal::I(x)) => Ok(VVal::I(x.wrapping_neg())),
                     (UnOp::Neg, VVal::L(x)) => Ok(VVal::L(x.wrapping_neg())),
+                    // 一元 + = 数值提升（VVal 的 char/byte/short 已是 I
+                    // 域——恒等）；I/L/D/F 同域直通
+                    (UnOp::Plus, ref x @ (VVal::I(_) | VVal::L(_))) => Ok(x.clone()),
                     (UnOp::BitNot, VVal::I(x)) => Ok(VVal::I(!x)),
                     (UnOp::BitNot, VVal::L(x)) => Ok(VVal::L(!x)),
                     _ => Err(()),
@@ -864,25 +867,14 @@ impl<'a> Exec<'a> {
                 let ch = self.ast.children(id).to_vec();
                 self.eval_call(&ch)
             }
-            NodeData::New { ty, anon_raw } => {
-                if anon_raw.is_some() {
-                    return Err(());
-                }
-                // new String(<char[]/String>)
-                if !matches!(ty, JType::Ref(r) if r == "String") {
-                    return Err(());
-                }
-                let ch = self.ast.children(id).to_vec();
-                let arg = self.eval(*ch.first().ok_or(())?)?;
-                match arg {
-                    VVal::CA(a) => {
-                        let n = a.borrow().len();
-                        self.str_budget(n)?;
-                        Ok(VVal::S(a.borrow().iter().collect()))
-                    }
-                    VVal::S(s) => Ok(VVal::S(s)),
-                    _ => Err(()),
-                }
+            NodeData::New { .. } => {
+                // 裸 new String(...)：**身份承载**——每次求值产生独立堆
+                // 对象，==/same()/assertNotSame/identityHashMap 敏感。折叠
+                // 成驻留字面量 = 身份坍缩（mockito MatchersTest 抓获：
+                // assertNotSame(one,two) 曾转成 assertNotSame("1243","1243")
+                // 直接 AssertionError）。驻留形态 `new String(x).intern()`
+                // 在 eval_call 的 intern 分支展开求值
+                Err(())
             }
             NodeData::NewArray { dims, sized, .. } => {
                 // new T[n]（一维带尺寸）；new T[]{…} 由 ArrayLit 路径
@@ -931,6 +923,27 @@ impl<'a> Exec<'a> {
         match self.ast.data(*callee).clone() {
             NodeData::Member { name } => {
                 let recv_id = *self.ast.children(*callee).first().ok_or(())?;
+                // new String(x).intern()：驻留结果与字面量同实例——直接
+                // 展开求值（绕过裸 New 的身份拒绝）。bd/ferns 解密模式的
+                // `b[i] = new String(chars).intern()` 走此路径
+                if self.ast.sn(name) == "intern" {
+                    if let NodeData::New { ty, anon_raw } = self.ast.data(recv_id).clone() {
+                        if anon_raw.is_none() && matches!(ty, JType::Ref(r) if r == "String") {
+                            let nch = self.ast.children(recv_id).to_vec();
+                            let arg = self.eval(*nch.first().ok_or(())?)?;
+                            return match arg {
+                                VVal::CA(a) => {
+                                    let n = a.borrow().len();
+                                    self.str_budget(n)?;
+                                    Ok(VVal::S(a.borrow().iter().collect()))
+                                }
+                                VVal::S(s) => Ok(VVal::S(s)),
+                                _ => Err(()),
+                            };
+                        }
+                        return Err(());
+                    }
+                }
                 let recv = self.eval(recv_id)?;
                 match (self.ast.sn(name), recv) {
                     ("toCharArray", VVal::S(s)) => {
