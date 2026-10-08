@@ -9,3 +9,4 @@
 
 # 本地实验
 *.tmp
+crates/cure-java-simplify/tests/corpus_data-cure-out/

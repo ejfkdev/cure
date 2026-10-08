@@ -1940,3 +1940,46 @@ fn dead_code_bare_methodsource_keeps_factory() {
     );
     assert!(!out3.contains("private static Object t()"), "{out3}");
 }
+
+// ---------------------------------------------------------------------------
+// vexec 带标签 break/continue 流传播（a5 抓获：解密风暴的 `break label`
+// 曾使循环执行转 Err 中止——static_exec 前缀在首个含标签跳转的循环截断）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn static_exec_labeled_break_in_loop() {
+    // break label 出循环：label 捕获 → 循环终止 → 后续可折叠
+    let out = run_src(
+        "class T{static int a;static{int x=0;outer:while(x<100){if(x==3){break outer;}x++;}a=x;}}",
+    );
+    assert!(out.contains("a = 3") || out.contains("a=3"), "{out}");
+}
+
+#[test]
+fn static_exec_labeled_continue_in_loop() {
+    // continue label：重跑外层循环（条件重判）——值必须精确
+    let out = run_src(
+        "class T{static int a;static{int x=0;int n=0;outer:while(x<6){x++;if(x%2==0){continue outer;}n++;}a=n;}}",
+    );
+    // x: 1..6，奇数 3 次 → n=3
+    assert!(out.contains("a = 3") || out.contains("a=3"), "{out}");
+}
+
+#[test]
+fn static_exec_labeled_block_break() {
+    // label 块（非循环）内的 break label：跳过块尾
+    let out = run_src(
+        "class T{static int a;static{int x=1;lbl:{if(x==1){break lbl;}x=100;}a=x;}}",
+    );
+    assert!(out.contains("a = 1") || out.contains("a=1"), "{out}");
+}
+
+#[test]
+fn static_exec_switch_labeled_break_escapes() {
+    // case 内带标签 break：跳过 switch 吞噬（曾整体转 Normal 丢失跳转）
+    let out = run_src(
+        "class T{static int a;static{int x=0;outer:while(true){switch(x){case 0:x=1;break;default:x=50;break outer;}if(x==1){x=2;break;}}a=x;}}",
+    );
+    // x=0→case0 x=1;break(裸)→if x==1→x=2 break(裸)→while 退出 → a=2
+    assert!(out.contains("a = 2") || out.contains("a=2"), "{out}");
+}

@@ -296,8 +296,11 @@ impl<'a> Exec<'a> {
                     match self.exec_stmt(ch[1])? {
                         Flow::Normal | Flow::Continue(None) => {}
                         Flow::Break(None) => return Ok(Flow::Normal),
-                        Flow::Continue(Some(_)) | Flow::Break(Some(_)) => return Err(()), // 应由 label 捕获
-                        f @ Flow::Return(_) => return Ok(f),
+                        // 带标签 break/continue 目标本循环之外——向上传递给
+                        // Label 层捕获（曾转 Err 中止整段执行：解密风暴的
+                        // `break label316` 使 static_exec 前缀在首个含标签
+                        // break 的循环处截断——a5 抓获）
+                        f => return Ok(f),
                     }
                 }
             }
@@ -308,8 +311,7 @@ impl<'a> Exec<'a> {
                     match self.exec_stmt(ch[0])? {
                         Flow::Normal | Flow::Continue(None) => {}
                         Flow::Break(None) => return Ok(Flow::Normal),
-                        Flow::Continue(Some(_)) | Flow::Break(Some(_)) => return Err(()),
-                        f @ Flow::Return(_) => return Ok(f),
+                        f => return Ok(f),
                     }
                     let cond = self.eval(ch[1])?;
                     match cond {
@@ -332,13 +334,17 @@ impl<'a> Exec<'a> {
             }
             NodeData::Switch => self.exec_switch(s),
             NodeData::Label { name } => {
-                // label: stmt —— break/continue <label> 在此捕获（按名字）
+                // label: stmt —— break/continue <label> 在此捕获（按名字）。
+                // continue <label>：重跑循环体（While 内部重判条件——
+                // `continue outer` 语义；tick 预算防病态非循环体循环）
                 let body = *self.ast.children(s).first().ok_or(())?;
-                match self.exec_stmt(body)? {
-                    Flow::Break(Some(l)) | Flow::Continue(Some(l)) if l == *name => {
-                        Ok(Flow::Normal)
+                loop {
+                    self.tick()?;
+                    match self.exec_stmt(body)? {
+                        Flow::Break(Some(l)) if l == *name => return Ok(Flow::Normal),
+                        Flow::Continue(Some(l)) if l == *name => continue,
+                        other => return Ok(other),
                     }
-                    other => Ok(other),
                 }
             }
             NodeData::Break { label } => {
@@ -648,8 +654,8 @@ impl<'a> Exec<'a> {
             match self.exec_stmt(body)? {
                 Flow::Normal | Flow::Continue(None) => {}
                 Flow::Break(None) => return Ok(Flow::Normal),
-                Flow::Continue(Some(_)) | Flow::Break(Some(_)) => return Err(()),
-                f @ Flow::Return(_) => return Ok(f),
+                // 带标签 break/continue 目标本循环之外——向上传递（同 While）
+                f => return Ok(f),
             }
             for &st in step_part {
                 self.eval(st)?; // 裸表达式步进（++i 等——eval 含存储副作用）
@@ -702,7 +708,10 @@ impl<'a> Exec<'a> {
             // 同一 case 的多条语句为直接孩子
             match self.exec_stmts(stmts)? {
                 Flow::Normal => {}
-                Flow::Break(_) => return Ok(Flow::Normal),
+                // 裸 break：退出 switch；带标签 break：目标在 switch 之外
+                // ——向上传递给 Label 层捕获（曾整体吞为 Normal：case 内
+                // `break label` 跳转丢失）
+                Flow::Break(None) => return Ok(Flow::Normal),
                 other => return Ok(other),
             }
             if arrow {
@@ -1273,8 +1282,14 @@ impl<'a> Exec<'a> {
             cuts: Vec::new(),
             rest_stack: Vec::new(),
             early_exit: None,
+            pending_break: None,
         };
-        self.run_level(stmts, None, true, &mut run)?;
+        self.run_level(stmts, None, true, &mut run, None, true)?;
+        // 根层未消费的带标签 break：有效 Java 的 label 必然在根内被
+        // Label 层捕获——未消费 = 病态/外溢 → 整段拒绝（保守）
+        if run.pending_break.is_some() {
+            return Err(());
+        }
         Ok(run)
     }
 
@@ -1287,6 +1302,8 @@ impl<'a> Exec<'a> {
         block: Option<JavaId>,
         is_root: bool,
         run: &mut PrefixRun,
+        exit_label: Option<String>,
+        allow_pending: bool,
     ) -> R<()> {
         let log_start = self.effect_log.len();
         let decl_start = self.decl_order.len();
@@ -1309,8 +1326,39 @@ impl<'a> Exec<'a> {
             let scopes_len = self.scopes.len();
             let decl_len = self.decl_order.len();
             if let Some(inner) = self.descend_target(st) {
+                // 下降层的标签语境：Label(L) → 本层可消费 break L；
+                // Block/Group 继承外层标签；Try 体层 sealed（break 到达
+                // 即停入 rest——finally 是 Try 的兄弟孩子，跳层会跳过
+                // finally 执行，语义破坏）
+                let (el, ap) = match self.ast.data(st).clone() {
+                    NodeData::Label { name } => (Some(name), true),
+                    NodeData::Try => (None, false),
+                    _ => (exit_label.clone(), true),
+                };
                 let inner_stmts = self.ast.children(inner).to_vec();
-                let r = self.run_level(&inner_stmts, Some(inner), false, run);
+                let r = self.run_level(&inner_stmts, Some(inner), false, run, el, ap);
+                // 子层带标签 break 上抛：命中本层标签 → 消费；否则保留
+                // pending 继续上抛。两种情形本层剩余均跳过（break 语义）
+                if run.pending_break.is_some() {
+                    if !allow_pending {
+                        // sealed 层（try 体）：按失败停——try 语句留 rest，
+                        // finally 语义保守
+                        run.pending_break = None;
+                        self.deep_restore(snap);
+                        run.cuts.truncate(cuts_len);
+                        run.rest_stack.truncate(rest_len);
+                        self.truncate_state(decl_len, scopes_len);
+                        stopped_at = Some(i);
+                        include_failed_stmt = true;
+                        break 'lvl;
+                    }
+                    let l = run.pending_break.clone().unwrap();
+                    if exit_label.as_deref() == Some(l.as_str()) {
+                        run.pending_break = None; // 消费
+                    }
+                    completed = i + 1;
+                    break 'lvl; // 无 rest 无 cut——父层 splice 覆盖
+                }
                 let inner_stopped = run.rest_stack.len() > rest_len;
                 match (r, inner_stopped) {
                     (Ok(()), false) => {
@@ -1378,6 +1426,16 @@ impl<'a> Exec<'a> {
                     Ok(Flow::Normal) => {
                         completed = i + 1;
                     }
+                    // 带标签 break 到达语句层：本层标签命中 → 消费跳过剩余；
+                    // 否则置 pending 上抛（层间传播）。sealed 层（try 体内）
+                    // 落入 Ok(other) 按失败保守处理
+                    Ok(Flow::Break(Some(ref l))) if allow_pending => {
+                        if exit_label.as_deref() != Some(l.as_str()) {
+                            run.pending_break = Some(l.clone());
+                        }
+                        completed = i + 1;
+                        break 'lvl; // 本层剩余跳过（无 rest——break 语义）
+                    }
                     Ok(other) => {
                         if is_root && i + 1 == stmts.len() {
                             // 末尾 return/break 逃逸：现有根层语义
@@ -1394,6 +1452,13 @@ impl<'a> Exec<'a> {
                         self.deep_restore(snap);
                         stopped_at = Some(i);
                         include_failed_stmt = true;
+                        if std::env::var("CURE_DBG_P1").is_ok() {
+                            eprintln!(
+                                "[P1-rl] root-level stop at stmt {} kind={:?}",
+                                i,
+                                self.ast.kind(st)
+                            );
+                        }
                         break 'lvl;
                     }
                 }
@@ -1559,6 +1624,11 @@ pub(crate) struct PrefixRun {
     pub rest_stack: Vec<Vec<JavaId>>,
     /// 根层末尾 return/break 逃逸（现有语义）。
     pub early_exit: Option<Flow>,
+    /// 层间带标签 break 传播：语句/子层产生 `break <l>` 且 l 非本层标签
+    /// 时置入——本层剩余跳过（无 rest 无 cut，父层覆盖效应），父层继续
+    /// 消费/上抛。根层未消费（病态——有效 Java 的 label 必在根内）→
+    /// run_prefix 整体拒绝。
+    pub pending_break: Option<String>,
 }
 
 impl PrefixRun {
