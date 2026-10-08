@@ -1999,6 +1999,14 @@ impl<L: Lang> Rule<L> for BlockFlatten {
         if inner.iter().any(|&s| declares(s)) {
             return None;
         }
+        // 模式绑定流作用域（R15 三角化根因 1——BindingsTest1 抓获）：
+        // instanceof 绑定（藏在 while/for/if 条件子树里，不在直接孩子的
+        // declares 三类中）的作用域按 JLS 6.3 可越出语句到 enclosing
+        // block——上提曾使两个匿名块内的 String s 绑定落进同一方法域
+        //（javac「变量 s 重复定义」）
+        if lang.has_pattern_bindings(id) {
+            return None;
+        }
         let idx = walk.index(id)?;
         Some(Edit::Splice {
             node: parent,

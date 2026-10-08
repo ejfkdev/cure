@@ -1363,6 +1363,19 @@ impl Lang for JavaAst {
         matches!(self.data(decl), NodeData::VarDecl { ty: JType::Char, .. })
     }
 
+    fn has_pattern_bindings(&self, root: JavaId) -> bool {
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            if let NodeData::InstanceOf { bind: Some(_), .. } = self.data(n) {
+                return true;
+            }
+            for &c in self.children(n) {
+                stack.push(c);
+            }
+        }
+        false
+    }
+
     fn is_long_decl(&self, decl: JavaId) -> bool {
         matches!(self.data(decl), NodeData::VarDecl { ty: JType::Long, .. })
     }

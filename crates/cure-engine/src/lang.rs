@@ -206,6 +206,12 @@ pub trait Lang {
     fn is_field_name(&self, _name: &str) -> bool {
         false
     }
+    /// 子树内是否含**模式绑定**（Java instanceof pattern：绑定作用域按
+    /// JLS 6.3 流可达性可越出语句本身到 enclosing block——块展平/语句
+    /// 移动类规则须拒绝。默认 false（无模式绑定的语言）。
+    fn has_pattern_bindings(&self, _root: Self::Id) -> bool {
+        false
+    }
     /// 赋值运算（`=` 之外的复合赋值也在此表达；None 表示简单赋值）。
     fn assign_op(&self, _id: Self::Id) -> Option<BinOp> {
         None

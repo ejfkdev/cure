@@ -292,17 +292,18 @@ impl<'a> Printer<'a> {
         self.out.push_str(&t.name);
         self.out.push_str(&t.ty_params);
         self.out.push_str(&t.header);
-        // JLS 声明序：extends 在 permits 之前（permits 提前 javac 报
-        //「需要 '{'」——差分审查抓获，JDK 语料 SourceFileAttribute 复现）
+        // JLS 8.1 声明序：extends → implements → permits（permits 在
+        // implements 之前曾使 sealed 头 javac「需要 '{'」——R15 三角化
+        // 根因 8：InputAstRegressionSealedAndPermits 复现）
         if !t.extends.is_empty() {
             self.out.push_str(&format!(" extends {}", t.extends.join(", ")));
-        }
-        if !t.permits.is_empty() {
-            self.out.push_str(&format!(" permits {}", t.permits.join(", ")));
         }
         if !t.implements.is_empty() {
             self.out
                 .push_str(&format!(" implements {}", t.implements.join(", ")));
+        }
+        if !t.permits.is_empty() {
+            self.out.push_str(&format!(" permits {}", t.permits.join(", ")));
         }
         self.out.push_str(" {");
         self.level += 1;
@@ -800,25 +801,23 @@ impl<'a> Printer<'a> {
                 self.out.push('}');
             }
         } else {
-            // 经典 fallthrough：每个标签一行
-            let mut first = true;
-            for &l in label_ids {
-                if !first {
-                    self.newline();
-                    self.indent();
-                }
-                first = false;
+            // 经典 fallthrough 多标签**逗号连接**：Case{labels>1} 节点
+            // 只来自逗号形源码（逐行形生成多个 Case{labels:1}），逗号
+            // 连接是精确保真；逐行拆回曾使「fall-through 到模式非法」
+            //（Unnamed.java:217——R15 三角化根因 2：`case String _,
+            // Object _ when …:` 拆成两行使模式标签成穿透首标签）
+            let texts: Vec<String> = label_ids.iter().map(|&l| label_text(l)).collect();
+            if !texts.is_empty() {
                 self.out.push_str("case ");
-                self.out.push_str(&label_text(l));
-                // 组合标签：`case null, default:`（labels 非空时 default
-                // 是尾标签）
-                if *is_default && label_ids.last() == Some(&l) {
+                self.out.push_str(&texts.join(", "));
+                if *is_default {
                     self.out.push_str(", default");
                 }
                 self.out.push(':');
-            }
-            if *is_default && label_ids.is_empty() {
+            } else if *is_default {
                 self.out.push_str("default:");
+            } else {
+                self.out.push_str("case :");
             }
             self.level += 1;
             for &s in stmt_ids {

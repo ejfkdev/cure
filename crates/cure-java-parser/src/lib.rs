@@ -258,6 +258,18 @@ impl<'src> Parser<'src> {
     /// case 标签的 when 守卫（case … when cond ->，Java 21）——消费并入
     /// 原文（标签区间由调用方闭合）。`when cond ->` 中 when 后是箭头时
     /// 不是守卫（是名为 when 的标签？保守不消费）。
+    /// 候选 `when` 是**绑定名**还是守卫关键字的判形：绑定名后必须紧跟
+    /// when(守卫)/:/->/,（`case Integer when when when >= 0 ->`——中间
+    /// when 是绑定，其后是守卫 when；若后随运算符则候选是守卫键）。
+    fn when_is_bind_form(&self) -> bool {
+        matches!(
+            &self.peek(1).tok,
+            Tok::Ident(k) if *k == "when"
+        ) || self.peek(1).is_punct(":")
+            || self.peek(1).is_punct("->")
+            || self.peek(1).is_punct(",")
+    }
+
     fn consume_when_guard(&mut self) {
         if self.at_kw("when") && !self.peek(1).is_punct("->") {
             self.bump();
@@ -271,10 +283,50 @@ impl<'src> Parser<'src> {
             // 由收尾判定接管；被括号包裹的守卫走平衡跳过（原文保真，
             // 语义不触碰——raw 标签由上层 text_of 拼回）
             let save = self.pos;
-            if self.at_punct("(") {
-                // 括号化守卫：平衡扫描（含嵌套 λ 的箭头/花括号）——
-                // 保守整段原文
-                let _ = self.skip_balanced("(", ")");
+            // 括号开头守卫也走**前哨扫描**（R15 三角化根因 3——
+            // T8314226/DeconstructionDesugaring 抓获：`when ((Integer)
+            // obj) > 0` 的盲平衡跳过只吃第一个括号组，残留 `> 0` 使
+            // 类型模式收尾判定失败 → 误判常量标签 + 语句垃圾）。扫描
+            // 失败（未找到 depth-0 收尾）再回退平衡跳过（保守原文）
+            let _ = save;
+            let scanned = self.at_punct("(");
+            if scanned {
+                let mut depth0 = 0i32;
+                let mut g0 = 0usize;
+                let mut ok = false;
+                while !self.at_eof() && g0 < 100_000 {
+                    g0 += 1;
+                    let t = self.tok().clone();
+                    match &t.tok {
+                        Tok::Punct(p) => match *p {
+                            "(" | "{" | "[" => depth0 += 1,
+                            ")" | "}" | "]" => {
+                                if depth0 == 0 {
+                                    break; // 越界闭括号——守卫意外闭合
+                                }
+                                depth0 -= 1;
+                            }
+                            "->" | ":" if depth0 == 0 => {
+                                ok = true;
+                                break;
+                            }
+                            _ => {}
+                        },
+                        Tok::Ident(k)
+                            if depth0 == 0 && (*k == "case" || *k == "default") =>
+                        {
+                            ok = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    self.bump();
+                }
+                if !ok {
+                    // 前哨失败（EOF 等）——回退平衡跳过（原文保守）
+                    self.pos = save;
+                    let _ = self.skip_balanced("(", ")");
+                }
             } else {
                 // 守卫表达式：**前哨扫描**到本 case 的收尾 `->` / `:`
                 //（不在嵌套 ()/<>/{}/[] 内）——不区分裸标识符/二元/λ
@@ -708,7 +760,15 @@ impl<'src> Parser<'src> {
                 let mut parts: String = String::new();
                 let mut prev_dot = false;
                 while !self.at_eof() && !self.at_punct(";") {
-                    if self.tok().line != pkg_line && !prev_dot && !self.at_punct(".") {
+                    // 首段放宽换行（R15 三角化根因 7——MinPkg 抓获：
+                    // 带注释的 package 首段换行——注释剥离使行号漂移，
+                    // 换行守卫曾截断成空包名 + 孤儿 raw）。后续段仍守
+                    //（防缺分号吞 class：parts 非空 + 换行 + 非点连接）
+                    if self.tok().line != pkg_line
+                        && !prev_dot
+                        && !self.at_punct(".")
+                        && !parts.is_empty()
+                    {
                         break; // 换行且非点连接
                     }
                     // 包名按 token 归一化（标识符 + 点拼接）：原文里的
@@ -800,10 +860,19 @@ impl<'src> Parser<'src> {
                 }
                 continue;
             }
-            // 顶层无法识别 → 原文保真
+            // 顶层无法识别 → 原文保真（**含已消费的修饰符**——mods 文本
+            // 前置拼回：R15 三角化根因 6：Java 25 隐式类顶层 `protected
+            // void finalize()` 曾从 mods 后取 raw 静默吞 protected——
+            // 可见性降低无法覆盖 Object.finalize）
             self.err_at("expected type declaration");
             let pos_before = self.pos;
             let text = self.sync_member();
+            let text = if !mods.trim().is_empty() {
+                // modifiers() 不含尾随空格——补一个分隔
+                format!("{mods} {text}")
+            } else {
+                text
+            };
             if !text.is_empty() {
                 unit.raws.push(text);
             }
@@ -979,6 +1048,15 @@ impl<'src> Parser<'src> {
                     if self.at_punct("(") {
                         self.skip_balanced("(", ")");
                     }
+                }
+                // 孤立逗号常量（`enum e3 { , }`——javac 实测接受；R15 三角
+                // 化根因 10：不消费使 `,` 流落成员 raw，printer 对零常量
+                // 补 `;` → `; ,` 非法）。作 raw 常量推入（constants 非空
+                // → printer 不补 `;` 且逐字回打）
+                if self.at_punct(",") {
+                    self.bump();
+                    enum_constants.push(",".to_string());
+                    continue;
                 }
                 if !matches!(self.tok().tok, Tok::Ident(_)) {
                     break;
@@ -1292,6 +1370,8 @@ impl<'src> Parser<'src> {
             if mods.is_empty() {
                 let _ = start;
             }
+            // 维度间注解（T name @A []）追加文本（进 mods）
+            let mut mods_suffix = String::new();
             let ty = match self.parse_type() {
                 Some(t) => t,
                 None => {
@@ -1319,13 +1399,78 @@ impl<'src> Parser<'src> {
                     continue;
                 }
             };
-            // 参数名后的额外维度 int a[]
-            let mut dims = 0u32;
-            while self.at_punct("[") && self.peek(1).is_punct("]") {
+            // 限定接收参数（JLS 8.4.1：`Inner Inner.this`——显式接收者形
+            // 参）：`.this` 后缀并入名（打印 `ty name` 即还原——R15 三角
+            // 化根因 5：MinRecv 抓获，曾无处安放使 expect(")") 失败、
+            // 恢复期拆出孤儿 `.this)`）。裸 `X this` 因 this 作 Ident 名
+            // 侥幸往返
+            let mut name = name;
+            'recv: while self.at_punct(".")
+                && matches!(&self.peek(1).tok, Tok::Ident(_))
+            {
+                // 限定接收参数（JLS 8.4.1）：`X Y.this` / 多段
+                // `X Y.Inner.this`——以 .this 结尾的段链。中间段试探消费，
+                // 链不以 .this/段续接收尾则回退（普通参数名不带点后缀）
+                if matches!(&self.peek(1).tok, Tok::Ident(t) if *t == "this") {
+                    self.bump(); // .
+                    self.bump(); // this
+                    name.push_str(".this");
+                    break 'recv;
+                }
+                let save = self.pos;
+                self.bump(); // .
+                let seg = match &self.tok().tok {
+                    Tok::Ident(i) => i.to_string(),
+                    _ => {
+                        self.pos = save;
+                        break 'recv;
+                    }
+                };
                 self.bump();
-                self.bump();
-                dims += 1;
+                if !self.at_punct(".") {
+                    // 段链到此为止且未以 .this 收尾——非接收参数，回退
+                    self.pos = save;
+                    break 'recv;
+                }
+                name.push('.');
+                name.push_str(&seg);
             }
+            // 参数名后的额外维度 int a[]——维度前可夹注解（T name @A []，
+            // JSR 308——R15 三角化根因 9a：MinAnnArr 抓获，@A 未吞使
+            // expect(")") 失败成孤儿；注解原文并入 mods 保往返）
+            let mut dims = 0u32;
+            loop {
+                if self.at_punct("@") {
+                    let as_ = self.cur_start();
+                    self.bump();
+                    self.bump();
+                    while self.at_punct(".") {
+                        if matches!(self.peek(1).tok, Tok::Ident(_)) {
+                            self.bump();
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                    if self.at_punct("(") {
+                        self.skip_balanced("(", ")");
+                    }
+                    let ann = self.text_of(as_, self.cur_start()).trim().to_string();
+                    mods_suffix.push_str(&ann);
+                }
+                if self.at_punct("[") && self.peek(1).is_punct("]") {
+                    self.bump();
+                    self.bump();
+                    dims += 1;
+                } else {
+                    break;
+                }
+            }
+            let mods = if mods_suffix.is_empty() {
+                mods
+            } else {
+                format!("{mods}{mods_suffix}")
+            };
             out.push(Param {
                 mods,
                 ty: wrap_dims(ty, dims),
@@ -1393,6 +1538,17 @@ impl<'src> Parser<'src> {
             let s = self.cur_start();
             self.bump(); // @
             self.bump(); // 注解名
+            // 限定名后缀（@A.B——InputWhitespaceAfterAnnotation:51 抓获：
+            // 只吞单 Ident 使 parse_type_base 起点为 `.` 失败 → 类头解析
+            // 失败；镜像 modifiers() 的段续接）
+            while self.at_punct(".") {
+                if matches!(self.peek(1).tok, Tok::Ident(_)) {
+                    self.bump();
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
             if self.at_punct("(") {
                 self.skip_balanced("(", ")");
             }
@@ -2655,7 +2811,14 @@ impl<'src> Parser<'src> {
                             let start = self.cur_start();
                             if self.parse_type().is_some() {
                                 if let Tok::Ident(bind) = &self.tok().tok {
-                                    if !is_reserved_after_type(bind) && *bind != "when" {
+                                    // `when` 是上下文关键字、**合法绑定名**
+                                    //（InputPatternsTrickyWhenUsage:18 抓获：
+                                    // `case Integer when when when >= 0 ->` 的
+                                    // 中间 when 是绑定名——一票否决曾误判常量
+                                    // 标签 + 语句垃圾）。回溯式判定：先当绑定
+                                    // 名消费，收尾不合法再整体回退
+                                    let when_bind = *bind == "when";
+                                    if !is_reserved_after_type(bind) && (!when_bind || self.when_is_bind_form()) {
                                         self.bump();
                                         while self.at_punct("[")
                                             && self.peek(1).is_punct("]")
@@ -2990,10 +3153,20 @@ impl<'src> Parser<'src> {
 
     fn parse_unary(&mut self) -> Option<JavaId> {
         // 表达式位置的前导类型注解（@A int.class——JSR 308 拷问文件）：
-        // 跳过后继续（TYPE_USE 无运行时语义）
-        if self.at_punct("@") {
+        // 跳过后继续（TYPE_USE 无运行时语义）。**循环**吞多注解
+        //（AllLocations:34 抓获——`@AO @AP Ext::…` 双注解曾只吞一个，
+        // 第二个落进 parse_primary 报 unexpected → 整条 return 断链）
+        while self.at_punct("@") {
             self.bump();
             self.bump();
+            while self.at_punct(".") {
+                if matches!(self.peek(1).tok, Tok::Ident(_)) {
+                    self.bump();
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
             if self.at_punct("(") {
                 self.skip_balanced("(", ")");
             }
@@ -3057,8 +3230,33 @@ impl<'src> Parser<'src> {
                             Tok::Ident(m) => m.to_string(),
                             _ => String::new(),
                         };
+                        // :: 后再跟显式 witness（A.B<String>::<Integer>new
+                        //——AllLocations:67 抓获：二段 witness 曾遇非 Ident
+                        // 得空名，后续 <Integer>new 断链使整个 return 语句
+                        // 消失）：TA + 名并入
+                        let mut m = m;
+                        if m.is_empty() && self.at_punct("<") {
+                            if let Some(ta2) = self.type_args_raw() {
+                                if let Tok::Ident(i) = &self.tok().tok {
+                                    m = format!("{ta2}{i}");
+                                    self.bump();
+                                }
+                            }
+                        }
                         if !m.is_empty() {
                             self.bump();
+                        }
+                        // **接收者侧类型实参保留**（泛型类构造器引用不可裸
+                        //——AllLocations javac「构造器引用无效」实锤：
+                        // `A.B<String>::new` 的 <String> 曾丢弃）：TA 并入
+                        // recv 的 Member 名（名字以原文打印，A.B<String>
+                        // 往返保真）
+                        if !ta.is_empty() {
+                            if let NodeData::Member { name } = self.ast.data(e) {
+                                let recv = self.ast.children(e)[0];
+                                let n2 = format!("{}{}", self.ast.sn(*name), ta);
+                                e = self.ast.member(recv, &n2);
+                            }
                         }
                         // 打印约定：无维度时纯方法名（打印机自打 ::）；带维度
                         // 时 "[]::m"（维度在 :: 前——打印机按 find("::") 切分）
@@ -3102,10 +3300,33 @@ impl<'src> Parser<'src> {
                                 ta_prefix = ta;
                             }
                         }
+                        // new 与类名间的注解（f1.new @A Inner()——
+                        // NestedTypes:44 抓获：@A 未吞使表达式断链、字段
+                        // 初始化截断、残体成 raw 成员）。注解原文并入 mname
+                        let mut anno_pre = String::new();
+                        while self.at_punct("@") {
+                            let as_ = self.cur_start();
+                            self.bump(); // @
+                            self.bump(); // 注解名
+                            while self.at_punct(".") {
+                                if matches!(self.peek(1).tok, Tok::Ident(_)) {
+                                    self.bump();
+                                    self.bump();
+                                } else {
+                                    break;
+                                }
+                            }
+                            if self.at_punct("(") {
+                                self.skip_balanced("(", ")");
+                            }
+                            anno_pre
+                                .push_str(self.text_of(as_, self.cur_start()).trim());
+                            anno_pre.push(' ');
+                        }
                         let Tok::Ident(cls) = &self.tok().tok else {
                             break;
                         };
-                        let mut mname = format!("new {}{cls}", ta_prefix);
+                        let mut mname = format!("new {}{}{}", ta_prefix, anno_pre, cls);
                         self.bump();
                         if self.at_punct("<") {
                             if let Some(ta) = self.type_args_raw() {
