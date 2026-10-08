@@ -1983,3 +1983,56 @@ fn static_exec_switch_labeled_break_escapes() {
     // x=0→case0 x=1;break(裸)→if x==1→x=2 break(裸)→while 退出 → a=2
     assert!(out.contains("a = 2") || out.contains("a=2"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// 第 11 轮攻击代理三实锤回归（全部第 10 轮新代码引入）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dead_code_witness_callee_keeps_method() {
+    // witness 保留把 callee Member 名拼成 `<String>pick`——死码裸名精确
+    // 匹配失明误删（WitDead 抓获：输出 javac 找不到符号）
+    let out = run_dead(
+        "class A{private <T> T pick(T x){return x;}String a=this.<String>pick(\"witness-call\");}",
+    );
+    assert!(out.contains("pick(T x)"), "{out}");
+}
+
+#[test]
+fn dead_code_witness_method_ref_veto() {
+    // `WitDead2::<String>nil` 的 MethodRef 否决取 rsplit 后名字带 TA
+    // 前缀 → veto 失效 → 方法误删（WitDead2 抓获）
+    let out = run_dead(
+        "class A{private static Object nil(){return null;}java.util.function.Supplier<Object> a=A::<String>nil;private static Object unused(){return null;}}",
+    );
+    assert!(out.contains("nil()"), "{out}");
+    assert!(!out.contains("unused()"), "{out}");
+}
+
+#[test]
+fn p1_barrier_refused_inside_try() {
+    // 屏障在 try 语境触发：重放裸赋值会丢异常窗口（catch 改道字段写/
+    // finally 副作用——P1g/P1h 攻击抓获：输入 caught|3 输出 EIIE）。
+    // 修复：try 语境屏障拒绝 → 语句保守失败 → try 原样保真
+    let src = "class T{static String r;static int k;static{k=2;try{r=opaque(1);}catch(RuntimeException e){r=\"caught\";}k=k+1;}static String opaque(int i){throw new RuntimeException(\"boom\");}}";
+    let out = run_src(src);
+    assert!(out.contains("try"), "{out}");
+    assert!(out.contains("catch"), "{out}");
+    assert!(out.contains("opaque(1)"), "{out}");
+    // finally 变体同守卫
+    let src2 = "class T{static String r;static int k;static{k=2;try{r=opaque(1);}catch(RuntimeException e){r=\"caught\";k=99;}finally{k=k+1;}}static String opaque(int i){throw new RuntimeException(\"boom\");}}";
+    let out2 = run_src(src2);
+    assert!(out2.contains("finally"), "{out2}");
+    assert!(out2.contains("k = 99"), "{out2}");
+}
+
+#[test]
+fn p1_barrier_still_works_outside_try() {
+    // 无 try 语境的屏障照常穿越（修复不扩散——BR1 基本行为回归）：
+    // 跨类未知调用 Other.opaque → 屏障 → 材料化重放 + 可求值实参代常量
+    let out = run_src(
+        "class T{static String r;static{int y=1+2;r=Other.opaque(y);}}",
+    );
+    assert!(out.contains("Other.opaque(3)"), "{out}");
+    assert!(!out.contains("int y"), "{out}");
+}

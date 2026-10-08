@@ -125,6 +125,12 @@ pub(crate) struct Exec<'a> {
     effect_log: Vec<EffectEvent>,
     /// 屏障穿越字段集（OpaqueFieldWrite 的目标——值 Undef，参与运算 → abort）
     opaque_fields: std::collections::HashSet<u32>,
+    /// try 语境深度（exec_try 体/finally 与 run_level Try 下降层内 >0）。
+    /// 屏障重放是「假设调用成功」的裸赋值——原语句在 try/catch/finally
+    /// 语境内时运行时可能抛出被 catch 改道（P1g/P1h/P1l 攻击抓获：
+    /// try/catch/finally 整体消失，输入 caught|3 输出 EIIE）。深度 >0
+    /// 时屏障拒绝 → 语句保守失败 → try 留 rest 原样保真。
+    try_depth: usize,
 }
 
 /// 执行效应（材料化重放的单位）。
@@ -151,7 +157,7 @@ pub(crate) enum EffectEvent {
 
 impl<'a> Exec<'a> {
     pub(crate) fn new(ast: &'a JavaAst) -> Self {
-        Exec { ast, steps: 0, exhausted: false, vars: HashMap::new(), field_writes: Vec::new(), decl_order: Vec::new(), scopes: vec![Vec::new()], var_width: HashMap::new(), effect_log: Vec::new(), opaque_fields: Default::default() }
+        Exec { ast, steps: 0, exhausted: false, vars: HashMap::new(), field_writes: Vec::new(), decl_order: Vec::new(), scopes: vec![Vec::new()], var_width: HashMap::new(), effect_log: Vec::new(), opaque_fields: Default::default(), try_depth: 0 }
     }
 
     /// 步数预算耗尽标志（规则据此放弃整段重写——中途状态不是
@@ -620,10 +626,18 @@ impl<'a> Exec<'a> {
                 _ => return Err(()),
             }
         }
-        // body 成功 ⇒ catch 不可达；Flow 传播前先执行 finally
-        let flow = self.exec_stmt(try_block)?;
+        // body 成功 ⇒ catch 不可达；Flow 传播前先执行 finally。
+        // try 语境计数：体内/finally 的屏障被拒绝（重放裸赋值会丢异常
+        // 窗口——P1g/P1h/P1l 攻击抓获）
+        self.try_depth += 1;
+        let flow = self.exec_stmt(try_block);
+        self.try_depth -= 1;
+        let flow = flow?;
         if let Some(f) = finally_block {
-            match self.exec_stmt(f)? {
+            self.try_depth += 1;
+            let fflow = self.exec_stmt(f);
+            self.try_depth -= 1;
+            match fflow? {
                 Flow::Normal => {}
                 // finally 里的 break/return 覆盖 body 的 Flow（Java 语义）
                 other => return Ok(other),
@@ -1126,6 +1140,13 @@ impl<'a> Exec<'a> {
         if self.ast.kind(target) != NodeKind::VarRef {
             return Ok(None);
         }
+        // try 语境拒绝（P1g/P1h/P1l 攻击抓获）：屏障重放 = 假设调用成功
+        // 的裸赋值——原语句的异常窗口（catch 改道字段写/finally 副作用）
+        // 会被材料化丢弃（输入 caught|3 → 输出 EIIE）。返回 None = 无
+        // 屏障 → 赋值求值失败 → 语句保守失败 → try 留 rest 原样保真
+        if self.try_depth > 0 {
+            return Ok(None);
+        }
         let k = match self.key(target) {
             Ok(k) => k,
             Err(()) => return Ok(None),
@@ -1250,6 +1271,7 @@ impl<'a> Exec<'a> {
             var_width: self.var_width.clone(),
             effect_log: self.effect_log.clone(),
             opaque_fields: self.opaque_fields.clone(),
+            try_depth: self.try_depth,
         }
     }
     fn deep_restore(&mut self, s: Snap) {
@@ -1269,6 +1291,7 @@ impl<'a> Exec<'a> {
         self.var_width = s.var_width;
         self.effect_log = s.effect_log;
         self.opaque_fields = s.opaque_fields;
+        self.try_depth = s.try_depth;
     }
 
     /// 前缀遍历（子块截断核心）：逐语句执行，遇失败语句时若它是
@@ -1330,13 +1353,16 @@ impl<'a> Exec<'a> {
                 // Block/Group 继承外层标签；Try 体层 sealed（break 到达
                 // 即停入 rest——finally 是 Try 的兄弟孩子，跳层会跳过
                 // finally 执行，语义破坏）
-                let (el, ap) = match self.ast.data(st).clone() {
-                    NodeData::Label { name } => (Some(name), true),
-                    NodeData::Try => (None, false),
-                    _ => (exit_label.clone(), true),
+                let (el, ap, in_try) = match self.ast.data(st).clone() {
+                    NodeData::Label { name } => (Some(name), true, false),
+                    NodeData::Try => (None, false, true),
+                    _ => (exit_label.clone(), true, false),
                 };
                 let inner_stmts = self.ast.children(inner).to_vec();
+                // Try 体下降层进 try 语境（体内屏障拒绝——异常窗口保守）
+                self.try_depth += in_try as usize;
                 let r = self.run_level(&inner_stmts, Some(inner), false, run, el, ap);
+                self.try_depth -= in_try as usize;
                 // 子层带标签 break 上抛：命中本层标签 → 消费；否则保留
                 // pending 继续上抛。两种情形本层剩余均跳过（break 语义）
                 if run.pending_break.is_some() {
@@ -1367,7 +1393,10 @@ impl<'a> Exec<'a> {
                         // 副作用丢失（t03 抓获：f="fin" 消失、println 整条吞）
                         if let NodeData::Try = self.ast.data(st) {
                             if let Some(fin) = self.try_finally_block(st) {
-                                match self.exec_stmt(fin) {
+                                self.try_depth += 1;
+                                let fflow = self.exec_stmt(fin);
+                                self.try_depth -= 1;
+                                match fflow {
                                     Ok(Flow::Normal) => {}
                                     _ => {
                                         // finally 失败 → 整条 try 按失败处理
@@ -1581,6 +1610,7 @@ struct Snap {
     var_width: HashMap<u32, u8>,
     effect_log: Vec<EffectEvent>,
     opaque_fields: std::collections::HashSet<u32>,
+    try_depth: usize,
 }
 
 /// 深拷贝一个值（别名保持：seen 以 Rc 地址识别同一数组）。

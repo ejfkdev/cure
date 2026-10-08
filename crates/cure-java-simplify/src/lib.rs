@@ -5787,6 +5787,31 @@ fn remove_dead_private_methods(ast: &JavaAst, unit: &mut CompilationUnit) -> usi
     }
 }
 
+/// 剥离 callee/MethodRef 名里的前导类型实参（witness 保留把
+/// `<String>pick` 整体并入 Member 名——第 11 轮攻击抓获：死码裸名
+/// 精确匹配失明 → 私有方法误删输出不可编译）。名字以 `<` 开头必为
+/// TA 前缀（标识符/`class`/`new` 等形态不可能以 `<` 开头）。
+fn strip_ta_prefix(name: &str) -> &str {
+    if !name.starts_with('<') {
+        return name;
+    }
+    let b = name.as_bytes();
+    let mut depth = 0i32;
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &name[i + 1..];
+                }
+            }
+            _ => {}
+        }
+    }
+    name // 不平衡（病态）——原样保守
+}
+
 /// (名字, 实参元数) 引用 + MethodRef/未知元数名字否决。
 fn collect_call_arity_refs(
     ast: &JavaAst,
@@ -5807,13 +5832,13 @@ fn collect_call_arity_refs(
                         _ => String::new(),
                     };
                     if !name.is_empty() {
-                        out.insert((name, ch.len() - 1));
+                        out.insert((strip_ta_prefix(&name).to_string(), ch.len() - 1));
                     }
                 }
             }
             NodeData::MethodRef { name } => {
                 if let Some(short) = ast.sn(*name).rsplit("::").next() {
-                    veto.insert(short.to_string());
+                    veto.insert(strip_ta_prefix(short).to_string());
                 }
             }
             _ => {}
@@ -5934,7 +5959,7 @@ fn collect_noop_private_methods(ast: &mut JavaAst, unit: &CompilationUnit) {
         while let Some(n) = stack.pop() {
             if let NodeData::MethodRef { name } = ast.data(n) {
                 if let Some(short) = ast.sn(*name).rsplit("::").next() {
-                    veto.insert(short.to_string());
+                    veto.insert(strip_ta_prefix(short).to_string());
                 }
             }
             for &c in ast.children(n) {
@@ -6278,10 +6303,10 @@ fn collect_call_names(ast: &JavaAst, root: JavaId, out: &mut std::collections::H
                 if let Some(&callee) = ast.children(id).first() {
                     match ast.data(callee) {
                         NodeData::Member { name } => {
-                            out.insert(ast.sn(*name).to_string());
+                            out.insert(strip_ta_prefix(ast.sn(*name)).to_string());
                         }
                         NodeData::VarRef { name } => {
-                            out.insert(ast.sn(*name).to_string());
+                            out.insert(strip_ta_prefix(ast.sn(*name)).to_string());
                         }
                         _ => {}
                     }
@@ -6290,7 +6315,7 @@ fn collect_call_names(ast: &JavaAst, root: JavaId, out: &mut std::collections::H
             NodeData::MethodRef { name } => {
                 // `recv::name` / `recv::new`
                 if let Some(short) = ast.sn(*name).rsplit("::").next() {
-                    out.insert(short.to_string());
+                    out.insert(strip_ta_prefix(short).to_string());
                 }
             }
             _ => {}
