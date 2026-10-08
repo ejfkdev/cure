@@ -548,6 +548,22 @@ fn subtree_has_var(lang: &JavaAst, id: JavaId, name: &str) -> bool {
     false
 }
 
+/// 名字绑定检查（catch 形参 / for-each 变量——不在 VarRef/VarDecl 扫描域）
+fn subtree_has_binding(lang: &JavaAst, id: JavaId, name: &str) -> bool {
+    let mut stack = vec![id];
+    while let Some(n) = stack.pop() {
+        match lang.data(n) {
+            NodeData::Catch { name: cn, .. } if cn == name => return true,
+            NodeData::ForEach { name: vn, .. } if vn == name => return true,
+            _ => {}
+        }
+        for &c in lang.children(n) {
+            stack.push(c);
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // new String 折叠（混淆器/反编译器产物）：new String("lit") → "lit"、new String() → ""
 // 仅字面量实参（new String(charArray/bytes) 是拷贝语义，不折）。
@@ -1666,6 +1682,57 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
                     _ => break,
                 }
             }
+            // 消费条件性守卫（第 12 轮攻击 A4a 抓获）：next() 必须每轮
+            // **无条件求值一次**。两类条件语境拒绝：
+            //   a) 语句级：wrapped 所在语句嵌于 if/for/while/try/catch/
+            //      switch/synchronized 内（消费次数或 0 或 N——A4a 内层
+            //      for 消费 3 个/外层轮 → 3 9 变 9 27 实锤）；
+            //   b) 表达式级：三元分支位 / 短路 &&、|| 右操作数（求值可跳过）。
+            // 顺序包裹（Block/Group/ExprStmt/Label/Return/Throw）与无条件
+            // 求值位（Call/New 实参、非短路 Binary、Assign、Cast、Paren、
+            // Index）放行
+            {
+                let mut cur = wrapped;
+                'walk: while cur != body {
+                    let par = parent_of_recv(lang, body, cur);
+                    if par == body || par == cur {
+                        break; // 直达 body（防御：不在子树内则停）
+                    }
+                    let ch = lang.children(par).to_vec();
+                    let idx = ch.iter().position(|&c| c == cur);
+                    match lang.kind(par) {
+                        NodeKind::Block
+                        | NodeKind::ExprStmt
+                        | NodeKind::Label
+                        | NodeKind::Return
+                        | NodeKind::Throw => {}
+                        NodeKind::Ternary => {
+                            // 分支位（1/2）条件求值；条件位（0）无条件
+                            if idx.unwrap_or(0) > 0 {
+                                return None;
+                            }
+                        }
+                        NodeKind::Binary => {
+                            if let Some(op) = lang.bin_op(par) {
+                                if matches!(op, BinOp::And | BinOp::Or) && idx == Some(1) {
+                                    return None; // 短路右操作数
+                                }
+                            }
+                        }
+                        NodeKind::If
+                        | NodeKind::While
+                        | NodeKind::DoWhile
+                        | NodeKind::For
+                        | NodeKind::Switch
+                        | NodeKind::Try
+                        | NodeKind::Catch
+                        | NodeKind::Synchronized
+                        | NodeKind::ForEach => return None,
+                        _ => {} // Call 实参/New 实参/Assign/Cast/Paren/Index…
+                    }
+                    cur = par;
+                }
+            }
             // 循环变量类型推导（三源优先级）：
             // 1) **迭代器声明类型的泛型实参**（`Iterator<ByteArrayWrapper> it`
             //    → ByteArrayWrapper——最可靠：声明即约束，jedis JedisByteMap
@@ -1695,9 +1762,15 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
                 NodeData::Cast { ty } => (wrapped, if is_object { ty.clone() } else { elem }),
                 _ => (wrapped, elem),
             };
-            // 新变量名（不与体内现有变量冲突）
-            let e_name = if subtree_has_var(&*lang, body, "e") {
-                "e2"
+            // 新变量名（不与体内现有变量/catch 形参/for-each 绑定冲突——
+            // A4c 抓获：catch (Exception e) 的形参不在 VarRef/VarDecl 域，
+            // 撞名输出 javac「已定义变量 e」）
+            let taken = |nm: &str| {
+                subtree_has_var(&*lang, body, nm)
+                    || subtree_has_binding(&*lang, body, nm)
+            };
+            let e_name = if taken("e") {
+                if taken("e2") { "e3" } else { "e2" }
             } else {
                 "e"
             };

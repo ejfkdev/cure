@@ -930,6 +930,14 @@ impl<'a> Exec<'a> {
                     if let NodeData::New { ty, anon_raw } = self.ast.data(recv_id).clone() {
                         if anon_raw.is_none() && matches!(ty, JType::Ref(r) if r == "String") {
                             let nch = self.ast.children(recv_id).to_vec();
+                            // 元数守卫：仅单参构造（String/String→String、
+                            // char[]→String）。(char[],int,int)/(byte[],…)
+                            // 重载有 offset/count 语义——折成整组数组即值变
+                            //（第 12 轮攻击抓获：new String(ca,1,3).intern()
+                            // 曾折成 ca 全量）
+                            if nch.len() != 1 {
+                                return Err(());
+                            }
                             let arg = self.eval(*nch.first().ok_or(())?)?;
                             return match arg {
                                 VVal::CA(a) => {

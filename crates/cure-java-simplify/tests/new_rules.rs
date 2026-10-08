@@ -2083,15 +2083,23 @@ fn local_propagation_raw_receiver_refused() {
 }
 
 #[test]
-fn foreach_bare_next_statement_dropped() {
-    // lombok ConfigurationKeysLoader 抓获：裸 it.next(); 替换成 e; 不是
-    // 合法语句——应整条删除（for-each 隐式消费）
+fn foreach_bare_next_statement_unconditional_only() {
+    // A4a/R12 攻击演化：try/if/内层循环内的条件消费不可转 for-each
+    //（消费次数 0 或 N ≠ for-each 隐式消费 1——A4a 实锤 3 9 → 9 27）。
+    // 修复 = 条件语境整体拒绝（while 原样保真）。
+    // 直接语句位的裸 it.next();（无条件）仍转换——语句删除（非 e;）
     let out = run_src(
         "class T{void m(java.util.List<String> list){java.util.Iterator<String> it=list.iterator();while(it.hasNext()){try{it.next();}catch(Exception ignore){}}}}",
     );
-    assert!(!out.contains("; e;"), "{out}");
-    assert!(!out.contains("e;\n"), "{out}");
-    assert!(out.contains("for (String e : list)"), "{out}");
+    assert!(out.contains("while (it.hasNext())"), "{out}");
+    assert!(out.contains("it.next();"), "{out}");
+    assert!(!out.contains(" e;"), "{out}");
+    // 无条件直接语句位：转换 + 语句删除
+    let out2 = run_src(
+        "class T{void m(java.util.List<String> list){java.util.Iterator<String> it=list.iterator();while(it.hasNext()){it.next();}}}",
+    );
+    assert!(out2.contains("for (String e : list)"), "{out2}");
+    assert!(!out2.contains("e;"), "{out2}");
 }
 
 #[test]
@@ -2103,4 +2111,49 @@ fn static_exec_try_window_barrier_refused() {
     );
     assert!(out.contains("catch"), "{out}");
     assert!(out.contains("k = k + 1") || out.contains("k = 3") || out.contains("k = 2"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// 第 12 轮修复回归（语义/转换）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn intern_arity_guard_offset_count() {
+    // A1f 抓获：new String(ca, 1, 3).intern() 的 offset/count 重载曾被
+    // 折成整组数组（abcabcbcd → abcabcabcdef 值变）——元数守卫后拒绝求值
+    let out = run_src(
+        "class T{static String r;static{r=new String(\"abcdef\".toCharArray(),1,3).intern();}}",
+    );
+    // 不可求值 → 语句失败 → r 赋值保留原文（不折成错值）
+    assert!(out.contains("new String"), "{out}");
+}
+
+#[test]
+fn foreach_conditional_consumption_refused() {
+    // A4a 抓获：内层循环消费 3 个/外层轮——for-each 隐式消费 1 不等价
+    //（3 9 → 9 27 值变）。条件语境（if/for/while/try）整体拒绝
+    let out = run_src(
+        "class T{void m(java.util.List<String> list){java.util.Iterator<String> it=list.iterator();while(it.hasNext()){for(int k=0;k<3;k++){it.next();}}}}",
+    );
+    assert!(out.contains("while (it.hasNext())"), "{out}");
+    // 短路右操作数 / 三元分支位同样拒绝
+    let out2 = run_src(
+        "class T{void m(java.util.List<String> list){java.util.Iterator<String> it=list.iterator();while(it.hasNext()){String s=it.hasNext()&&it.next()!=null?\"a\":\"b\";}}}",
+    );
+    assert!(out2.contains("while (it.hasNext())"), "{out2}");
+    // 无条件表达式位（Binary Add 左右均求值）照常转换
+    let out3 = run_src(
+        "class T{String m(java.util.List<String> list){java.util.Iterator<String> it=list.iterator();String acc=\"\";while(it.hasNext()){acc=acc+it.next()+\"-\";}return acc;}}",
+    );
+    assert!(out3.contains("for (String e : list)"), "{out3}");
+}
+
+#[test]
+fn foreach_var_avoids_catch_param() {
+    // A4c 抓获：for-each 变量 e 与 catch 形参 e 撞名——输出「已定义变量」
+    let out = run_src(
+        "class T{void m(java.util.List<String> list){java.util.Iterator<String> it=list.iterator();while(it.hasNext()){String s=it.next();try{System.out.println(s);}catch(Exception e){}}}}",
+    );
+    // 首形态（VarDecl e = it.next()）直接语句位——转换后 e2 不撞 catch e
+    assert!(!out.contains("for (String e : list) {") || !out.contains("catch (Exception e)"), "{out}");
 }

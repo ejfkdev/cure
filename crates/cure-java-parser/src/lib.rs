@@ -743,9 +743,21 @@ impl<'src> Parser<'src> {
                 match self.type_decl_body(&mods, mods_start) {
                     Some(t) => unit.types.push(t),
                     None => {
+                        let pos_before = self.pos;
                         let text = self.sync_member();
                         if !text.is_empty() {
                             unit.raws.push(text);
+                        }
+                        // 停滞守卫（A8mem：sync_member 在 depth-0 `}` 不消费
+                        // 即 break——本循环原位自旋 2M 轮/147MB）
+                        if self.pos == pos_before && !self.at_eof() {
+                            let ts = self.cur_start();
+                            let te = self.tok().end;
+                            let t = self.text_of(ts, te).trim().to_string();
+                            if !t.is_empty() {
+                                unit.raws.push(t);
+                            }
+                            self.bump();
                         }
                     }
                 }
@@ -753,9 +765,20 @@ impl<'src> Parser<'src> {
             }
             // 顶层无法识别 → 原文保真
             self.err_at("expected type declaration");
+            let pos_before = self.pos;
             let text = self.sync_member();
             if !text.is_empty() {
                 unit.raws.push(text);
+            }
+            // 停滞守卫（同上——单 token raw 保真 + 强制推进）
+            if self.pos == pos_before && !self.at_eof() {
+                let ts = self.cur_start();
+                let te = self.tok().end;
+                let t = self.text_of(ts, te).trim().to_string();
+                if !t.is_empty() {
+                    unit.raws.push(t);
+                }
+                self.bump();
             }
         }
         unit
@@ -1821,15 +1844,33 @@ impl<'src> Parser<'src> {
             //（final record X(…) {}——checkstyle Java15FinalLocalRecord 抓获：
             // 修饰前缀曾使局部 record 走变量声明路径 → 风暴）
             let save = self.pos;
+            let raw_start = self.cur_start();
             // 修饰全形态（strictfp enum E{…};——checkstyle Java16LocalEnum：
-            // 修饰集含 strictfp/public/static 等，非仅 final/@Anno）
-            while matches!(&self.tok().tok, Tok::Ident(i) if is_modifier_kw(i)) {
-                self.bump();
+            // 修饰集含 strictfp/public/static 等，非仅 final/@Anno）。
+            // 修饰与注解**任意交错**（F2 抓获：`final @Deprecated static
+            // record R(…) {}` 的 static 在注解后——旧三段式循环止于 @，
+            // static 残留使类型关键字判定失败 → 局部 record 退化为残句
+            // 输出丢 {} 不可编译）。raw_start 记在修饰前——注解/修饰
+            // 一并入原文（@Deprecated 有运行时可观察性，丢弃即有损）
+            loop {
+                if matches!(&self.tok().tok, Tok::Ident(i) if is_modifier_kw(i)) {
+                    self.bump();
+                    continue;
+                }
+                if self.at_value_decl() {
+                    self.bump();
+                    continue;
+                }
+                if self.at_punct("@") && !self.at_annotation_decl() {
+                    self.bump();
+                    self.bump();
+                    if self.at_punct("(") {
+                        self.skip_balanced("(", ")");
+                    }
+                    continue;
+                }
+                break;
             }
-            if self.at_value_decl() {
-                self.bump();
-            }
-            self.skip_mods_annotations();
             if self.at_kw("class")
                 || self.at_kw("interface")
                 || self.at_kw("enum")
@@ -1837,13 +1878,15 @@ impl<'src> Parser<'src> {
             {
                 let text = self.sync_member();
                 // 尾分号（enum E{…}; 容错形态）一并并入
-                let text = if self.at_punct(";") {
+                if self.at_punct(";") {
                     self.bump();
-                    format!("{text};")
-                } else {
-                    text
-                };
-                return self.ast.raw(&text.trim());
+                }
+                // 从修饰前起整体保真（sync_member 只覆盖关键字起的段）
+                let text = self
+                    .text_of(raw_start, self.t[self.pos.min(self.t.len() - 1)].start)
+                    .trim()
+                    .to_string();
+                return self.ast.raw(&text);
             }
             self.pos = save;
         }
@@ -1882,6 +1925,7 @@ impl<'src> Parser<'src> {
                 self.bump();
                 extra += 1;
             }
+            let base_ty = ty.clone();
             let ty0 = wrap_dims(ty, extra);
             let mut decls: Vec<(String, JType, Option<JavaId>)> = Vec::new();
             // 第一个声明符
@@ -1946,11 +1990,11 @@ impl<'src> Parser<'src> {
                 if had_eq && init.is_none() {
                     return self.raw_from(start);
                 }
-                // 后续声明符继承首声明符类型（去掉数组维度后），JType::Var 不回加
-                let base = match &decls[0].1 {
-                    JType::Array(inner) => (**inner).clone(),
-                    other => other.clone(),
-                };
+                // 后续声明符维度**相加**（JLS 14.4：声明类型 + 声明符自带
+                // C 风格维度——`int[] p, q[][]` 的 q = int[3]——A5e 抓获：
+                // 曾按首声明符剥一层继承使 q 降维）。基类型 = 解析出的
+                // 声明类型（parse_type 的 dims），非首声明符的整型
+                let base = base_ty.clone();
                 let decl_ty = wrap_dims(base, d_extra);
                 let init = self.wrap_decl_init_array(init, &decl_ty);
                 decls.push((name, decl_ty, init));
@@ -2192,6 +2236,18 @@ impl<'src> Parser<'src> {
                 if had_eq && init.is_none() {
                     return self.raw_from(for_start);
                 }
+                // type_dims 取**包装前**的解析类型（`int k[]` 的 C 风格
+                // extra 不能感染兄弟声明符 l——for_ty 含 extra 曾使
+                // `for (int k[], l = 0)` 打出 l[]）
+                let type_dims = {
+                    let mut d = 0u32;
+                    let mut t = &ty;
+                    while let JType::Array(inner) = t {
+                        d += 1;
+                        t = inner;
+                    }
+                    d
+                };
                 let for_ty = wrap_dims(ty, extra);
                 let init = self.wrap_decl_init_array(init, &for_ty);
                 inits.push(self.ast.var_decl(&name, for_ty, init));
@@ -2223,8 +2279,11 @@ impl<'src> Parser<'src> {
                     } else {
                         None
                     };
-                    // with_type=false 打印时只输出名字，类型用 Var 占位即可
-                    let for_ty2 = wrap_dims(JType::Var, d_extra);
+                    // with_type=false 打印时只输出名字，类型用 Var 占位即可。
+                    // 维度**相加**（JLS 14.14 与 14.4 同：声明类型 dims +
+                    // 声明符自带——`for (String[] s, t[][];;)` 的 t =
+                    // String[3]——A5e 抓获曾只记自带维度降维）
+                    let for_ty2 = wrap_dims(JType::Var, type_dims + d_extra);
                     let init2 = self.wrap_decl_init_array(init2, &for_ty2);
                     inits.push(self.ast.var_decl(&n2, for_ty2, init2));
                 }
@@ -2354,9 +2413,20 @@ impl<'src> Parser<'src> {
                     break;
                 }
                 // catch 形参 final 保留（mockito 5 + lombok 21 文件抓获：
-                // 曾丢弃——风格保真；start 前移到 final 之前使 ty_raw 含它）
+                // 曾丢弃——风格保真；start 前移到 final 之前使 ty_raw 含它）。
+                // 注解与 final 任意序（JLS 14.20 VariableModifier——A9g 抓获：
+                // `catch (@A final X e)` 曾 parse_type 失败输出结构破坏且
+                // 非幂等）——与方法形参路径同法跳过
                 let start = self.cur_start();
-                while self.at_kw("final") {
+                while self.at_kw("final") || self.at_punct("@") {
+                    if self.at_punct("@") {
+                        self.bump(); // @
+                        self.bump(); // 注解名
+                        if self.at_punct("(") {
+                            self.skip_balanced("(", ")");
+                        }
+                        continue;
+                    }
                     self.bump();
                 }
                 if self.parse_type().is_none() {
@@ -2638,7 +2708,9 @@ impl<'src> Parser<'src> {
                     let s = self.parse_stmt();
                     if matches!(self.ast.data(s), &NodeData::Group) {
                         stmts.extend(self.ast.children(s).iter().copied());
-                    } else {
+                    } else if !matches!(self.ast.data(s), &NodeData::Empty) {
+                        // 空语句（`case X:;` 的裸 ;）不进树——打印空行后重
+                        // 解析即消失，破坏幂等（Switches F3 抓获）
                         stmts.push(s);
                     }
                 }

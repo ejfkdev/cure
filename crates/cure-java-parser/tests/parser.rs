@@ -502,3 +502,60 @@ fn no_runaway_error_loop_on_malformed_for() {
         reparsed.errors.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// 第 12 轮修复回归
+// ---------------------------------------------------------------------------
+
+#[test]
+fn for_init_declarator_dims_add() {
+    // A5e 抓获：维度相加（JLS 14.14/14.4：声明类型 dims + 声明符自带）
+    let out = fmt("class A{void m(){for (String[] s, t[][];;){break;}}}");
+    assert!(out.contains("t[][][]"), "{out}");
+    // 局部声明同法
+    let out2 = fmt("class A{void m(){int[] p = null, q[][] = null;int r[] = p;}}");
+    assert!(out2.contains("int[] p = null;"), "{out2}");
+    assert!(out2.contains("int[][][] q = null;"), "{out2}");
+}
+
+#[test]
+fn member_level_stall_guard() {
+    // A8mem 抓获：顶层残骸 `}` 曾使成员循环 2M 自旋（2M 错误/147MB）
+    let out = parse("class C { void m() {} }\nvoid n() {} }\n");
+    assert!(out.errors.len() < 10, "runaway: {} errors", out.errors.len());
+    let printed = cure_java_print::print_unit(&out.ast, &out.unit);
+    let reparsed = parse(&printed);
+    assert!(
+        reparsed.errors.len() < 10,
+        "reparse runaway: {}",
+        reparsed.errors.len()
+    );
+}
+
+#[test]
+fn catch_param_annotation_before_final() {
+    // A9g 抓获：`catch (@A final X e)` 注解在 final 前——JLS 14.20
+    // VariableModifier 任意序；曾 parse_type 失败输出结构破坏且非幂等
+    let out = fmt("class A{@interface B{ }void m(){try{x();}catch (@B final Exception e){}catch (final @B Exception e){}}void x(){}}");
+    assert!(out.contains("catch (@B final Exception e)"), "{out}");
+    assert!(out.contains("catch (final @B Exception e)"), "{out}");
+}
+
+#[test]
+fn local_record_interleaved_modifiers_verbatim() {
+    // F2 抓获：`final @Deprecated static record R(…) {}` 的 static 在注解后
+    // ——修饰/注解交错曾使局部 record 退化残句丢 {} 不可编译；修饰符
+    // 原文保真（@Deprecated 有运行时可观察性）
+    let out = fmt("class A{void m(){final @Deprecated static record R(String a) {}record Ok(String a) {}}}");
+    assert!(out.contains("final @Deprecated static record R(String a) {}"), "{out}");
+    assert!(out.contains("record Ok(String a) {}"), "{out}");
+}
+
+#[test]
+fn empty_case_statement_dropped_for_idempotency() {
+    // F3 抓获：`case X:;` 的裸 ; 打印空行后重解析消失——非幂等
+    let src = "class A{void m(int x){switch (x){case 1:;default:case 2:;}}}";
+    let p1 = fmt(src);
+    let p2 = fmt(&p1);
+    assert_eq!(p1, p2, "not idempotent");
+}
