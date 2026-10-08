@@ -781,6 +781,13 @@ impl<L: Lang> Rule<L> for LocalPropagation {
                 value = lang.build_int(v, true);
             }
         }
+        // byte/short 窄域声明：Int 字面量内联到**调用实参位**是非法收窄
+        //（JLS 常量收窄仅限赋值上下文——t04h 抓获：eat(127, 1023) 进
+        // byte/short 形参不可编译）。使用位置不可判 → 保守拒绝传播
+        //（char 域已有 Int→Char 转换——Char 字面量到 char 形参合法）
+        if !lang.is_wide_decl(id) && !lang.is_char_decl(id) {
+            return None;
+        }
 
         // 扫描 decl 之后的区域（用途/遮蔽全区间；写冲突窗口见下）。
         // 句法引用计数兜底事件盲区：赋值目标内的读（t[k]=… 的 t）

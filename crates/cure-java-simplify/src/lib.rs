@@ -570,8 +570,10 @@ impl Rule<JavaAst> for NewStringFold {
         if !matches!(ty, JType::Ref(n) if n == "String" || n == "java.lang.String" || n.ends_with(".String")) {
             return None;
         }
-        // 折叠产出池化字面量，改变 String 引用身份 → 守卫
-        if lang.has_string_identity_compare(root) {
+        // 折叠产出池化字面量，改变 String 引用身份 → 守卫（单元级：
+        // 字段 init 的 == 观察点在其他方法——单根扫描看不见）
+        let _ = root;
+        if lang.unit_string_identity {
             return None;
         }
         let args = lang.children(id).to_vec();
@@ -622,7 +624,8 @@ impl Rule<JavaAst> for NewStringCharArrayFold {
         if !matches!(ty, JType::Ref(n) if n == "String" || n.ends_with(".String")) {
             return None;
         }
-        if lang.has_string_identity_compare(root) {
+        let _ = root;
+        if lang.unit_string_identity {
             return None;
         }
         // 唯一实参：new char[]{...}（NewArray sized=0，唯一孩子 ArrayLit）
@@ -965,13 +968,30 @@ impl Rule<JavaAst> for StaticExec {
                             .iter()
                             .find(|(fk, _)| fk == k)
                             .map(|(_, v)| v.clone())?;
+                        // 字段声明域截断（静态块里 f += …L 的复合赋值
+                        // 隐式收窄）：static int/byte/short/char 字段上的
+                        // L 值按域截断成 Int（t04i 抓获：f = 3000000001L
+                        // 写进 static int 不可编译且值错）
+                        let v = match (&v, lang.field_types.get(&name)) {
+                            (vexec::VVal::L(x), Some(JType::Int)) => vexec::VVal::I(*x as i32),
+                            (vexec::VVal::L(x), Some(JType::Byte)) => vexec::VVal::I(*x as i8 as i32),
+                            (vexec::VVal::L(x), Some(JType::Short)) => vexec::VVal::I(*x as i16 as i32),
+                            (vexec::VVal::L(x), Some(JType::Char)) => vexec::VVal::I(*x as u16 as i32),
+                            _ => v,
+                        };
                         let (val, mut extra) = materialize(lang, &v)?;
                         let tgt = lang.var(&name);
                         insert.push(lang.assign(tgt, val));
                         insert.append(&mut extra);
                     }
                     vexec::EffectEvent::ClassLoad { stmt, call, name } => {
-                        // 重放为原语句 + 字面量实参（副作用 = 类初始化）
+                        // 重放为「try { 原语句(字面量实参) } catch (Exception
+                        // cure$ex) {}」——forName 抛受检 ClassNotFoundException，
+                        // 裸语句在 javac 下不可编译（终审代理抓获：修复输入
+                        // 固有缺陷后输出独有「未报告的异常错误」——曾因 var121
+                        // 前置错误掩蔽）。catch 在 JDK 假设下是死路，仅为
+                        // 受检异常路径的编译合法性；形参名 cure$ex 防局部撞名
+                        //（catch 形参不得遮蔽作用域内局部）
                         let lit = lang.lit(Lit::Str(name.clone()));
                         let callee = *lang.children(*call).first()?;
                         let callee_copy = lang.copy_subtree(callee);
@@ -981,7 +1001,11 @@ impl Rule<JavaAst> for StaticExec {
                         } else {
                             new_call
                         };
-                        insert.push(new_stmt);
+                        let try_block = lang.block(vec![new_stmt]);
+                        let catch_block = lang.block(vec![]);
+                        let catch_arm = lang.catch_("Exception", "cure$ex", catch_block);
+                        let wrapped = lang.try_(vec![], try_block, vec![catch_arm], None);
+                        insert.push(wrapped);
                     }
                 }
             }
@@ -1022,13 +1046,22 @@ impl Rule<JavaAst> for StaticExec {
                 // I 值发 Char 字面量；long 域的 I 值发 5L
                 let (ty, val) = match (*dom, val) {
                     (2, lit) if lang.kind(lit) == NodeKind::Literal => {
-                        if let Some(LitRef::Int(v)) = lang.literal(lit) {
-                            match u32::try_from(v).ok().and_then(char::from_u32) {
-                                Some(c) => (JType::Char, lang.lit(Lit::Char(c))),
-                                None => (JType::Char, lit),
+                        // Int/Long 字面量都按 char 域转换（t04f 抓获：
+                        // Long 直通产出 char c = 98L 不可编译）
+                        match lang.literal(lit) {
+                            Some(LitRef::Int(v)) => {
+                                match u32::try_from(v).ok().and_then(char::from_u32) {
+                                    Some(c) => (JType::Char, lang.lit(Lit::Char(c))),
+                                    None => (JType::Char, lit),
+                                }
                             }
-                        } else {
-                            (JType::Char, lit)
+                            Some(LitRef::Long(v)) => {
+                                match u32::try_from(v as i32 as i64).ok().and_then(char::from_u32) {
+                                    Some(c) => (JType::Char, lang.lit(Lit::Char(c))),
+                                    None => (JType::Char, lit),
+                                }
+                            }
+                            _ => (JType::Char, lit),
                         }
                     }
                     (3, lit) => (JType::Byte, lit),
@@ -1200,16 +1233,35 @@ impl Rule<JavaAst> for TryUnwrapRethrow {
             }
             return None;
         }
-        // 混合：只删重抛臂（Splice 掉对应 catch 槽）——定位第一个重抛臂
-        for (slot, &c) in ch.iter().enumerate() {
-            if c != try_block && lang.kind(c) == NodeKind::Catch && rethrow_only(c) {
-                return Some(Edit::Splice {
-                    node: id,
-                    index: slot,
-                    remove: 1,
-                    insert: vec![],
-                });
+        // 混合：只删重抛臂（Splice 掉对应 catch 槽）。守卫：被删臂**之后**
+        // 的所有 catch 也必须是纯重抛——否则该类型异常改道后续真处理臂
+        //（JavaInputAstVisitor 抓获：删 catch(FormattingError){throw e} 后
+        // Error 落进 catch(Throwable) 被重新包装，异常消息可观察改变）。
+        // catch 匹配按序——更早的臂不受影响（它们本来就先匹配）。
+        let catch_slots: Vec<usize> = ch
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| lang.kind(c) == NodeKind::Catch)
+            .map(|(i, _)| i)
+            .collect();
+        for &slot in &catch_slots {
+            let c = ch[slot];
+            if !rethrow_only(c) {
+                continue;
             }
+            let later_all_rethrow = catch_slots
+                .iter()
+                .filter(|&&s2| s2 > slot)
+                .all(|&s2| rethrow_only(ch[s2]));
+            if !later_all_rethrow {
+                continue;
+            }
+            return Some(Edit::Splice {
+                node: id,
+                index: slot,
+                remove: 1,
+                insert: vec![],
+            });
         }
         None
     }
@@ -3548,6 +3600,10 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
         }
     }
 
+    // 单元级 String 身份比较标志（new String(lit) 解包守卫——字段 init
+    // 的观察点在其他方法，单根扫描看不见）
+    ast.unit_string_identity = ast.any_string_identity(&bodies);
+
     // 单 return 方法收集
     for ty in &unit.types {
         for m in &ty.members {
@@ -5587,7 +5643,10 @@ fn remove_dead_private_fields(ast: &JavaAst, unit: &mut CompilationUnit) -> usiz
         }
     }
     // 2) 删除（可变借用阶段；嵌套类型递归）：
-    //    先逐成员清理声明符（字面量 init 或无 init 且零引用），再删空成员
+    //    先逐成员清理声明符（字面量 init 或无 init 且零引用），再删空成员。
+    //    serialVersionUID / serialPersistentFields 是 JVM 序列化按名反射
+    //    读取的契约字段——「零源码引用」判据不适用（a9/a_ 抓获：删除后
+    //    SUID 退化为结构计算值，旧流反序列化 InvalidClassException）
     for_each_type_mut(unit, &mut |ty: &mut TypeDecl| {
         for m in ty.members.iter_mut() {
             if let Member::Field { mods, declarators, .. } = m {
@@ -5599,9 +5658,11 @@ fn remove_dead_private_fields(ast: &JavaAst, unit: &mut CompilationUnit) -> usiz
                 let dead: Vec<bool> = declarators
                     .iter()
                     .map(|d| {
+                        let reflective =
+                            d.name == "serialVersionUID" || d.name == "serialPersistentFields";
                         let init_ok =
                             d.init.map(|i| is_const_init(ast, i)).unwrap_or(true);
-                        init_ok && !referenced.contains(&d.name)
+                        !reflective && init_ok && !referenced.contains(&d.name)
                     })
                     .collect();
                 let before = declarators.len();

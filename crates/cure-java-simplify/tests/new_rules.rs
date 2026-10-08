@@ -1028,10 +1028,18 @@ fn rethrow_only_catch_unwrapped() {
     let out = run_src("class A{double m() throws E{try{if(d==0)return 0.0;}catch(E v){throw v;}return 1.0;}}");
     assert!(!out.contains("try"), "{out}");
     assert!(!out.contains("catch"), "{out}");
-    // 混合：只删重抛臂，真处理保留
+    // 混合 + 后续真 catch：重抛臂保留——删除会改变该类型的异常路由
+    //（E 与 R 的继承关系不可证；JavaInputAstViewer 抓获删
+    // catch(FormattingError) 后 Error 落进 catch(Throwable) 被包装）。
+    // 后续 catch 全为纯重抛时才可安全删除（重抛自身透明）
     let out = run_src("class A{void m(){try{f();}catch(E e){throw e;}catch(R r){log(r);}}}");
     assert!(out.contains("catch (R r)"), "{out}");
-    assert!(!out.contains("catch (E"), "{out}");
+    assert!(out.contains("catch (E e)"), "{out}");
+    // 末位重抛臂（其后无 catch）→ 可删，真处理臂保留。
+    //（两臂全重抛走整体剥壳——另行覆盖）
+    let out2 = run_src("class A{void m() throws R{try{f();}catch(E e){log(e);}catch(R r){throw r;}}}");
+    assert!(!out2.contains("catch (R r)"), "{out2}");
+    assert!(out2.contains("catch (E e)"), "{out2}");
 }
 
 #[test]
@@ -1686,4 +1694,80 @@ fn ternary_equal_branch_respects_type_payloads() {
     // 值等但原文不同的 NumRaw/Int 组合：既有保守行为是不折（允许）
     let out5 = run_src("class A{int m(boolean c){return c?0x1F:31;}}");
     assert!(out5.contains("return c ? 0x1F : 31;") || out5.contains("return 31;"), "{out5}");
+}
+
+// ---------------------------------------------------------------------------
+// 第 7 轮抽样修复（7 项）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rethrow_catch_removal_respects_later_catches() {
+    // 删 catch(FormattingError){throw e} 后该类型落进 catch(Throwable)
+    // 被重新包装——异常消息可观察改变（JavaInputAstVisitor 抓获）。
+    // 守卫：被删臂之后的所有 catch 也必须是纯重抛
+    let out = run_src(
+        "class A{String d(String s){return s;}String m(StringBuilder b){try{return b.toString();}catch(IllegalStateException e){throw e;}catch(Throwable t){throw new RuntimeException(d(t.getMessage()));}}}",
+    );
+    assert!(out.contains("catch (IllegalStateException e)"), "{out}");
+    assert!(out.contains("catch (Throwable t)"), "{out}");
+}
+
+#[test]
+fn new_string_unwrap_unit_level_identity_guard() {
+    // 字段 init 的 new String("lit") 解包——== 观察点在其他方法
+    //（单根扫描看不见）：txt == "hello" 曾 false→true
+    let out = run_src(
+        "class A{String txt=new String(\"hello\");boolean c(){return txt==\"hello\";}}",
+    );
+    assert!(out.contains("new String(\"hello\")"), "{out}");
+}
+
+#[test]
+fn qualified_new_with_type_args_roundtrip() {
+    // outer.new <TA>Inner(...)（构造器显式类型实参在类名前）
+    let out = run_src(
+        "class A{class Inner{Inner(String s){}}Object m(A a){return a.new Inner(\"x\").new <String>Inner(\"y\");}}",
+    );
+    assert!(out.contains(".new <String>Inner(\"y\")"), "{out}");
+}
+
+#[test]
+fn compound_assign_long_rhs_narrows() {
+    // JLS §15.26.2：byte b=100; b+=100L → (byte)200 = -56（L 值按目标
+    // 域截断——曾穿透成 L(200) 材料 201L，不可编译且值错）
+    let out = run_src(
+        "class A{static int f;static{int x=1;int y=2;int z=3;byte b=100;b+=100L;int r=b+1;f=r;}}",
+    );
+    assert!(out.contains("f = -55;"), "{out}");
+}
+
+#[test]
+fn int_compound_assign_long_rhs_wraps() {
+    // int i=1; i+=3000000000L → (int) 环绕 -1294967295（曾材料成
+    // 3000000001L 写 static int 不可编译）
+    let out = run_src(
+        "class A{static int f;static{int x=1;int y=2;int z=3;int i=1;i+=3000000000L;f=i;}}",
+    );
+    assert!(out.contains("f = -1294967295;"), "{out}");
+}
+
+#[test]
+fn narrow_decl_int_literal_not_inlined_into_call_args() {
+    // byte/short 域的 Int 字面量内联到调用实参位 = 非法收窄（JLS 常量
+    // 收窄仅限赋值上下文）→ 保守拒绝传播
+    let out = run_src(
+        "class A{static void eat(byte a,short b){}static void m(){byte b=127;short s=1023;eat(b,s);}}",
+    );
+    assert!(out.contains("eat(b, s);"), "{out}");
+}
+
+#[test]
+fn char_short_long_rhs_materialize_domains() {
+    // char c='a'; c+=1L → 'b'；short s=1000; s+=1L → 1001（逃逸材料化
+    // 的域保持——char 值发 Char 字面量，不发 98L）
+    let out = run_src(
+        "class A{static void eat(char c,short s){}static{int x=1;int y=2;int z=3;char c='a';c+=1L;short sh=1000;sh+=1L;String t=System.console()==null?null:null;eat(c,sh);}}",
+    );
+    assert!(out.contains("eat('b', ") || out.contains("eat(c, "), "{out}");
+    assert!(!out.contains("98L"), "{out}");
 }

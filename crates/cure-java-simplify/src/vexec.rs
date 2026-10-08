@@ -339,11 +339,16 @@ impl<'a> Exec<'a> {
     }
 
     fn coerce_decl(&self, v: VVal, ty: &JType) -> VVal {
-        // 声明窄化（char c = <int 字面量> 等）：I → char 域裁剪
+        // 声明窄化（char c = <int 字面量> 等）：I → char 域裁剪。
+        // L 值按声明域截断（long 声明除外——保持）
         match (v, ty) {
             (VVal::I(x), JType::Char) => VVal::I(x as u16 as i32),
             (VVal::I(x), JType::Byte) => VVal::I(x as i8 as i32),
             (VVal::I(x), JType::Short) => VVal::I(x as i16 as i32),
+            (VVal::L(x), JType::Char) => VVal::I(x as u16 as i32),
+            (VVal::L(x), JType::Byte) => VVal::I(x as i8 as i32),
+            (VVal::L(x), JType::Short) => VVal::I(x as i16 as i32),
+            (VVal::L(x), JType::Int) => VVal::I(x as i32),
             (v, _) => v,
         }
     }
@@ -355,13 +360,21 @@ impl<'a> Exec<'a> {
             NodeData::VarRef { .. } => {
                 let k = self.key(target)?;
                 if self.scopes.iter().any(|sc| sc.contains(&k)) {
-                    // 按声明域收窄（JLS 复合赋值：byte b=100; b+=100 → -56）
-                    let v = match self.var_width.get(&k) {
-                        Some(&w) if w != 0 => match v {
-                            VVal::I(x) => VVal::I(narrow(x, w)),
-                            other => other,
-                        },
-                        _ => v,
+                    // 按声明域收窄（JLS 复合赋值/赋值的隐式收窄）。
+                    // L 值必须按目标域截断：`byte b=100; b+=100L` →
+                    // (byte)200 = -56；`int i; i+=3000000000L` → (int)…
+                    //（边界攻击 t04e/t04i 抓获：L 曾直接穿透成 L(200)，
+                    // 材料化 201L 不可编译且值错——原程序 -55）
+                    let w = self.var_width.get(&k).copied().unwrap_or(0);
+                    let v = match (w, v) {
+                        // long 域（5）保持
+                        (5, v) => v,
+                        // int 域（0）：L → I 截断
+                        (0, VVal::L(x)) => VVal::I(x as i32),
+                        // 窄域（2/3/4）：I 收窄；L 先 as i32 再收窄
+                        (wn, VVal::I(x)) if wn != 0 => VVal::I(narrow(x, wn)),
+                        (wn, VVal::L(x)) if wn != 0 => VVal::I(narrow(x as i32, wn)),
+                        (_, v) => v,
                     };
                     self.vars.insert(k, v);
                     Ok(Flow::Normal)

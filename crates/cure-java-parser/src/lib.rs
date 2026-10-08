@@ -2544,10 +2544,21 @@ impl<'src> Parser<'src> {
                         // `recv.new Inner(args)`；效果=Call（保守 Unknown）；
                         // 成员名带空格不会与真实标识符冲突，规则不误匹配。
                         self.bump();
+                        // 构造器显式类型实参（JLS 15.9：new <TA> Name(…)）
+                        // 在类名**之前**（InputUnusedLocalVariableNested
+                        // Classes3 抓获：`new <String>InnerInner3` 曾因
+                        // 期待 Ident 遇 < 而 break——第二个 .new 丢失，
+                        // 输出不可编译）
+                        let mut ta_prefix = String::new();
+                        if self.at_punct("<") {
+                            if let Some(ta) = self.type_args_raw() {
+                                ta_prefix = ta;
+                            }
+                        }
                         let Tok::Ident(cls) = &self.tok().tok else {
                             break;
                         };
-                        let mut mname = format!("new {cls}");
+                        let mut mname = format!("new {}{cls}", ta_prefix);
                         self.bump();
                         if self.at_punct("<") {
                             if let Some(ta) = self.type_args_raw() {

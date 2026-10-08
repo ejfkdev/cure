@@ -250,6 +250,11 @@ pub struct JavaAst {
     /// String 引用身份比较缓存：(root, 结果)。prepare() 清空（树已变），
     /// 首次查询时计算——供 new String(lit) 等折叠守卫复用（每轮至多一次全扫）。
     string_identity: std::cell::Cell<Option<(JavaId, bool)>>,
+    /// **单元级** String 身份比较存在标志（collect_unit_consts 每轮重算）。
+    /// new String(lit) 解包为池化字面量会翻转任何 == 观察点——字段 init
+    /// 解包的观察点在**其他方法**里（InputNoWhitespaceAfterWithEmoji 抓获
+    /// 合成证实：a == "hello" false→true），单根扫描看不见 → 单元级守卫。
+    pub unit_string_identity: bool,
     /// 名字 intern 表 + 节点名字键（cure-tree `NameTable`；本语言
     /// `Lang::NameKey = u32` intern id）。单元级持久、只增；prepare
     /// 增量扩展新节点，既有节点键与其名字恒同。
@@ -730,6 +735,17 @@ impl JavaAst {
     /// 折叠守卫用：new String(lit)/常量链等产出池化字面量会改变 == 语义。
     /// 结果按 (root, prepare 代次) 缓存——prepare 每次改树后清空，
     /// 首次查询全扫一次，同轮内所有守卫调用复用。
+    /// 多根扫描：任一根存在 String 身份比较。
+    pub fn any_string_identity(&self, roots: &[JavaId]) -> bool {
+        roots.iter().any(|&r| {
+            let hit = Self::scan_string_identity(self, r);
+            if hit {
+                self.string_identity.set(Some((r, true)));
+            }
+            hit
+        })
+    }
+
     pub fn has_string_identity_compare(&self, root: JavaId) -> bool {
         if let Some((r, v)) = self.string_identity.get() {
             if r == root {
