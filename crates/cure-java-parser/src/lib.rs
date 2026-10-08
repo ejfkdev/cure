@@ -261,7 +261,55 @@ impl<'src> Parser<'src> {
     fn consume_when_guard(&mut self) {
         if self.at_kw("when") && !self.peek(1).is_punct("->") {
             self.bump();
-            let _ = self.parse_expr(PREC_TERNARY);
+            // 守卫表达式内 λ 合法（`case Integer i when list.stream()
+            // .anyMatch(x -> x < i)`——ES/WG 复现：in_case_label=true
+            // 使主表达式解析把 `x ->` 当 switch 箭头拒绝 → 解析失败风暴
+            // → 恢复期重组毁文件）。临时解除标记。
+            // 但守卫后的 `->`（case 体）不能再被当 λ 箭头误吃——
+            // CP5 复现：`(o instanceof String) -> {}` 被解析为 λ。
+            // 对策：λ 允许，但完成后若停在 `->` 之前的表达式边界，
+            // 由收尾判定接管；被括号包裹的守卫走平衡跳过（原文保真，
+            // 语义不触碰——raw 标签由上层 text_of 拼回）
+            let save = self.pos;
+            if self.at_punct("(") {
+                // 括号化守卫：平衡扫描（含嵌套 λ 的箭头/花括号）——
+                // 保守整段原文
+                let _ = self.skip_balanced("(", ")");
+            } else {
+                // 守卫表达式：**前哨扫描**到本 case 的收尾 `->` / `:`
+                //（不在嵌套 ()/<>/{}/[] 内）——不区分裸标识符/二元/λ
+                //（DeconstructionDesugaring 的 `((int) o1) == 0 && …` /
+                // GuardsErrors 的 `i == check` / WG 的 λ 形态全覆盖；
+                // 原文保真——语义不触碰，标签 raw 由上层 text_of 拼回）
+                let mut depth = 0i32;
+                let mut guard = 0usize;
+                while !self.at_eof() && guard < 100_000 {
+                    guard += 1;
+                    let t = self.tok().clone();
+                    match &t.tok {
+                        Tok::Punct(p) => match *p {
+                            // 只追踪 ()/{}——< > 在守卫里几乎总是比较
+                            // 运算符（`x < i` 曾虚假加深度使收尾箭头
+                            // 永不停——WG 复现）
+                            "(" | "{" | "[" => depth += 1,
+                            ")" | "}" | "]" => {
+                                if depth == 0 {
+                                    break; // 守卫意外闭合——上层回退
+                                }
+                                depth -= 1;
+                            }
+                            "->" | ":" if depth == 0 => break,
+                            _ => {}
+                        },
+                        Tok::Ident(k) if depth == 0 && (*k == "case" || *k == "default") => {
+                            break; // 下一标签——守卫已空/失败
+                        }
+                        _ => {}
+                    }
+                    self.bump();
+                }
+            }
+            let _ = save;
         }
     }
 
@@ -2803,9 +2851,17 @@ impl<'src> Parser<'src> {
                         // 打印约定：无维度时纯方法名（打印机自打 ::）；带维度
                         // 时 "[]::m"（维度在 :: 前——打印机按 find("::") 切分）
                         let name = if dims.is_empty() {
-                            format!("{ta}{m}")
+                            // 无维度：TA 丢弃（`ArrayList<String>::new` →
+                            // `ArrayList::new`——类型实参由目标类型推断，
+                            // 与 H1 witness 同一权衡；保留曾打印出
+                            // `recv::<String>new` 无维度错位形态不可编译）
+                            format!("{m}")
                         } else {
-                            format!("{dims}::{ta}{m}")
+                            // `T<?>[]::new`：TA 属于类型侧（维度前）——
+                            // 打印器按 find("::") 切分后 recv+前段 =
+                            // `T<?>[]`（ES NodeConstruction 抓获：曾拼成
+                            // []::<?>new → `T[]::<?>new` 不可编译）
+                            format!("{ta}{dims}::{m}")
                         };
                         e = self.ast.method_ref(e, &name);
                         continue;

@@ -202,7 +202,20 @@ fn lit_value_eq(x: &Lit, y: &Lit) -> bool {
             Lit::TextBlock(_) => return None,
         })
     }
-    matches!(r(x), Some(rx) if Some(rx) == r(y))
+    // ±0.0 位模式区分（IEEE == 视相等但 1/x 符号不同——ES
+    // StripeStatsHarvesterTests 抓获：b ? 0.0 : -0.0 曾折成 0.0）
+    match (r(x), r(y)) {
+        (Some(rx), Some(ry)) => {
+            if let (LitRef::Double(a), LitRef::Double(b)) = (rx, ry) {
+                return a == b && a.is_sign_negative() == b.is_sign_negative();
+            }
+            if let (LitRef::Float(a), LitRef::Float(b)) = (rx, ry) {
+                return a == b && a.is_sign_negative() == b.is_sign_negative();
+            }
+            rx == ry
+        }
+        _ => false,
+    }
 }
 
 /// 同名同元数方法候选（no-op 调用消解用）。

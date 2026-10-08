@@ -1137,13 +1137,15 @@ impl<'a> Printer<'a> {
                     self.out.push('(');
                 }
                 self.expr(recv, prec::POSTFIX);
-                // 数组类型方法引用：name 形如 "[]::new"/"[][]::m"——
-                // 维度属接收方类型（T[]::new），须在 :: 之前输出
-                let (dims, rest) = match name.find("::") {
-                    Some(i) if name.starts_with("[]") => (&name[..i], &name[i + 2..]),
-                    _ => ("", name),
+                // 数组类型方法引用：name 形如 "[]::new"/"<?>[]::new"/
+                // "[][]::m"——前段（TA+维度）属接收方类型侧
+                //（T<?>[]::new），在 :: 之前输出（ES NodeConstruction
+                // 抓获：T[]::<?>new 不可编译）
+                let (front, rest) = match name.find("::") {
+                    Some(i) => (&name[..i], &name[i + 2..]),
+                    None => ("", name),
                 };
-                self.out.push_str(dims);
+                self.out.push_str(front);
                 self.out.push_str("::");
                 self.out.push_str(rest);
                 if need {

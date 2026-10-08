@@ -1606,12 +1606,23 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
                     _ => break,
                 }
             }
-            // 循环变量类型：从可迭代对象的声明类型推导（ArrayList<String>→String，
-            // 裸类型→Object）。元素为 Object 时【保留 Cast】（裸集合上
-            // for (String e : raw) 非法，必须 for (Object e) + (String) e）
-            let elem = match lang.var_type(iterable) {
-                Some(t) => generic_elem_ty(t).unwrap_or(JType::Ref("Object".into())),
-                None => JType::Ref("Object".into()),
+            // 循环变量类型推导（三源优先级）：
+            // 1) **迭代器声明类型的泛型实参**（`Iterator<ByteArrayWrapper> it`
+            //    → ByteArrayWrapper——最可靠：声明即约束，jedis JedisByteMap
+            //    抓获：曾退化成 Object → e.data 编译错误，38 处/28 文件）
+            // 2) 可迭代对象的元素类型（ArrayList<String>→String，裸类型→Object）
+            // 元素为 Object 时【保留 Cast】（裸集合上 for (String e : raw) 非法，
+            // 必须 for (Object e) + (String) e）
+            let it_decl_elem = match lang.data(decl) {
+                NodeData::VarDecl { ty, .. } => generic_elem_ty(ty),
+                _ => None,
+            };
+            let elem = match it_decl_elem {
+                Some(t) => t,
+                None => match lang.var_type(iterable) {
+                    Some(t) => generic_elem_ty(t).unwrap_or(JType::Ref("Object".into())),
+                    None => JType::Ref("Object".into()),
+                },
             };
             let elem = if for_each_elem_ok(&elem) {
                 elem
@@ -3622,7 +3633,47 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
 
     // 单元级 String 身份比较标志（new String(lit) 解包守卫——字段 init
     // 的观察点在其他方法，单根扫描看不见）
-    ast.unit_string_identity = ast.any_string_identity(&bodies);
+    // 同一性断言方法名（assertNotSame/assertSame/isSameInstanceAs/
+    // isNotSameInstanceAs——guava/mockito 测试框架的实例同一性断言：
+    // new String("a") 折叠会翻转断言结果——ConcurrentHashMultisetTest
+    // testIdentityKeyEquality 抓获）→ new String 折叠拒绝
+    {
+        let identity_assert = [
+            "assertSame",
+            "assertNotSame",
+            "isSameInstanceAs",
+            "isNotSameInstanceAs",
+            "referenceEquals",
+            "same",
+        ];
+        let mut hit = false;
+        for root in &bodies {
+            let mut stack = vec![*root];
+            while let Some(n) = stack.pop() {
+                if let NodeData::Call = ast.data(n) {
+                    if let Some(&callee) = ast.children(n).first() {
+                        let nm = match ast.data(callee) {
+                            NodeData::Member { name } => ast.sn(*name),
+                            NodeData::VarRef { name } => ast.sn(*name),
+                            _ => "",
+                        };
+                        if identity_assert.contains(&nm) {
+                            hit = true;
+                            break;
+                        }
+                    }
+                }
+                for &c in ast.children(n) {
+                    stack.push(c);
+                }
+            }
+            if hit {
+                break;
+            }
+        }
+        ast.unit_string_identity =
+            ast.any_string_identity(&bodies) || hit;
+    }
 
     // 单 return 方法收集（仅**不可覆写**方法：private/static/final——
     // UIAction.accept 抓获：protected 单 return 方法被子类覆写，
@@ -5421,6 +5472,101 @@ fn collect_anon_and_string_names(
 // 传递性死代码：迭代到不动点（删一层后重收集引用）。
 // ---------------------------------------------------------------------------
 
+/// **死码分析统一超集扫描**：单元内对「引用扫描不可见域」的全量兜底。
+/// 覆盖（第 9 轮 dead-code 全审 761 处悬空的 6 类根因）：
+///   - NodeData::Raw 文本（语句级注解 → Raw：guava TypeToken 34 个
+///     悬空方法主因）
+///   - New{anon_raw} 匿名类体（局部类调用：grpc 15 个方法）
+///   - 成员 mods 注解实参（@Method("name") 按名反射 / @MethodSource）
+///   - 枚举常量原文（guava CaseFormat 等调用在枚举体）
+///   - ForEach 元素类型（import 悬空 383 例）
+///   - NewArray 数组类型（import 悬空）
+///   - 方法级 ty_params 泛型界（jspecify @Nullable 90 例）
+///   - 字符串字面量（反射按名查找）
+/// 返回：名字出现集（保守超集——名字出现在任何不可见域即视作引用）
+fn collect_all_blind_refs(
+    ast: &JavaAst,
+    unit: &CompilationUnit,
+) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = Default::default();
+    let mut split_into = |text: &str, out: &mut std::collections::HashSet<String>| {
+        for id in text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+            if !id.is_empty() {
+                out.insert(id.to_string());
+            }
+        }
+    };
+    // 1) AST 节点层：Raw / anon_raw / 字符串字面量 / ForEach ty / NewArray ty
+    let mut bodies: Vec<JavaId> = Vec::new();
+    for_each_type(unit, &mut |ty| collect_member_roots(ty, &mut bodies));
+    for root in bodies {
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            match ast.data(n) {
+                NodeData::Raw { text } => split_into(text, &mut out),
+                NodeData::New { anon_raw: Some(raw), .. } => split_into(raw, &mut out),
+                NodeData::Literal(Lit::Str(text)) => split_into(text, &mut out),
+                // ForEach 元素类型（类型名在节点数据不在孩子）
+                NodeData::ForEach { ty, .. } => {
+                    collect_ty_idents(ty, &mut out);
+                }
+                // NewArray 数组创建类型
+                NodeData::NewArray { ty, .. } => {
+                    collect_ty_idents(ty, &mut out);
+                }
+                _ => {}
+            }
+            for &c in ast.children(n) {
+                stack.push(c);
+            }
+        }
+    }
+    // 2) 结构层：成员 mods 注解实参 / 枚举常量原文 / 方法级 ty_params /
+    //    record 组件头
+    for_each_type(unit, &mut |ty: &TypeDecl| {
+        collect_mods_idents_all(&ty.mods, &mut out);
+        for e in &ty.enum_constants {
+            split_into(e, &mut out);
+        }
+        split_into(&ty.ty_params, &mut out);
+        split_into(&ty.header, &mut out);
+        for m in &ty.members {
+            match m {
+                Member::Method { mods, ty_params, params, .. }
+                | Member::Constructor { mods, ty_params, params, .. } => {
+                    collect_mods_idents_all(mods, &mut out);
+                    split_into(ty_params, &mut out);
+                    for p in params {
+                        collect_mods_idents_all(&p.mods, &mut out);
+                        collect_ty_idents(&p.ty, &mut out);
+                    }
+                }
+                Member::Field { mods, declarators, .. } => {
+                    collect_mods_idents_all(mods, &mut out);
+                    // 注意：字段**声明名**不进 blind 集（自己删自己永真）
+                    let _ = declarators;
+                }
+                Member::Type(t) => {
+                    let _ = t; // for_each_type 已递归
+                }
+                _ => {}
+            }
+        }
+    });
+    out
+}
+
+/// mods 全文本切分（含注解实参——@Method(METHOD_NAME) 常量引用 /
+/// @MethodSource("name") 按名反射——dubbo MethodConfigTest 34 个
+/// 悬空字段主因）。
+fn collect_mods_idents_all(mods: &str, out: &mut std::collections::HashSet<String>) {
+    for id in mods.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
+        if !id.is_empty() {
+            out.insert(id.to_string());
+        }
+    }
+}
+
 /// JVM/库按名反射调用的回调方法（序列化机制等）——零句法调用者是
 /// 正常形态，删除即语义破坏（IteratorWildcard 抓获：writeObject 删除
 /// 失去串行化同步与权限预检）。
@@ -5438,6 +5584,11 @@ fn remove_dead_private_methods(ast: &JavaAst, unit: &mut CompilationUnit) -> usi
     let mut removed = 0usize;
     // 匿名类体/字符串字面量中出现的名字（引用扫描不可见域）
     let anon_names = collect_anon_and_string_names(ast, unit);
+    // **超集盲扫**：Raw 文本/枚举体/注解实参/局部类等对句法引用扫描
+    // 不可见的域（第 9 轮全审 34 个悬空方法的 6 类根因——guava
+    // TypeToken 的 @SuppressWarnings 局部声明、grpc 局部类体、
+    // rocketmq record 变量名、guava 枚举常量体调用）
+    let blind = collect_all_blind_refs(ast, unit);
     loop {
         // 1) 全单元引用（不可变借用阶段）：(名字, 实参个数) 精确到元数
         //    （非 varargs 下元数=形参数是过载解析的硬约束——bd.java 的
@@ -5479,6 +5630,7 @@ fn remove_dead_private_methods(ast: &JavaAst, unit: &mut CompilationUnit) -> usi
                         // getMethod 按名查找）或匿名类体 → 保守保留
                         || REFLECTIVE_MAGIC_METHODS.contains(&name.as_str())
                         || anon_names.contains(name)
+                        || blind.contains(name)
                         || referenced.contains(&(name.clone(), params.len()));
                     keep
                 } else {
@@ -5631,6 +5783,9 @@ fn collect_noop_private_methods(ast: &mut JavaAst, unit: &CompilationUnit) {
             }
         }
     });
+    // 超集盲扫否决（Raw 文本/枚举体/注解实参里的方法名引用——
+    // no-op 删除后这些域的调用会悬空）
+    let blind = collect_all_blind_refs(ast, unit);
     // MethodRef（this::m / A::m）：绑定元数不可判定 → 名字否决
     //（否则 no-op 调用删除先行，引用悬空）
     let mut roots: Vec<JavaId> = Vec::new();
@@ -5649,7 +5804,7 @@ fn collect_noop_private_methods(ast: &mut JavaAst, unit: &CompilationUnit) {
         }
     }
     for (name, arities) in by_name {
-        if veto.contains(&name) {
+        if veto.contains(&name) || blind.contains(&name) {
             continue;
         }
         ast.noop_private_methods.insert(name, arities);
@@ -5742,6 +5897,12 @@ fn remove_unused_imports(ast: &JavaAst, unit: &mut CompilationUnit) -> usize {
                 stack.push(c);
             }
         }
+    }
+    // 1.5) 超集盲扫（Raw/枚举体/注解实参/ForEach ty/NewArray ty/
+    //      方法级 ty_params——657 个悬空 import 的根因。idents 是
+    //      「使用的名字」超集方向，直接并入）
+    for name in collect_all_blind_refs(ast, unit) {
+        idents.insert(name);
     }
     // 2) 结构字符串（mods/注解原文、泛型参数、extends/implements/throws、
     //    方法/类型名——字段/参数/返回类型）
@@ -5870,6 +6031,9 @@ fn remove_dead_private_fields(ast: &JavaAst, unit: &mut CompilationUnit) -> usiz
     let mut removed = 0usize;
     // 匿名类体/字符串字面量名字（引用扫描不可见）
     let anon_names = collect_anon_and_string_names(ast, unit);
+    // 超集盲扫（68 个悬空字段根因：mods 注解实参 @Method(METHOD_NAME)、
+    // 枚举体 .add(SHORT_NAME)、Raw 文本局部类）
+    let blind = collect_all_blind_refs(ast, unit);
     // 1) 全单元字段名引用（值位置）
     let mut referenced: HashSet<String> = HashSet::new();
     let mut bodies: Vec<JavaId> = Vec::new();
@@ -5946,6 +6110,7 @@ fn remove_dead_private_fields(ast: &JavaAst, unit: &mut CompilationUnit) -> usiz
                             && init_ok
                             && !referenced.contains(&d.name)
                             && !anon_names.contains(&d.name)
+                            && !blind.contains(&d.name)
                     })
                     .collect();
                 let before = declarators.len();

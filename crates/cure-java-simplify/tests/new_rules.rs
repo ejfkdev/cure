@@ -1811,3 +1811,78 @@ fn nested_kill_in_bare_block_not_statement_deleted() {
     assert!(out.contains("work();"), "{out}");
     assert!(out.contains("f = false;"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// 第 9 轮（GitHub 16 库新语料）修复回归
+// ---------------------------------------------------------------------------
+
+#[test]
+fn when_guard_sentinel_forms_all_parse() {
+    // λ / 括号化 / 裸标识符 / 比较运算 / 多行——前哨扫描统一处理
+    let src = r#"class WG {
+        String m(Object expr) {
+            return switch (expr) {
+                case Integer i when List.of(1,2).stream().anyMatch(x -> x < i) -> "lam";
+                case String s when (s instanceof String) -> "paren";
+                case Object rp when consult -> "bare";
+                case Number n when n.intValue() < 64 -> "cmp";
+                default -> "other";
+            };
+        }
+        int consult = 1;
+    }"#;
+    let out = run_src(src);
+    assert!(out.contains("anyMatch(x -> x < i)"), "{out}");
+    assert!(out.contains("when (s instanceof String)"), "{out}");
+    assert!(out.contains("when consult"), "{out}");
+    assert!(out.contains("when n.intValue() < 64"), "{out}");
+}
+
+#[test]
+fn iterator_element_type_from_declaration() {
+    // jedis JedisByteMap 抓获：元素类型曾退化 Object → e.data 编译错误。
+    // 迭代器声明类型的泛型实参是最可靠来源
+    let out = run_src(
+        "class A{class W{byte[] data;}java.util.Map<W,Object> m=new java.util.HashMap<>();void k(java.util.Set<W> s){java.util.Iterator<W> it=m.keySet().iterator();while(it.hasNext()){s.add(it.next().data);}}}",
+    );
+    assert!(out.contains("for (W e : m.keySet())"), "{out}");
+    assert!(out.contains("e.data"), "{out}");
+}
+
+#[test]
+fn signed_zero_not_folded_in_ternary() {
+    // IEEE == 视 ±0.0 相等但位模式不同（1/x 符号）——两支不同零不折
+    let out = run_src(
+        "class A{double m(boolean b){return b ? 0.0 : -0.0;}double n(boolean b){return b ? -0.0 : 0.0;}}",
+    );
+    assert!(out.contains("b ? 0.0 : -0.0;"), "{out}");
+    assert!(out.contains("b ? -0.0 : 0.0;"), "{out}");
+}
+
+#[test]
+fn identity_assert_blocks_new_string_unwrap() {
+    // assertNotSame/assertSame/isSameInstanceAs 等同一性断言在场 →
+    // new String("a") 不折叠（guava testIdentityKeyEquality 抓获）
+    let out = run_src(
+        "class A{void t(){String s1=new String(\"a\");String s2=new String(\"a\");org.junit.Assert.assertNotSame(s1,s2);}}",
+    );
+    assert!(out.contains("new String(\"a\")"), "{out}");
+}
+
+#[test]
+fn dead_code_blind_refs_cover_raw_and_annotations() {
+    // 语句级注解→Raw 的调用 / mods 注解实参常量 / 枚举体调用——盲扫覆盖
+    let out = run_dead(
+        "class A{private int helper(int y){return y;}void m(){@SuppressWarnings(\"x\")int r=helper(1);System.out.println(r);}}",
+    );
+    assert!(out.contains("helper"), "{out}");
+    // mods 注解实参常量引用：@Method(METHOD_NAME) 的 METHOD_NAME 不删
+    let out2 = run_dead(
+        "class B{private static final int METHOD_NAME=1;@Method(name=METHOD_NAME) void t(){}}",
+    );
+    assert!(out2.contains("METHOD_NAME"), "{out2}");
+    let out3 = run_dead(
+        "enum C{A{void x(){work();}};private void work(){}}",
+    );
+    assert!(out3.contains("work"), "{out3}");
+}
