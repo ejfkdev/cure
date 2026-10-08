@@ -1771,3 +1771,40 @@ fn char_short_long_rhs_materialize_domains() {
     assert!(out.contains("eat('b', ") || out.contains("eat(c, "), "{out}");
     assert!(!out.contains("98L"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// 第 7 轮代理 1（payload 验证）抓获的 2 个先存 bug
+// ---------------------------------------------------------------------------
+
+#[test]
+fn user_class_named_string_not_folded() {
+    // ends_with(".String") 过匹配：com.sun...operations.String 是
+    // UnaryOperation 子类（XSLTC Compiler 抓获：曾折成 "" 注入需要
+    // UnaryOperation 的形参位）——只认 String/java.lang.String
+    let out = run_src(
+        "class A{static class String{}Object m(){return new A.String();}}",
+    );
+    assert!(out.contains("new A.String();"), "{out}");
+}
+
+#[test]
+fn nested_kill_in_do_while_not_statement_deleted() {
+    // 嵌套击杀不得删外层整条语句（RealTimeSequencer.pump() 的 133 行
+    // do-while 曾被整删成 3 行 return false——JDK 语料 ≥9 文件）
+    let out = run_src(
+        "class A{static boolean f=true;static void run(boolean c){f=true;do{f=false;work();}while(c);}}",
+    );
+    assert!(out.contains("do {"), "{out}");
+    assert!(out.contains("while (c);"), "{out}");
+    assert!(out.contains("work();"), "{out}");
+}
+
+#[test]
+fn nested_kill_in_bare_block_not_statement_deleted() {
+    // 裸块 {work(); f=false;}——f 的击杀写曾连带 work() 调用一起删
+    let out = run_src(
+        "class A{static int n;static boolean f=true;static void run(){f=true;{work();f=false;}n=1;}}",
+    );
+    assert!(out.contains("work();"), "{out}");
+    assert!(out.contains("f = false;"), "{out}");
+}

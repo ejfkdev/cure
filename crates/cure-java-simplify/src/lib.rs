@@ -149,7 +149,7 @@ impl Rule<JavaAst> for StringBuilderFold {
                     return None;
                 }
                 NodeData::New { ty, .. } => {
-                    let is_sb = matches!(ty, JType::Ref(n) if n == "StringBuilder" || n == "java.lang.StringBuilder" || n.ends_with(".StringBuilder"));
+                    let is_sb = matches!(ty, JType::Ref(n) if n == "StringBuilder" || n == "java.lang.StringBuilder");
                     if !is_sb {
                         return None;
                     }
@@ -567,7 +567,7 @@ impl Rule<JavaAst> for NewStringFold {
         let NodeData::New { ty, .. } = lang.data(id) else {
             return None;
         };
-        if !matches!(ty, JType::Ref(n) if n == "String" || n == "java.lang.String" || n.ends_with(".String")) {
+        if !matches!(ty, JType::Ref(n) if n == "String" || n == "java.lang.String") {
             return None;
         }
         // 折叠产出池化字面量，改变 String 引用身份 → 守卫（单元级：
@@ -621,7 +621,7 @@ impl Rule<JavaAst> for NewStringCharArrayFold {
         let NodeData::New { ty, .. } = lang.data(id) else {
             return None;
         };
-        if !matches!(ty, JType::Ref(n) if n == "String" || n.ends_with(".String")) {
+        if !matches!(ty, JType::Ref(n) if n == "String" || n == "java.lang.String") {
             return None;
         }
         let _ = root;
@@ -1864,7 +1864,7 @@ impl Rule<JavaAst> for StringBuilderStatements {
         let sb_new = lang.children(ic[0])[0];
         let (ctor_arg, a0) = match lang.data(sb_new) {
             NodeData::New { ty, .. } => {
-                let is_sb = matches!(ty, JType::Ref(n) if n == "StringBuilder" || n == "java.lang.StringBuilder" || n.ends_with(".StringBuilder"));
+                let is_sb = matches!(ty, JType::Ref(n) if n == "StringBuilder" || n == "java.lang.StringBuilder");
                 if !is_sb {
                     return None;
                 }
@@ -2700,7 +2700,7 @@ impl Rule<JavaAst> for Base64NewStringFold {
         let NodeData::New { ty, .. } = lang.data(id) else {
             return None;
         };
-        if !matches!(ty, JType::Ref(n) if n == "String" || n.ends_with(".String")) {
+        if !matches!(ty, JType::Ref(n) if n == "String" || n == "java.lang.String") {
             return None;
         }
         // 折叠产出池化字面量，改变 String 引用身份 → 守卫

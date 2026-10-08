@@ -2980,6 +2980,22 @@ impl<L: Lang> Rule<L> for StoreKill {
             }
         }
         let (si, kill_assign) = killed_by?;
+        // 击杀语句级守卫：击杀赋值必须就是**顶层语句本身**（或其
+        // ExprStmt 包裹）。嵌套击杀（do-while 体/裸块/for-init 里的写）
+        // 曾按 stmts[si] 删整条外层语句——连兄弟副作用一起删
+        //（RealTimeSequencer.pump() 的 133 行 do-while 曾被整删成
+        // 3 行；ConstantPool.writeTags 双 for+switch 全删——JDK 语料
+        // ≥9 文件）。同语句内击杀点之后的读也无法用语句级窗口证明
+        // 不可达 → 保守拒绝嵌套击杀（顶层击杀不受影响）
+        {
+            let kill_container = match walk.parents.get(&kill_assign) {
+                Some(&(p, _)) if lang.kind(p) == NodeKind::ExprStmt => p,
+                _ => kill_assign,
+            };
+            if kill_container != stmts[si] {
+                return None;
+            }
+        }
         // 异常窗口守卫：被击杀点到击杀点之间的语句若可能抛（效果 >
         // MayRead），异常路径会绕过击杀点直达 finally/catch——后者可能
         // 在「中间值」状态读到本变量（finally-flag 恢复模式：
