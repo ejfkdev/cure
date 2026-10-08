@@ -1318,6 +1318,13 @@ impl Lang for JavaAst {
             _ => None,
         }
     }
+    fn member_name(&self, id: JavaId) -> Option<&str> {
+        match self.data(id) {
+            NodeData::Member { name } => Some(self.sn(*name)),
+            NodeData::MethodRef { name } => Some(self.sn(*name)),
+            _ => None,
+        }
+    }
     fn assign_op(&self, id: JavaId) -> Option<BinOp> {
         match self.data(id) {
             NodeData::Assign { op } => *op,

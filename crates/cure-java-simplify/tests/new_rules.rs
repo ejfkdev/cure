@@ -1514,3 +1514,48 @@ fn final_reassign_in_rest_still_bails() {
     assert!(v_count <= 1, "{out}");
     assert!(out.contains("c = \"W\";"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// 审查代理 4 抓获的两 bug 回归锁定
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ternary_equal_branch_respects_member_names() {
+    // x.m1() 与 x.m2()：同接收方不同成员名 → 不得判结构相等折叠。
+    // Types.java Rewriter.high 抓获：`high ? syms.objectType : syms.botType`
+    // 曾被 ternary_fold 的 c?a:a 分支删成恒真——静态删除活分支
+    let out = run_src(
+        "class A{String m(Object o, boolean c){return c ? o.hashCode() : o.toString();}}",
+    );
+    assert!(out.contains("o.hashCode() : o.toString()"), "{out}");
+    // 正向对照：成员名相同才折
+    let out2 = run_src(
+        "class A{String m(Object o, boolean c){return c ? o.toString() : o.toString();}}",
+    );
+    assert!(out2.contains("o.toString();"), "{out2}");
+    assert!(!out2.contains("?"), "{out2}");
+    // 字段成员同理：x.f 与 x.g 不折
+    let out3 = run_src(
+        "class A{int m(A x, boolean c){return c ? x.f : x.g;}}",
+    );
+    assert!(out3.contains("x.f : x.g"), "{out3}");
+}
+
+#[test]
+fn lone_surrogate_roundtrip_preserved() {
+    // 词法层哨兵 + 打印还原："\ud800" 往返不损坏（此前 unwrap_or(FFFD)
+    // 静吞——InputAvoidEscapedUnicodeCharacters 的 2048 个 surrogate
+    // 转义曾折成 FFFD）
+    let out = run_src("class A{String s=\"\\ud800\";String t=\"\\udfff\";char c='\\ud800';}");
+    assert!(out.contains("\\uD800"), "{out}");
+    assert!(out.contains("\\uDFFF"), "{out}");
+    assert!(!out.contains('\u{fffd}'), "{out}");
+}
+
+#[test]
+fn lone_surrogate_concat_folds_correctly() {
+    // 拼接折叠：转义文本级拼接语义正确（lone surrogate + x / 代理对）
+    let out = run_src("class A{String a=\"\\ud800\"+\"x\";String b=\"\\ud800\"+\"\\udfff\";}");
+    assert!(out.contains("\"\\uD800x\""), "{out}");
+    assert!(out.contains("\"\\uD800\\uDFFF\""), "{out}");
+}

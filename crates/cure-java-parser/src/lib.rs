@@ -102,10 +102,17 @@ fn build_decoded(src: &str, b: &[u8], first: usize) -> String {
             && b[k..k + 4].iter().all(|c| c.is_ascii_hexdigit());
         if eligible {
             let hex = &src[k..k + 4];
-            let decoded = u32::from_str_radix(hex, 16)
-                .ok()
-                .and_then(char::from_u32)
-                .unwrap_or('\u{fffd}');
+            let v = u32::from_str_radix(hex, 16).unwrap_or(0xfffd);
+            // lone surrogate（U+D800–DFFF）：Rust char 不可表示。映射到
+            // 15 号专用区哨兵（U+F0000 + 偏移，实践中永不冲突），打印机
+            // 侧还原为 \uXXXX 转义——往返保真（此前 unwrap_or(FFFD)
+            // 静默损坏，InputAvoidEscapedUnicodeCharacters 抓获：
+            // 2048 个 surrogate 转义折成 FFFD）
+            let decoded = if (0xd800..=0xdfff).contains(&v) {
+                char::from_u32(0xf0000 + (v - 0xd800)).unwrap_or('\u{fffd}')
+            } else {
+                char::from_u32(v).unwrap_or('\u{fffd}')
+            };
             out.push_str(&src[copy..run_start]); // 逃逸前的原文
             // 前 run-1 个 \ 原样保留（\ 对 = 转义反斜杠），\uXXXX → 解码字符
             for _ in 0..run - 1 {

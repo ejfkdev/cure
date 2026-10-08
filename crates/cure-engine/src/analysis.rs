@@ -118,6 +118,12 @@ pub fn structurally_equal<L: Lang>(lang: &L, a: L::Id, b: L::Id) -> bool {
     if lang.var_name(a) != lang.var_name(b) {
         return false;
     }
+    // 成员名（x.f 的 f / X::m 的 m）：var_name 不覆盖 Member——
+    // syms.objectType 与 syms.botType 曾被误判相等 → ternary_fold
+    // `c ? a : a` 分支删除活分支（Types.java Rewriter.high 抓获）
+    if lang.member_name(a) != lang.member_name(b) {
+        return false;
+    }
     match (lang.literal(a), lang.literal(b)) {
         (Some(x), Some(y)) if x == y => {}
         (None, None) => {}

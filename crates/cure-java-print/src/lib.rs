@@ -1281,6 +1281,12 @@ fn push_escaped(out: &mut String, c: char) {
         '\n' => out.push_str("\\n"),
         '\t' => out.push_str("\\t"),
         '\r' => out.push_str("\\r"),
+        // lone surrogate 哨兵（解析器映射的 U+F0000+F000–F7FF）：
+        // 还原为 \uXXXX 转义——JLS 转义是词法前的文本处理，打印
+        // \ud800 与源码原义等值
+        c if (0xf0000..=0xf07ff).contains(&(c as u32)) => {
+            out.push_str(&format!("\\u{:04X}", 0xd800 + (c as u32) - 0xf0000));
+        }
         // 其余控制字符：\uXXXX（\u000a/\u000d 会被 JLS 预处理成行终止符，
         // 必须用上面的专用转义；其余控制码无此问题）
         c if (c as u32) < 0x20 || c as u32 == 0x7f => {
@@ -1292,6 +1298,10 @@ fn push_escaped(out: &mut String, c: char) {
 
 fn escape_char(c: char) -> String {
     match c {
+        // lone surrogate 哨兵 → \uXXXX（同 push_escaped）
+        c if (0xf0000..=0xf07ff).contains(&(c as u32)) => {
+            format!("\\u{:04X}", 0xd800 + (c as u32) - 0xf0000)
+        }
         '\'' => "\\'".to_string(),
         '\\' => "\\\\".to_string(),
         '\n' => "\\n".to_string(),

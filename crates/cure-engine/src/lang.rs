@@ -166,6 +166,12 @@ pub trait Lang {
     fn literal(&self, id: Self::Id) -> Option<LitRef<'_>>;
     /// 变量相关名字：VarRef / VarDecl 读写的名字，以及 ForEach / Catch 的**声明绑定名**。
     fn var_name(&self, id: Self::Id) -> Option<&str>;
+    /// 成员访问/方法引用的**成员名**（x.f / x.m() / X::m 的 f/m 部分）。
+    /// 结构相等性比较用（var_name 只覆盖 VarRef——x.a 与 x.b 曾被误判
+    /// 相等 → ternary_fold 删除活分支，Types.java Rewriter.high 抓获）。
+    fn member_name(&self, _id: Self::Id) -> Option<&str> {
+        None
+    }
     /// 赋值运算（`=` 之外的复合赋值也在此表达；None 表示简单赋值）。
     fn assign_op(&self, _id: Self::Id) -> Option<BinOp> {
         None
