@@ -785,6 +785,28 @@ fn count_name_refs<L: Lang>(lang: &L, stmts: &[L::Id], name: &str) -> usize {
     n
 }
 
+/// null 字面量不可安全内联的使用位：沿 Paren 链向上（Paren 不改变静
+/// 态类型），首遇 Call/New（实参或 callee 位）或 Member/Index/InstanceOf
+/// 头位即拒绝——裸 null 在这些位置丢失声明类型带来的重载消歧依据
+///（`sb.append(null)` 对 append(CharSequence)/append(char[]) 二义），
+/// 或干脆非法（`null.m()`）。Cast 及其余节点重建类型语境 → 安全。
+/// 传播类规则（local/assign）共用的位置门。
+fn null_unsafe_position<L: Lang>(lang: &L, walk: &Walk<L>, use_id: L::Id) -> bool {
+    let mut cur = use_id;
+    while let Some(&(p, _)) = walk.parents.get(&cur) {
+        match lang.kind(p) {
+            NodeKind::Paren => cur = p,
+            NodeKind::Call
+            | NodeKind::New
+            | NodeKind::Member
+            | NodeKind::Index
+            | NodeKind::InstanceOf => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn count_var_refs<L: Lang>(lang: &L, node: L::Id, name: &str, n: &mut usize) {
     if lang.kind(node) == NodeKind::VarRef && lang.var_name(node) == Some(name) {
         *n += 1;
@@ -1004,6 +1026,18 @@ impl<L: Lang> Rule<L> for LocalPropagation {
                 }
                 cur = p;
             }
+        }
+        // null 字面量实参位：`String s = null; sb.append(s)` 合法——s 的
+        // 声明类型是重载消歧依据；内联成 `sb.append(null)` 后
+        // append(CharSequence) 与 append(char[]) 二义，不可编译
+        //（ddc 输出 PurchasesOrchestrator 复现：R8 null 复位赋值 + 单次
+        // 使用恰好落在重载族调用上）。沿 Paren 链向上（Paren 不改变静
+        // 态类型），首遇 Call/New 实参位即拒绝；Cast 及其余节点重建类
+        // 型语境（`(String) s` 重新钉住重载）→ 放行
+        if matches!(lang.literal(value), Some(LitRef::Null))
+            && null_unsafe_position(&*lang, walk, use_id)
+        {
+            return None;
         }
         // value 读到的名字键（写冲突兴趣集；reads 含 name 自身——一票否决）
         let mut watch_keys: Vec<L::NameKey> = Vec::new();
@@ -2631,16 +2665,16 @@ impl<L: Lang> Rule<L> for AssignPropagation {
             return None;
         }
         let use_id = wa.uses[0];
-        // null 字面量不得内联进调用接收者位（同 local_propagation）
-        if matches!(lang.literal(value), Some(LitRef::Null)) {
-            // 接收者位：AST 形态 Call→Member→[recv]（VarRef 的父是
-            // Member）或 Call→[recv]（静态调用无此形态，防御保留）
-            if let Some(&(p, _)) = walk.parents.get(&use_id) {
-                let at_head = lang.children(p).first() == Some(&use_id);
-                if at_head && matches!(lang.kind(p), NodeKind::Member | NodeKind::Call) {
-                    return None;
-                }
-            }
+        // null 字面量：接收者位（AST 形态 Call→Member→[recv]，VarRef 的
+        // 父是 Member）或静态调用 callee（防御）之外，**实参位**同样拒绝
+        // ——`str2 = null; append(str2)` 合法（str2 声明类型钉住重载），
+        // 内联成 `append(null)` 后 append(CharSequence)/append(char[])
+        // 二义（ddc 输出 PurchasesOrchestrator 复现）。null_unsafe_position
+        // 沿 Paren 链判位；Cast 包裹（(String) s）重建类型 → 放行
+        if matches!(lang.literal(value), Some(LitRef::Null))
+            && null_unsafe_position(&*lang, walk, use_id)
+        {
+            return None;
         }
         // 写冲突兴趣集：value 读到的名字键 + x 自身（自身被写 → 覆盖，拒绝）
         let mut watch_keys: Vec<L::NameKey> = Vec::new();

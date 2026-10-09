@@ -498,6 +498,62 @@ fn generic_elem_ty(ty: &JType) -> Option<JType> {
     Some(JType::Ref(inner.to_string()))
 }
 
+/// for-each 可迭代位的静态类型门：数组恒可迭代；Ref 名剥去泛型实参后
+/// 取末段，须落在 JDK 已知 Iterable 实现族白名单（java.lang.Iterable 与
+/// java.util/java.util.concurrent 集合）。不透明类名（Kotlin Sequence
+/// 伪装 d7.e 等）与未知简单名都不过门——while→for-each 还原只在类型
+/// 可判定处发生（ddc 输出 FileHelper$…/k6.h0 复现：Sequence 有
+/// .iterator() 但不是 java.lang.Iterable，for-each 不可编译）。
+fn statically_iterable(ty: &JType) -> bool {
+    match ty {
+        JType::Array(_) => true,
+        JType::Ref(name) => {
+            let base = name.split('<').next().unwrap_or(name).trim();
+            let last = base.rsplit('.').next().unwrap_or(base);
+            matches!(
+                last,
+                "Iterable"
+                    | "Collection"
+                    | "List"
+                    | "ArrayList"
+                    | "LinkedList"
+                    | "Vector"
+                    | "Stack"
+                    | "AbstractList"
+                    | "AbstractCollection"
+                    | "Set"
+                    | "HashSet"
+                    | "LinkedHashSet"
+                    | "TreeSet"
+                    | "SortedSet"
+                    | "NavigableSet"
+                    | "AbstractSet"
+                    | "Queue"
+                    | "Deque"
+                    | "ArrayDeque"
+                    | "PriorityQueue"
+                    | "BlockingQueue"
+                    | "BlockingDeque"
+                    | "ConcurrentLinkedQueue"
+                    | "ConcurrentLinkedDeque"
+                    | "ConcurrentSkipListSet"
+                    | "CopyOnWriteArrayList"
+                    | "CopyOnWriteArraySet"
+                    | "EnumSet"
+                    | "LinkedBlockingQueue"
+                    | "LinkedBlockingDeque"
+                    | "ArrayBlockingQueue"
+                    | "PriorityBlockingQueue"
+                    | "DelayQueue"
+                    | "SynchronousQueue"
+                    | "LinkedTransferQueue"
+                    | "TransferQueue"
+            )
+        }
+        _ => false,
+    }
+}
+
 /// for-each 元素类型合法性：`?`/`? extends …`/`? super …`（通配符）不是
 /// 合法变量类型 → Object（jdk-sources Subject 抓获：`Iterator<?> ce =
 /// c.iterator()` 还原成 `for (? e2 : c)` 非法 Java）
@@ -1651,6 +1707,22 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         let iterable = lang.children(ic[0])[0];
         if subtree_has_var(&*lang, iterable, &it_name) {
             return None;
+        }
+        // ===== for-each 可迭代位静态类型门 =====
+        // for (T e : expr) 要求 expr 的静态类型是数组或 java.lang.Iterable
+        // 子类型。源码级只有 VarRef 的**声明类型**可见（NewArray 本就无
+        // .iterator() 调用，不会走到这）；不透明方法调用返回值与不透明
+        // 类名（Kotlin Sequence：d7.j.f(…) 的返回 / d7.e 形参）都判不
+        // 出 Iterable —— 内联成 for-each 会产出「for-each 不适用于表达
+        // 式类型」（ddc 输出 FileHelper$removeFirstLinesFromFile$1 /
+        // k6.h0 复现）。类型未知或不在已知 Iterable 族白名单 → 保守拒
+        // 绝（保留 while 形态，语义不变）。
+        {
+            let ty = lang.var_type(iterable);
+            let ok = ty.is_some_and(|t| statically_iterable(t));
+            if !ok {
+                return None;
+            }
         }
         // cond: it.hasNext()
         if lang.kind(cond) != NodeKind::Call {
