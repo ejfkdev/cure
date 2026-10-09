@@ -495,7 +495,7 @@ impl<L: Lang> Rule<L> for SelfAssign {
         &[NodeKind::Assign]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
-        let RewriteCtx { lang, walk: _ } = ctx;
+        let RewriteCtx { lang, walk } = ctx;
         if lang.kind(id) != NodeKind::Assign {
             return None;
         }
@@ -510,7 +510,18 @@ impl<L: Lang> Rule<L> for SelfAssign {
         if lang.var_name(t) != lang.var_name(v) || !lang.is_local_var(t) {
             return None;
         }
-        Some(Edit::Delete { node: id })
+        // 删除目标必须是**语句**：`x = x;` 的 AST 形态是 ExprStmt[Assign]
+        // ——删 Assign 留下空 ExprStmt 壳，后续规则按 children[0] 遍历
+        // 即 panic（ddc weixin gp0.d1 复现：clinit 里 R8 寄存器噪声
+        // `file = file;` 触发）。嵌套赋值位（`y = (x = x)` 的值孩子）删
+        // 中树节点直接留洞——拒绝。Block 直挂 Assign 的语言形态照旧删
+        // Assign 本身（Block 孩子删除安全）。
+        let (parent, _) = walk.parents.get(&id)?;
+        match lang.kind(*parent) {
+            NodeKind::ExprStmt => Some(Edit::Delete { node: *parent }),
+            NodeKind::Block => Some(Edit::Delete { node: id }),
+            _ => None,
+        }
     }
 }
 

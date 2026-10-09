@@ -4143,7 +4143,12 @@ fn collect_own_clinit_lits(
             for &st in ast.children(*body) {
                 let asg = match ast.kind(st) {
                     NodeKind::ExprStmt => {
-                        let c = ast.children(st)[0];
+                        // 防御：规则间中树删除可能留下空 ExprStmt 壳
+                        //（self_assign 曾删 Assign 节点而非语句——weixin
+                        // gp0.d1 复现）；空壳无赋值可收集，跳过
+                        let Some(&c) = ast.children(st).first() else {
+                            continue;
+                        };
                         if ast.kind(c) == NodeKind::Assign {
                             c
                         } else {
