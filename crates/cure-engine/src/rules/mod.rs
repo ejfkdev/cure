@@ -818,6 +818,25 @@ fn null_unsafe_position<L: Lang>(lang: &L, walk: &Walk<L>, use_id: L::Id) -> boo
     false
 }
 
+/// 有声明类型的值（VarRef）不可内联进**类型判定位**：cast 操作数与
+/// instanceof 被测式的可转换性依赖被替换变量的静态类型——`Object o =
+/// k3Var; String s = (String) o;` 合法，内联成 `(String) k3Var` 后引用
+/// 类型不相关 → 不可编译（ddc weixin dt/k 复现：R8 宽化赋值的 Object
+/// 中转变量被传播进 narrowing cast）。沿 Paren 链向上，首遇 Cast /
+/// InstanceOf 即命中；其余位置类型语境与变量无关 → 放行。字面量自带
+/// 类型不受此限（null 走 null_unsafe_position）。
+fn typed_position_unsafe<L: Lang>(lang: &L, walk: &Walk<L>, use_id: L::Id) -> bool {
+    let mut cur = use_id;
+    while let Some(&(p, _)) = walk.parents.get(&cur) {
+        match lang.kind(p) {
+            NodeKind::Paren => cur = p,
+            NodeKind::Cast | NodeKind::InstanceOf => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn count_var_refs<L: Lang>(lang: &L, node: L::Id, name: &str, n: &mut usize) {
     if lang.kind(node) == NodeKind::VarRef && lang.var_name(node) == Some(name) {
         *n += 1;
@@ -1047,6 +1066,13 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         // 型语境（`(String) s` 重新钉住重载）→ 放行
         if matches!(lang.literal(value), Some(LitRef::Null))
             && null_unsafe_position(&*lang, walk, use_id)
+        {
+            return None;
+        }
+        // VarRef 值不得内联进 cast/instanceof 类型判定位（声明类型即合法
+        // 性依据——同 null 实参位的族）
+        if lang.kind(value) == NodeKind::VarRef
+            && typed_position_unsafe(&*lang, walk, use_id)
         {
             return None;
         }
@@ -2687,6 +2713,13 @@ impl<L: Lang> Rule<L> for AssignPropagation {
         {
             return None;
         }
+        // VarRef 值不得内联进 cast/instanceof 类型判定位（声明类型即合法
+        // 性依据——同 null 实参位的族）
+        if lang.kind(value) == NodeKind::VarRef
+            && typed_position_unsafe(&*lang, walk, use_id)
+        {
+            return None;
+        }
         // 写冲突兴趣集：value 读到的名字键 + x 自身（自身被写 → 覆盖，拒绝）
         let mut watch_keys: Vec<L::NameKey> = Vec::new();
         collect_read_keys(&*lang, value, &mut watch_keys);
@@ -2941,6 +2974,18 @@ impl<L: Lang> Rule<L> for MultiUseCopyPropagation {
         }
         // y 也不得在【赋值前】与 x 指向不同值（x=y 之前 y 已是其所值，无需检查）；
         // 但 x=y 之间不能有对 y 的写（相邻语句，天然无中间）——赋值本身就是当前值 ✓
+
+        // VarRef 值（y）不得内联进 cast/instanceof 类型判定位：被替换
+        // 变量（x）的声明类型是这些位置可转换性的依据——`Object x =
+        // k3Var; s = (String) x;` 合法，替换成 `(String) k3Var` 引用类型
+        // 不相关即不可编译（ddc weixin dt/k 复现）。任一使用点命中 →
+        // 整体拒绝（多用途替换不可拆单点）。
+        if w1.uses
+            .iter()
+            .any(|&u| typed_position_unsafe(&*lang, walk, u))
+        {
+            return None;
+        }
 
         let mut edits: Vec<Edit<L>> = w1.uses
             .iter()

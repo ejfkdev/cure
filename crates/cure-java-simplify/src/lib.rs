@@ -11,7 +11,7 @@ mod vexec;
 
 use cure_engine::kind::{BinOp, UnOp};
 use cure_engine::{Config, Edit, Effect, Lang, LitRef, NodeKind, Report, RewriteCtx, Rule};
-use cure_java_ast::{CompilationUnit, JavaAst, JavaId, JType, Lit, Member, NoopCandidate, NodeData, TypeDecl};
+use cure_java_ast::{CompilationUnit, JavaAst, JavaId, JType, Lit, Member, NoopCandidate, NodeData, TypeDecl, TypeKind};
 
 // ---------------------------------------------------------------------------
 // Java 特有规则
@@ -4073,6 +4073,31 @@ fn collect_bodies_recursive(
     shadowed: &mut std::collections::HashSet<String>,
     field_decls: &mut std::collections::HashMap<String, u32>,
 ) {
+    // 枚举常量是隐式 public static final 字段，参与名字遮蔽/唯一性
+    // 计数：嵌套枚举的常量与外层同名字段撞名时（ddc weixin mapsdk hm
+    // 复现：外层 `static final String b17 = "hm"` vs 枚举常量 b17），
+    // 不计数会让外层字段被误判全单元唯一 → 收集进常量表 → 嵌套枚举
+    // clinit 里裸名 b17（解析到枚举常量）被替换成 "hm"，产出
+    // `new hm.b[] {a, "hm"}` 不可编译。计数后双见 → 外层字段按既有
+    // 保守语义全弃。常量原文可带注解/实参/类体——取名字标识符。
+    if ty.kind == TypeKind::Enum {
+        for c in &ty.enum_constants {
+            if c.trim() == "," {
+                continue;
+            }
+            let last = c.split('(').next().unwrap_or(c)
+                .split_whitespace()
+                .next_back()
+                .unwrap_or("");
+            let name: String = last
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '$')
+                .collect();
+            if !name.is_empty() {
+                *field_decls.entry(name).or_insert(0) += 1;
+            }
+        }
+    }
     for m in &ty.members {
         match m {
             Member::Method { body: Some(b), params, .. }

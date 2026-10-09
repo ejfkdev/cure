@@ -218,3 +218,66 @@ public class ValOf {
         "同类限定 ValOf.valueOf(true) 应内联并折叠\n{out}"
     );
 }
+
+#[test]
+fn enum_constant_shadows_outer_const_field() {
+    // ddc weixin mapsdk hm 复现：外层 `static final String b17 = "hm"` 与
+    // 嵌套枚举常量 b17 撞名——常量收集器没把枚举常量算进字段声明计数，
+    // 外层字段被误判全单元唯一 → 嵌套枚举 clinit 的裸名 b17（解析到枚举
+    // 常量）被替换成 "hm"，产出 `new E[] {a, "hm"}` 不可编译。
+    let out = run_src(
+        r#"
+public class Enc {
+    private static final java.lang.String b17 = "hm";
+    public static enum E {
+        a, b17;
+        private static final Enc.E[] c;
+        private E() {}
+        static {
+            c = new Enc.E[] {a, b17};
+        }
+    }
+    public static void main(String[] args) {
+        System.out.println(b17 + E.c[1]);
+    }
+}
+"#,
+    );
+    assert!(
+        out.contains("new Enc.E[] {a, b17}"),
+        "枚举常量 b17 不得被外层同名字段字面量替换\n{out}"
+    );
+    assert!(
+        !out.contains("{a, \"hm\"}"),
+        "坏形态（枚举常量→字符串字面量）不得出现\n{out}"
+    );
+}
+
+#[test]
+fn typed_var_not_inlined_into_cast_position() {
+    // ddc weixin dt/k 复现：R8 宽化中转 `Object obj5 = k3Var;` 的单次
+    // 使用在 narrowing cast 位——`(String) obj5` 合法（Object 声明类型
+    // 钉住可转换性），传播内联成 `(String) k3Var` 后引用类型不相关即
+    // 不可编译。instanceof 被测式同族。
+    let out = run_src(
+        r#"
+public class CastPos {
+    static Object src() { return null; }
+    public static void main(String[] args) {
+        Object obj5 = src();
+        String s = (String) obj5;
+        boolean b = obj5 instanceof java.lang.String;
+        System.out.println(s + b);
+    }
+}
+"#,
+    );
+    assert!(
+        out.contains("(String) obj5"),
+        "cast 操作数位的 Object 中转变量必须保持变量形态\n{out}"
+    );
+    assert!(
+        out.contains("obj5 instanceof"),
+        "instanceof 被测式位同理保持变量形态\n{out}"
+    );
+}
