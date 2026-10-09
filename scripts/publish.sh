@@ -31,12 +31,15 @@ if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
 fi
 
 # --- 依赖拓扑序（被依赖者在前）---
+# 正确拓扑序（parser 依赖 print——首次发布时 print 排在 parser 之后
+# 曾使 parser 找不到上游 crate 而失败，实测抓获）：
+# engine → tree → java-ast → java-print → java-parser → simplify → cli
 CRATES=(
   cure-engine
   cure-tree
   cure-java-ast
-  cure-java-parser
   cure-java-print
+  cure-java-parser
   cure-java-simplify
   cure-cli
 )
