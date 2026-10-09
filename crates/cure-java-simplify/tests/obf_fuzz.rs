@@ -424,6 +424,8 @@ fn obf_fuzz_differential() {
         fs::write(clean_dir.join(format!("{cls}.java")), &cured).unwrap();
         for d in [&orig_dir, &clean_dir] {
             let out = Command::new("javac")
+                .arg("-encoding")
+                .arg("UTF-8")
                 .arg("-nowarn")
                 .arg("-d")
                 .arg(d)

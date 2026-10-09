@@ -78,6 +78,8 @@ fn asc_real_pipeline_robust_simplification() {
 
     // javac → d8 → dex → 最小 APK
     let out = env(Command::new("javac"))
+        .arg("-encoding")
+        .arg("UTF-8")
         .arg("-nowarn")
         .arg("--release")
         .arg("17")

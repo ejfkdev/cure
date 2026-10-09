@@ -97,7 +97,7 @@ fn ddc_real_pipeline_semantics_preserved() {
     fs::write(&src_file, CLEAN_SRC).unwrap();
 
     // 1. javac（--release 17：d8 不支持新版 class）
-    let out = run_java(Command::new("javac").arg("-nowarn").arg("--release").arg("17").arg("-d").arg(&base).arg(&src_file));
+    let out = run_java(Command::new("javac").arg("-encoding").arg("UTF-8").arg("-nowarn").arg("--release").arg("17").arg("-d").arg(&base).arg(&src_file));
     assert!(out.status.success(), "javac: {}", String::from_utf8_lossy(&out.stderr));
 
     // 2. d8 → classes.dex
@@ -117,7 +117,7 @@ fn ddc_real_pipeline_semantics_preserved() {
     let ddc_dir = base.join("ddc_run");
     fs::create_dir_all(&ddc_dir).unwrap();
     fs::write(ddc_dir.join("Demo3.java"), strip_package(&ddc_src)).unwrap();
-    let out = run_java(Command::new("javac").arg("-nowarn").arg("-d").arg(&ddc_dir).arg(ddc_dir.join("Demo3.java")));
+    let out = run_java(Command::new("javac").arg("-encoding").arg("UTF-8").arg("-nowarn").arg("-d").arg(&ddc_dir).arg(ddc_dir.join("Demo3.java")));
     assert!(out.status.success(), "ddc 输出无法编译：\n{}", String::from_utf8_lossy(&out.stderr));
     let ddc_run = run_java(Command::new("java").arg("-cp").arg(&ddc_dir).arg("Demo3"));
     let ddc_out = String::from_utf8_lossy(&ddc_run.stdout).to_string();
@@ -136,7 +136,7 @@ fn ddc_real_pipeline_semantics_preserved() {
     let cured_dir = base.join("cured");
     fs::create_dir_all(&cured_dir).unwrap();
     fs::write(cured_dir.join("Demo3.java"), strip_package(&cured)).unwrap();
-    let out = run_java(Command::new("javac").arg("-nowarn").arg("-d").arg(&cured_dir).arg(cured_dir.join("Demo3.java")));
+    let out = run_java(Command::new("javac").arg("-encoding").arg("UTF-8").arg("-nowarn").arg("-d").arg(&cured_dir).arg(cured_dir.join("Demo3.java")));
     assert!(
         out.status.success(),
         "cure 产物无法编译：\n{}\n== 源码 ==\n{cured}",
@@ -293,7 +293,7 @@ fn ddc_dual_layer_obfuscation() {
     fs::write(&src_file, HARD_SRC).unwrap();
 
     // javac → d8 → ddc
-    let out = run_java(Command::new("javac").arg("-nowarn").arg("--release").arg("17").arg("-d").arg(&base).arg(&src_file));
+    let out = run_java(Command::new("javac").arg("-encoding").arg("UTF-8").arg("-nowarn").arg("--release").arg("17").arg("-d").arg(&base).arg(&src_file));
     assert!(out.status.success());
     let out = run_java(Command::new(D8).arg("--release").arg("--output").arg(&base).arg(base.join("HardObf.class")));
     assert!(out.status.success());
@@ -306,7 +306,7 @@ fn ddc_dual_layer_obfuscation() {
     let ddc_dir = base.join("ddc_run");
     fs::create_dir_all(&ddc_dir).unwrap();
     fs::write(ddc_dir.join("HardObf.java"), strip_package(&decomp_src)).unwrap();
-    let out = run_java(Command::new("javac").arg("-nowarn").arg("-d").arg(&ddc_dir).arg(ddc_dir.join("HardObf.java")));
+    let out = run_java(Command::new("javac").arg("-encoding").arg("UTF-8").arg("-nowarn").arg("-d").arg(&ddc_dir).arg(ddc_dir.join("HardObf.java")));
     assert!(out.status.success());
     let ddc_run = run_java(Command::new("java").arg("-cp").arg(&ddc_dir).arg("HardObf"));
     let ddc_out = String::from_utf8_lossy(&ddc_run.stdout).to_string();
@@ -324,7 +324,7 @@ fn ddc_dual_layer_obfuscation() {
     let cured_dir = base.join("cured");
     fs::create_dir_all(&cured_dir).unwrap();
     fs::write(cured_dir.join("HardObf.java"), strip_package(&cured)).unwrap();
-    let out = run_java(Command::new("javac").arg("-nowarn").arg("-d").arg(&cured_dir).arg(cured_dir.join("HardObf.java")));
+    let out = run_java(Command::new("javac").arg("-encoding").arg("UTF-8").arg("-nowarn").arg("-d").arg(&cured_dir).arg(cured_dir.join("HardObf.java")));
     assert!(out.status.success(), "cure 产物编译失败：\n{}\n{cured}", String::from_utf8_lossy(&out.stderr));
     let cured_run = run_java(Command::new("java").arg("-cp").arg(&cured_dir).arg("HardObf"));
     let cured_out = String::from_utf8_lossy(&cured_run.stdout).to_string();

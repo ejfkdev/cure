@@ -150,6 +150,8 @@ fn gauntlet_full_stack_deobfuscation() {
         fs::write(clean_dir.join("Gauntlet.java"), &cleaned).unwrap();
         for d in [&orig_dir, &clean_dir] {
             let out = Command::new("javac")
+                .arg("-encoding")
+                .arg("UTF-8")
                 .arg("-nowarn")
                 .arg("-d")
                 .arg(d)

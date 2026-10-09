@@ -156,6 +156,8 @@ fn deobfuscate_simulated_obfuscator() {
         fs::write(&cf, &cleaned).unwrap();
         for (d, f) in [(&orig_dir, &of), (&clean_dir, &cf)] {
             let out = Command::new("javac")
+                .arg("-encoding")
+                .arg("UTF-8")
                 .arg("-nowarn")
                 .arg("-d")
                 .arg(d)
