@@ -630,3 +630,17 @@ fn local_decl_raw_with_array_initializer() {
     assert!(out.contains("int b @A []=new int[]{3};"), "{out}");
     assert!(out.contains("int c,d @A []={4};"), "{out}");
 }
+
+#[test]
+fn raw_local_decl_stops_at_block_close() {
+    // R20 P1：残缺 init（int x = new A 直撞块尾）的 depth-0 `}` 是方法/
+    // 块闭括号——raw_local_decl 曾吞进 Raw span → 打印器再补闭括号 →
+    // 每轮 +2 括号无界发散（Sample.java 幂等 0→1 实锺）
+    let src = "class MR{void m(){int x=new A}}";
+    let p1 = fmt(src);
+    let p2 = fmt(&p1);
+    assert_eq!(p1, p2, "not idempotent: {p1}");
+    let opens = p1.matches('{').count();
+    let closes = p1.matches('}').count();
+    assert_eq!(opens, closes, "unbalanced: {p1}");
+}

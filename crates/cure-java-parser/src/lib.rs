@@ -498,6 +498,14 @@ impl<'src> Parser<'src> {
             } else if is_p(";") && depth == 0 {
                 self.bump();
                 break;
+            } else if is_p("}") && depth == 0 {
+                // R20 P1：残缺 init（`int x = new A` 直撞块尾）的 `}` 是
+                // 方法/块闭括号——**停不消费**（曾落入兜底 bump 被吞进
+                // Raw span → 块/类打印器再补闭括号 → 每轮 +2 括号无界
+                // 发散——Sample.java 幂等 0→1 实锺）。初始化器的 `}` 全在
+                // skip_balanced_braces 内部消费，depth-0 的 `}` 不可能是
+                // 初始化器闭括号——该出口安全
+                break;
             }
             self.bump();
         }
