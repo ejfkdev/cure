@@ -1020,6 +1020,12 @@ impl Rule<JavaAst> for StaticExec {
         // 每层逃逸局部：decl_order[decl_start .. 更深层 decl_start] 中
         // 存活且名字被该层以下剩余引用者。值先取出。
         let mut escaped_by_cut: Vec<Vec<(u32, vexec::VVal, u8, JType)>> = Vec::new();
+        // 被剪裁删除的**存活**局部名（逐 cut）：opaque 调用重放的悬空守
+        // 卫用——重放语句在完成区间内，rest_j 看不见它，其保留原子树的
+        // 实参不得引用这些名字（k.java：`Object[] v0x=…; v0x[0]=…;
+        // String.format(…, v0x)` 的 vararg 实参位——剪掉声明留裸名 →
+        // 找不到符号）
+        let mut cut_live_names: Vec<std::collections::HashSet<String>> = Vec::new();
         for (j, cut) in run.cuts.iter().enumerate() {
             let range_end = if j == 0 {
                 decl_order.len()
@@ -1028,11 +1034,14 @@ impl Rule<JavaAst> for StaticExec {
             };
             let rest_j = run.rest_for_cut(j);
             let mut esc: Vec<(u32, vexec::VVal, u8, JType)> = Vec::new();
+            let mut live_names: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for &k in &decl_order[cut.decl_start.min(range_end)..range_end] {
                 if ex.var_value(k).is_none() {
                     continue; // 已随作用域弹出——非存活局部
                 }
                 let name = lang.name_of_key(k)?;
+                live_names.insert(name.clone());
                 let referenced = rest_j.iter().any(|&st| {
                     cure_engine::analysis::subtree_contains(lang, st, |n| {
                         lang.kind(n) == NodeKind::VarRef
@@ -1051,6 +1060,7 @@ impl Rule<JavaAst> for StaticExec {
                 }
             }
             escaped_by_cut.push(esc);
+            cut_live_names.push(live_names);
         }
         drop(ex);
         // ---- 每层材料化（日志区间按执行序重放）----
@@ -1113,6 +1123,7 @@ impl Rule<JavaAst> for StaticExec {
                         }
                         let cch = lang.children(*call).to_vec();
                         let mut new_args: Vec<JavaId> = Vec::new();
+                        let mut kept_original: Vec<bool> = Vec::new();
                         for (i, &arg) in cch.iter().enumerate().skip(1) {
                             let val = args.get(i - 1).cloned().flatten();
                             let replaced = match val {
@@ -1122,7 +1133,32 @@ impl Rule<JavaAst> for StaticExec {
                                 Some(vexec::VVal::B(b)) => Some(lang.lit(Lit::Bool(b))),
                                 _ => None,
                             };
+                            kept_original.push(replaced.is_none());
                             new_args.push(replaced.unwrap_or_else(|| lang.copy_subtree(arg)));
+                        }
+                        // 悬空守卫：保留原子树的实参（数组/Undef 等不可求
+                        // 值值）若引用被剪裁删除的存活局部 → 该调用重放后
+                        // 残留对已删声明的裸名引用 → 整段放弃（保守）
+                        let names_j = cut_live_names.get(j)?;
+                        for ((i, &arg), &kept) in
+                            cch.iter().enumerate().skip(1).zip(kept_original.iter())
+                        {
+                            let _ = i;
+                            if kept
+                                && !names_j.is_empty()
+                                && cure_engine::analysis::subtree_contains(
+                                    lang,
+                                    arg,
+                                    |n| {
+                                        lang.kind(n) == NodeKind::VarRef
+                                            && lang
+                                                .var_name(n)
+                                                .is_some_and(|nm| names_j.contains(nm))
+                                    },
+                                )
+                            {
+                                return None;
+                            }
                         }
                         let callee = *lang.children(*call).first()?;
                         let callee_copy = lang.copy_subtree(callee);
@@ -1693,6 +1729,16 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         }
         let decl = decl?;
         let it_name = lang.var_name(decl)?.to_string();
+        // it 在 while **之后**不得再被引用：for-each 把迭代器声明消费进循
+        // 环头，循环后残留的裸名引用会悬空（Kotlin 协程状态机的保存块
+        // `it2x = iterator;`——ddc lark viewmodel/a 复现：找到符号 →
+        // 找不到符号）。rest = 同块 while 之后的全部语句（含嵌套子树）。
+        if stmts[idx + 1..]
+            .iter()
+            .any(|&s| subtree_has_var(lang, s, &it_name))
+        {
+            return None;
+        }
         let init_call = lang.children(decl).first().copied()?;
         if lang.kind(init_call) != NodeKind::Call {
             return None;

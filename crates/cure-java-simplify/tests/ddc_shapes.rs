@@ -281,3 +281,40 @@ public class CastPos {
         "instanceof 被测式位同理保持变量形态\n{out}"
     );
 }
+
+#[test]
+fn while_iterator_no_post_loop_reference() {
+    // ddc lark viewmodel/a 复现：Kotlin 协程状态机在 while 循环**之后**
+    // 保存迭代器（`it2x = iterator;`）——for-each 把迭代器声明消费进循
+    // 环头会让该引用悬空。规则必须拒绝这种还原（保持 while 形态）。
+    let out = run_src(
+        r#"
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+
+public class PostUse {
+    static java.util.List<String> saved;
+    static int consume(List<String> src) {
+        Iterator<String> it = src.iterator();
+        int n = 0;
+        while (it.hasNext()) {
+            n += it.next().length();
+        }
+        // 循环后引用 it（状态机保存块的形状）
+        String marker = (it == null) ? "x" : "y";
+        return n + marker.length();
+    }
+    public static void main(String[] args) {
+        List<String> src = new ArrayList<>();
+        src.add("alpha");
+        System.out.println(consume(src));
+    }
+}
+"#,
+    );
+    assert!(
+        out.contains("while (it.hasNext())"),
+        "循环后仍引用迭代器 → 不得还原 for-each（声明会被消费）\n{out}"
+    );
+}
