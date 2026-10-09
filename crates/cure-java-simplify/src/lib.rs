@@ -2439,6 +2439,11 @@ impl Rule<JavaAst> for StrLenFold {
         &[NodeKind::Call]
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        // 语句位标志先取（ctx.lang 借用后 ctx 部分移动——R13 教训）
+        let at_stmt_pos = ctx
+            .parent(id)
+            .map(|p| ctx.lang.kind(p) == NodeKind::ExprStmt)
+            .unwrap_or(false);
         let lang = ctx.lang;
         if lang.kind(id) != NodeKind::Call {
             return None;
@@ -4598,6 +4603,11 @@ impl Rule<JavaAst> for ConstMethodInline {
         true
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        // 语句位标志先取（ctx.lang 借用后 ctx 部分移动——R13 教训）
+        let at_stmt_pos = ctx
+            .parent(id)
+            .map(|p| ctx.lang.kind(p) == NodeKind::ExprStmt)
+            .unwrap_or(false);
         let lang = ctx.lang;
         if lang.kind(id) != NodeKind::Call {
             return None;
@@ -4642,6 +4652,17 @@ impl Rule<JavaAst> for ConstMethodInline {
             .map(|(p, &a)| (p.clone(), a))
             .collect();
         let with = copy_subst(lang, body_expr, &map);
+        // **语句位形态守卫**（ddc/deepseek cs8 抓获：`e("KType");` 的
+        // 单 return 体内联成 `mk(...).a;`——字段访问不是合法表达式语句
+        //（JLS 14.8 仅赋值/自增自减/调用/new），与 R12 foreach 的 e; 同
+        // 族）。调用在裸 ExprStmt 位（结果弃置）时，替换表达式必须是
+        // Call/New——否则保留原调用
+        if at_stmt_pos {
+            match lang.kind(with) {
+                NodeKind::Call | NodeKind::New => {}
+                _ => return None,
+            }
+        }
         Some(Edit::Replace {
             target: id,
             with,

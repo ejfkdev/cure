@@ -2479,3 +2479,15 @@ fn param_dims_annos_method_raw_not_over_swallow() {
     assert!(out.contains("return 2;"), "{out}");
     assert!(out.contains("int x @A []"), "{out}");
 }
+
+#[test]
+fn const_method_inline_statement_position_guard() {
+    // ddc/deepseek cs8 抓获：`e("KType");`（结果弃置的调用语句）的单
+    // return 体内联成 `mk(...).a;`——字段访问不是合法表达式语句
+    //（JLS 14.8）。语句位只允许 Call/New 形态替换
+    let out = run_src(
+        "class T{static class S{public int a;}static class B{public S a=new S();}static B mk(String s){return new B();}static final S e(String str){return mk(str).a;}void use(){e(\"x\");S q=e(\"y\");}}",
+    );
+    // 语句位保留原调用；表达式位照常内联
+    assert!(out.contains("e(\"x\");"), "{out}");
+}
