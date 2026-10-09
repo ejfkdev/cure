@@ -185,9 +185,6 @@ impl<'a> Exec<'a> {
         self.ast.var_key(id).ok_or(())
     }
 
-    fn name(&self, id: JavaId) -> R<&'a str> {
-        self.ast.var_name(id).ok_or(())
-    }
 
     // ---- 语句 ----
 
@@ -612,7 +609,7 @@ impl<'a> Exec<'a> {
         }
         // 布局识别：resource…（非 Block 非 Catch 的头部）→ abort
         let mut i = 0usize;
-        while i < ch.len()
+        if i < ch.len()
             && self.ast.kind(ch[i]) != NodeKind::Block
             && self.ast.kind(ch[i]) != NodeKind::Catch
         {
@@ -859,7 +856,7 @@ impl<'a> Exec<'a> {
             NodeData::Member { name } => {
                 // arr.length
                 let recv = *self.ast.children(id).first().ok_or(())?;
-                if self.ast.sn(name.clone()) != "length" {
+                if self.ast.sn(name) != "length" {
                     return Err(());
                 }
                 let arr = self.eval_ref_value(recv)?;
@@ -1119,9 +1116,6 @@ impl<'a> Exec<'a> {
     // ---- 结果提取 ----
 
     /// 段内声明的局部名字键集合。
-    pub(crate) fn local_keys(&self) -> impl Iterator<Item = u32> + '_ {
-        self.vars.keys().copied()
-    }
 
     pub(crate) fn var_value(&self, k: u32) -> Option<&VVal> {
         self.vars.get(&k)

@@ -393,7 +393,7 @@ fn bit_set(bits: &mut Vec<u64>, idx: usize) {
 /// 位图读位（越界 = false）。
 fn bit_get(bits: &[u64], idx: usize) -> bool {
     bits.get(idx / 64)
-        .map_or(false, |w| (w >> (idx % 64)) & 1 == 1)
+        .is_some_and(|w| (w >> (idx % 64)) & 1 == 1)
 }
 
 /// 编辑全部 with 根（Replace / 全 Replace Multi）。

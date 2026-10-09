@@ -304,7 +304,7 @@ fn default_dir_output_suffix_is_cure_out() {
 
 #[test]
 fn broken_pipe_exits_quietly() {
-    use std::io::Write;
+    
     let dir = TempDir::new().unwrap();
     let p = tmp_java(&dir, "A.java", "class A{int m(){int a=foo();int b=a;return b;}}");
     // head 提前关闭管道：不应 panic（"failed printing to stdout"）

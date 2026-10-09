@@ -209,7 +209,7 @@ fn run_corpus(root: &str, label: &str) {
                 "{}: 第三轮仍有 {} 次改写（全链路未收敛——疑似振荡/发散）\n{:?}",
                 o.path.display(),
                 o.second_edits,
-                &o.second_by_rule
+                o.second_by_rule
             );
         } else {
             dirty += 1;
@@ -267,7 +267,7 @@ fn count_code_lines(src: &str) -> usize {
 fn context_of(text: &str, line: usize) -> String {
     let mut out = String::new();
     for (i, l) in text.lines().enumerate() {
-        if i + 1 >= line.saturating_sub(2) && i + 1 <= line + 2 {
+        if i + 1 >= line.saturating_sub(2) && i < line + 2 {
             out.push_str(&format!("{:5}: {}\n", i + 1, l));
         }
     }

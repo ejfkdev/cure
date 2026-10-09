@@ -2280,7 +2280,7 @@ impl<'src> Parser<'src> {
                 || self.at_kw("enum")
                 || self.at_kw("record")
             {
-                let text = self.sync_member();
+                let _ = self.sync_member();
                 // 尾分号（enum E{…}; 容错形态）一并并入
                 if self.at_punct(";") {
                     self.bump();
@@ -2309,7 +2309,7 @@ impl<'src> Parser<'src> {
         }
         // 局部变量声明 vs 表达式语句（回溯判定）
         let save = self.pos;
-        if let Some((ty, had_final)) = self.try_decl_prefix() {
+if let Some((ty, had_final)) = self.try_decl_prefix() {
             // 类型侧维度注解（int @A [] x——R18 BUG A）：整句 Raw
             //（raw_local_decl：= {…} 初始化器感知——R19 P0-1）
             if self.ty_dims_annos {
@@ -2674,7 +2674,7 @@ impl<'src> Parser<'src> {
                     self.skip_balanced("(", ")");
                 }
             }
-            if let Some((ty, had_final)) = self.try_decl_prefix() {
+            if let Some((ty, _had_final)) = self.try_decl_prefix() {
                 // 声明式 init：`int i = 0, j = 1`（后续声明符无类型 token）
                 let name = match &self.tok().tok {
                     Tok::Ident(i) => {
@@ -2914,7 +2914,7 @@ impl<'src> Parser<'src> {
                 }
                 self.pos = save;
                 if is_decl {
-                    if let Some((ty, had_final)) = self.try_decl_prefix() {
+                    if let Some((ty, _had_final)) = self.try_decl_prefix() {
                         let name = match &self.tok().tok {
                             Tok::Ident(i) => {
                                 let n = i.to_string();

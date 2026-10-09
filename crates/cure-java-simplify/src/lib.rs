@@ -295,9 +295,9 @@ impl Rule<JavaAst> for BoxUnboxChain {
                 if lang.sn(*name) != "valueOf" {
                     return None;
                 }
-                match lang.var_name(recv) {
-                    Some(n) => (n.to_string(), *ich.get(1)?),
-                    None => return None,
+                {
+                    let n = lang.var_name(recv)?;
+                    (n.to_string(), *ich.get(1)?)
                 }
             } else if let NodeData::VarRef { name } = lang.data(icallee) {
                 // java.lang.Integer.valueOf 形态在解析里是 member 链；
@@ -308,7 +308,7 @@ impl Rule<JavaAst> for BoxUnboxChain {
                 return None;
             }
         };
-        let unbox_name = unbox.clone();
+        let unbox_name = *unbox;
         let expected = BOXERS
             .iter()
             .find(|(b, _)| *b == box_name.as_str())
@@ -1722,7 +1722,7 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
             // Index）放行
             {
                 let mut cur = wrapped;
-                'walk: while cur != body {
+                while cur != body {
                     let par = parent_of_recv(lang, body, cur);
                     if par == body || par == cur {
                         break; // 直达 body（防御：不在子树内则停）
@@ -2440,7 +2440,7 @@ impl Rule<JavaAst> for StrLenFold {
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         // 语句位标志先取（ctx.lang 借用后 ctx 部分移动——R13 教训）
-        let at_stmt_pos = ctx
+        let _at_stmt_pos = ctx
             .parent(id)
             .map(|p| ctx.lang.kind(p) == NodeKind::ExprStmt)
             .unwrap_or(false);
@@ -2525,7 +2525,7 @@ impl LiteralEval {
         let NodeData::Member { name: method } = lang.data(callee) else {
             return None;
         };
-        let method = method.clone();
+        let method = *method;
         let recv = lang.children(callee)[0];
         // 实参必须全部为字面量
         let args: Vec<Lit> = ch[1..]
@@ -2613,7 +2613,7 @@ fn eval_cast_literal(lang: &mut JavaAst, id: JavaId) -> Option<Edit<JavaAst>> {
     let inner = lang.children(id)[0];
     let lit = litref_to_lit(lang.literal(inner))?;
     let with = match (&ty, &lit) {
-        (JType::Char, Lit::Int(v)) if (0 as i64..=0xFFFF).contains(v) => {
+        (JType::Char, Lit::Int(v)) if (0_i64..=0xFFFF).contains(v) => {
             lang.build_char(char::from_u32(*v as u32)?)
         }
         (JType::Char, Lit::Char(_)) => inner,
@@ -2684,7 +2684,7 @@ fn eval_static_method(cls: &str, method: &str, args: &[Lit]) -> Option<Lit> {
     let cls = cls.rsplit('.').next().unwrap_or(cls);
     Some(match (cls, method, args) {
         ("Integer", "parseInt", [Lit::Str(s)]) => {
-            Lit::Int(s.trim().parse::<i64>().ok()? as i64)
+            Lit::Int(s.trim().parse::<i64>().ok()?)
         }
         ("Integer", "toString", [Lit::Int(v)]) => Lit::Str(v.to_string()),
         ("Integer", "toString", [Lit::Long(v)]) => Lit::Str(v.to_string()),
@@ -3809,7 +3809,7 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
     for ty in &unit.types {
         // 本类型自己的 clinit 顶层字面量赋值（静态初始化块材料化形态）
         let mut own_lits: std::collections::HashMap<String, JavaId> = Default::default();
-        collect_own_clinit_lits(&ast, ty, &mut own_lits);
+        collect_own_clinit_lits(ast, ty, &mut own_lits);
         for m in &ty.members {
             if let Member::Field { mods, ty: fty, declarators } = m {
                 let words: Vec<&str> = mods.split_whitespace().collect();
@@ -3827,7 +3827,7 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
                         Some(init) => {
                             // 声明初始化路径：final + 字面量 + 无写 + 无遮蔽
                             if !is_final
-                                || !is_const_init(&ast, init)
+                                || !is_const_init(ast, init)
                                 || shadowed.contains(&d.name)
                                 || write_counts.get(&d.name).copied().unwrap_or(0) != 0
                             {
@@ -3850,7 +3850,7 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
                                 continue;
                             }
                             match own_lits.get(&d.name) {
-                                Some(&init) if is_const_init(&ast, init) => init,
+                                Some(&init) if is_const_init(ast, init) => init,
                                 _ => continue,
                             }
                         }
@@ -3860,8 +3860,8 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
                         ast.const_fields.remove(&d.name);
                         ast.const_scalars.remove(&d.name);
                     } else {
-                        let scalar_ok = scalar_lit_of(&ast, init)
-                            .map_or(false, |l| lit_type_matches_decl(fty, l));
+                        let scalar_ok = scalar_lit_of(ast, init)
+                            .is_some_and(|l| lit_type_matches_decl(fty, l));
                         ast.const_fields.insert(d.name.clone(), init);
                         if scalar_ok {
                             ast.const_scalars.insert(d.name.clone());
@@ -3952,18 +3952,18 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
                             // rms 是参数——内联后自由引用悬空——
                             // EvaluationRmsCheckerTest 抓获：16 文件输出
                             // 不可编译）→ 拒绝
-                            && !subtree_has_anon(&ast, expr)
+                            && !subtree_has_anon(ast, expr)
                             // varargs 形参：单实参直通 `array(arg)` 的
                             // 内联丢 `new T[]{arg}` 包装——junit5 131 处
                             // 断言恒败 → 拒绝
                             && !params.iter().any(|p| p.varargs)
-                            && !subtree_calls_self(&ast, expr, name)
+                            && !subtree_calls_self(ast, expr, name)
                             // 类型敏感守卫：字面量替换会改变形参位置的静态类型
                             // （switch 模式选择器 / instanceof 被测式 / Raw 不
                             // 可见构造）——`match(42)` 内联成 switch(42) 遭
                             // javac 拒绝（Adv6 差分抓获）。混淆 helper（纯算
                             // 术/字符串体）不受影响。
-                            && !subtree_has_type_sensitive(&ast, expr)
+                            && !subtree_has_type_sensitive(ast, expr)
                         && method_name_count.get(name).copied() == Some(1)
                         {
                             let ps: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
@@ -4438,7 +4438,7 @@ impl Rule<JavaAst> for ConstFieldPropagate {
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
         let parent = ctx.parent(id);
-        let grandparent = parent.and_then(|p| ctx.parent(p));
+        let _grandparent = parent.and_then(|p| ctx.parent(p));
         let lang = ctx.lang;
         if lang.kind(id) != NodeKind::VarRef {
             return None;
@@ -4614,12 +4614,12 @@ impl Rule<JavaAst> for ConstMethodInline {
         }
         let ch = lang.children(id).to_vec();
         let method_name = match lang.data(ch[0]) {
-            NodeData::VarRef { name } => name.clone(),
+            NodeData::VarRef { name } => *name,
             NodeData::Member { name } => {
                 let recv = lang.children(ch[0])[0];
                 match lang.var_name(recv) {
                     Some(r) if r == "this" || r.chars().next().is_some_and(|c| c.is_uppercase()) => {
-                        name.clone()
+                        *name
                     }
                     _ => return None,
                 }
@@ -4642,9 +4642,7 @@ impl Rule<JavaAst> for ConstMethodInline {
             return None;
         }
         for &a in &args {
-            if lang.literal(a).is_none() {
-                return None;
-            }
+            lang.literal(a)?;
         }
         let map: std::collections::HashMap<String, JavaId> = params
             .iter()
@@ -5278,7 +5276,7 @@ impl Rule<JavaAst> for StringSwitchRecover {
         }
         // 选择器 x.hashCode()
         let x = match lang.data(ch[0]) {
-            NodeData::Call { .. } => {
+            NodeData::Call => {
                 let cc = lang.children(ch[0]);
                 if cc.len() != 1 {
                     return None;
@@ -5369,7 +5367,7 @@ impl Rule<JavaAst> for StringSwitchRecover {
                     let init = *lang.children(*decl).first()?;
                     equals_lit(lang, init, &x)?
                 }
-                NodeData::Call { .. } => equals_lit(lang, guard, &x)?,
+                NodeData::Call => equals_lit(lang, guard, &x)?,
                 _ => return None,
             };
             guard_nodes.push(guard);
@@ -5484,9 +5482,7 @@ impl Rule<JavaAst> for StringSwitchRecover {
             }
             NodeData::Literal(Lit::Int(_)) | NodeData::Literal(Lit::Long(_)) => {}
             _ => {
-                if lang.literal(tsel).is_none() {
-                    return None;
-                }
+                lang.literal(tsel)?;
             }
         }
         // 签名一致性：所有 inner switch + trailing 的**case 体**全同
@@ -5779,7 +5775,7 @@ fn collect_all_blind_refs(
     unit: &CompilationUnit,
 ) -> std::collections::HashSet<String> {
     let mut out: std::collections::HashSet<String> = Default::default();
-    let mut split_into = |text: &str, out: &mut std::collections::HashSet<String>| {
+    let split_into = |text: &str, out: &mut std::collections::HashSet<String>| {
         for id in text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$') {
             if !id.is_empty() {
                 out.insert(id.to_string());
@@ -6517,39 +6513,6 @@ fn remove_dead_private_fields(ast: &JavaAst, unit: &mut CompilationUnit) -> usiz
     });
     removed
 }
-
-fn collect_call_names(ast: &JavaAst, root: JavaId, out: &mut std::collections::HashSet<String>) {
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        match ast.data(id) {
-            NodeData::Call => {
-                if let Some(&callee) = ast.children(id).first() {
-                    match ast.data(callee) {
-                        NodeData::Member { name } => {
-                            out.insert(strip_ta_prefix(ast.sn(*name)).to_string());
-                        }
-                        NodeData::VarRef { name } => {
-                            out.insert(strip_ta_prefix(ast.sn(*name)).to_string());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            NodeData::MethodRef { name } => {
-                // `recv::name` / `recv::new`
-                if let Some(short) = ast.sn(*name).rsplit("::").next() {
-                    out.insert(strip_ta_prefix(short).to_string());
-                }
-            }
-            _ => {}
-        }
-        for &c in ast.children(id) {
-            stack.push(c);
-        }
-    }
-}
-
-
 
 fn simplify_type(ast: &mut JavaAst, ty: &mut TypeDecl, cfg: &Config, total: &mut Report) {
     for m in &mut ty.members {

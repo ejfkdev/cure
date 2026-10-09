@@ -166,7 +166,7 @@ impl Gen {
             1 => format!("flag = {};", self.bool_expr(2)),
             2 => format!("s = s + {};", self.str_expr(1)),
             3 => format!("acc = acc + bump({});", self.rng.range(3) + 1),
-            _ => format!("System.out.println(\"m\" + acc + \":\" + s);"),
+            _ => "System.out.println(\"m\" + acc + \":\" + s);".to_string(),
         }
     }
 

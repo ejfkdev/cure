@@ -854,7 +854,7 @@ public class DNeg {
     assert!(out.contains("return x;"), "{out}");
     let mut outcome = parse("class A{int m(){return -(-5);}}");
     simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
-    let out = print_unit(&outcome.ast, &mut outcome.unit);
+    let out = print_unit(&outcome.ast, &outcome.unit);
     assert!(out.contains("return 5;"), "{out}");
 }
 

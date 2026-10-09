@@ -2,9 +2,9 @@
 //!
 //! 解析序：`CURE_LANG`（显式 `zh`/`en` 覆盖）> `LC_ALL` > `LC_MESSAGES`
 //! > `LANG` > `LANGUAGE` > Windows 用户 UI 语言。主子标签以 `zh` 开头
-//! （zh / zh_CN / zh-Hans / zh_TW.UTF-8 …）选中文；声明了其他语言选英文。
-//! `C`、`POSIX`、空值视为未声明语言，链继续。`LANGUAGE` 是冒号分隔的
-//! 优先列表（`zh:en`）——只取第一项。
+//! > （zh / zh_CN / zh-Hans / zh_TW.UTF-8 …）选中文；声明了其他语言选英文。
+//! > `C`、`POSIX`、空值视为未声明语言，链继续。`LANGUAGE` 是冒号分隔的
+//! > 优先列表（`zh:en`）——只取第一项。
 //!
 //! 环境变量永远优先——Win32 调用仅在没有任何变量声明语言时执行
 //! （裸 cmd.exe / PowerShell 不导出 locale 变量；Git Bash / Cygwin / WSL

@@ -4,8 +4,9 @@
 [![Documentation](https://docs.rs/cure-java-simplify/badge.svg)](https://docs.rs/cure-java-simplify)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/ejfkdev/cure/blob/main/LICENSE)
 
-The Java rule pack of [cure](https://github.com/ejfkdev/cure): 58
-semantic-preserving simplification rules over
+The Java rule pack of [cure](https://github.com/ejfkdev/cure): 30
+Java-specific semantic-preserving simplification rules (64 with the engine's
+34 built-ins) over
 [`cure-java-ast`](https://crates.io/crates/cure-java-ast), driven to a fixed
 point by [`cure-engine`](https://crates.io/cure-engine).
 

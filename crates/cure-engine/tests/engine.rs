@@ -372,8 +372,8 @@ fn build(toy: &mut Toy, v: &V) -> Id {
                 "assign" => toy.push(NodeKind::Assign, child_ids, None),
                 "decl" => {
                     let name = sym_of(&rest[0]).unwrap().to_string();
-                    let id = toy.push(NodeKind::VarDecl, child_ids[1..].to_vec(), Some(name));
-                    id
+                    
+                    toy.push(NodeKind::VarDecl, child_ids[1..].to_vec(), Some(name))
                 }
                 "new" => toy.push(NodeKind::New, child_ids, None),
                 "arr" => toy.push(NodeKind::ArrayLit, child_ids, None),

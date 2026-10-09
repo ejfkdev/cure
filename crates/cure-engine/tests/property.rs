@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use cure_engine::kind::{BinOp, LitRef, NodeKind, UnOp};
+#[allow(unused_imports)]
 use BinOp::{Add, And, Div, Eq, Ge, Gt, Le, Lt, Mul, Ne, Or, Rem, Sub};
 use BinOp as B;
 use UnOp::Not as UnNot;
@@ -397,8 +398,7 @@ impl Interp {
     }
 
     fn binop(&self, op: BinOp, l: V, r: V) -> V {
-        use BinOp::{Add, And, Div, Eq, Ge, Gt, Le, Lt, Mul, Ne, Or, Rem, Sub};
-use BinOp as B;
+        use BinOp as B;
         match (l, r) {
             (V::Int(a), V::Int(b)) => {
                 if op.is_comparison() {
@@ -542,8 +542,7 @@ impl<'a> Gen<'a> {
     }
 
     fn expr(&mut self, ty: Ty, depth: u32) -> Id {
-        use BinOp::{Add, And, Div, Eq, Ge, Gt, Le, Lt, Mul, Ne, Or, Rem, Sub};
-use BinOp as B;
+        use BinOp as B;
         if depth == 0 {
             return match ty {
                 Ty::Int => {

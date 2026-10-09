@@ -56,7 +56,7 @@ fn self_is_terminal<L: Lang>(lang: &L, n: L::Id) -> bool {
 /// 子树是否含 switch 表达式产出（yield）。折叠丢弃含 yield 的分支会
 /// 缩小产出集 → switch 表达式静态类型改变（var 推断随之破坏）。
 fn contains_yield<L: Lang>(lang: &L, n: L::Id) -> bool {
-    subtree_contains(&*lang, n, |x| lang.kind(x) == NodeKind::Yield)
+    subtree_contains(lang, n, |x| lang.kind(x) == NodeKind::Yield)
 }
 
 pub struct ConstCondition;
@@ -1368,13 +1368,10 @@ impl<L: Lang> Rule<L> for BoolShortCircuit {
                 match (op, is_lit(r, true), is_lit(r, false)) {
                     (BinOp::And, true, _) => l,
                     (BinOp::Or, _, true) => l,
-                    (BinOp::And, _, true) | (BinOp::Or, true, _) => {
-                        if lang.effect(l) <= Effect::MayRead {
+                    (BinOp::And, _, true) | (BinOp::Or, true, _)
+                        if lang.effect(l) <= Effect::MayRead => {
                             r
-                        } else {
-                            return None;
                         }
-                    }
                     _ => return None,
                 }
             }
@@ -1485,11 +1482,10 @@ impl<L: Lang> Rule<L> for TernaryFold {
                     return Some(Edit::Replace { target: id, with: a });
                 }
             }
-            Some(LitRef::Bool(false)) => {
-                if !in_inferred_var_init(&*lang, walk, id) {
+            Some(LitRef::Bool(false))
+                if !in_inferred_var_init(&*lang, walk, id) => {
                     return Some(Edit::Replace { target: id, with: b });
                 }
-            }
             _ => {}
         }
         // c ? a : a：两臂结构全同 → 折叠不改变静态类型（lub(a,a)=a），

@@ -328,7 +328,7 @@ public class UnrC {
 "#;
     let mut outcome = parse(src);
     assert!(outcome.errors.is_empty());
-    let report = simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
+    let _report = simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
     let after = print_unit(&outcome.ast, &outcome.unit);
     // 死 case 体已消失；CFF 还原后整段被 static_exec 折叠为常量输出
     // （by_rule 断言不可靠——多规则接力时归属可能在任一环）

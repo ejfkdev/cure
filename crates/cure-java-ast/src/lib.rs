@@ -1449,7 +1449,7 @@ impl Lang for JavaAst {
             // `String s2 = …` 赋值失败）。元素名须**全串**一致（含实参），
             // 维度须与声明嵌套一致；var 推断声明恒安全
             if matches!(use_parent, Some(p) if {
-                matches!(self.data(p), NodeData::Index { .. }) && use_at_head
+                matches!(self.data(p), NodeData::Index) && use_at_head
             }) {
                 return self.index_base_newarray_unsound(decl, value);
             }
@@ -1669,103 +1669,6 @@ impl JavaAst {
 }
 
 // ---------------------------------------------------------------------------
-// 测试
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builder_smoke() {
-        let mut a = JavaAst::new();
-        let one = a.lit(Lit::Int(1));
-        let x = a.var_decl("x", JType::Int, Some(one));
-        let xv = a.var("x");
-        let r = a.ret(Some(xv));
-        let body = a.block(vec![x, r]);
-        assert_eq!(a.kind(body), NodeKind::Block);
-        assert_eq!(a.children(body).len(), 2);
-    }
-
-    #[test]
-    fn effect_aggregation() {
-        let mut a = JavaAst::new();
-        let f = a.plain_call("foo", vec![]);
-        let r = a.ret(Some(f));
-        let body = a.block(vec![r]);
-        a.prepare(body);
-        assert_eq!(a.effect(f), Effect::Unknown);
-        assert_eq!(a.effect(r), Effect::Unknown);
-        assert_eq!(a.effect(body), Effect::Unknown);
-
-        let mut b = JavaAst::new();
-        let two = b.lit(Lit::Int(2));
-        let three = b.lit(Lit::Int(3));
-        let add = b.bin(BinOp::Add, two, three);
-        let r2 = b.ret(Some(add));
-        let body2 = b.block(vec![r2]);
-        b.prepare(body2);
-        assert_eq!(b.effect(add), Effect::Pure);
-        // return 语句本身按控制流计为 MayThrow，Block 聚合随之
-        assert_eq!(b.effect(r2), Effect::MayThrow);
-        assert_eq!(b.effect(body2), Effect::MayThrow);
-    }
-
-    #[test]
-    fn var_type_resolution_and_shadowing() {
-        let mut a = JavaAst::new();
-        // { boolean b = true; { int b2 = 1; b2; } b; }
-        let one = a.lit(Lit::Int(1));
-        let b2_decl = a.var_decl("b2", JType::Int, Some(one));
-        let inner_b2 = a.var("b2");
-        let inner_stmt = a.expr_stmt(inner_b2);
-        let inner = a.block(vec![b2_decl, inner_stmt]);
-        let tv = a.lit(Lit::Bool(true));
-        let decl_b = a.var_decl("b", JType::Bool, Some(tv));
-        let outer_b = a.var("b");
-        let outer_stmt = a.expr_stmt(outer_b);
-        let body = a.block(vec![decl_b, inner, outer_stmt]);
-        a.prepare(body);
-        assert!(a.is_bool(outer_b));
-        // b2 的使用在 inner 块内，类型可解析
-        assert!(a.var_type(inner_b2).is_some());
-    }
-
-    #[test]
-    fn raw_and_foreach_semantics() {
-        let mut a = JavaAst::new();
-        // { int x = 1; RAW; for (String s : list) { s.len(); } }
-        let one = a.lit(Lit::Int(1));
-        let dx = a.var_decl("x", JType::Int, Some(one));
-        let r = a.raw("broken ~!@ code");
-        let sv = a.var("s");
-        let call = a.method_call(sv, "len", vec![]);
-        let es = a.expr_stmt(call);
-        let body = a.block(vec![es]);
-        let lst = a.var("list");
-        let fe = a.for_each("s", JType::Ref("String".into()), lst, body);
-        let all = a.block(vec![dx, r, fe]);
-        a.prepare(all);
-        assert_eq!(a.kind(r), NodeKind::Raw);
-        assert_eq!(a.effect(r), Effect::Unknown);
-        assert!(a.var_type(sv).is_some()); // 循环变量类型可解析
-    }
-
-    #[test]
-    fn num_raw_literal() {
-        let mut a = JavaAst::new();
-        let l = a.lit(Lit::NumRaw {
-            text: "0x1F".into(),
-            val: NumVal::Int(31),
-        });
-        a.prepare(l);
-        assert!(a.is_exact_int(l));
-        assert!(matches!(a.literal(l), Some(LitRef::Int(31))));
-    }
-}
-
-// ---------------------------------------------------------------------------
 // 区域事件索引（使用索引）：规则区域扫描的预计算。
 // 遍历序必须与引擎 scan_region 原递归严格一致：
 //   Assign      → [Write(目标)] + value 子树（目标本身不再当 Use 扫）
@@ -1875,7 +1778,7 @@ impl JavaAst {
             // 三元：结果可为基本类型（R14 族 B 抓获：`Object o = true ?
             // 'a' : 'b'; o.hashCode()` 曾内联成 'a'.hashCode() 不可解引用）
             // ——含引用臂的保守拒绝（过度面小）
-            NodeData::Ternary { .. } => true,
+            NodeData::Ternary => true,
             // 基本类型 cast：(int) 'a' 结果 int——引用 cast 保守同拒
             NodeData::Cast { .. } => true,
             // instanceof：结果恒 boolean
@@ -1885,7 +1788,7 @@ impl JavaAst {
             // `Character c = s.charAt(0); return c.toString()` 曾产出
             // `s.charAt(0).toString()` 无法取消引用 char）。装箱名精确
             // 匹配，非装箱引用类型（Foo f = m(); f.x()）不受限
-            NodeData::Call { .. } | NodeData::Member { .. } | NodeData::Index { .. } => {
+            NodeData::Call | NodeData::Member { .. } | NodeData::Index => {
                 match self.data(decl) {
                     NodeData::VarDecl { ty: JType::Ref(n), .. } => {
                         let boxed = [
@@ -1965,3 +1868,100 @@ pub static PREPARE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 pub static PREPARE_NODES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub static COLLECT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_smoke() {
+        let mut a = JavaAst::new();
+        let one = a.lit(Lit::Int(1));
+        let x = a.var_decl("x", JType::Int, Some(one));
+        let xv = a.var("x");
+        let r = a.ret(Some(xv));
+        let body = a.block(vec![x, r]);
+        assert_eq!(a.kind(body), NodeKind::Block);
+        assert_eq!(a.children(body).len(), 2);
+    }
+
+    #[test]
+    fn effect_aggregation() {
+        let mut a = JavaAst::new();
+        let f = a.plain_call("foo", vec![]);
+        let r = a.ret(Some(f));
+        let body = a.block(vec![r]);
+        a.prepare(body);
+        assert_eq!(a.effect(f), Effect::Unknown);
+        assert_eq!(a.effect(r), Effect::Unknown);
+        assert_eq!(a.effect(body), Effect::Unknown);
+
+        let mut b = JavaAst::new();
+        let two = b.lit(Lit::Int(2));
+        let three = b.lit(Lit::Int(3));
+        let add = b.bin(BinOp::Add, two, three);
+        let r2 = b.ret(Some(add));
+        let body2 = b.block(vec![r2]);
+        b.prepare(body2);
+        assert_eq!(b.effect(add), Effect::Pure);
+        // return 语句本身按控制流计为 MayThrow，Block 聚合随之
+        assert_eq!(b.effect(r2), Effect::MayThrow);
+        assert_eq!(b.effect(body2), Effect::MayThrow);
+    }
+
+    #[test]
+    fn var_type_resolution_and_shadowing() {
+        let mut a = JavaAst::new();
+        // { boolean b = true; { int b2 = 1; b2; } b; }
+        let one = a.lit(Lit::Int(1));
+        let b2_decl = a.var_decl("b2", JType::Int, Some(one));
+        let inner_b2 = a.var("b2");
+        let inner_stmt = a.expr_stmt(inner_b2);
+        let inner = a.block(vec![b2_decl, inner_stmt]);
+        let tv = a.lit(Lit::Bool(true));
+        let decl_b = a.var_decl("b", JType::Bool, Some(tv));
+        let outer_b = a.var("b");
+        let outer_stmt = a.expr_stmt(outer_b);
+        let body = a.block(vec![decl_b, inner, outer_stmt]);
+        a.prepare(body);
+        assert!(a.is_bool(outer_b));
+        // b2 的使用在 inner 块内，类型可解析
+        assert!(a.var_type(inner_b2).is_some());
+    }
+
+    #[test]
+    fn raw_and_foreach_semantics() {
+        let mut a = JavaAst::new();
+        // { int x = 1; RAW; for (String s : list) { s.len(); } }
+        let one = a.lit(Lit::Int(1));
+        let dx = a.var_decl("x", JType::Int, Some(one));
+        let r = a.raw("broken ~!@ code");
+        let sv = a.var("s");
+        let call = a.method_call(sv, "len", vec![]);
+        let es = a.expr_stmt(call);
+        let body = a.block(vec![es]);
+        let lst = a.var("list");
+        let fe = a.for_each("s", JType::Ref("String".into()), lst, body);
+        let all = a.block(vec![dx, r, fe]);
+        a.prepare(all);
+        assert_eq!(a.kind(r), NodeKind::Raw);
+        assert_eq!(a.effect(r), Effect::Unknown);
+        assert!(a.var_type(sv).is_some()); // 循环变量类型可解析
+    }
+
+    #[test]
+    fn num_raw_literal() {
+        let mut a = JavaAst::new();
+        let l = a.lit(Lit::NumRaw {
+            text: "0x1F".into(),
+            val: NumVal::Int(31),
+        });
+        a.prepare(l);
+        assert!(a.is_exact_int(l));
+        assert!(matches!(a.literal(l), Some(LitRef::Int(31))));
+    }
+}

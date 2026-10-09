@@ -49,7 +49,7 @@ impl BatchFileReader {
         if let Some(r) = self.ring.as_mut() {
             return r.read_batch(paths);
         }
-        paths.iter().map(|p| fs::read_to_string(p)).collect()
+        paths.iter().map(fs::read_to_string).collect()
     }
 }
 

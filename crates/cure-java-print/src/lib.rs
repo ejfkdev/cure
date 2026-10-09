@@ -699,7 +699,7 @@ impl<'a> Printer<'a> {
                 let body = ast.children(id)[0];
                 if self.ast.data(body) == &NodeData::Empty {
                     // label:;（指向空分号）——直接同行输出分号
-                    self.out.push_str(";");
+                    self.out.push(';');
                     return;
                 }
                 self.level += 1;
@@ -1287,7 +1287,7 @@ impl<'a> Printer<'a> {
                 self.out.push_str(&ty_str(ty));
                 for i in 0..*dims {
                     self.out.push('[');
-                    if (i as u16) < *sized {
+                    if i < *sized {
                         self.expr(ch[i as usize], prec::ASSIGN);
                     }
                     self.out.push(']');

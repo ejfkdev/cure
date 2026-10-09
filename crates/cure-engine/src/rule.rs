@@ -314,5 +314,5 @@ pub(crate) fn structural_sort_key<L: Lang>(snap: &Walk<L>, edit: &Edit<L>) -> (L
             Edit::Multi(es) => es.first().and_then(|x| first_pos(snap, x)),
         }
     }
-    first_pos(snap, edit).unwrap_or_else(|| (snap.root, 0))
+    first_pos(snap, edit).unwrap_or((snap.root, 0))
 }

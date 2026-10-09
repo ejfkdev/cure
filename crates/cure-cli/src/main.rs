@@ -634,7 +634,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         let r = (backend.process)(&src, &opts, None, &display)?;
         // --stats/--report：单文件也输出汇总（结构指标随处可得）
         if opts.stats || opts.report {
-            print_stats_summary(&[r.clone()], &opts);
+            print_stats_summary(std::slice::from_ref(&r), &opts);
         }
         return Ok(final_code_opts(r.changed, r.errored, &opts));
     }
@@ -917,7 +917,7 @@ fn process_source(
     result.changed = result.edits > 0 || printed != src;
 
     if opts.diff && result.changed {
-        result.diff_text = unified_diff(&src, &printed, display);
+        result.diff_text = unified_diff(src, &printed, display);
     }
 
     if opts.check {
@@ -1084,7 +1084,7 @@ fn myers_script(a: &[&str], b: &[&str]) -> Option<Vec<(usize, usize, DiffOp)>> {
             k += 2;
         }
     }
-    let d_final = found_d? as usize;
+    let d_final = found_d?;
     // 回溯
     let mut ops: Vec<(usize, usize, DiffOp)> = Vec::new();
     let mut x = n as isize;

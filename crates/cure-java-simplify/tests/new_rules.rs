@@ -1,8 +1,7 @@
 //! 新增规则 golden 测试：短路/常量折叠/三元/零元素/死赋值/StringBuilder/装箱链/迭代器还原。
 
-use cure_engine::kind::{BinOp, UnOp};
-use cure_engine::{Config, Lang};
-use cure_java_ast::{JType, JavaAst, JavaId, Lit};
+use cure_engine::Config;
+use cure_java_ast::{JavaAst, JavaId};
 use cure_java_parser::parse;
 use cure_java_print::print;
 use cure_java_simplify::simplify;
@@ -812,7 +811,7 @@ fn fold_i32_min_negation_refused() {
 #[test]
 fn fold_neg_normal_still_works() {
     // 常规负字面量取反不受影响
-    let out = run_src("class A{int f(){int a = -3 - 4; return -a;}}");
+    let _out = run_src("class A{int f(){int a = -3 - 4; return -a;}}");
     // a 折为 -7 后 -a 保留（a 是变量非字面量）——换个直接形态：
     let out2 = run_src("class A{int f(){return -(-7);}}");
     assert!(out2.contains("return 7;"), "{out2}");
