@@ -269,9 +269,12 @@ pub struct JavaAst {
     /// 用：前缀字段写被 rest 再赋值时，仅 final 才放弃（非 final 的
     /// 材料化写是死写，语义恒等、可编译）。
     pub final_fields: HashSet<String>,
-    /// 可内联的单 return 方法：名字 → (参数名表, 返回表达式节点)。
-    /// 由 simplify_unit 填充（解密 helper：d(0) → 方法体）。
-    pub inline_methods: HashMap<String, (Vec<String>, JavaId)>,
+    /// 可内联的单 return 方法：名字 → (参数名表, 返回表达式节点, 声明
+    /// 该方法的类的简单名)。owner 供 const_method_inline 的归属守卫：
+    /// 限定调用的接收者类名必须与之一致——名字匹配不判归属会把 JDK 的
+    /// Integer.valueOf 当本类同名方法内联。由 simplify_unit 填充（解密
+    /// helper：d(0) → 方法体）。
+    pub inline_methods: HashMap<String, (Vec<String>, JavaId, String)>,
     /// String 引用身份比较缓存：(root, 结果)。prepare() 清空（树已变），
     /// 首次查询时计算——供 new String(lit) 等折叠守卫复用（每轮至多一次全扫）。
     string_identity: std::cell::Cell<Option<(JavaId, bool)>>,

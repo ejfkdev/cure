@@ -4039,7 +4039,8 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
                         && method_name_count.get(name).copied() == Some(1)
                         {
                             let ps: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
-                            ast.inline_methods.insert(name.clone(), (ps, expr));
+                            let owner = ty.name.rsplit('.').next().unwrap_or(&ty.name).to_string();
+                            ast.inline_methods.insert(name.clone(), (ps, expr, owner));
                         }
                     }
                 }
@@ -4690,13 +4691,17 @@ impl Rule<JavaAst> for ConstMethodInline {
             return None;
         }
         let ch = lang.children(id).to_vec();
-        let method_name = match lang.data(ch[0]) {
-            NodeData::VarRef { name } => *name,
+        // recv_class：静态限定调用的接收者名（Type.valueOf 形态）。
+        // 归属守卫的输入——None = 裸名调用（valueOf(x)，隐式本类）或
+        // this 前缀，不做归属判定。
+        let (method_name, recv_class) = match lang.data(ch[0]) {
+            NodeData::VarRef { name } => (*name, None),
             NodeData::Member { name } => {
                 let recv = lang.children(ch[0])[0];
                 match lang.var_name(recv) {
-                    Some(r) if r == "this" || r.chars().next().is_some_and(|c| c.is_uppercase()) => {
-                        *name
+                    Some(r) if r == "this" => (*name, None),
+                    Some(r) if r.chars().next().is_some_and(|c| c.is_uppercase()) => {
+                        (*name, Some(r.to_string()))
                     }
                     _ => return None,
                 }
@@ -4704,7 +4709,18 @@ impl Rule<JavaAst> for ConstMethodInline {
             _ => return None,
         };
         let entry = lang.inline_methods.get(lang.sn(method_name)).cloned()?;
-        let (params, body_expr) = entry;
+        let (params, body_expr, owner) = entry;
+        // **归属守卫**：限定调用的接收者类名必须等于声明类——此前名字
+        // 匹配不判归属，把 JDK 的 `Integer.valueOf(-1)`（接收者大写即
+        // 放行）误当本类 `valueOf(boolean)` 内联，代入 -1 产出
+        // `!-1 ? Boolean.FALSE : Boolean.TRUE` 不可编译（ddc lark 语料
+        // jna Function 复现）。裸名/this 调用在同一单元内由方法名唯一
+        // 性计数守卫兜底。
+        if let Some(recv) = recv_class {
+            if recv != owner {
+                return None;
+            }
+        }
         // 终止守卫：方法体内不得含任何【内联名】的裸调用
         {
             let names: Vec<String> = lang.inline_methods.keys().cloned().collect();

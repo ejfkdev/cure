@@ -174,3 +174,47 @@ public class TypedListLoop {
         "List 白名单类型应还原 for-each\n{out}"
     );
 }
+
+#[test]
+fn const_method_inline_owner_guard() {
+    // ddc lark 语料 jna Function 复现：本类 static Boolean valueOf(boolean)
+    // 与 JDK Integer.valueOf(int) 撞名——名字匹配不判归属曾把
+    // Integer.valueOf(-1) 当本类方法内联，产出 `!-1 ? Boolean.FALSE :
+    // Boolean.TRUE` 不可编译。归属守卫：限定调用接收者 == 声明类；
+    // 字面量实参的同类调用（裸名/限定名）照常内联。
+    let out = run_src(
+        r#"
+public class ValOf {
+    static java.lang.Integer TRUE_C = java.lang.Integer.valueOf(-1);
+    static java.lang.Boolean valueOf(boolean p) {
+        return !p ? Boolean.FALSE : Boolean.TRUE;
+    }
+    static Object bare() {
+        return valueOf(false);
+    }
+    static Object qualified() {
+        return ValOf.valueOf(true);
+    }
+    public static void main(String[] args) {
+        System.out.println(TRUE_C + "" + bare() + qualified());
+    }
+}
+"#,
+    );
+    // JDK 调用原样保留（归属不符 → 不内联）
+    assert!(
+        out.contains("Integer.valueOf(-1)"),
+        "Integer.valueOf 必须原样保留（归属不符）\n{out}"
+    );
+    assert!(!out.contains("!-1"), "撞名误内联的坏形态不得出现\n{out}");
+    // 同类字面量实参调用照常内联 + 下游折叠收尾：
+    // valueOf(false) → !false ? FALSE : TRUE → return Boolean.TRUE;
+    assert!(
+        out.contains("return Boolean.TRUE;"),
+        "同类裸名 valueOf(false) 应内联并折叠\n{out}"
+    );
+    assert!(
+        out.contains("return Boolean.FALSE;"),
+        "同类限定 ValOf.valueOf(true) 应内联并折叠\n{out}"
+    );
+}
