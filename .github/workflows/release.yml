@@ -1,12 +1,20 @@
-# 发版流程：推送 v* tag 触发。
-#   git tag v0.1.0 && git push origin v0.1.0
-# 1. 六平台编译 cure 二进制（Linux 启用 io_uring feature）
-# 2. 依序发布 workspace 全部 crate 到 crates.io（scripts/publish.sh）
-# 3. 汇总产物 + sha256 校验和，创建 GitHub Release（自动生成 notes）
+# Tag-triggered release: builds cure for six targets (every platform
+# cross-compiles on its family's runner — no Intel macOS runners), UPX-
+# compresses where supported (everything but Mach-O), and uploads the RAW
+# binaries — no zip/tar wrapping.
+#
+# The binary reports the tag's version: the workflow rewrites
+# workspace.package.version (inherited by every crate, feeding
+# CARGO_PKG_VERSION) from the tag name before building. Release assets
+# ship stripped (CARGO_PROFILE_RELEASE_STRIP=symbols) even though the
+# workspace profile keeps the fat-LTO build for local use.
+#
+# Crates.io publishing runs as a separate job (scripts/publish.sh,
+# idempotent — already-published versions are skipped, so re-pushing a
+# tag after a partial publish is safe).
 #
 # 前置：仓库 Settings → Secrets → CARGO_REGISTRY_TOKEN
 # （crates.io → Account Settings → API Tokens，scope: publish-new + publish-update）
-name: Release
 
 on:
   push:
@@ -17,41 +25,89 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_STRIP: symbols
 
 jobs:
-  binaries:
-    name: build (${{ matrix.target }})
+  release:
+    name: cure ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            upx: true
             features: io-uring
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            upx: true
             features: io-uring
-          - os: macos-13 # Intel runner
-            target: x86_64-apple-darwin
-            features: ""
-          - os: macos-latest # Apple Silicon
-            target: aarch64-apple-darwin
-            features: ""
+          # Windows x64 + arm64 (arm64 cross on the x64 runner; UPX
+          # best-effort — ARM64 PE support depends on the UPX build)
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            upx: true
             features: ""
-          - os: windows-latest # 交叉编译 ARM64 Windows（不可运行，仅产物）
+          - os: windows-latest
             target: aarch64-pc-windows-msvc
+            upx: true
+            features: ""
+          # macOS arm64 + amd64 (amd64 cross on the arm64 runner — the
+          # last Intel runners queue for ages; UPX does not support
+          # Mach-O, so both ship stripped, uncompressed)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            upx: false
+            features: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            upx: false
             features: ""
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      # Strip the leading 'v': v1.2.3 → 1.2.3. The tag's annotated
+      # message becomes the release description.
+      - name: Tag → version
+        shell: bash
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          # %(contents:body) EXCLUDES the tag signature: committers with
+          # tag.gpgsign=true (SSH) would otherwise leak the signature
+          # block into the release description.
+          TAG_SUBJECT=$(git tag -l --format='%(contents:subject)' "${GITHUB_REF_NAME}")
+          TAG_BODY_ONLY=$(git tag -l --format='%(contents:body)' "${GITHUB_REF_NAME}")
+          {
+            echo "TAG_BODY<<EOF"
+            echo "$TAG_SUBJECT"
+            echo ""
+            echo "$TAG_BODY_ONLY"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      # First `^version = "…"` in the root manifest is [workspace.package];
+      # every crate inherits it, so CARGO_PKG_VERSION (binary --version)
+      # follows the tag.
+      - name: Stamp version
+        shell: bash
+        run: |
+          python -c "
+          import re
+          s = open('Cargo.toml').read()
+          s = re.sub(r'^version = \"[^\"]+\"', 'version = \"${VERSION}\"', s, count=1, flags=re.M)
+          open('Cargo.toml', 'w').write(s)
+          "
+          grep -n '^version' Cargo.toml
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: ${{ matrix.target }}
+
       - name: Build
         shell: bash
         run: |
@@ -60,58 +116,68 @@ jobs:
           else
             cargo build --release -p cure-cli --target ${{ matrix.target }}
           fi
-      - name: Package (unix)
-        if: matrix.target != 'x86_64-pc-windows-msvc' && matrix.target != 'aarch64-pc-windows-msvc'
+
+      - name: UPX-compress (linux/windows; best-effort)
+        if: matrix.upx
         shell: bash
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          STAGE="cure-v${VERSION}-${{ matrix.target }}"
-          mkdir -p "${STAGE}"
-          cp "target/${{ matrix.target }}/release/cure" "${STAGE}/"
-          cp LICENSE README.md README.zh-CN.md "${STAGE}/"
-          tar czf "cure-v${VERSION}-${{ matrix.target }}.tar.gz" "${STAGE}"
-      - name: Package (windows)
-        if: matrix.target == 'x86_64-pc-windows-msvc' || matrix.target == 'aarch64-pc-windows-msvc'
-        shell: pwsh
+          BIN="target/${{ matrix.target }}/release/cure"
+          if [ "${{ runner.os }}" = "Windows" ]; then BIN="$BIN.exe"; fi
+          case "${{ runner.os }}" in
+            Linux)   sudo apt-get update -y && sudo apt-get install -y upx-ucl ;;
+            Windows) choco install upx -y --no-progress ;;
+          esac
+          BEFORE=$(stat -c %s "$BIN" 2>/dev/null || wc -c < "$BIN")
+          { upx --best --lzma "$BIN" || upx --best "$BIN"; } && upx -t "$BIN" \
+            || echo "::warning::UPX unsupported for this binary — shipping uncompressed"
+          AFTER=$(stat -c %s "$BIN" 2>/dev/null || wc -c < "$BIN")
+          echo "upx: $BEFORE -> $AFTER bytes"
+
+      - name: Verify binary
+        shell: bash
         run: |
-          $VERSION = $env:GITHUB_REF_NAME.TrimStart('v')
-          $STAGE = "cure-v$VERSION-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force $STAGE | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/cure.exe" $STAGE
-          Copy-Item LICENSE,README.md,README.zh-CN.md $STAGE
-          Compress-Archive -Path $STAGE -DestinationPath "cure-v$VERSION-${{ matrix.target }}.zip"
-      - uses: actions/upload-artifact@v4
+          BIN="target/${{ matrix.target }}/release/cure"
+          if [ "${{ runner.os }}" = "Windows" ]; then BIN="$BIN.exe"; fi
+          if [ "${{ matrix.target }}" = "aarch64-pc-windows-msvc" ]; then
+            echo "(windows-arm64 binary cannot execute on the x64 runner — skipping run check)"
+          else
+            OUT="$("$BIN" version)"
+            echo "$OUT"
+            case "$OUT" in *" $VERSION"*) ;; *) echo "::error::version mismatch: want $VERSION"; exit 1;; esac
+            # smoke: simplify a snippet end-to-end
+            echo 'class A{int f(int x){int y=x+0;return y*1;}}' | "$BIN" -
+          fi
+
+      # Raw binaries as release assets — deliberately NOT zipped/tarballed.
+      # Named with the FULL target triple (not a platform name): cargo-
+      # binstall's {target} placeholder resolves its download URL from
+      # exactly this form, per [package.metadata.binstall] in cure-cli.
+      - name: Stage binary asset
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/cure"
+          OUT="cure-${{ env.TAG }}-${{ matrix.target }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "$BIN.exe" "$OUT.exe"
+          else
+            cp "$BIN" "$OUT"
+            chmod +x "$OUT"
+          fi
+          ls -la "cure-${{ env.TAG }}-${{ matrix.target }}"*
+
+      - uses: softprops/action-gh-release@v3.0.3
         with:
-          name: ${{ matrix.target }}
-          path: cure-v*-${{ matrix.target }}.*
-          if-no-files-found: error
+          files: cure-${{ env.TAG }}-${{ matrix.target }}*
+          body: ${{ env.TAG_BODY }}
+          generate_release_notes: true
 
   publish-crates:
     name: publish (crates.io)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Publish workspace crates in dependency order
         run: bash scripts/publish.sh
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-  release:
-    name: create GitHub release
-    needs: [binaries, publish-crates]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Create release
-        run: |
-          (cd dist && sha256sum cure-v* | tee checksums.sha256 > /dev/null)
-          gh release create "${GITHUB_REF_NAME}" dist/cure-v* dist/checksums.sha256 \
-            --title "cure ${GITHUB_REF_NAME}" \
-            --generate-notes
-        env:
-          GH_TOKEN: ${{ github.token }}

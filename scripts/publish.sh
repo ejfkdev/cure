@@ -45,6 +45,13 @@ CRATES=(
 )
 
 for c in "${CRATES[@]}"; do
+  # 幂等：该版本已在线上（重推 tag / 部分发布后续跑）→ 跳过而非失败
+  VER=$(awk -F'"' '/^version/{print $2; exit}' "crates/$c/Cargo.toml")
+  if [ -z "$DRY" ] && curl -sf -H "User-Agent: publish-check" \
+      "https://crates.io/api/v1/crates/$c/$VER" > /dev/null 2>&1; then
+    echo "==> $c@$VER 已存在于 crates.io —— 跳过"
+    continue
+  fi
   echo "==> cargo publish $DRY -p $c"
   attempt=1
   until cargo publish $DRY -p "$c"; do
