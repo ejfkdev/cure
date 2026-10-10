@@ -318,3 +318,82 @@ public class PostUse {
         "循环后仍引用迭代器 → 不得还原 for-each（声明会被消费）\n{out}"
     );
 }
+
+#[test]
+fn ctor_delegation_hoist_with_inline() {
+    // ddc weibo MediaPicker（Kotlin 默认参数桥）形态：值已折成三元，
+    // this() 委托仍在纯前置之后——「对 this 的调用必须是构造器中的第
+    // 一个语句」。前置整体后移（纯值晚求值恒等）、实参递归内联。
+    let out = run_src(
+        r#"
+public class Hoist {
+    Hoist(long p1, long p2) {}
+    Hoist(long p1, long p2, int p3, Object marker) {
+        long v5;
+        long v6 = 0L;
+        v5 = (p3 & 1) == 0 ? p1 : 0L;
+        v6 = (p3 & 2) == 0 ? p2 : 9223372036854775807L;
+        this(v5, v6);
+        Object[] box = new Object[] { Long.valueOf(v5), Long.valueOf(v6) };
+        System.out.println(box.length);
+    }
+    public static void main(String[] args) {
+        new Hoist(1L, 2L);
+    }
+}
+"#,
+    );
+    assert!(
+        out.contains("this((p3 & 1) == 0 ? p1 : 0L, (p3 & 2) == 0 ? p2 : 9223372036854775807L);"),
+        "委托须在首位且实参内联三元\n{out}"
+    );
+}
+
+#[test]
+fn ctor_delegation_hoist_rejects_impure_pre() {
+    // 前置含**裸调用语句**（非赋值）→ 不能删也不能跨 this() 换序 →
+    // 整条放弃（保持输入的位次——不合法是输入固有，规则不恶化）
+    let out = run_src(
+        r#"
+public class NoHoist {
+    NoHoist(int a) {}
+    NoHoist(int p, Object m) {
+        side(p);
+        this(p);
+    }
+    static int side(int x) { return x + 1; }
+    public static void main(String[] args) { new NoHoist(1); }
+}
+"#,
+    );
+    let side_pos = out.find("side(p);").unwrap_or(usize::MAX);
+    let this_pos = out.find("this(p);").unwrap_or(usize::MAX);
+    assert!(
+        side_pos < this_pos,
+        "不纯前置（裸调用）不得被跨过提升\n{out}"
+    );
+}
+
+#[test]
+fn ctor_delegation_hoist_recursive_arg() {
+    // 传递内联：v6 = p1 + 1; this(p1, v6) → this(p1, p1 + 1)
+    //（local_propagation 同形合法内联，本测试锁定组合终态）
+    let out = run_src(
+        r#"
+public class RecHoist {
+    RecHoist(int a, int b) {}
+    RecHoist(int p1, Object m) {
+        int v6 = 0;
+        v6 = p1 + 1;
+        this(p1, v6);
+        System.out.println(v6);
+    }
+    public static void main(String[] args) { new RecHoist(7); }
+}
+"#,
+    );
+    assert!(
+        out.contains("this(p1, p1 + 1);"),
+        "实参内联：this(p1, p1 + 1)\n{out}"
+    );
+}

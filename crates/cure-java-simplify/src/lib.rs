@@ -4428,6 +4428,203 @@ impl Rule<JavaAst> for StaticArrayIndexFold {
 // 删除整条 if 与落空等价。
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// 构造器委托提升：R8/d8 的 Kotlin 默认参数桥（与 Java 缺省参桥接）在
+// ddc 的 IR 值钻石折叠下把 `v = (p3 & 1) == 0 ? p1 : 0L; …; this(v…)`
+// 直接折成 `this((p3 & 1) == 0 ? p1 : 0L, …)` 到达首位。源码层走完
+// if_assign_ternary 后值已折成三元，但委托语句仍在纯赋值之后——
+// 「对 this/super 的调用必须是构造器中的第一个语句」。
+// 形状：根块 [纯前置…, this(args)/super(args), rest…] →
+// [this(内联实参…), 前置…, rest…]。
+// 前置全部 Effect::Pure（提升后重求值恒等；不纯的任何前置都让整条
+// 放弃——副作用语句既不能删、也不能跨 this() 换序）。实参是 VarRef 且
+// 前置恰有其（最后一次）赋值 → 该表达式内联进参数位；前置语句保留在
+// 委托之后（rest 里的读取仍解析到同名声明，纯值晚求值恒等）。
+// 嵌套块里的委托（R8 merged-ctor 每分支异参）是 Java 不可表 floor：
+// 仅根块（方法/构造器体直级）触发。
+// ---------------------------------------------------------------------------
+
+pub struct CtorDelegationHoist;
+
+/// 前置语句值的安全性白名单：字面量 / 局部变量·参数读（is_local_var
+/// ——裸名隐式字段读解析不到局部，天然出局）/ 算术·比较·三元 / 括号 /
+/// cast。字段读（this.x 经由 Member）、调用、数组访问都不允许——委托
+/// 构造器可写字段/数组内容，跨 this() 搬移会读到不同值；调用另有求值
+/// 次数语义。这是 MayRead 粒度的精确化：MayRead 不区分读的目标。
+fn hoist_value_ok(lang: &JavaAst, e: JavaId) -> bool {
+    match lang.kind(e) {
+        NodeKind::Literal => true,
+        NodeKind::VarRef => lang.is_local_var(e),
+        NodeKind::Binary | NodeKind::Unary | NodeKind::Ternary | NodeKind::Paren
+        | NodeKind::Cast => lang.children(e).iter().all(|&c| hoist_value_ok(lang, c)),
+        _ => false,
+    }
+}
+
+/// 递归实参解析：`v6 = v5 + 1; v5 = p1; this(v5, v6)` 的实参位要变成
+/// `(p1, p1 + 1)`——被内联表达式里的**前置局部名**继续替换为其赋值表
+/// 达式（只在这张表内递归；叶子恒为参数/表外名字，求值点保持 this()
+/// 之前，顺序安全）。访问集防环。
+fn hoist_resolve_arg(
+    lang: &mut JavaAst,
+    assign: &std::collections::HashMap<String, JavaId>,
+    a: JavaId,
+    visiting: &mut std::collections::HashSet<String>,
+) -> Option<JavaId> {
+    let name = match lang.data(a) {
+        NodeData::VarRef { name } => lang.sn(*name).to_string(),
+        _ => return Some(a), // 非变量实参原样
+    };
+    // 不在前置赋值表里的实参（参数/后置局部）保持原样——它不是失败
+    let Some(&expr) = assign.get(&name) else {
+        return Some(a);
+    };
+    if !visiting.insert(name.clone()) {
+        return None; // 环（v = w; w = v）
+    }
+    let r = hoist_subst(lang, assign, expr, visiting);
+    visiting.remove(&name);
+    r
+}
+
+/// 拷贝 expr 并把其中出现在 assign 表里的 VarRef 递归替换。
+fn hoist_subst(
+    lang: &mut JavaAst,
+    assign: &std::collections::HashMap<String, JavaId>,
+    e: JavaId,
+    visiting: &mut std::collections::HashSet<String>,
+) -> Option<JavaId> {
+    match lang.data(e) {
+        NodeData::VarRef { name } => {
+            let n = lang.sn(*name).to_string();
+            if let Some(&src) = assign.get(&n) {
+                if !visiting.insert(n.clone()) {
+                    return None;
+                }
+                let r = hoist_subst(lang, assign, src, visiting);
+                visiting.remove(&n);
+                r
+            } else {
+                Some(e)
+            }
+        }
+        _ => {
+            let ch = lang.children(e).to_vec();
+            let mut new_ch = Vec::with_capacity(ch.len());
+            for c in ch {
+                new_ch.push(hoist_subst(lang, assign, c, visiting)?);
+            }
+            Some(lang.clone_node(e, new_ch))
+        }
+    }
+}
+
+impl Rule<JavaAst> for CtorDelegationHoist {
+    fn name(&self) -> &'static str {
+        "ctor_delegation_hoist"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Block]
+    }
+    fn structural(&self) -> bool {
+        true
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        // 仅根块：嵌套块内的 this()/super()（每分支异参的合并构造器）
+        // 无法靠提升产出合法 Java
+        if ctx.parent(id).is_some() {
+            return None;
+        }
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::Block {
+            return None;
+        }
+        let stmts = lang.children(id).to_vec();
+        // 定位根级委托：ExprStmt{Call{This/Super callee}}
+        let mut ctor_idx: Option<usize> = None;
+        for (i, &st) in stmts.iter().enumerate() {
+            if *lang.data(st) != NodeData::ExprStmt {
+                continue;
+            }
+            let Some(&inner) = lang.children(st).first() else { continue };
+            if lang.kind(inner) != NodeKind::Call {
+                continue;
+            }
+            let Some(&callee) = lang.children(inner).first() else { continue };
+            if matches!(lang.data(callee), NodeData::This | NodeData::Super) {
+                ctor_idx = Some(i);
+                break;
+            }
+        }
+        let ci = ctor_idx?;
+        if ci == 0 {
+            return None; // 已在首位
+        }
+        // 前置：全为 纯白名单赋值 / 带白名单 init 的声明 / 裸声明；
+        // 收集 名 → 最后赋值表达式
+        let mut last_assign: std::collections::HashMap<String, JavaId> =
+            std::collections::HashMap::new();
+        for &st in &stmts[..ci] {
+            let (name, value) = match lang.data(st) {
+                NodeData::VarDecl { name, .. } => {
+                    let init = lang.children(st).first().copied();
+                    match init {
+                        Some(e) => (name.clone(), e),
+                        None => continue, // 裸声明：无效果，随前置后移
+                    }
+                }
+                NodeData::ExprStmt => {
+                    let Some(&a) = lang.children(st).first() else {
+                        return None;
+                    };
+                    // 复合赋值有读语义 → 保守放弃（显式 trait 限定：具名类型
+                    // 下 &mut 构建器 assign_op(op,t,v) 会遮蔽查询方法）
+                    if lang.kind(a) != NodeKind::Assign
+                        || <JavaAst as Lang>::assign_op(&*lang, a).is_some()
+                    {
+                        return None;
+                    }
+                    let ch = lang.children(a).to_vec();
+                    let (t, v) = (*ch.first()?, *ch.get(1)?);
+                    if lang.kind(t) != NodeKind::VarRef || !lang.is_local_var(t) {
+                        return None; // 非局部目标（字段写等）→ 放弃
+                    }
+                    let vn = lang.var_name(t)?;
+                    (vn.to_string(), v)
+                }
+                _ => return None, // if/try/调用等其他形态 → 整条放弃
+            };
+            if !hoist_value_ok(lang, value) {
+                return None; // 字段读/调用/数组读：跨 this() 搬移会变值
+            }
+            last_assign.insert(name, value);
+        }
+        // 实参递归内联：VarRef 且前置有赋值 → 表内传递替换
+        let call_stmt = stmts[ci];
+        let call = *lang.children(call_stmt).first()?;
+        let cch = lang.children(call).to_vec();
+        let callee = *cch.first()?;
+        let mut new_args: Vec<JavaId> = Vec::with_capacity(cch.len() - 1);
+        for &a in &cch[1..] {
+            new_args.push(hoist_resolve_arg(lang, &last_assign, a, &mut Default::default())?);
+        }
+        // 新块：[委托(内联实参)] ++ 前置 ++ rest（rest 原位不动）
+        let callee_copy = lang.copy_subtree(callee);
+        let new_call = lang.call(callee_copy, new_args);
+        let new_stmt = lang.expr_stmt(new_call);
+        let mut insert: Vec<JavaId> = Vec::with_capacity(ci + 1);
+        insert.push(new_stmt);
+        insert.extend(stmts[..ci].iter().copied());
+        Some(Edit::Splice {
+            node: id,
+            index: 0,
+            remove: ci + 1,
+            insert,
+        })
+    }
+}
+
 pub struct TrailingIfContinue;
 
 impl Rule<JavaAst> for TrailingIfContinue {
@@ -5800,6 +5997,7 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(CffRecover));
     rules.push(Box::new(StaticArrayIndexFold));
     rules.push(Box::new(TrailingAssignReturn));
+    rules.push(Box::new(CtorDelegationHoist));
     rules.push(Box::new(TrailingIfContinue));
     rules.push(Box::new(ConstFieldPropagate));
     rules.push(Box::new(NoopPrivateCall));
