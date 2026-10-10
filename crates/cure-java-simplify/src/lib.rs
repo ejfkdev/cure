@@ -4447,21 +4447,6 @@ impl Rule<JavaAst> for StaticArrayIndexFold {
 
 pub struct CtorDelegationHoist;
 
-/// 前置语句值的安全性白名单：字面量 / 局部变量·参数读（is_local_var
-/// ——裸名隐式字段读解析不到局部，天然出局）/ 算术·比较·三元 / 括号 /
-/// cast。字段读（this.x 经由 Member）、调用、数组访问都不允许——委托
-/// 构造器可写字段/数组内容，跨 this() 搬移会读到不同值；调用另有求值
-/// 次数语义。这是 MayRead 粒度的精确化：MayRead 不区分读的目标。
-fn hoist_value_ok(lang: &JavaAst, e: JavaId) -> bool {
-    match lang.kind(e) {
-        NodeKind::Literal => true,
-        NodeKind::VarRef => lang.is_local_var(e),
-        NodeKind::Binary | NodeKind::Unary | NodeKind::Ternary | NodeKind::Paren
-        | NodeKind::Cast => lang.children(e).iter().all(|&c| hoist_value_ok(lang, c)),
-        _ => false,
-    }
-}
-
 /// 递归实参解析：`v6 = v5 + 1; v5 = p1; this(v5, v6)` 的实参位要变成
 /// `(p1, p1 + 1)`——被内联表达式里的**前置局部名**继续替换为其赋值表
 /// 达式（只在这张表内递归；叶子恒为参数/表外名字，求值点保持 this()
@@ -4595,9 +4580,10 @@ impl Rule<JavaAst> for CtorDelegationHoist {
                 }
                 _ => return None, // if/try/调用等其他形态 → 整条放弃
             };
-            if !hoist_value_ok(lang, value) {
-                return None; // 字段读/调用/数组读：跨 this() 搬移会变值
-            }
+            // 值不设白名单：实参内联 = 原位再求值（ddc IR 折叠同款——
+            // 基线把 new/调用臂内联进 this() 并保留原赋值在后，接受
+            // 重复求值）；前置语句整体后移保持相对次序。前置**形态**仍
+            // 限于赋值/声明——裸调用/控制流语句无法安全换位。
             last_assign.insert(name, value);
         }
         // 实参递归内联：VarRef 且前置有赋值 → 表内传递替换
@@ -6022,6 +6008,21 @@ pub fn simplify(ast: &mut JavaAst, root: JavaId, cfg: &Config) -> Report {
 }
 
 /// 整个编译单元：逐个方法体/初始化块/字段初始化器优化，签名不动。
+/// 带外部事实的单元简化：前端 IR 权威陈述（单定义/单使用/布尔性/
+/// 调用副作用）注入后运行常规管线——事实只放宽守卫，不改变规则集。
+/// 单元结束自动清空（JavaFacts 生命周期 = 编译单元）。
+pub fn simplify_unit_with_facts(
+    ast: &mut JavaAst,
+    unit: &mut CompilationUnit,
+    cfg: &Config,
+    facts: &cure_java_ast::JavaFacts,
+) -> Report {
+    ast.set_facts(facts.clone());
+    let r = simplify_unit(ast, unit, cfg);
+    ast.clear_facts();
+    r
+}
+
 pub fn simplify_unit(ast: &mut JavaAst, unit: &mut CompilationUnit, cfg: &Config) -> Report {
     let mut total = Report::default();
     // 收敛外循环：引擎单次调用跑至"本轮无应用"即停，但末轮被丢弃的结构

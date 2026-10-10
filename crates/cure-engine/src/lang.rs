@@ -180,6 +180,39 @@ pub trait Lang {
         false
     }
 
+    // ---- 外部事实（front-end facts）----------------------------------
+    //
+    // 语言无关的「前端断言」词汇：持有 IR/类型/数据流信息的调用方
+    //（反编译前端等）对源码层**可见变量与被调成员**的权威陈述。引擎
+    // 规则保持形状驱动——事实只用于**放宽守卫**（替代源码层保守扫
+    // 描/回退），永不引入源码无法自证的新改写方向，语义保持承诺不
+    // 变。默认实现 = 无事实（保守，纯源码模式）。
+    //
+    // 携带方式由各语言 crate 自定（本 trait 只定义查询面）；事实的
+    // 生命周期是**编译单元**——换单元必须清空/替换。
+
+    /// 变量（按名字键）在源码外**无隐藏写**且全部可见写恰为一次
+    /// （单一定义）。传播/钻石折叠据此跳过写窗口扫描。
+    fn fact_single_def(&self, _key: Self::NameKey) -> bool {
+        false
+    }
+    /// 变量（按名字键）的读点恰为一次（前端权威计数）。传播据此
+    /// 免句法引用计数兜底。
+    fn fact_single_use(&self, _key: Self::NameKey) -> bool {
+        false
+    }
+    /// 变量（按名字键）的静态类型为原始布尔。类型敏感的布尔折叠
+    /// 据此放行 int 形状。
+    fn fact_bool_valued(&self, _key: Self::NameKey) -> bool {
+        false
+    }
+    /// 按被调成员名的副作用上限（池级/IR 分析：纯方法调用、无抛
+    /// 字段读等）。`None` = 未知（保守）。条件折叠/短路重建据此
+    /// 放行含调用的条件。
+    fn fact_call_effect(&self, _name: &str) -> Option<Effect> {
+        None
+    }
+
     fn bin_op(&self, id: Self::Id) -> Option<BinOp>;
     fn un_op(&self, id: Self::Id) -> Option<UnOp>;
     fn literal(&self, id: Self::Id) -> Option<LitRef<'_>>;

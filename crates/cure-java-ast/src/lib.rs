@@ -228,10 +228,46 @@ pub struct NoopCandidate {
 }
 
 
-/// Java AST arena。只追加不回收，[`JavaId`] 永不失效。
+// ---------------------------------------------------------------------------
+// 外部事实（front-end facts）——cure-engine Lang 事实查询面的 Java 载体。
+//
+// 持有 IR/类型/数据流信息的调用方（反编译前端）对源码可见变量与被调
+// 成员的权威陈述。语言无关的词汇语义见 cure_engine::lang 的 trait 文档；
+// 本结构只是键的承载（局部名 → 变量事实；成员名 → 调用副作用上限）。
+// 生命周期 = 编译单元：换单元必须 clear_facts()（simplify_unit 门面
+// 已自动管理）。零依赖 Rust 结构（序列化形态留给后续 feature 门控）。
+// ---------------------------------------------------------------------------
+
+/// 单个局部变量的事实集（全部缺省 false = 未知/不成立）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VarFacts {
+    /// 源码外无隐藏写，可见写恰为一次（单一定义）。
+    pub single_def: bool,
+    /// 读点恰为一次（前端权威计数）。
+    pub single_use: bool,
+    /// 静态类型为原始 boolean（寄存器复用 demux 的真值）。
+    pub bool_valued: bool,
+}
+
+/// 编译单元级事实集：局部名（前端发射的名字与源码文本一致——名字是
+/// 文本往返的稳定键）→ 变量事实；被调成员名 → 副作用上限。
+#[derive(Debug, Clone, Default)]
+pub struct JavaFacts {
+    pub vars: HashMap<String, VarFacts>,
+    pub call_effects: HashMap<String, std::collections::HashSet<cure_engine::Effect>>,
+}
+
+impl JavaFacts {
+    pub fn var(&self, name: &str) -> VarFacts {
+        self.vars.get(name).copied().unwrap_or_default()
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct JavaAst {
     pub(crate) nodes: Vec<Node>,
+    /// 外部事实（前端注入；编译单元生命周期）。None = 纯源码保守模式。
+    pub facts: Option<JavaFacts>,
     /// prepare() 重建：JavaId → 聚合效果。
     /// 槽位 = arena 下标（稠密 u32）；None = 未算/失效。Vec 索引替代哈希。
     effect_cache: Vec<Option<Effect>>,
@@ -884,6 +920,17 @@ impl JavaAst {
     }
 
     /// 名字键 → 名字反查（虚拟执行的字段写材料化）。
+    /// 注入外部事实（前端 IR 权威陈述）。编译单元生命周期——换单元
+    /// 前必须 clear_facts（simplify_unit / simplify_unit_with_facts
+    /// 门面自动管理）。重复注入覆盖。
+    pub fn set_facts(&mut self, facts: JavaFacts) {
+        self.facts = Some(facts);
+    }
+    /// 清空外部事实（回到纯源码保守模式）。
+    pub fn clear_facts(&mut self) {
+        self.facts = None;
+    }
+
     pub fn name_of_key(&self, k: u32) -> Option<String> {
         Some(self.names.name(k).to_string())
     }
@@ -1221,6 +1268,36 @@ impl Lang for JavaAst {
 
     fn var_key(&self, id: JavaId) -> Option<u32> {
         self.names.var_key(id.0 as usize)
+    }
+
+    // ---- 外部事实（cure-engine Lang 词汇的 Java 实现：查 facts 槽）----
+
+    fn fact_single_def(&self, key: u32) -> bool {
+        match (&self.facts, self.names.name(key)) {
+            (Some(f), n) => f.var(n).single_def,
+            _ => false,
+        }
+    }
+    fn fact_single_use(&self, key: u32) -> bool {
+        match (&self.facts, self.names.name(key)) {
+            (Some(f), n) => f.var(n).single_use,
+            _ => false,
+        }
+    }
+    fn fact_bool_valued(&self, key: u32) -> bool {
+        match (&self.facts, self.names.name(key)) {
+            (Some(f), n) => f.var(n).bool_valued,
+            _ => false,
+        }
+    }
+    fn fact_call_effect(&self, name: &str) -> Option<cure_engine::Effect> {
+        self.facts
+            .as_ref()
+            .and_then(|f| {
+                f.call_effects.get(name).map(|set| {
+                    set.iter().copied().fold(Effect::Pure, Effect::worst)
+                })
+            })
     }
 
     fn node_index(&self, id: JavaId) -> usize {
