@@ -4445,6 +4445,96 @@ impl Rule<JavaAst> for StaticArrayIndexFold {
 // 仅根块（方法/构造器体直级）触发。
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 纯调用语句删除：结果被丢弃的 `Long.compare(a, b);` /
+// `Integer.compare(...)` / `Float.compare` / `Double.compare` /
+// `Short/Byte/Character.compare` / `Objects.toString(x);`。来源：ddc 把
+// dex 的 cmp-long/cmpg-float 指令渲染成 X.compare 语句 + 独立的原始比
+// 较分支（结果用后者），前者是永不被读的纯函数调用；R8 删日志后遗留的
+// Objects.toString 同族。全语料实测：三 APK 合计 ~6.3 万处。
+// 守卫：语句位（结果弃置是构造性的）；X.compare 全重载收**基本类型**
+// 形参（无装箱 NPE 语义）；Objects.toString(null) 返回 "null" 无副作用。
+// ---------------------------------------------------------------------------
+
+pub struct DeadPureCall;
+
+impl Rule<JavaAst> for DeadPureCall {
+    fn name(&self) -> &'static str {
+        "dead_pure_call"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::ExprStmt]
+    }
+    fn structural(&self) -> bool {
+        true
+    }
+    fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        let lang = ctx.lang;
+        if lang.kind(id) != NodeKind::ExprStmt {
+            return None;
+        }
+        let Some(&call) = lang.children(id).first() else { return None };
+        if lang.kind(call) != NodeKind::Call {
+            return None;
+        }
+        let cch = lang.children(call).to_vec();
+        let Some(&callee) = cch.first() else { return None };
+        // 静态限定调用：Receiver 是简单类名（java.lang 箱类型/Objects——
+        // 不经 this/实例接收者）
+        let (recv, name) = match lang.data(callee) {
+            NodeData::Member { name } => {
+                let Some(&recv_expr) = lang.children(callee).first() else { return None };
+                // 接收者取末段名：裸类名（VarRef Long）或限定链末段
+                //（java.util.Objects 的 Member 末端）
+                let recv_name = match lang.data(recv_expr) {
+                    NodeData::VarRef { name } => lang.sn(*name).to_string(),
+                    NodeData::Member { name } => lang.sn(*name).to_string(),
+                    _ => return None,
+                };
+                if !recv_name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_uppercase())
+                {
+                    return None;
+                }
+                (recv_name, lang.sn(*name))
+            }
+            _ => return None,
+        };
+        let args = &cch[1..];
+        let pure = match (recv.as_str(), name) {
+            ("Long" | "Integer" | "Float" | "Double" | "Short" | "Byte" | "Character", "compare") => {
+                // 基本类型重载：全部实参须为 int/long/float/double/char
+                // 字面量或解析到基本类型局部（装箱实参走 valueOf 重载——
+                // 拆箱可 NPE，保守放过）
+                args.iter().all(|&a| match lang.data(a) {
+                    NodeData::Literal(
+                        Lit::Int(_) | Lit::Long(_) | Lit::Float(_) | Lit::Double(_),
+                    ) => true,
+                    // 数值字面量保留原文（0L / 0x1F）：NumVal 恒为数值
+                    NodeData::Literal(Lit::NumRaw { .. }) => true,
+                    NodeData::VarRef { .. } => {
+                        let t = lang.var_type(a);
+                        matches!(
+                            t,
+                            Some(JType::Int | JType::Long | JType::Float | JType::Double | JType::Char
+                                | JType::Short | JType::Byte)
+                        )
+                    }
+                    _ => false,
+                })
+            }
+            ("Objects", "toString") => args.len() == 1,
+            _ => false,
+        };
+        if !pure {
+            return None;
+        }
+        Some(Edit::Delete { node: id })
+    }
+}
+
 pub struct CtorDelegationHoist;
 
 /// 递归实参解析：`v6 = v5 + 1; v5 = p1; this(v5, v6)` 的实参位要变成
@@ -5983,6 +6073,7 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     rules.push(Box::new(CffRecover));
     rules.push(Box::new(StaticArrayIndexFold));
     rules.push(Box::new(TrailingAssignReturn));
+    rules.push(Box::new(DeadPureCall));
     rules.push(Box::new(CtorDelegationHoist));
     rules.push(Box::new(TrailingIfContinue));
     rules.push(Box::new(ConstFieldPropagate));

@@ -397,3 +397,53 @@ public class RecHoist {
         "实参内联：this(p1, p1 + 1)\n{out}"
     );
 }
+
+#[test]
+fn dead_pure_call_statements_removed() {
+    // ddc 的 cmp 指令渲染族：compare 语句结果永不被读（真分支用原始
+    // 比较另行表达）；Objects.toString 是 R8 删日志残留。三 APK 实测
+    // ~6.3 万处。
+    let out = run_src(
+        r#"
+public class DeadCmp {
+    static long scale(long p0x, long p1x, String s) {
+        Long.compare(p1x, 0L);
+        if (p1x > 0L) {
+            Long.compare(p0x, 0L);
+            if (p0x > 0L) {
+                boolean empty = s.isEmpty();
+                return empty ? (p1x + p0x) / 2L : 0L;
+            }
+        }
+        java.util.Objects.toString(s);
+        return 0L;
+    }
+    public static void main(String[] args) {
+        System.out.println(scale(4L, 2L, "x"));
+    }
+}
+"#,
+    );
+    assert!(!out.contains(".compare("), "丢弃结果的 compare 语句应删除\n{out}");
+    assert!(!out.contains("Objects.toString"), "Objects.toString 语句应删除\n{out}");
+    assert!(out.contains("if (p1x > 0L)"), "真分支保留\n{out}");
+}
+
+#[test]
+fn dead_pure_call_boxed_operand_kept() {
+    // 装箱实参走 valueOf 重载——拆箱可 NPE，保守不删
+    let out = run_src(
+        r#"
+public class BoxedCmp {
+    static int f(Long x) {
+        Long.compare(x, 0L);
+        return x == null ? -1 : 1;
+    }
+    public static void main(String[] args) {
+        System.out.println(f(null));
+    }
+}
+"#,
+    );
+    assert!(out.contains("Long.compare(x, 0L);"), "装箱实参的 compare 保留（拆箱 NPE 语义）\n{out}");
+}
