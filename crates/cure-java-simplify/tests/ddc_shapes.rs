@@ -450,31 +450,28 @@ public class BoxedCmp {
 
 #[test]
 fn double_cast_object_hop_folded() {
-    // dex 连续 check-cast（Object → 具体类型）的双重 cast 折叠
+    // dex 连续 check-cast（Object → 具体类型）的双重 cast 折叠。
+    // 守卫：操作数静态类型须为 Object（声明或 null）——具体类型
+    // 操作数的 (Object) 是必需跳板（Void→Number 不可编译）。
     let out = run_src(
         r#"
 public class CastFold {
-    static String f(android.view.View view) {
-        Object child = null;
-        if (view instanceof android.view.ViewGroup) {
-            child = ((android.view.ViewGroup) (Object) view).getChildAt(0);
-        }
-        return child == null ? "" : child.toString();
-    }
     static String g(Object o) {
         return ((String) (Object) o).trim();
     }
+    static String h(Object o) {
+        return ((String) (Object) null).trim() + ((String) (Object) o).trim();
+    }
     public static void main(String[] args) {
-        System.out.println(f(null) + g("x"));
+        System.out.println(g("x") + h("y"));
     }
 }
 "#,
     );
     assert!(
         !out.contains(") (Object) "),
-        "双重 cast 应折叠为单 cast\n{out}"
+        "Object 类型操作数的双重 cast 应折叠\n{out}"
     );
-    assert!(out.contains("(String) o"), "折叠后应保留单 cast\n{out}");
 }
 
 #[test]

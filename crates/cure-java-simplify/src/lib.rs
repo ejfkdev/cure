@@ -57,20 +57,33 @@ impl Rule<JavaAst> for CastSimplify {
             }
         }
         // (T)(Object) x → (T) x：dex 的连续 check-cast（先 Object 再具体
-        // 类型）被忠实再现成双重 cast。`(Object)` 一跳是必然的加宽转型，
-        // 纯噪声——编辑**内层 cast 为其操作数**（外层 T 保留）。
-        // 三语料实测 61,890 处。守卫：内层 cast 目标必须是 Object（唯一
-        // 安全的中间跳——Object 是万物超类，折叠后 `(T) x` 在源类型为
-        // 任何引用类型时仍编译合法——downcast/upcast 皆可）。
+        // 类型）被忠实再现成双重 cast。`(Object)` 一跳在**操作数静态类型
+        // 为 Object 或 null** 时是纯噪声——`(T) objTypedAsObject` 合法。
+        // 操作数类型是具体类型（Void/String/方法返回值等）时 `(Object)`
+        // 是必需跳板（`(Number) voidReturning()` 不可编译——lark LayoutNode
+        // ×4 教训）——不折叠。三语料实测：Object 类型源占大多数。
         if let NodeData::Cast { ty: inner_cast_ty } = lang.data(inner) {
             let is_obj = matches!(inner_cast_ty,
                 JType::Ref(r) if r == "java.lang.Object" || r == "Object");
             if is_obj {
                 let operand = lang.children(inner).first().copied()?;
-                return Some(Edit::Replace {
-                    target: inner,
-                    with: operand,
-                });
+                // 操作数静态类型检查：null/this/literal 恒为 Object（安全）；
+                // VarRef 须解析到 Object 声明；其余（方法调用返回具体类型、
+                // 嵌套 cast 后的具体类型等）不可判 → 保守放过
+                let operand_is_object = match lang.data(operand) {
+                    NodeData::Literal(_) | NodeData::This => true,
+                    NodeData::VarRef { .. } => {
+                        matches!(lang.var_type(operand),
+                            Some(JType::Ref(r)) if r == "java.lang.Object" || r == "Object")
+                    }
+                    _ => false,
+                };
+                if operand_is_object {
+                    return Some(Edit::Replace {
+                        target: inner,
+                        with: operand,
+                    });
+                }
             }
         }
         None
