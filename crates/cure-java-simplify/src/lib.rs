@@ -4788,13 +4788,15 @@ impl Rule<JavaAst> for TrailingElseFlatten {
                 }
             }
         }
-        // 一般展平：if 改为 2-child，else 体追加到父 Block 的 if 之后
+        // 一般展平：构 2-child If 节点 + else 体语句追加到父 Block
         let parent = parent?;
         if lang.kind(parent) != NodeKind::Block {
             return None;
         }
         let idx = idx?;
-        let mut insert: Vec<JavaId> = vec![ch[0], then];
+        // 构新 If 节点（[cond, then]）——cond 是表达式不能裸插语句列表
+        let new_if = lang.clone_node(id, vec![ch[0], then]);
+        let mut insert: Vec<JavaId> = vec![new_if];
         // else 体语句追加（Block 展平或单语句直接加）
         if lang.kind(els) == NodeKind::Block {
             insert.extend(lang.children(els).to_vec());
