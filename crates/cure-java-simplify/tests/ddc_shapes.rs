@@ -498,3 +498,69 @@ public class CastKeep {
     // 真正的跳板场景是 (A)(B) x——这里只测 Object 中转被折叠
     assert!(!out.contains("(Object) o"), "Object 中转应被折叠\n{out}");
 }
+
+#[test]
+fn trailing_else_flatten() {
+    // if (c) { …; return; } else { … } → if (c) { …; return; } + else 续排
+    let out = run_src(
+        r#"
+public class ElseFlat {
+    static int f(int x) {
+        if (x > 0) {
+            return 1;
+        } else {
+            int y = x * 2;
+            return y;
+        }
+    }
+    public static void main(String[] args) {
+        System.out.println(f(5) + f(-3));
+    }
+}
+"#,
+    );
+    assert!(!out.contains("} else {"), "尾随 else 应展平\n{out}");
+}
+
+#[test]
+fn trailing_else_void_return_removed() {
+    // if (c) { …; return; } else { return; } → if (c) { …; return; }
+    let out = run_src(
+        r#"
+public class VoidRet {
+    static void g(boolean c) {
+        if (c) {
+            System.out.println("yes");
+            return;
+        } else {
+            return;
+        }
+    }
+    public static void main(String[] args) { g(true); g(false); }
+}
+"#,
+    );
+    assert!(!out.contains("} else {"), "else 仅裸 return 应删除\n{out}");
+}
+
+#[test]
+fn trailing_else_throw_kept_flattened() {
+    // then 终结于 throw 同族展平
+    let out = run_src(
+        r#"
+public class ThrowFlat {
+    static int h(int x) {
+        if (x < 0) {
+            throw new IllegalArgumentException("neg");
+        } else {
+            return x + 1;
+        }
+    }
+    public static void main(String[] args) {
+        System.out.println(h(1));
+    }
+}
+"#,
+    );
+    assert!(!out.contains("} else {"), "throw 终结的 else 也应展平\n{out}");
+}
