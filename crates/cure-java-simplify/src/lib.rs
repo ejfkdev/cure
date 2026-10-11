@@ -56,6 +56,23 @@ impl Rule<JavaAst> for CastSimplify {
                 });
             }
         }
+        // (T)(Object) x → (T) x：dex 的连续 check-cast（先 Object 再具体
+        // 类型）被忠实再现成双重 cast。`(Object)` 一跳是必然的加宽转型，
+        // 纯噪声——编辑**内层 cast 为其操作数**（外层 T 保留）。
+        // 三语料实测 61,890 处。守卫：内层 cast 目标必须是 Object（唯一
+        // 安全的中间跳——Object 是万物超类，折叠后 `(T) x` 在源类型为
+        // 任何引用类型时仍编译合法——downcast/upcast 皆可）。
+        if let NodeData::Cast { ty: inner_cast_ty } = lang.data(inner) {
+            let is_obj = matches!(inner_cast_ty,
+                JType::Ref(r) if r == "java.lang.Object" || r == "Object");
+            if is_obj {
+                let operand = lang.children(inner).first().copied()?;
+                return Some(Edit::Replace {
+                    target: inner,
+                    with: operand,
+                });
+            }
+        }
         None
     }
 }

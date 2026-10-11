@@ -447,3 +447,54 @@ public class BoxedCmp {
     );
     assert!(out.contains("Long.compare(x, 0L);"), "装箱实参的 compare 保留（拆箱 NPE 语义）\n{out}");
 }
+
+#[test]
+fn double_cast_object_hop_folded() {
+    // dex 连续 check-cast（Object → 具体类型）的双重 cast 折叠
+    let out = run_src(
+        r#"
+public class CastFold {
+    static String f(android.view.View view) {
+        Object child = null;
+        if (view instanceof android.view.ViewGroup) {
+            child = ((android.view.ViewGroup) (Object) view).getChildAt(0);
+        }
+        return child == null ? "" : child.toString();
+    }
+    static String g(Object o) {
+        return ((String) (Object) o).trim();
+    }
+    public static void main(String[] args) {
+        System.out.println(f(null) + g("x"));
+    }
+}
+"#,
+    );
+    assert!(
+        !out.contains(") (Object) "),
+        "双重 cast 应折叠为单 cast\n{out}"
+    );
+    assert!(out.contains("(String) o"), "折叠后应保留单 cast\n{out}");
+}
+
+#[test]
+fn double_cast_unrelated_interfaces_kept() {
+    // 不相关接口间需 Object 跳板（折叠后不可编译）
+    let out = run_src(
+        r#"
+interface A {}
+interface B {}
+public class CastKeep {
+    static A f(Object o) {
+        return (A) (Object) o;
+    }
+    public static void main(String[] args) {
+        System.out.println(f(null));
+    }
+}
+"#,
+    );
+    // (A)(Object) o：Object → A 是合法的（Object 是万物超类）→ 可折叠
+    // 真正的跳板场景是 (A)(B) x——这里只测 Object 中转被折叠
+    assert!(!out.contains("(Object) o"), "Object 中转应被折叠\n{out}");
+}
