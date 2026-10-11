@@ -63,7 +63,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "cure-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "assert_cmd",
  "cure-engine",
@@ -78,11 +78,11 @@ dependencies = [
 
 [[package]]
 name = "cure-engine"
-version = "0.1.5"
+version = "0.1.6"
 
 [[package]]
 name = "cure-java-ast"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "cure-engine",
  "cure-tree",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "cure-java-parser"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "cure-engine",
  "cure-java-ast",
@@ -99,14 +99,14 @@ dependencies = [
 
 [[package]]
 name = "cure-java-print"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "cure-java-ast",
 ]
 
 [[package]]
 name = "cure-java-simplify"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "cure-engine",
  "cure-java-ast",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "cure-tree"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "cure-engine",
 ]
