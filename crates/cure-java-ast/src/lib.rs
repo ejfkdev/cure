@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use cure_engine::analysis::{subtree_metrics, TreeMetrics};
-use cure_engine::lang::ReassocOutcome;
+use cure_engine::lang::{ReassocOutcome, StmtKill};
 use cure_engine::Lang;
 pub use cure_tree::ChildList;
 use cure_tree::{EventStore, NameTable};
@@ -263,6 +263,27 @@ impl JavaFacts {
     }
 }
 
+/// Per-statement syntactic name facts used by propagation rules: VarRef
+/// multiplicity plus whether a lambda in the subtree captures the name.
+/// Built once per statement alongside the region-event index and
+/// invalidated by the same `invalidate_effect` ancestor walk.
+#[derive(Clone, Copy, Debug)]
+struct StmtFact {
+    key: u32,
+    refs: u32,
+    lambda_cap: bool,
+}
+
+/// Per-statement kill event (`collect_stmt_kill_events`). `kind`:
+/// 1 = Read, 2 = Shadow, 3 = DomWrite.
+#[derive(Clone, Copy, Debug)]
+struct StmtKillFact {
+    key: u32,
+    kind: u8,
+    assign: JavaId,
+}
+
+
 #[derive(Default, Debug)]
 pub struct JavaAst {
     pub(crate) nodes: Vec<Node>,
@@ -327,6 +348,10 @@ pub struct JavaAst {
     /// 供引擎 scan_region 快路径——收集器在 cure-tree，只依赖 Lang
     /// 钩子，遍历序与引擎原递归严格一致。
     events: EventStore<JavaId, u32>,
+    /// 语句级名字事实（稠密槽 = 语句根 arena 下标；None = 未建/失效）。
+    stmt_facts: Vec<Option<Box<[StmtFact]>>>,
+    /// 语句级 kill 事件（同一槽位与失效机制）。
+    stmt_kills: Vec<Option<Box<[StmtKillFact]>>>,
     /// 上次 prepare 的根。B3 早退（events_clean）只对**树全局**缓存
     /// （事件索引/效果表）合法；var_types 是 **root 相关**的作用域分析
     /// ——根变化时必须重建，否则 is_local_var 全 false、传播规则停摆
@@ -1230,6 +1255,12 @@ impl Lang for JavaAst {
         // 事件索引同步失效：本节点子树若被改，其预计算事件已陈旧
         // （B3 脏标记 + 清空该槽——见 cure-tree EventStore）
         self.events.invalidate(id.0 as usize);
+        if let Some(slot) = self.stmt_facts.get_mut(id.0 as usize) {
+            *slot = None;
+        }
+        if let Some(slot) = self.stmt_kills.get_mut(id.0 as usize) {
+            *slot = None;
+        }
     }
 
     fn debug_verify_events(&self, stmt: JavaId) {
@@ -1268,6 +1299,36 @@ impl Lang for JavaAst {
 
     fn var_key(&self, id: JavaId) -> Option<u32> {
         self.names.var_key(id.0 as usize)
+    }
+
+    fn stmt_var_ref_count(&self, stmt: JavaId, key: u32) -> Option<u32> {
+        let slot = self.stmt_facts.get(stmt.0 as usize)?.as_deref()?;
+        Some(
+            slot.binary_search_by_key(&key, |f| f.key)
+                .ok()
+                .map_or(0, |i| slot[i].refs),
+        )
+    }
+
+    fn stmt_lambda_captures(&self, stmt: JavaId, key: u32) -> Option<bool> {
+        let slot = self.stmt_facts.get(stmt.0 as usize)?.as_deref()?;
+        Some(
+            slot.binary_search_by_key(&key, |f| f.key)
+                .ok()
+                .is_some_and(|i| slot[i].lambda_cap),
+        )
+    }
+
+    fn stmt_kill_event(&self, stmt: JavaId, key: u32) -> Option<StmtKill<JavaId>> {
+        let slot = self.stmt_kills.get(stmt.0 as usize)?.as_deref()?;
+        Some(match slot.binary_search_by_key(&key, |f| f.key) {
+            Ok(i) => match slot[i].kind {
+                1 => StmtKill::Read,
+                2 => StmtKill::Shadow,
+                _ => StmtKill::DomWrite(slot[i].assign),
+            },
+            Err(_) => StmtKill::None,
+        })
     }
 
     // ---- 外部事实（cure-engine Lang 词汇的 Java 实现：查 facts 槽）----
@@ -1642,6 +1703,8 @@ impl Lang for JavaAst {
         // 差分当场抓获）。性能背景：Types.java 上 prepare 每 pass 全量重建
         // = 726 倍冗余（37 万文件语料 prepare 占 57% 线程时间）。
         self.events.resize(n_nodes);
+        self.stmt_facts.resize_with(n_nodes, || None);
+        self.stmt_kills.resize_with(n_nodes, || None);
         if self.events.is_clean() {
             if self.prepared_root == Some(root) {
                 return;
@@ -1660,6 +1723,14 @@ impl Lang for JavaAst {
                 let events = cure_tree::collect_region_events(self, sr);
                 self.events.put(idx, events);
             }
+            if self.stmt_facts.get(idx).map_or(true, |f| f.is_none()) {
+                let facts = self.collect_stmt_facts(sr);
+                self.stmt_facts[idx] = Some(facts);
+            }
+            if self.stmt_kills.get(idx).map_or(true, |f| f.is_none()) {
+                let kills = self.collect_stmt_kill_facts(sr);
+                self.stmt_kills[idx] = Some(kills);
+            }
         }
         // ---- 效果表（cure-tree rebuild_effects：不动点 sweep——
         // children-先于-parent 索引序 + 注入节点违例多轮收敛）----
@@ -1670,6 +1741,69 @@ impl Lang for JavaAst {
 }
 
 impl JavaAst {
+    /// One traversal of a statement subtree: every VarRef increments its
+    /// name key; a VarRef under any Lambda also marks the name as
+    /// lambda-captured. Sorted by key for binary-search queries.
+    fn collect_stmt_facts(&self, root: JavaId) -> Box<[StmtFact]> {
+        let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut caps: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut stack: Vec<(JavaId, bool)> = vec![(root, false)];
+        while let Some((id, in_lambda)) = stack.pop() {
+            let node = &self.nodes[id.0 as usize];
+            let is_lambda = matches!(node.data, NodeData::Lambda { .. });
+            if matches!(node.data, NodeData::VarRef { .. }) {
+                if let Some(key) = self.names.var_key(id.0 as usize) {
+                    *counts.entry(key).or_insert(0) += 1;
+                    if in_lambda {
+                        caps.insert(key);
+                    }
+                }
+            }
+            let child_in_lambda = in_lambda || is_lambda;
+            for &c in node.children.as_slice() {
+                stack.push((c, child_in_lambda));
+            }
+        }
+        let mut facts: Vec<StmtFact> = counts
+            .into_iter()
+            .map(|(key, refs)| StmtFact {
+                key,
+                refs,
+                lambda_cap: caps.contains(&key),
+            })
+            .collect();
+        facts.sort_unstable_by_key(|f| f.key);
+        facts.into_boxed_slice()
+    }
+
+    /// One DFS for all names in the statement (first event wins), sorted
+    /// by key for binary-search queries.
+    fn collect_stmt_kill_facts(&self, root: JavaId) -> Box<[StmtKillFact]> {
+        let mut facts: Vec<StmtKillFact> = cure_engine::rules::collect_stmt_kill_events(self, root)
+            .into_iter()
+            .map(|(key, event)| match event {
+                StmtKill::None => unreachable!("collector only records real events"),
+                StmtKill::Read => StmtKillFact {
+                    key,
+                    kind: 1,
+                    assign: JavaId(0),
+                },
+                StmtKill::Shadow => StmtKillFact {
+                    key,
+                    kind: 2,
+                    assign: JavaId(0),
+                },
+                StmtKill::DomWrite(assign) => StmtKillFact {
+                    key,
+                    kind: 3,
+                    assign,
+                },
+            })
+            .collect();
+        facts.sort_unstable_by_key(|f| f.key);
+        facts.into_boxed_slice()
+    }
+
     /// root 相关的作用域分析（从 prepare 提取——根变化时单独重建）。
     pub(crate) fn rebuild_var_types(&mut self, root: JavaId) {
         // ---- 变量类型（作用域栈）----

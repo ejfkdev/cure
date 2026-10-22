@@ -12,6 +12,18 @@ use std::hash::Hash;
 use crate::effect::Effect;
 use crate::kind::{BinOp, LitRef, NodeKind, UnOp};
 
+/// Result of scanning one statement for a name: any-path reads keep the
+/// init alive, shadowing declarations reject, and a dominating simple
+/// assignment kills it. `None` means the statement neither reads, shadows,
+/// nor dominantly writes the name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StmtKill<Id> {
+    None,
+    Read,
+    Shadow,
+    DomWrite(Id),
+}
+
 pub trait Lang {
     /// 稳定节点句柄（通常是 `Copy` 的索引 newtype）。
     type Id: Copy + Eq + Hash + Ord + Debug;
@@ -83,6 +95,23 @@ pub trait Lang {
     /// 节点的名字键（VarRef/VarDecl/ForEach/Catch 等命名节点）；
     /// 无名节点返回 None。
     fn var_key(&self, _id: Self::Id) -> Option<Self::NameKey> {
+        None
+    }
+    /// Syntactic VarRef count for `key` inside this statement subtree.
+    /// `None` = no fresh index (unbuilt/stale) — callers fall back to a
+    /// recursive walk. Indexed languages return `Some(0)` for a statement
+    /// that simply does not mention the name.
+    fn stmt_var_ref_count(&self, _stmt: Self::Id, _key: Self::NameKey) -> Option<u32> {
+        None
+    }
+    /// Whether a lambda inside this statement subtree captures `key`.
+    /// Same `None` contract as [`Self::stmt_var_ref_count`].
+    fn stmt_lambda_captures(&self, _stmt: Self::Id, _key: Self::NameKey) -> Option<bool> {
+        None
+    }
+    /// Precomputed statement-level kill event for `key`. `None` = no fresh
+    /// index (callers fall back to [`crate::rules::scan_kill_event`]).
+    fn stmt_kill_event(&self, _stmt: Self::Id, _key: Self::NameKey) -> Option<StmtKill<Self::Id>> {
         None
     }
     /// 节点是否不透明（内部含不可解析原文，读/写集不可证明）：

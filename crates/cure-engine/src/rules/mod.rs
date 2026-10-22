@@ -9,7 +9,7 @@ use crate::effect::Effect;
 use crate::kind::{BinOp, LitRef, NodeKind, UnOp};
 use crate::pattern::{matches, Pat};
 use crate::rule::{Edit, RewriteCtx, Rule};
-use crate::lang::{Lang, ReassocOutcome};
+use crate::lang::{Lang, ReassocOutcome, StmtKill};
 use crate::walk::Walk;
 
 // ---------------------------------------------------------------------------
@@ -788,10 +788,20 @@ impl<L: Lang> Rule<L> for ArithIdentity {
 /// 语句区间内名字的**句法** VarRef 出现次数（逐节点计数；含赋值目标、
 /// 数组下标基——事件模型对这些位置的读不可见）。传播类规则的引用
 /// 计数兜底。注意与「语句级存在性」区分：同一语句里出现两次要计 2。
-fn count_name_refs<L: Lang>(lang: &L, stmts: &[L::Id], name: &str) -> usize {
+///
+/// `key` 用于有索引语言的一次二分查询；未索引节点回退递归计数。
+fn count_name_refs<L: Lang>(
+    lang: &L,
+    stmts: &[L::Id],
+    key: L::NameKey,
+    name: &str,
+) -> usize {
     let mut n: usize = 0;
     for &s in stmts {
-        count_var_refs(lang, s, name, &mut n);
+        match lang.stmt_var_ref_count(s, key) {
+            Some(c) => n += c as usize,
+            None => count_var_refs(lang, s, name, &mut n),
+        }
     }
     n
 }
@@ -937,37 +947,46 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         // 对事件索引不可见——bd.java 差分抓获：load 被替换而 store
         // 目标残留，输出引用已删除的变量。
         let name_str = lang.var_name(id)?.to_string();
-        // **λ 捕获守卫**（jOOQ Tools.hasAmbiguousNames 抓获：`Set names =
-        // new HashSet<>(); return anyMatch(fields, f -> !names.add(...))`
-        // 曾被内联成 `f -> !new HashSet<>().add(...)`——每次谓词新建
-        // Set，add 恒 true，重名检测恒 false）→ 拒绝传播
-        {
-            let mut captured = false;
-            for &st in &stmts[index + 1..] {
-                // λ 体内引用 x → 捕获（延迟/多次求值——内联 init 改变
-                // 求值次数与状态共享）
-                if subtree_contains(&*lang, st, |n| {
-                    if lang.kind(n) == NodeKind::Lambda {
-                        return subtree_contains(&*lang, n, |m| {
-                            lang.kind(m) == NodeKind::VarRef
-                                && lang.var_name(m) == Some(name_str.as_str())
-                        });
-                    }
-                    false
-                }) {
-                    captured = true;
-                    break;
+        let name_key = lang.var_key(id)?;
+        // **λ 捕获守卫 + 句法引用计数**（jOOQ Tools.hasAmbiguousNames
+        // 抓获：`Set names = new HashSet<>(); return anyMatch(fields, f ->
+        // !names.add(...))` 曾被内联成 `f -> !new HashSet<>().add(...)`——
+        // 每次谓词新建 Set，add 恒 true，重名检测恒 false）→ 拒绝传播。
+        // Indexed languages answer both facts per statement in one binary
+        // search; the recursive pair is the fallback for unindexed nodes.
+        // 两个条件任一成立即拒绝，故可提前退出。
+        let mut captured = false;
+        let mut syntactic_refs = 0usize;
+        for &st in &stmts[index + 1..] {
+            let (refs, cap) = match (
+                lang.stmt_var_ref_count(st, name_key),
+                lang.stmt_lambda_captures(st, name_key),
+            ) {
+                (Some(refs), Some(cap)) => (refs as usize, cap),
+                _ => {
+                    let mut n = 0usize;
+                    count_var_refs(&*lang, st, &name_str, &mut n);
+                    let cap = subtree_contains(&*lang, st, |n| {
+                        if lang.kind(n) == NodeKind::Lambda {
+                            return subtree_contains(&*lang, n, |m| {
+                                lang.kind(m) == NodeKind::VarRef
+                                    && lang.var_name(m) == Some(name_str.as_str())
+                            });
+                        }
+                        false
+                    });
+                    (n, cap)
                 }
-            }
-            if captured {
-                return None;
+            };
+            syntactic_refs += refs;
+            captured |= cap;
+            if captured || syntactic_refs > 1 {
+                break;
             }
         }
-        let syntactic_refs = count_name_refs(&*lang, &stmts[index + 1..], &name_str);
-        if syntactic_refs != 1 {
+        if captured || syntactic_refs != 1 {
             return None;
         }
-        let name_key = lang.var_key(id)?;
         let mut wa = Watch::<L>::new(name_key, &[]);
         for &s in &stmts[index + 1..] {
             scan_region(&*lang, s, &mut wa);
@@ -1129,7 +1148,7 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         // 使用点之后的死写（如 v = "y"）同样引用声明，残留会让输出失去声明。
         if let Some(ui) = use_stmt_idx {
             // 句法版：任何残留引用（含事件不可见的目标位）都拒绝删声明
-            if count_name_refs(&*lang, &stmts[ui + 1..], &name_str) != 0 {
+            if count_name_refs(&*lang, &stmts[ui + 1..], name_key, &name_str) != 0 {
                 return None;
             }
             let mut wc = Watch::<L>::new(name_key, &[name_key]);
@@ -2691,7 +2710,7 @@ impl<L: Lang> Rule<L> for AssignPropagation {
         // 扫描赋值之后的区域（用途/遮蔽全区间；写冲突窗口见下）。
         // 句法引用计数兜底（同 local_propagation——bd.java 教训）
         let name_key = lang.var_key(target)?;
-        if count_name_refs(&*lang, &stmts[idx + 1..], &name) != 1 {
+        if count_name_refs(&*lang, &stmts[idx + 1..], name_key, &name) != 1 {
             return None;
         }
         let mut wa = Watch::<L>::new(name_key, &[]);
@@ -2968,7 +2987,7 @@ impl<L: Lang> Rule<L> for MultiUseCopyPropagation {
         // 出现 > uses ⇒ 存在事件看不见的引用（bd.java 差分二轮抓获：
         // var10004 = var154 的读被替换、var10004[i]= 写目标残留 →
         // 读写裂脑 → 类初始化 AIOOBE）
-        let synth = count_name_refs(&*lang, &stmts[idx + 1..], &name);
+        let synth = count_name_refs(&*lang, &stmts[idx + 1..], name_key, &name);
         if synth != w1.uses.len() {
             return None;
         }
@@ -3089,113 +3108,107 @@ impl<L: Lang> Rule<L> for TernaryBoolOp {
 
 pub struct StoreKill;
 
-/// 语句级事件分类：任意路径的读都保活 init；只有**支配写**才击杀。
-/// （条件分支里的读在部分路径消费旧值——`x = C ? x+1 : x+2` 的分支读
-/// 就是活引用；条件分支里的写不必然执行 → 不击杀，继续扫。）
-enum KillEvent<L: Lang> {
-    /// 任意位置的读 → init 活着
-    Read,
-    /// 支配位置的简单赋值（写）
-    DomWrite(L::Id),
-    /// 同名重声明（遮蔽）
-    Shadow,
-}
-
 /// 扫描一个节点在 `name` 上的事件。
 /// `dominating`：当前子树是否在必经路径上（If/While 的 cond、Ternary 的
 /// cond、For 的 init/cond、非短路二元两侧 = true；分支体/循环体 = false）。
-fn scan_kill_event<L: Lang>(
+///
+/// 语言侧若提供语句级预计算索引（[`Lang::stmt_kill_event`]），调用方
+/// 应优先查询；本函数是未索引节点的回退路径。
+pub fn scan_kill_event<L: Lang>(
     lang: &L,
     node: L::Id,
     name: &str,
     dominating: bool,
-) -> Option<KillEvent<L>> {
+) -> StmtKill<L::Id> {
     match lang.kind(node) {
         NodeKind::VarRef => {
             if lang.var_name(node) == Some(name) {
-                Some(KillEvent::Read)
+                StmtKill::Read
             } else {
-                None
+                StmtKill::None
             }
         }
         NodeKind::VarDecl => {
             if lang.var_name(node) == Some(name) {
-                Some(KillEvent::Shadow)
+                StmtKill::Shadow
             } else {
                 // 其他变量声明：init 必经求值
                 for &c in lang.children(node) {
-                    if let Some(e) = scan_kill_event(lang, c, name, dominating) {
-                        return Some(e);
+                    let e = scan_kill_event(lang, c, name, dominating);
+                    if !matches!(e, StmtKill::None) {
+                        return e;
                     }
                 }
-                None
+                StmtKill::None
             }
         }
         NodeKind::Assign => {
             let ch = lang.children(node);
             // RHS 先求值
             if let Some(&val) = ch.get(1) {
-                if let Some(e) = scan_kill_event(lang, val, name, dominating) {
-                    if matches!(e, KillEvent::Read | KillEvent::Shadow) {
-                        return Some(e);
-                    }
+                let e = scan_kill_event(lang, val, name, dominating);
+                if matches!(e, StmtKill::Read | StmtKill::Shadow) {
+                    return e;
                 }
             }
             if lang.assign_op(node).is_none() {
                 if let Some(&t) = ch.first() {
                     if lang.kind(t) == NodeKind::VarRef && lang.var_name(t) == Some(name) {
                         if dominating {
-                            return Some(KillEvent::DomWrite(node));
+                            return StmtKill::DomWrite(node);
                         }
-                        return None; // 条件写：不击杀，也不算读
+                        return StmtKill::None; // 条件写：不击杀，也不算读
                     }
                 }
             }
-            None
+            StmtKill::None
         }
         NodeKind::If | NodeKind::While | NodeKind::Ternary => {
             // cond 必经；分支体/循环体不必然——但其中的【读】仍保活 init，
             // 必须扫描（以非支配标记：读传播，写不击杀）
             let ch = lang.children(node);
             if let Some(&c) = ch.first() {
-                if let Some(e) = scan_kill_event(lang, c, name, true) {
-                    return Some(e);
+                let e = scan_kill_event(lang, c, name, true);
+                if !matches!(e, StmtKill::None) {
+                    return e;
                 }
             }
             for &c in &ch[1..] {
-                if let Some(e) = scan_kill_event(lang, c, name, false) {
-                    if matches!(e, KillEvent::Read | KillEvent::Shadow) {
-                        return Some(e);
-                    }
+                let e = scan_kill_event(lang, c, name, false);
+                if matches!(e, StmtKill::Read | StmtKill::Shadow) {
+                    return e;
                 }
             }
-            None
+            StmtKill::None
         }
         NodeKind::Binary => {
-            let op = lang.bin_op(node)?;
+            let Some(op) = lang.bin_op(node) else {
+                return StmtKill::None;
+            };
             let ch = lang.children(node);
             if op.is_short_circuit() {
                 // 左支必经；右支条件求值（读→保活；写→不击杀）
                 if let Some(&l) = ch.first() {
-                    if let Some(e) = scan_kill_event(lang, l, name, true) {
-                        return Some(e);
+                    let e = scan_kill_event(lang, l, name, true);
+                    if !matches!(e, StmtKill::None) {
+                        return e;
                     }
                 }
                 if let Some(&r) = ch.get(1) {
-                    if let Some(e) = scan_kill_event(lang, r, name, false) {
-                        if matches!(e, KillEvent::Read | KillEvent::Shadow) {
-                            return Some(e);
-                        }
+                    let e = scan_kill_event(lang, r, name, false);
+                    if matches!(e, StmtKill::Read | StmtKill::Shadow) {
+                        return e;
                     }
                 }
-                None
+                StmtKill::None
             } else {
                 for &c in ch {
-                    if let Some(e) = scan_kill_event(lang, c, name, dominating) {
-                        return Some(e);
+                    let e = scan_kill_event(lang, c, name, dominating);
+                    if !matches!(e, StmtKill::None) {
+                        return e;
                     }
                 }
-                None
+                StmtKill::None
             }
         }
         NodeKind::For | NodeKind::ForEach | NodeKind::Switch | NodeKind::Try => {
@@ -3209,28 +3222,117 @@ fn scan_kill_event<L: Lang>(
                 _ => 0,
             };
             for &c in &ch[..dom_len] {
-                if let Some(e) = scan_kill_event(lang, c, name, true) {
-                    return Some(e);
+                let e = scan_kill_event(lang, c, name, true);
+                if !matches!(e, StmtKill::None) {
+                    return e;
                 }
             }
             for &c in &ch[dom_len..] {
-                if let Some(e) = scan_kill_event(lang, c, name, false) {
-                    if matches!(e, KillEvent::Read | KillEvent::Shadow) {
-                        return Some(e);
-                    }
+                let e = scan_kill_event(lang, c, name, false);
+                if matches!(e, StmtKill::Read | StmtKill::Shadow) {
+                    return e;
                 }
             }
-            None
+            StmtKill::None
         }
         _ => {
             for &c in lang.children(node) {
-                if let Some(e) = scan_kill_event(lang, c, name, dominating) {
-                    return Some(e);
+                let e = scan_kill_event(lang, c, name, dominating);
+                if !matches!(e, StmtKill::None) {
+                    return e;
                 }
             }
-            None
+            StmtKill::None
         }
     }
+}
+
+/// One DFS of a statement computing the dominating=true kill event for
+/// every name that has one. Recursion order matches [`scan_kill_event`];
+/// the first event per name wins. Used by language crates to build a
+/// per-statement index so StoreKill does not rescan subtrees per candidate.
+pub fn collect_stmt_kill_events<L: Lang>(lang: &L, root: L::Id) -> Vec<(L::NameKey, StmtKill<L::Id>)> {
+    use std::collections::BTreeMap;
+    enum Act<Id> {
+        Enter(Id, bool),
+        AfterAssign(Id, bool),
+    }
+    let mut events: BTreeMap<L::NameKey, StmtKill<L::Id>> = BTreeMap::new();
+    let mut stack = vec![Act::Enter(root, true)];
+    while let Some(act) = stack.pop() {
+        match act {
+            Act::AfterAssign(id, dominating) => {
+                if lang.assign_op(id).is_some() {
+                    continue;
+                }
+                let Some(&target) = lang.children(id).first() else {
+                    continue;
+                };
+                if lang.kind(target) != NodeKind::VarRef {
+                    continue;
+                }
+                let Some(key) = lang.var_key(target) else {
+                    continue;
+                };
+                if dominating {
+                    events.entry(key).or_insert(StmtKill::DomWrite(id));
+                }
+            }
+            Act::Enter(node, dominating) => match lang.kind(node) {
+                NodeKind::VarRef => {
+                    if let Some(key) = lang.var_key(node) {
+                        events.entry(key).or_insert(StmtKill::Read);
+                    }
+                }
+                NodeKind::VarDecl => {
+                    if let Some(key) = lang.var_key(node) {
+                        events.entry(key).or_insert(StmtKill::Shadow);
+                    }
+                    for &c in lang.children(node).iter().rev() {
+                        stack.push(Act::Enter(c, dominating));
+                    }
+                }
+                NodeKind::Assign => {
+                    let ch = lang.children(node);
+                    stack.push(Act::AfterAssign(node, dominating));
+                    if let Some(&val) = ch.get(1) {
+                        stack.push(Act::Enter(val, dominating));
+                    }
+                }
+                NodeKind::If | NodeKind::While | NodeKind::Ternary => {
+                    let ch = lang.children(node);
+                    for (i, &c) in ch.iter().enumerate().rev() {
+                        stack.push(Act::Enter(c, i == 0));
+                    }
+                }
+                NodeKind::Binary => {
+                    let ch = lang.children(node);
+                    let short = lang.bin_op(node).is_some_and(|op| op.is_short_circuit());
+                    for (i, &c) in ch.iter().enumerate().rev() {
+                        let child_dom = if short { i == 0 } else { dominating };
+                        stack.push(Act::Enter(c, child_dom));
+                    }
+                }
+                NodeKind::For | NodeKind::ForEach | NodeKind::Switch | NodeKind::Try => {
+                    let ch = lang.children(node);
+                    let dom_len = match lang.kind(node) {
+                        NodeKind::For => ch.len().saturating_sub(2),
+                        NodeKind::ForEach | NodeKind::Switch => 1,
+                        _ => 0,
+                    };
+                    for (i, &c) in ch.iter().enumerate().rev() {
+                        stack.push(Act::Enter(c, i < dom_len));
+                    }
+                }
+                _ => {
+                    for &c in lang.children(node).iter().rev() {
+                        stack.push(Act::Enter(c, dominating));
+                    }
+                }
+            },
+        }
+    }
+    events.into_iter().collect()
 }
 
 impl<L: Lang> Rule<L> for StoreKill {
@@ -3270,8 +3372,8 @@ impl<L: Lang> Rule<L> for StoreKill {
             }
             _ => return None,
         };
-        let name = if is_decl {
-            lang.var_name(id)?.to_string()
+        let (name, name_key) = if is_decl {
+            (lang.var_name(id)?.to_string(), lang.var_key(id)?)
         } else {
             let a = match lang.kind(id) {
                 NodeKind::Assign => id,
@@ -3281,7 +3383,7 @@ impl<L: Lang> Rule<L> for StoreKill {
             if lang.kind(t) != NodeKind::VarRef || !lang.is_local_var(t) {
                 return None;
             }
-            lang.var_name(t)?.to_string()
+            (lang.var_name(t)?.to_string(), lang.var_key(t)?)
         };
 
         let parent = walk.parent(stmt_node)?;
@@ -3294,13 +3396,16 @@ impl<L: Lang> Rule<L> for StoreKill {
         // 扫描：读（任意路径）→ 保活；支配写 → 击杀；条件写 → 继续
         let mut killed_by: Option<(usize, L::Id)> = None;
         for (si, &s) in stmts.iter().enumerate().skip(idx + 1) {
-            match scan_kill_event(&*lang, s, &name, true) {
-                Some(KillEvent::Read) | Some(KillEvent::Shadow) => return None,
-                Some(KillEvent::DomWrite(assign)) => {
+            let event = lang
+                .stmt_kill_event(s, name_key)
+                .unwrap_or_else(|| scan_kill_event(&*lang, s, &name, true));
+            match event {
+                StmtKill::None => continue,
+                StmtKill::Read | StmtKill::Shadow => return None,
+                StmtKill::DomWrite(assign) => {
                     killed_by = Some((si, assign));
                     break;
                 }
-                None => continue,
             }
         }
         let (si, kill_assign) = killed_by?;
