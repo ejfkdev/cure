@@ -572,22 +572,32 @@ impl<L: Lang> Rule<L> for DeadDecl {
         // 抓获：删掉 j 后 arr[j] 悬空）。写目标本身也是 VarRef，同样被
         // 句法扫描覆盖。
         let name_str = lang.var_name(id)?.to_string();
-        let referenced = stmts[idx + 1..].iter().any(|&s| {
-            subtree_contains(&*lang, s, |n| {
-                lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name_str.as_str())
-            })
-        });
-        if referenced {
-            return None;
-        }
-        // 遮蔽 / 不透明（匿名类捕获的原文引用无 AST 节点）仍走事件扫描
         let name_key = lang.var_key(id)?;
-        let mut w = Watch::<L>::new(name_key, &[]);
         for &s in &stmts[idx + 1..] {
-            scan_region(&*lang, s, &mut w);
-        }
-        if w.opaque || w.shadowed {
-            return None;
+            match (lang.stmt_mentions(s, name_key), lang.stmt_opaque(s)) {
+                (Some(mentions), Some(opaque)) => {
+                    // Any VarRef (including event-blind write targets),
+                    // any same-name declaration, or an opaque region.
+                    if mentions || opaque {
+                        return None;
+                    }
+                }
+                _ => {
+                    // 遮蔽 / 不透明（匿名类捕获的原文引用无 AST 节点）
+                    // 仍走事件扫描
+                    if subtree_contains(&*lang, s, |n| {
+                        lang.kind(n) == NodeKind::VarRef
+                            && lang.var_name(n) == Some(name_str.as_str())
+                    }) {
+                        return None;
+                    }
+                    let mut w = Watch::<L>::new(name_key, &[]);
+                    scan_region(&*lang, s, &mut w);
+                    if w.opaque || w.shadowed {
+                        return None;
+                    }
+                }
+            }
         }
         Some(Edit::Delete { node: id })
     }
@@ -646,12 +656,20 @@ impl<L: Lang> Rule<L> for AssignBackFold {
         // 观察，拒绝。
         let name_str = lang.var_name(id)?.to_string();
         for &s in &stmts[idx + 1..] {
-            let mut w = Watch::<L>::new(name_key, &[]);
-            scan_region(&*lang, s, &mut w);
-            let referenced = subtree_contains(&*lang, s, |n| {
-                lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name_str.as_str())
-            });
-            let touched = referenced || w.opaque || w.shadowed;
+            // Indexed: VarRef mention (including event-blind assignment
+            // targets) or a Shadow declaration, plus opaque subtrees.
+            let touched = match (lang.stmt_mentions(s, name_key), lang.stmt_opaque(s)) {
+                (Some(mentions), Some(opaque)) => mentions || opaque,
+                _ => {
+                    let mut w = Watch::<L>::new(name_key, &[]);
+                    scan_region(&*lang, s, &mut w);
+                    let referenced = subtree_contains(&*lang, s, |n| {
+                        lang.kind(n) == NodeKind::VarRef
+                            && lang.var_name(n) == Some(name_str.as_str())
+                    });
+                    referenced || w.opaque || w.shadowed
+                }
+            };
             if !touched {
                 continue; // 与 x 无关的语句，跳过
             }

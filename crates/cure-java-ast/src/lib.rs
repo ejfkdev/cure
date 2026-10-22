@@ -272,6 +272,8 @@ struct StmtFact {
     key: u32,
     refs: u32,
     lambda_cap: bool,
+    /// VarDecl/ForEach/Catch declares this name (region-event Shadow).
+    shadow: bool,
 }
 
 /// Per-statement kill event (`collect_stmt_kill_events`). `kind`:
@@ -283,6 +285,11 @@ struct StmtKillFact {
     assign: JavaId,
 }
 
+
+#[derive(Clone, Copy, Debug)]
+struct StmtOpq {
+    opaque: bool,
+}
 
 #[derive(Default, Debug)]
 pub struct JavaAst {
@@ -352,6 +359,8 @@ pub struct JavaAst {
     stmt_facts: Vec<Option<Box<[StmtFact]>>>,
     /// 语句级 kill 事件（同一槽位与失效机制）。
     stmt_kills: Vec<Option<Box<[StmtKillFact]>>>,
+    /// 语句是否含不透明区域（与其余索引同一失效机制）。
+    stmt_opq: Vec<Option<StmtOpq>>,
     /// 上次 prepare 的根。B3 早退（events_clean）只对**树全局**缓存
     /// （事件索引/效果表）合法；var_types 是 **root 相关**的作用域分析
     /// ——根变化时必须重建，否则 is_local_var 全 false、传播规则停摆
@@ -1261,6 +1270,9 @@ impl Lang for JavaAst {
         if let Some(slot) = self.stmt_kills.get_mut(id.0 as usize) {
             *slot = None;
         }
+        if let Some(slot) = self.stmt_opq.get_mut(id.0 as usize) {
+            *slot = None;
+        }
     }
 
     fn debug_verify_events(&self, stmt: JavaId) {
@@ -1268,7 +1280,9 @@ impl Lang for JavaAst {
             return;
         }
         if let Some(indexed) = self.region_events(stmt) {
-            let fresh = cure_tree::collect_region_events(self, stmt);
+            let Some(fresh) = cure_tree::collect_region_events(self, stmt) else {
+                return;
+            };
             // 比较（键+种类+节点）三元组序列
             let key = |e: &cure_engine::kind::RegionEvent<JavaId, u32>| {
                 (e.key, matches!(e.kind, cure_engine::kind::EventKind::Use), e.node.0)
@@ -1289,12 +1303,7 @@ impl Lang for JavaAst {
         id: JavaId,
     ) -> Option<&[cure_engine::kind::RegionEvent<JavaId, u32>]> {
         // 空序列 = 未索引（非语句节点或已失效）→ None 走原递归
-        let v = self.events.slot(id.0 as usize);
-        if v.is_empty() {
-            None
-        } else {
-            Some(v)
-        }
+        self.events.slot(id.0 as usize)
     }
 
     fn var_key(&self, id: JavaId) -> Option<u32> {
@@ -1329,6 +1338,19 @@ impl Lang for JavaAst {
             },
             Err(_) => StmtKill::None,
         })
+    }
+
+    fn stmt_mentions(&self, stmt: JavaId, key: u32) -> Option<bool> {
+        let slot = self.stmt_facts.get(stmt.0 as usize)?.as_deref()?;
+        Some(
+            slot.binary_search_by_key(&key, |f| f.key)
+                .ok()
+                .is_some_and(|i| slot[i].refs > 0 || slot[i].shadow),
+        )
+    }
+
+    fn stmt_opaque(&self, stmt: JavaId) -> Option<bool> {
+        self.stmt_opq.get(stmt.0 as usize)?.map(|f| f.opaque)
     }
 
     // ---- 外部事实（cure-engine Lang 词汇的 Java 实现：查 facts 槽）----
@@ -1705,6 +1727,7 @@ impl Lang for JavaAst {
         self.events.resize(n_nodes);
         self.stmt_facts.resize_with(n_nodes, || None);
         self.stmt_kills.resize_with(n_nodes, || None);
+        self.stmt_opq.resize_with(n_nodes, || None);
         if self.events.is_clean() {
             if self.prepared_root == Some(root) {
                 return;
@@ -1719,9 +1742,10 @@ impl Lang for JavaAst {
         self.events.mark_clean();
         for sr in cure_tree::stmt_roots(self, root) {
             let idx = sr.0 as usize;
-            if self.events.slot(idx).is_empty() {
-                let events = cure_tree::collect_region_events(self, sr);
-                self.events.put(idx, events);
+            if self.events.slot(idx).is_none() {
+                if let Some(events) = cure_tree::collect_region_events(self, sr) {
+                    self.events.put(idx, events);
+                }
             }
             if self.stmt_facts.get(idx).map_or(true, |f| f.is_none()) {
                 let facts = self.collect_stmt_facts(sr);
@@ -1730,6 +1754,11 @@ impl Lang for JavaAst {
             if self.stmt_kills.get(idx).map_or(true, |f| f.is_none()) {
                 let kills = self.collect_stmt_kill_facts(sr);
                 self.stmt_kills[idx] = Some(kills);
+            }
+            if self.stmt_opq.get(idx).map_or(true, |f| f.is_none()) {
+                if let Some(opq) = self.stmt_opaque_fact(sr) {
+                    self.stmt_opq[idx] = Some(opq);
+                }
             }
         }
         // ---- 效果表（cure-tree rebuild_effects：不动点 sweep——
@@ -1747,10 +1776,16 @@ impl JavaAst {
     fn collect_stmt_facts(&self, root: JavaId) -> Box<[StmtFact]> {
         let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         let mut caps: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut shadows: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut opaque = false;
         let mut stack: Vec<(JavaId, bool)> = vec![(root, false)];
         while let Some((id, in_lambda)) = stack.pop() {
             let node = &self.nodes[id.0 as usize];
             let is_lambda = matches!(node.data, NodeData::Lambda { .. });
+            let is_named_decl = matches!(
+                node.data,
+                NodeData::VarDecl { .. } | NodeData::ForEach { .. } | NodeData::Catch { .. }
+            );
             if matches!(node.data, NodeData::VarRef { .. }) {
                 if let Some(key) = self.names.var_key(id.0 as usize) {
                     *counts.entry(key).or_insert(0) += 1;
@@ -1758,22 +1793,46 @@ impl JavaAst {
                         caps.insert(key);
                     }
                 }
+            } else if is_named_decl {
+                if let Some(key) = self.names.var_key(id.0 as usize) {
+                    shadows.insert(key);
+                }
+            }
+            if self.is_opaque(id) {
+                opaque = true;
             }
             let child_in_lambda = in_lambda || is_lambda;
             for &c in node.children.as_slice() {
                 stack.push((c, child_in_lambda));
             }
         }
-        let mut facts: Vec<StmtFact> = counts
+        let mut keys: std::collections::HashSet<u32> = counts.keys().copied().collect();
+        keys.extend(shadows.iter().copied());
+        let mut facts: Vec<StmtFact> = keys
             .into_iter()
-            .map(|(key, refs)| StmtFact {
+            .map(|key| StmtFact {
                 key,
-                refs,
+                refs: counts.get(&key).copied().unwrap_or(0),
                 lambda_cap: caps.contains(&key),
+                shadow: shadows.contains(&key),
             })
             .collect();
         facts.sort_unstable_by_key(|f| f.key);
         facts.into_boxed_slice()
+    }
+
+    /// Whether the statement subtree contains an opaque node.
+    fn stmt_opaque_fact(&self, root: JavaId) -> Option<StmtOpq> {
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if self.is_opaque(id) {
+                return Some(StmtOpq { opaque: true });
+            }
+            for &c in self.nodes[id.0 as usize].children.as_slice() {
+                stack.push(c);
+            }
+        }
+        Some(StmtOpq { opaque: false })
     }
 
     /// One DFS for all names in the statement (first event wins), sorted

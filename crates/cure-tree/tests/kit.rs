@@ -138,12 +138,7 @@ impl Lang for Toy {
         self.events.invalidate(id as usize);
     }
     fn region_events(&self, id: ToyId) -> Option<&[RegionEvent<ToyId, u32>]> {
-        let v = self.events.slot(id as usize);
-        if v.is_empty() {
-            None
-        } else {
-            Some(v)
-        }
+        self.events.slot(id as usize)
     }
     fn var_key(&self, id: ToyId) -> Option<u32> {
         self.names.var_key(id as usize)
@@ -199,9 +194,10 @@ impl Lang for Toy {
             self.events.mark_clean();
             for sr in cure_tree::stmt_roots(self, root) {
                 let idx = sr as usize;
-                if self.events.slot(idx).is_empty() {
-                    let ev = cure_tree::collect_region_events(self, sr);
-                    self.events.put(idx, ev);
+                if self.events.slot(idx).is_none() {
+                    if let Some(ev) = cure_tree::collect_region_events(self, sr) {
+                        self.events.put(idx, ev);
+                    }
                 }
             }
         }

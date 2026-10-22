@@ -114,6 +114,16 @@ pub trait Lang {
     fn stmt_kill_event(&self, _stmt: Self::Id, _key: Self::NameKey) -> Option<StmtKill<Self::Id>> {
         None
     }
+    /// Whether the statement syntactically mentions `key` (VarRef) or
+    /// declares it (VarDecl/ForEach/Catch). `None` = no index.
+    fn stmt_mentions(&self, _stmt: Self::Id, _key: Self::NameKey) -> Option<bool> {
+        None
+    }
+    /// Whether the statement subtree contains an opaque region. `None` =
+    /// no index.
+    fn stmt_opaque(&self, _stmt: Self::Id) -> Option<bool> {
+        None
+    }
     /// 节点是否不透明（内部含不可解析原文，读/写集不可证明）：
     /// Java 的 Raw 节点与匿名类体（anon_raw）。区域用量分析的可靠性
     /// 前提——漏判会导致捕获变量被误删（对抗波 4 抓获）。

@@ -10,7 +10,10 @@ use cure_engine::Lang;
 /// 走引擎的 `scan_region` 递归路径，其 Opaque 分支保守拒绝）。
 #[derive(Debug)]
 pub struct EventStore<Id, NameKey> {
-    events: Vec<Vec<RegionEvent<Id, NameKey>>>,
+    /// `None` = 未索引（未构建/失效/子树含不透明节点）；`Some([])` 是
+    /// **已索引且零事件**——查询侧必须走快路径直接返回，不能回退递归
+    /// （大量 `foo();` 这类无命名事件的语句曾让每次查询重扫整棵子树）。
+    events: Vec<Option<Vec<RegionEvent<Id, NameKey>>>>,
     clean: bool,
 }
 
@@ -28,20 +31,21 @@ impl<Id: Clone, NameKey: Clone> EventStore<Id, NameKey> {
     /// 槽位扩到 `count`（不缩；新槽为空 = 未索引）。
     pub fn resize(&mut self, count: usize) {
         if self.events.len() < count {
-            self.events.resize(count, Vec::new());
+            self.events.resize_with(count, || None);
         }
     }
 
-    /// 空槽 = 未索引（调用方回落引擎递归路径）。
-    pub fn slot(&self, idx: usize) -> &[RegionEvent<Id, NameKey>] {
-        self.events.get(idx).map(|v| v.as_slice()).unwrap_or(&[])
+    /// `None` = 未索引（调用方回落引擎递归路径）；`Some([])` = 已索引
+    /// 且零事件（调用方直接返回，不再递归）。
+    pub fn slot(&self, idx: usize) -> Option<&[RegionEvent<Id, NameKey>]> {
+        self.events.get(idx).and_then(|v| v.as_deref())
     }
 
     pub fn put(&mut self, idx: usize, events: Vec<RegionEvent<Id, NameKey>>) {
         if self.events.len() <= idx {
-            self.events.resize(idx + 1, Vec::new());
+            self.events.resize_with(idx + 1, || None);
         }
-        self.events[idx] = events;
+        self.events[idx] = Some(events);
     }
 
     pub fn is_clean(&self) -> bool {
@@ -57,7 +61,7 @@ impl<Id: Clone, NameKey: Clone> EventStore<Id, NameKey> {
     pub fn invalidate(&mut self, idx: usize) {
         self.clean = false;
         if let Some(slot) = self.events.get_mut(idx) {
-            slot.clear();
+            *slot = None;
         }
     }
 }
@@ -87,17 +91,18 @@ pub fn stmt_roots<L: Lang>(lang: &L, root: L::Id) -> Vec<L::Id> {
 /// 返回空 Vec = 子树含不透明节点（调用方存空 = 未索引哨兵）。
 /// 事件序与引擎 `scan_region` 原递归**严格一致**（分配器 dispatch 的
 /// 是同一组 Lang 钩子）。
+/// `None` = 子树含不透明节点（不建索引，查询侧回落递归的 Opaque 分支）；
+/// `Some(可能为空)` = 索引有效（空=零事件，查询侧应直接返回）。
 pub fn collect_region_events<L: Lang>(
     lang: &L,
     node: L::Id,
-) -> Vec<RegionEvent<L::Id, L::NameKey>> {
+) -> Option<Vec<RegionEvent<L::Id, L::NameKey>>> {
     let mut out = Vec::new();
-    let opaque = collect_events_into(lang, node, &mut out);
-    if opaque {
-        return Vec::new();
+    if collect_events_into(lang, node, &mut out) {
+        return None;
     }
     out.sort_by_key(|e| e.key);
-    out
+    Some(out)
 }
 
 /// 返回值：子树是否含不透明节点（读/写集不可证明）。
