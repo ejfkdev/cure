@@ -1991,22 +1991,35 @@ impl<L: Lang> Rule<L> for DeadStore {
                 return None;
             }
             let name_key0 = lang.var_key(name_node)?;
-            let mut w0 = Watch::<L>::new(name_key0, &[name_key0]);
+            // Indexed: a statement that neither mentions the name (any
+            // VarRef, including event-blind assignment targets, or a
+            // shadowing declaration) nor contains opaque text cannot read,
+            // write or shadow it. The recursive event scan remains the
+            // fallback for unindexed nodes.
             for &s in &stmts[idx + 1..] {
-                scan_region(&*lang, s, &mut w0);
-            }
-            // 只判**本名字**的读/写（watch 集即本名字）；Raw 区域不可证明
-            if w0.opaque || !w0.uses.is_empty() || w0.wrote(name_key0) || w0.shadowed {
-                return None;
-            }
-            // 句法补扫：事件模型对赋值**目标子树**的读失明（arr[j]='q'
-            // 的 j 不产生 Use 事件——传播类规则同源问题第三次现身）。
-            // 零用途判死前句法计数目标位置的下标读
-            for &s in &stmts[idx + 1..] {
-                if subtree_contains(&*lang, s, |n| {
-                    lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name.as_str())
-                }) {
-                    return None;
+                match (lang.stmt_mentions(s, name_key0), lang.stmt_opaque(s)) {
+                    (Some(mentions), Some(opaque)) => {
+                        if mentions || opaque {
+                            return None;
+                        }
+                    }
+                    _ => {
+                        let mut w0 = Watch::<L>::new(name_key0, &[name_key0]);
+                        scan_region(&*lang, s, &mut w0);
+                        if w0.opaque
+                            || !w0.uses.is_empty()
+                            || w0.wrote(name_key0)
+                            || w0.shadowed
+                        {
+                            return None;
+                        }
+                        if subtree_contains(&*lang, s, |n| {
+                            lang.kind(n) == NodeKind::VarRef
+                                && lang.var_name(n) == Some(name.as_str())
+                        }) {
+                            return None;
+                        }
+                    }
                 }
             }
             if lang.effect(first_value) > Effect::MayRead {

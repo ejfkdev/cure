@@ -1777,7 +1777,6 @@ impl JavaAst {
         let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         let mut caps: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut shadows: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let mut opaque = false;
         let mut stack: Vec<(JavaId, bool)> = vec![(root, false)];
         while let Some((id, in_lambda)) = stack.pop() {
             let node = &self.nodes[id.0 as usize];
@@ -1797,9 +1796,6 @@ impl JavaAst {
                 if let Some(key) = self.names.var_key(id.0 as usize) {
                     shadows.insert(key);
                 }
-            }
-            if self.is_opaque(id) {
-                opaque = true;
             }
             let child_in_lambda = in_lambda || is_lambda;
             for &c in node.children.as_slice() {
