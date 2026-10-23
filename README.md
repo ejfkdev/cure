@@ -121,18 +121,19 @@ otherwise the locale is auto-detected. Full option reference: `cure --help`.
 | 2. Differential testing | Original and simplified versions each compiled by `javac` and run; stdout / exit code / exception signature must match byte-for-byte (12 families: overflow, NaN, division by zero, StringBuilder, iterators, boxing, short-circuit side effects, …) | full Java-language semantics |
 | 3. Corpora | 3,999 vendored real-world files in 12 auto-discovered suites + 5,596-file external mega-corpus + the 371k-file OpenJDK source corpus | robustness (no panics), self-consistency (output re-parses cleanly), idempotency (second pass = 0 rewrites) |
 | 4. Decompiled apps | 144,592 files from 5 real-world Android APKs run through [ddc](https://github.com/ejfkdev/ddc), then cure (full + `--dead-code`) | same invariants + javac differential: every package whose ddc output compiles must still compile after cure |
-| 5. ECMAScript conformance | [Test262](https://github.com/tc39/test262), two layers: (a) original vs cured run in fresh `node` vm contexts, exception status + stdout compared (34,006 executable cases); (b) **compile-only on all 49,266 files** including async/module/negative — valid script/module source must still compile after cure | ECMAScript semantics: f64/ToInt32 domains, ±2^53, TDZ, Annex B hoisting, eval scoping, destructuring, generator/`yield` grammar, sparse arrays; plus ESM/import-attributes/top-level-await syntax |
+| 5. ECMAScript conformance | [Test262](https://github.com/tc39/test262), three layers: (a) sync original vs cured in fresh `node` vm contexts, exception status + stdout compared (34,006 executable cases); (b) **async** cases executed with `$DONE`/microtask/timer draining (5,423 executed); (c) **compile-only on all 49,266 files** including async/module/negative — valid script/module source must still compile after cure | ECMAScript semantics: f64/ToInt32 domains, ±2^53, TDZ, Annex B hoisting, eval scoping, destructuring, generator/`yield` grammar, sparse arrays, async/await ordering; plus ESM/import-attributes/top-level-await syntax |
 
-`cargo test` runs 430 tests. The Test262 semantic differential reaches
+`cargo test` runs 431 tests. The Test262 semantic differential reaches
 **33,962/34,006 (99.87%) identical runs**; the only 44 excluded cases compare
 `Function.prototype.toString` **source text** (cure reformats function
 bodies) or use arrow functions as computed-property keys, which relies on
-that same text. The compile layer is **49,165/49,165 valid files still
+that same text. The async layer executes **5,423/5,423 cases identically
+(0 mismatch)**; the compile layer is **49,165/49,165 valid files still
 compiling after cure** (0 broken; modules via `vm.SourceTextModule`).
-Sampled versions of both layers are standing tests
-(`cargo test -p cure-ts-simplify --test t262_sem|t262_compile`); they skip
-automatically when `/tmp/test262` or `node` is unavailable (`T262_ROOT` /
-`T262_SAMPLE` override). Layers 1–2 caught three real semantic/parse bugs
+Sampled versions of all three layers are standing tests
+(`cargo test -p cure-ts-simplify --test t262_sem|t262_async|t262_compile`);
+they skip automatically when `/tmp/test262` or `node` is unavailable
+(`T262_ROOT` / `T262_SAMPLE` override). Layers 1–2 caught three real semantic/parse bugs
 during development (`x && true` mis-fold, `((Cast) x).method()` postfix loss,
 `new` treated as a type name).
 

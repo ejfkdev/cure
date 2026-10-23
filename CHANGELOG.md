@@ -5,6 +5,21 @@
 
 ## [Unreleased]
 
+### 验证（TS/JS async 语义差分——2026-10-23 第五批）
+
+- **Test262 async 语义差分**（`examples/t262_async_sem` +
+  `tests/t262_async.rs` + `scripts/t262_async_driver.mjs`）：`flags`
+  含 async 的 5,516 个可执行用例逐例在独立 vm 上下文执行，等待
+  `$DONE`/微任务/定时器排空后比较异常状态与 stdout——**5,423 个执行
+  结果一致（0 失配）**，93 个原版自身失败跳过。抽样 200 例已固化为
+  常驻测试。
+- 已知环境边界：`await-using/syntax/` 组在 node/V8 上会让**原版**
+  SIGSEGV（与 cure 无关），async 语义层跳过该目录；编译层仍覆盖。
+- 修复：`await using x = …;` 语句整条原文保真（曾拆成
+  `await using; x = …`，异步 dispose 时机与不可变绑定全丢——
+  staging explicit-resource-management 用例抓获）；async 驱动逐条
+  输出 + 逐例清理定时器，避免长跑内存累积。
+
 ### 验证（TS/JS 编译差分——2026-10-23 第四批）
 
 - **Test262 全量编译差分**（`examples/t262_compile` +

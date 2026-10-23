@@ -110,16 +110,16 @@ cure [选项] <文件.java>... | <目录> | -
 | 2. 差分测试 | 原版与简化版各自 `javac` 编译、`java` 运行，**stdout/退出码/异常签名必须一致**（12 组：溢出、NaN、除零异常、StringBuilder、迭代器、装箱、短路副作用…） | Java 全链路语义保持 |
 | 3. 语料库 | 3,999 个入库真实文件（12 套自动发现）+ 5,596 文件外部 mega 语料 + 37 万文件 OpenJDK 源码语料 | 鲁棒性（不 panic）、自洽性（输出可重新干净解析）、幂等性（第二轮 0 改写） |
 | 4. 反编译 APK | 5 个真实 Android APK 经 [ddc](https://github.com/ejfkdev/ddc) 反编译共 144,592 文件，cure 完整 + `--dead-code` 双模式 | 同上三不变量 + javac 差分：ddc 原输出可编译的包在 cure 后必须仍可编译 |
-| 5. ECMAScript 规范符合性 | [Test262](https://github.com/tc39/test262) 两层：(a) 原版与 cure 版各在全新 `node` vm 上下文执行，比较异常状态 + stdout（34,006 个可执行用例）；(b) **全部 49,266 个文件做编译差分**（含 async/module/负向）——合法 script/module 源码在 cure 后必须仍可编译 | ECMAScript 语义：f64/ToInt32 域、±2^53、TDZ、Annex B 提升、eval 作用域、解构、生成器/`yield` 文法、稀疏数组；外加 ESM/导入属性/顶层 await 语法 |
+| 5. ECMAScript 规范符合性 | [Test262](https://github.com/tc39/test262) 三层：(a) 同步用例原版与 cure 版各在全新 `node` vm 上下文执行，比较异常状态 + stdout（34,006 个可执行用例）；(b) **async 用例**执行并排空 `$DONE`/微任务/定时器（5,423 个执行）；(c) **全部 49,266 个文件做编译差分**（含 async/module/负向）——合法 script/module 源码在 cure 后必须仍可编译 | ECMAScript 语义：f64/ToInt32 域、±2^53、TDZ、Annex B 提升、eval 作用域、解构、生成器/`yield` 文法、稀疏数组、async/await 时序；外加 ESM/导入属性/顶层 await 语法 |
 
-`cargo test` 共 430 个测试。Test262 语义差分 **33,962/34,006（99.87%）
+`cargo test` 共 431 个测试。Test262 语义差分 **33,962/34,006（99.87%）
 执行结果逐字节一致**；仅 44 个用例被排除——它们比较
 `Function.prototype.toString` 的**源码文本**（cure 会重排函数体格式），
-或用箭头函数作计算属性名（键依赖同一文本）。编译层 **49,165/49,165
-个合法文件在 cure 后仍可编译（0 破坏**；module 用
-`vm.SourceTextModule`）。两层均有 800/1200 例抽样常驻测试
-（`cargo test -p cure-ts-simplify --test t262_sem` /
-`--test t262_compile`）；语料或 `node` 缺失时自动跳过
+或用箭头函数作计算属性名（键依赖同一文本）。async 层 **5,423/5,423
+个用例执行结果一致（0 失配）**；编译层 **49,165/49,165 个合法文件在
+cure 后仍可编译（0 破坏**；module 用 `vm.SourceTextModule`）。三层均有
+抽样常驻测试（`cargo test -p cure-ts-simplify --test
+t262_sem|t262_async|t262_compile`）；语料或 `node` 缺失时自动跳过
 （`T262_ROOT` / `T262_SAMPLE` 可覆盖）。第 1、2 层在本轮开发中**实际抓到 3 个
 语义/解析 bug**（`x && true` 误折叠、`((Cast) x).method()` 后缀丢失、
 `new` 被当类型名）。

@@ -882,6 +882,21 @@ impl<'a> Parser<'a> {
                 "var" | "const" => self.parse_var_decl_stmt(),
                 "let" if self.let_is_decl() => self.parse_var_decl_stmt(),
                 "using" if self.using_is_decl() => self.parse_var_decl_stmt(),
+                "await"
+                    if self.tk_at(1).kind == TokKind::Ident
+                        && self.tk_at(1).text == "using"
+                        && (self.tk_at(2).kind == TokKind::Ident
+                            || self.is_punct_at(2, "{")
+                            || self.is_punct_at(2, "[")) =>
+                {
+                    // `await using x = …;`（async 函数/模块顶层）：整条原文
+                    // 保真（await using 的异步 dispose 时机 + 绑定模式不可
+                    // 结构化；曾拆成 `await using; x = …`——Test262
+                    // explicit-resource-management/async 家族抓获）
+                    let s = self.pos;
+                    self.skip_balanced_to_stmt_boundary();
+                    self.ast.raw(&self.raw_between(s, self.pos))
+                }
                 "if" => self.parse_if(),
                 "while" => self.parse_while(),
                 "do" => self.parse_do_while(),
