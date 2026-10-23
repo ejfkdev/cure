@@ -116,6 +116,11 @@ pub enum NodeData {
     // ---- 语句 ----
     Block,
     /// 合成分组（无花括号、无作用域）：if/for 头多语句的承载。
+    /// **模块语句合成根**（simplify 门面构建）：顶层语句统一拼成一条
+    /// 语句列表使引擎规则获得完整父链（if-true 解包等跨语句规则）。
+    /// 模块级名字**不绑定**（跨根读不可见——保守非局部）；直接
+    /// VarDecl 孩子标记不透明（死存/传播锚定由 const 表规则接管）。
+    ModuleBlock,
     Group,
     Empty,
     ExprStmt,
@@ -271,6 +276,9 @@ pub enum TopItem {
     ExportRaw(String),
     /// 不可解析的原文区域。
     Raw(String),
+    /// `export <语句>`（const/let/var/解构声明——值级照常简化，
+    /// 打印加 export 前缀）。函数/类导出走 Func/Class 的 sig 前缀。
+    ExportStmt(TsId),
 }
 
 /// 类形态声明（class/interface/enum/namespace——head_raw 保真全部头部）。
@@ -323,6 +331,15 @@ pub struct TsAst {
     pub(crate) nodes: Vec<Node>,
     /// 外部事实（前端注入；None = 纯源码保守模式）。
     pub facts: Option<TsFacts>,
+    /// 模块级常量表（collect_unit_consts 填充）：名字 → init 节点。
+    /// 收集条件：零写、零遮蔽、同名唯一、init 纯净（字面量/字面量
+    /// 数组/先前常量的纯表达式链——混淆器拷贝链的核心武器）。
+    pub const_fields: HashMap<String, TsId>,
+    /// 可安全做 VarRef → 字面量替换的常量名（标量字面量 init）。
+    pub const_scalars: HashSet<String>,
+    /// 可内联的模块级单 return 函数：名字 → (参数名表, 返回表达式)。
+    /// 常量解密 helper（字符串数组访问器）的调用点展开材料。
+    pub inline_funcs: HashMap<String, (Vec<String>, TsId)>,
     /// prepare() 重建：TsId → 聚合效果（稠密槽）。
     effect_cache: Vec<Option<Effect>>,
     /// prepare() 重建：VarRef → 是否解析到**局部绑定**（作用域栈解析）。
@@ -377,7 +394,7 @@ impl TsAst {
     /// 固有 kind（与 Lang trait 同名；供不依赖引擎的下游使用，如 printer）。
     pub fn kind(&self, id: TsId) -> NodeKind {
         match &self.nodes[id.0 as usize].data {
-            NodeData::Block | NodeData::Group => NodeKind::Block,
+            NodeData::Block | NodeData::Group | NodeData::ModuleBlock => NodeKind::Block,
             NodeData::Empty => NodeKind::Empty,
             NodeData::ExprStmt => NodeKind::ExprStmt,
             NodeData::VarDecl { .. } => NodeKind::VarDecl,
@@ -444,6 +461,11 @@ impl TsAst {
     }
     pub fn group(&mut self, stmts: Vec<TsId>) -> TsId {
         self.push(NodeData::Group, stmts)
+    }
+
+    /// 模块语句合成根。
+    pub fn module_block(&mut self, stmts: Vec<TsId>) -> TsId {
+        self.push(NodeData::ModuleBlock, stmts)
     }
     pub fn empty(&mut self) -> TsId {
         self.push(NodeData::Empty, vec![])
@@ -874,6 +896,9 @@ impl TsAst {
         for n in &self.param_scope {
             base.insert(n.clone());
         }
+        // 模块合成根：直接 VarDecl 孩子不透明（引擎锚定拒绝——
+        // 跨根安全性由 const 表规则接管）
+        let module_root = matches!(self.nodes[root.0 as usize].data, NodeData::ModuleBlock);
         let mut scopes: Vec<HashSet<String>> = vec![base];
         let mut stack = vec![Frame::Enter(root)];
         let mut lambda_depth = 0i32;
@@ -887,6 +912,8 @@ impl TsAst {
                         Bind(Vec<String>),
                     }
                     let action = match &node.data {
+                        // ModuleBlock 不推作用域：模块级名字不绑定
+                        //（跨根读不可见——保守非局部）
                         NodeData::Block | NodeData::For { .. } | NodeData::Try => {
                             let mut a = Action::None;
                             // For 头部的 let 声明进新层（for (let i…））
@@ -992,6 +1019,13 @@ impl TsAst {
         // FuncStmt 名）的全部出现节点；var 声明的可见性判定见上。
         self.var_trap.clear();
         self.var_trap.resize(self.nodes.len(), false);
+        if module_root {
+            for &c in self.nodes[root.0 as usize].children.as_slice() {
+                if matches!(self.nodes[c.0 as usize].data, NodeData::VarDecl { .. }) {
+                    self.var_trap[c.0 as usize] = true;
+                }
+            }
+        }
         // 名字 → 出现节点列表（var_name 持有者；键克隆避免借用冲突）
         let mut occ: HashMap<String, Vec<TsId>> = HashMap::new();
         let mut walk = vec![root];
@@ -1570,6 +1604,7 @@ impl Lang for TsAst {
             | NodeData::This
             | NodeData::Paren
             | NodeData::Block
+            | NodeData::ModuleBlock
             | NodeData::Group
             | NodeData::Empty
             | NodeData::VarDecl { .. }

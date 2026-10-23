@@ -137,6 +137,10 @@ impl<'a> Printer<'a> {
                 }
             }
             TopItem::Class(c) => self.print_class(c),
+            TopItem::ExportStmt(stmt) => {
+                self.out.push_str("export ");
+                self.print_stmt_at(*stmt);
+            }
             TopItem::Import(raw) | TopItem::ExportRaw(raw) | TopItem::Raw(raw) => {
                 let r = raw.trim_end();
                 self.out.push_str(r);
@@ -996,19 +1000,11 @@ impl<'a> Printer<'a> {
             JsLit::Int(v) => self.out.push_str(&v.to_string()),
             JsLit::Double(v) => self.out.push_str(&format_js_number(*v)),
             JsLit::NumRaw { text, val } => match val {
+                // 十六/八/二进制原文**归一化**为十进制（反混淆可读性
+                //——0x1f 与 31 语义恒等；混淆器偏爱 radix 形态）
                 NumVal::Int(v) => {
-                    let is_radix = text.starts_with("0x")
-                        || text.starts_with("0X")
-                        || text.starts_with("0o")
-                        || text.starts_with("0O")
-                        || text.starts_with("0b")
-                        || text.starts_with("0B");
-                    if is_radix {
-                        let clean: String = text.chars().filter(|c| *c != '_').collect();
-                        self.out.push_str(&clean);
-                    } else {
-                        self.out.push_str(&v.to_string());
-                    }
+                    let _ = text;
+                    self.out.push_str(&v.to_string());
                 }
                 NumVal::Double(v) => {
                     if v.is_nan() || v.is_infinite() {

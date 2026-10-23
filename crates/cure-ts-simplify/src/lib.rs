@@ -12,7 +12,11 @@
 //! - is_bool 仅语法级（比较/逻辑/!）——真值不确定性由规则守卫覆盖
 
 
-use cure_engine::{Config, Report, Rule};
+use cure_engine::kind::{LitRef, NodeKind, UnOp};
+use cure_engine::{Config, Edit, Effect, Lang, Report, RewriteCtx, Rule};
+use cure_ts_ast::JsLit;
+use std::collections::HashSet;
+
 use cure_ts_ast::{
     simple_params, ClassDecl, ClassMember, ModuleUnit, NodeData, TopItem, TsAst, TsId,
 };
@@ -28,7 +32,66 @@ pub fn simplify_unit(ast: &mut TsAst, unit: &mut ModuleUnit, cfg: &Config) -> Re
     let mut total = Report::default();
     for _cycle in 0..6 {
         let mut round = Report::default();
+        collect_unit_consts(ast, unit);
+        // ---- 模块语句合成单根 ----
+        // 顶层普通语句（非 Func/Class/Import/Raw/ExportStmt）拼进
+        // ModuleBlock：引擎获得完整父链（if-true 解包、跨语句事件
+        // 分析）。重分发按位进行：孩子多出 → 追加 Stmt 项；不足 →
+        // 多余项删除（全 Stmt 包装同质——位位移无害）。
+        let stmt_positions: Vec<usize> = unit
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| matches!(it, TopItem::Stmt(_)))
+            .map(|(i, _)| i)
+            .collect();
+        if !stmt_positions.is_empty() {
+            // 多声明符 Group 拆开入块（Group 孩子直挂 ModuleBlock——
+            // prepare 的模块级不透明标记覆盖**直接 VarDecl 孩子**；
+            // Group 包裹曾屏蔽标记，引擎在组内删除跨根引用的模块
+            // 声明——node 差分 real_16 抓获：`},Yn=-1;` 的 Yn 被删）
+            let mut stmts: Vec<TsId> = Vec::new();
+            for &i in &stmt_positions {
+                let s = match unit.items[i] {
+                    TopItem::Stmt(s) => s,
+                    _ => unreachable!(),
+                };
+                if matches!(ast.data(s), NodeData::Group) {
+                    stmts.extend(ast.children(s).iter().copied());
+                } else {
+                    stmts.push(s);
+                }
+            }
+            let root = ast.module_block(stmts);
+            let r = simplify(ast, root, cfg);
+            merge_report(&mut round, r);
+            let new_children = ast.children(root).to_vec();
+            let m = new_children.len();
+            let n = stmt_positions.len();
+            for (k, &pos) in stmt_positions.iter().enumerate() {
+                if k < m {
+                    unit.items[pos] = TopItem::Stmt(new_children[k]);
+                }
+            }
+            if m > n {
+                let extra: Vec<TopItem> =
+                    new_children[n..].iter().map(|&c| TopItem::Stmt(c)).collect();
+                let insert_at = stmt_positions[n - 1] + 1;
+                for (j, e) in extra.into_iter().enumerate() {
+                    unit.items.insert(insert_at + j, e);
+                }
+            } else if m < n {
+                // 尾部 m..n 位被删除（从后往前 remove 保持下标稳定）
+                for &pos in stmt_positions[m..].iter().rev() {
+                    unit.items.remove(pos);
+                }
+            }
+        }
+        // ---- 其余项（函数/类/导出声明）逐根 ----
         for item in &mut unit.items {
+            if matches!(item, TopItem::Stmt(_)) {
+                continue; // 已在合成根跑过
+            }
             simplify_top_item(ast, item, cfg, &mut round);
         }
         total.edits += round.edits;
@@ -41,12 +104,646 @@ pub fn simplify_unit(ast: &mut TsAst, unit: &mut ModuleUnit, cfg: &Config) -> Re
             break;
         }
     }
+    // 模块级死常量/死内联函数清除（全部使用位已被传播/内联消灭）。
+    // 门控：**ESM 模块检测**（import/export 存在——classic script 不可能
+    // 含这些语句；脚本顶层是全局属性，外部脚本可读——删除不可证安全）
+    // 或 --dead-code 显式开启。
+    let module_detected = unit.items.iter().any(|it| {
+        matches!(
+            it,
+            TopItem::Import(_)
+                | TopItem::ExportRaw(_)
+                | TopItem::ExportStmt(_)
+        ) || matches!(it, TopItem::Func { sig_raw, .. } if sig_raw.contains("export"))
+            || matches!(it, TopItem::Class(c) if c.head_raw.contains("export"))
+    });
+    if module_detected || cfg.remove_dead_methods {
+        total.edits += remove_dead_module_items(ast, unit);
+    }
     total
 }
+
+/// 模块级死项清除：
+/// - **死常量**：名字 ∈ const_fields、全模块 VarRef 计数为零、任何
+///   原文区域（Raw/模板 quasi/解构模式/签名）无该词——可安全移除声明
+/// - **死内联函数**：名字 ∈ inline_funcs、VarRef 计数零（调用全部被
+///   内联消灭）、非导出——移除声明
+/// 引用计数必须覆盖**原文区域**：Raw 文本里出现过的名字（JSX/坏区域）
+/// 视为被引用——保守保留。
+fn remove_dead_module_items(ast: &mut TsAst, unit: &mut ModuleUnit) -> usize {
+    // 每项的 (VarRef 引用集, 原文区域) 分别收集——候选项判定时
+    // **排除自身**（函数签名里的自身名字、声明自身不算引用——
+    // 否则死函数永远「被自己引用」）
+    let n_items = unit.items.len();
+    let mut item_refs: Vec<HashSet<String>> = Vec::with_capacity(n_items);
+    let mut item_raws: Vec<Vec<String>> = Vec::with_capacity(n_items);
+    for item in &unit.items {
+        let mut refs: HashSet<String> = HashSet::new();
+        let mut raws: Vec<String> = Vec::new();
+        match item {
+            TopItem::Stmt(s) | TopItem::ExportStmt(s) => {
+                collect_refs_and_raws(ast, *s, &mut refs, &mut raws);
+            }
+            TopItem::Func { sig_raw, body, .. } => {
+                raws.push(sig_raw.clone());
+                if let Some(b) = body {
+                    collect_refs_and_raws(ast, *b, &mut refs, &mut raws);
+                }
+            }
+            TopItem::Class(c) => {
+                raws.push(c.head_raw.clone());
+                for m in &c.members {
+                    match m {
+                        ClassMember::Method { sig_raw, body } => {
+                            raws.push(sig_raw.clone());
+                            if let Some(b) = body {
+                                collect_refs_and_raws(ast, *b, &mut refs, &mut raws);
+                            }
+                        }
+                        ClassMember::Field { sig_raw, init, .. } => {
+                            raws.push(sig_raw.clone());
+                            if let Some(i) = init {
+                                collect_refs_and_raws(ast, *i, &mut refs, &mut raws);
+                            }
+                        }
+                        ClassMember::StaticBlock { body } => {
+                            collect_refs_and_raws(ast, *body, &mut refs, &mut raws);
+                        }
+                        ClassMember::Raw(raw) => raws.push(raw.clone()),
+                    }
+                }
+            }
+            TopItem::Import(raw) | TopItem::ExportRaw(raw) | TopItem::Raw(raw) => {
+                raws.push(raw.clone());
+            }
+        }
+        item_refs.push(refs);
+        item_raws.push(raws);
+    }
+    // 全项（含原文词）引用并集
+    let all_words = |exclude: Option<usize>| -> HashSet<String> {
+        let mut out: HashSet<String> = HashSet::new();
+        for (i, refs) in item_refs.iter().enumerate() {
+            if Some(i) != exclude {
+                out.extend(refs.iter().cloned());
+            }
+        }
+        for (i, raws) in item_raws.iter().enumerate() {
+            if Some(i) == exclude {
+                continue;
+            }
+            for raw in raws {
+                for w in raw.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')) {
+                    if !w.is_empty() {
+                        out.insert(w.to_string());
+                    }
+                }
+            }
+        }
+        out
+    };
+    let mut removed = 0usize;
+    let mut drop_indices: Vec<usize> = Vec::new();
+    for (i, item) in unit.items.iter().enumerate() {
+        match item {
+            TopItem::Stmt(s) => {
+                if let NodeData::VarDecl { name, .. } = ast.data(*s) {
+                    if ast.const_fields.contains_key(name)
+                        && !all_words(Some(i)).contains(name)
+                    {
+                        drop_indices.push(i);
+                    }
+                }
+            }
+            TopItem::Func { sig_raw, name, .. } => {
+                if !sig_raw.contains("export")
+                    && ast.inline_funcs.contains_key(name)
+                    && !all_words(Some(i)).contains(name)
+                {
+                    drop_indices.push(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    removed = drop_indices.len();
+    for &i in drop_indices.iter().rev() {
+        unit.items.remove(i);
+    }
+    removed
+}
+
+/// 收集子树的 VarRef 名 + Raw/模板 quasi/解构模式原文。
+fn collect_refs_and_raws(ast: &TsAst, root: TsId, refs: &mut HashSet<String>, raws: &mut Vec<String>) {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        match ast.data(n) {
+            NodeData::VarRef { name } => {
+                refs.insert(ast.sn(*name).to_string());
+            }
+            NodeData::Raw { text } | NodeData::ClassExpr { raw: text } => {
+                raws.push(text.clone());
+            }
+            NodeData::Template { quasis, .. } => {
+                for q in quasis {
+                    raws.push(q.clone());
+                }
+            }
+            NodeData::Destruct { pattern_raw } => {
+                raws.push(pattern_raw.clone());
+            }
+            NodeData::DestructStmt { pattern, .. } => {
+                raws.push(pattern.clone());
+            }
+            _ => {}
+        }
+        for &c in ast.children(n) {
+            stack.push(c);
+        }
+    }
+}
+
+/// 模块级常量/内联函数收集（每轮重算——Java 版同构）：
+///
+/// **常量接纳条件**（混淆器拷贝链的关键）：
+/// - 名字全模块唯一声明（同名二见 → 放弃）
+/// - **零写**：任何赋值目标/++--（含 `arr[i] =` 的数组基座）出现即除名
+/// - **零遮蔽**：任何函数体/类成员/嵌套作用域内的同名声明/参数/绑定
+/// - init 纯净：字面量、字面量数组、或**全部自由变量已在先前接纳集**
+///   的纯表达式（`var a = 0x1; var b = a + 0x1;` 的链式拷贝——var
+///   的非字面量 init 仅在引用先序常量时时间无关地确定）
+///
+/// **内联函数**：模块级 `function f(简单参数) { return 纯表达式; }`
+/// ——字符串数组访问器 `_0x5d3e(i) { return arr[i - off]; }` 的调用点
+/// 展开材料。
+pub fn collect_unit_consts(ast: &mut TsAst, unit: &ModuleUnit) {
+    ast.const_fields.clear();
+    ast.const_scalars.clear();
+    ast.inline_funcs.clear();
+
+    // ---- 第一遍：模块级声明计数（唯一性）+ 内部遮蔽集 + 全单元写计数 ----
+    // 关键区分：模块语句**根**的 VarDecl/解构是「被遮蔽者候选」——只计数
+    // 不入 shadowed；其**内部**（初始化表达式里的 lambda/嵌套块）与一切
+    // 函数/类体内的声明才是「遮蔽者」。曾因不区分而把每个模块声明都
+    // 计入 shadowed ——常量收集全军覆没（obf1 样本抓获）。
+    let mut shadowed: HashSet<String> = HashSet::new();
+    let mut write_counts: std::collections::HashMap<String, u32> = Default::default();
+    let mut decl_counts: std::collections::HashMap<String, u32> = Default::default();
+
+    fn walk_interior(
+        ast: &TsAst,
+        from: TsId,
+        skip_root_decl: bool,
+        shadowed: &mut HashSet<String>,
+        write_counts: &mut std::collections::HashMap<String, u32>,
+    ) {
+        // skip_root_decl：from 本身是模块语句根（其 VarDecl 只计数——
+        // 由调用方处理），从孩子开始走
+        let mut stack: Vec<TsId> = Vec::new();
+        let roots: Vec<TsId> = if skip_root_decl {
+            ast.children(from).to_vec()
+        } else {
+            vec![from]
+        };
+        for r in roots.into_iter().rev() {
+            stack.push(r);
+        }
+        while let Some(n) = stack.pop() {
+            match ast.data(n) {
+                NodeData::VarDecl { name, .. } | NodeData::ForEach { name, .. } => {
+                    shadowed.insert(name.clone());
+                }
+                NodeData::Catch { param_raw: Some(p) } => {
+                    let p = p.trim();
+                    if !p.is_empty()
+                        && p.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                        && !p.starts_with(|c: char| c.is_ascii_digit())
+                    {
+                        shadowed.insert(p.to_string());
+                    }
+                }
+                NodeData::Destruct { pattern_raw } | NodeData::DestructStmt { pattern: pattern_raw, .. } => {
+                    for w in pattern_raw
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                    {
+                        if !w.is_empty() && !w.starts_with(|c: char| c.is_ascii_digit()) {
+                            shadowed.insert(w.to_string());
+                        }
+                    }
+                }
+                NodeData::FuncStmt { name, params_raw, .. } => {
+                    shadowed.insert(name.clone());
+                    if let Some(ps) = simple_params(params_raw) {
+                        for p in ps {
+                            shadowed.insert(p);
+                        }
+                    }
+                }
+                NodeData::Lambda { params_raw, .. } => {
+                    if let Some(ps) = simple_params(params_raw) {
+                        for p in ps {
+                            shadowed.insert(p);
+                        }
+                    }
+                }
+                NodeData::Assign { .. } => {
+                    let t = ast.children(n)[0];
+                    let mut ts = vec![t];
+                    while let Some(x) = ts.pop() {
+                        if ast.kind(x) == NodeKind::VarRef {
+                            if let Some(nm) = ast.var_name(x) {
+                                *write_counts.entry(nm.to_string()).or_insert(0) += 1;
+                            }
+                        }
+                        for &c in ast.children(x) {
+                            ts.push(c);
+                        }
+                    }
+                }
+                // ++/-- 目标也是写（seq 差分抓获：`var i = 0;
+                // (i++, i++)` 的 i 曾未被计数而接纳为常量）
+                NodeData::Unary { op }
+                    if matches!(
+                        op,
+                        UnOp::PreInc | UnOp::PreDec | UnOp::PostInc | UnOp::PostDec
+                    ) =>
+                {
+                    let t = ast.children(n)[0];
+                    if ast.kind(t) == NodeKind::VarRef {
+                        if let Some(nm) = ast.var_name(t) {
+                            *write_counts.entry(nm.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for &c in ast.children(n) {
+                stack.push(c);
+            }
+        }
+    }
+
+    for item in &unit.items {
+        match item {
+            TopItem::Stmt(s) | TopItem::ExportStmt(s) => {
+                // 根声明计数（唯一性）；根的解构模式词也计数（重声明）
+                match ast.data(*s) {
+                    NodeData::VarDecl { name, .. } => {
+                        *decl_counts.entry(name.clone()).or_insert(0) += 1;
+                    }
+                    NodeData::DestructStmt { pattern, .. } => {
+                        for w in pattern
+                            .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                        {
+                            if !w.is_empty() {
+                                *decl_counts.entry(w.to_string()).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // 初始化表达式**内部**（lambda 参数等）是遮蔽者；整个
+                // 子树的写也要计
+                walk_interior(ast, *s, true, &mut shadowed, &mut write_counts);
+            }
+            TopItem::Func { body: Some(b), .. } => {
+                walk_interior(ast, *b, false, &mut shadowed, &mut write_counts);
+                // 函数名本身作为全局可调用——体内同名局部声明遮蔽它
+            }
+            TopItem::Func { name, .. } => {
+                let _ = name;
+            }
+            TopItem::Class(c) => {
+                for m in &c.members {
+                    match m {
+                        ClassMember::Method { body: Some(b), .. } => {
+                            walk_interior(ast, *b, false, &mut shadowed, &mut write_counts);
+                        }
+                        ClassMember::StaticBlock { body } => {
+                            walk_interior(ast, *body, false, &mut shadowed, &mut write_counts);
+                        }
+                        ClassMember::Field { init: Some(i), .. } => {
+                            walk_interior(ast, *i, false, &mut shadowed, &mut write_counts);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- 第二遍：按声明序接纳模块级常量（链式拷贝） ----
+    let mut accepted: HashSet<String> = HashSet::new();
+    let mut scalar_set: HashSet<String> = HashSet::new();
+    for item in &unit.items {
+        if let TopItem::Stmt(s) | TopItem::ExportStmt(s) = item {
+            if let NodeData::VarDecl { name, .. } = ast.data(*s) {
+                let name = name.clone();
+                let Some(&init) = ast.children(*s).first() else { continue };
+                if decl_counts.get(&name).copied().unwrap_or(0) != 1 {
+                    continue; // 同名二见
+                }
+                if shadowed.contains(&name) {
+                    continue;
+                }
+                if write_counts.get(&name).copied().unwrap_or(0) != 0 {
+                    continue;
+                }
+                if !const_init_ok(ast, init, &accepted, &scalar_set) {
+                    continue;
+                }
+                let scalar_ok = matches!(ast.kind(init), NodeKind::Literal);
+                ast.const_fields.insert(name.clone(), init);
+                if scalar_ok {
+                    ast.const_scalars.insert(name.clone());
+                    scalar_set.insert(name.clone());
+                }
+                accepted.insert(name);
+            }
+        }
+    }
+
+    // ---- 第三遍：数组逃逸扫描 ----
+    // 数组候选（const_fields 中 init 为 ArrayLit 的名字）仅当**每个**
+    // 使用都在只读上下文（Index 读基座 / 纯方法接收者 / for-of 迭代 /
+    // spread / 模板插值）才保留下标折叠资格。任何其他上下文
+    //（别名赋值/调用实参/return/未知方法接收者——`copy = arr;
+    // copy.sort()` / `log.push(x)` 的突变能力对写扫描不可见）→ 除名。
+    {
+        let array_names: HashSet<String> = ast
+            .const_fields
+            .iter()
+            .filter(|(_, &init)| ast.kind(init) == NodeKind::ArrayLit)
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !array_names.is_empty() {
+            // 父/祖父表（walk 需要两级上下文判定赋值目标位的 Index）
+            let mut parents: std::collections::HashMap<TsId, (TsId, usize)> = Default::default();
+            let mut escaped: HashSet<String> = HashSet::new();
+            let mut roots: Vec<TsId> = Vec::new();
+            for_each_item_body(unit, &mut |r| roots.push(r));
+            for root in roots {
+                let mut stack = vec![(root, TsId(u32::MAX), 0usize)];
+                while let Some((n, p, i)) = stack.pop() {
+                    if p != TsId(u32::MAX) {
+                        parents.insert(n, (p, i));
+                    }
+                    if let NodeData::VarRef { name } = ast.data(n) {
+                        let nm = ast.sn(*name);
+                        if array_names.contains(nm) {
+                            if !array_read_context(ast, n, &parents) {
+                                escaped.insert(nm.to_string());
+                            }
+                        }
+                    }
+                    for (ci, &c) in ast.children(n).iter().enumerate() {
+                        stack.push((c, n, ci));
+                    }
+                }
+            }
+            for e in escaped {
+                ast.const_fields.remove(&e);
+            }
+        }
+    }
+
+    // ---- 内联函数：模块级单 return（体不含 this/arguments/自引用） ----
+    for item in &unit.items {
+        if let TopItem::Func { sig_raw, body: Some(b), name, .. } = item {
+            let _ = name;
+            if sig_raw.contains("export default") {
+                continue;
+            }
+            let stmts = ast.children(*b).to_vec();
+            if stmts.len() != 1 {
+                continue;
+            }
+            if !matches!(ast.data(stmts[0]), NodeData::Return) {
+                continue;
+            }
+            let Some(&expr) = ast.children(stmts[0]).first() else { continue };
+            // 参数提取（sig 首对圆括号）
+            let open = match sig_raw.find('(') {
+                Some(o) => o,
+                None => continue,
+            };
+            let bytes = sig_raw.as_bytes();
+            let mut depth = 0i32;
+            let mut close = None;
+            for (i, &bb) in bytes.iter().enumerate().skip(open) {
+                match bb {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = close else { continue };
+            let Some(params) = simple_params(&sig_raw[open + 1..close]) else {
+                continue;
+            };
+            let fname = sig_name(sig_raw);
+            if fname.is_empty() || shadowed.contains(&fname) {
+                continue;
+            }
+            // 体守卫：this / arguments / 自引用（递归内联会无限展开；
+            // this 的调用点绑定与表达式位置不同——语义改变）
+            if body_has_inline_hazard(ast, expr, &fname) {
+                continue;
+            }
+            ast.inline_funcs.insert(fname, (params, expr));
+        }
+    }
+}
+
+/// 内联危险：this / arguments / 递归自引用。
+fn body_has_inline_hazard(ast: &TsAst, expr: TsId, fname: &str) -> bool {
+    let mut stack = vec![expr];
+    while let Some(n) = stack.pop() {
+        match ast.data(n) {
+            NodeData::This => return true,
+            NodeData::VarRef { name } => {
+                if ast.sn(*name) == fname || ast.sn(*name) == "arguments" {
+                    return true;
+                }
+            }
+            NodeData::Raw { .. } | NodeData::ClassExpr { .. } => return true,
+            _ => {}
+        }
+        for &c in ast.children(n) {
+            stack.push(c);
+        }
+    }
+    false
+}
+
+/// 常量 init 判定：字面量 / 字面量数组 / 自由变量全在已接纳集的纯表达式。
+fn const_init_ok(
+    ast: &TsAst,
+    init: TsId,
+    accepted: &HashSet<String>,
+    scalar_set: &HashSet<String>,
+) -> bool {
+    match ast.kind(init) {
+        NodeKind::Literal => true,
+        NodeKind::ArrayLit => {
+            if ast.effect(init) > Effect::MayRead {
+                return false;
+            }
+            // 数组元素：字面量或已接纳常量的引用（混淆器字符串数组的
+            // 元素有时本身就是前置常量名——Java 版同构支持）
+            let mut ok = true;
+            let mut stack = vec![init];
+            while let Some(n) = stack.pop() {
+                match ast.kind(n) {
+                    NodeKind::Literal | NodeKind::ArrayLit => {}
+                    NodeKind::VarRef => {
+                        let nm = ast.var_name(n).unwrap_or("");
+                        if !accepted.contains(nm) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    NodeKind::Binary => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+                for &c in ast.children(n) {
+                    stack.push(c);
+                }
+            }
+            ok
+        }
+        NodeKind::Binary => {
+            // 表达式效果 ≤ MayRead 且自由变量全在先序接纳集**且为标量**
+            //（数组引用 = 别名——突变能力经别名传导，链式拷贝对数组
+            // 恒不安全；标量值语义无此问题）
+            if ast.effect(init) > Effect::MayRead {
+                return false;
+            }
+            let mut ok = true;
+            let mut stack = vec![init];
+            while let Some(n) = stack.pop() {
+                match ast.kind(n) {
+                    NodeKind::Literal | NodeKind::Binary | NodeKind::Paren => {}
+                    NodeKind::VarRef => {
+                        let nm = ast.var_name(n).unwrap_or("");
+                        if !scalar_set.contains(nm) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+                for &c in ast.children(n) {
+                    stack.push(c);
+                }
+            }
+            ok
+        }
+        _ => false,
+    }
+}
+
+/// sig 里的函数名（"function name(" / "function* name("）。
+fn sig_name(sig_raw: &str) -> String {
+    let after = sig_raw.strip_prefix("function").unwrap_or(sig_raw);
+    let after = after.strip_prefix('*').unwrap_or(after);
+    let name: String = after
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .collect();
+    name
+}
+
+/// 全部可执行体根（语句/函数体/类成员/字段 init）。
+fn for_each_item_body(unit: &ModuleUnit, f: &mut dyn FnMut(TsId)) {
+    for item in &unit.items {
+        match item {
+            TopItem::Stmt(s) | TopItem::ExportStmt(s) => f(*s),
+            TopItem::Func { body: Some(b), .. } => f(*b),
+            TopItem::Class(c) => {
+                for m in &c.members {
+                    match m {
+                        ClassMember::Method { body: Some(b), .. } => f(*b),
+                        ClassMember::StaticBlock { body } => f(*body),
+                        ClassMember::Field { init: Some(i), .. } => f(*i),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 数组候选的 VarRef 是否处于**只读上下文**。
+fn array_read_context(
+    ast: &TsAst,
+    varref: TsId,
+    parents: &std::collections::HashMap<TsId, (TsId, usize)>,
+) -> bool {
+    let Some(&(p, ci)) = parents.get(&varref) else {
+        return false; // 根位——保守逃逸
+    };
+    match ast.kind(p) {
+        // arr[i] 读位：Index 基座且 Index 不在赋值目标位
+        NodeKind::Index => {
+            if ci != 0 {
+                return false;
+            }
+            if let Some(&(gp, gci)) = parents.get(&p) {
+                // Index 作为 Assign 的 child-0 = 写目标 → 逃逸
+                if ast.kind(gp) == NodeKind::Assign && gci == 0 {
+                    return false;
+                }
+            }
+            true
+        }
+        // arr.length / arr.join()——纯读成员
+        NodeKind::Member => {
+            if ci != 0 {
+                return false;
+            }
+            let mname = ast.member_name(p).unwrap_or("");
+            if mname == "length" {
+                return true;
+            }
+            ARRAY_PURE_METHODS.contains(&mname)
+        }
+        // for (const x of arr) ——迭代只读；spread …arr；模板插值
+        NodeKind::ForEach | NodeKind::Custom(_) => ci == 0,
+        _ => false,
+    }
+}
+
+/// 数组的纯读方法（未知方法默认逃逸——用户函数可能突变）。
+const ARRAY_PURE_METHODS: &[&str] = &[
+    "join", "indexOf", "lastIndexOf", "includes", "concat", "slice", "at",
+    "entries", "keys", "values", "toString", "toLocaleString", "find",
+    "findIndex", "findLast", "findLastIndex", "flat", "flatMap", "map",
+    "filter", "reduce", "reduceRight", "forEach", "some", "every",
+    "toSorted", "toReversed", "toSpliced", "with",
+];
 
 fn simplify_top_item(ast: &mut TsAst, item: &mut TopItem, cfg: &Config, total: &mut Report) {
     match item {
         TopItem::Stmt(s) => {
+            simplify_stmt_root(ast, s, cfg, total);
+        }
+        TopItem::ExportStmt(s) => {
             simplify_stmt_root(ast, s, cfg, total);
         }
         TopItem::Func { sig_raw, body, .. } => {
@@ -174,9 +871,289 @@ fn merge_report(total: &mut Report, r: Report) {
     }
 }
 
-/// TS 规则集：引擎默认规则（Lang 钩子承担 JS 语义守卫）+ TS 专属规则。
+// ---------------------------------------------------------------------------
+// TS 专属规则包（混淆器对抗）
+// ---------------------------------------------------------------------------
+
+/// **模块常量传播**：`_0x4b1c`（const_fields）→ init 子树拷贝。
+/// 收集期已保证零写/零遮蔽/先序确定（见 collect_unit_consts）。
+pub struct TsConstPropagate;
+
+impl Rule<TsAst> for TsConstPropagate {
+    fn name(&self) -> &'static str {
+        "ts_const_propagate"
+    }
+    /// 结构性：VarRef → init 子树的成本可能**上升**（链式拷贝的表达式
+    /// 比名字贵）——单调成本门会拒绝。净简化在后续折叠完成（Java 的
+    /// ConstFieldPropagate 同款声明）。
+    fn structural(&self) -> bool {
+        true
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::VarRef]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
+        // 目标位检查先行（ctx 借用结束后再拿 lang 的可变借用）
+        if let Some(p) = ctx.parent(id) {
+            let k = ctx.lang.kind(p);
+            if k == NodeKind::Assign && ctx.lang.children(p).first() == Some(&id) {
+                return None;
+            }
+            if k == NodeKind::Unary {
+                if let Some(op) = ctx.lang.un_op(p) {
+                    if matches!(
+                        op,
+                        UnOp::PreInc | UnOp::PreDec | UnOp::PostInc | UnOp::PostDec
+                    ) && ctx.lang.children(p).first() == Some(&id)
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        let RewriteCtx { lang, .. } = ctx;
+        let name = lang.var_name(id)?;
+        // 仅标量（值语义——数组/对象传播会破坏同一性：`copy === arr`
+        // 曾被替换成 `copy === [3,1,2]`；数组走 ts_static_array_index
+        // 的下标折叠）
+        if !lang.const_scalars.contains(name) {
+            return None;
+        }
+        let Some(&init) = lang.const_fields.get(name) else {
+            return None;
+        };
+        // init 效果 ≤ MayRead：自由变量已由收集期的先序接纳约束保证
+        // 全是**已验证常量**——常量读取无位置敏感性（写/抛/未知调用
+        // 仍然拒绝）
+        if lang.effect(init) > Effect::MayRead {
+            return None;
+        }
+        let copy = lang.copy_subtree(init);
+        Some(Edit::Replace { target: id, with: copy })
+    }
+}
+
+/// **常量数组下标折叠**：`_0x3f2a[2]`（const ArrayLit）→ 元素字面量。
+/// 数组内容零写（收集期写扫描含 `arr[i] =` 基座）→ 值恒定。
+pub struct TsStaticArrayIndex;
+
+impl Rule<TsAst> for TsStaticArrayIndex {
+    fn name(&self) -> &'static str {
+        "ts_static_array_index"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Index]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
+        let RewriteCtx { lang, .. } = ctx;
+        let ch = lang.children(id).to_vec();
+        if ch.len() != 2 {
+            return None;
+        }
+        let (base, idx) = (ch[0], ch[1]);
+        // optional index 不碰
+        if matches!(lang.data(id), NodeData::Index { optional: true }) {
+            return None;
+        }
+        // 基座：const 名字（VarRef）或**内联后的数组字面量本体**
+        //（ts_const_propagate 把整个 ArrayLit 拷到使用位——直配形态
+        // 同样可折；数组是语法常量）
+        let arr = match lang.data(base) {
+            NodeData::VarRef { name } => {
+                let name = lang.sn(*name);
+                let Some(&a) = lang.const_fields.get(name) else {
+                    return None;
+                };
+                a
+            }
+            _ if lang.kind(base) == NodeKind::ArrayLit => base,
+            _ => return None,
+        };
+        if lang.kind(arr) != NodeKind::ArrayLit {
+            return None;
+        }
+        // 全字面量元素（非字面量元素的下标折叠会改变求值语义）
+        let elems = lang.children(arr).to_vec();
+        if !elems.iter().all(|&e| lang.kind(e) == NodeKind::Literal) {
+            return None;
+        }
+        let i = match lang.literal(idx) {
+            Some(LitRef::Int(v)) => v,
+            _ => return None,
+        };
+        let i = usize::try_from(i).ok()?;
+        let &elem = elems.get(i)?;
+        Some(Edit::Replace { target: id, with: elem })
+    }
+}
+
+/// **真值字面量折叠**：`![]` → false、`!!{}` → true（经 bool_not_fold
+/// 链式收敛）——混淆器的 JSFuck 风格布尔噪声。
+pub struct TsTruthyFold;
+
+impl Rule<TsAst> for TsTruthyFold {
+    fn name(&self) -> &'static str {
+        "ts_truthy_fold"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Unary]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
+        let RewriteCtx { lang, .. } = ctx;
+        if lang.un_op(id) != Some(UnOp::Not) {
+            return None;
+        }
+        let operand = *lang.children(id).first()?;
+        let truthy = definitely_truthy(lang, operand)?;
+        let v = !truthy; // !truthy → false；!falsy → true
+        Some(Edit::Replace {
+            target: id,
+            with: lang.build_bool(v),
+        })
+    }
+}
+
+/// 操作数是否「确定真值」（JS 语义：[] / {} / new / 非空串 / 非零数 /
+/// true 恒真；0 / NaN / '' / null / false 恒假）。None = 不确定。
+fn definitely_truthy(lang: &TsAst, e: TsId) -> Option<bool> {
+    use JsLit::*;
+    match lang.data(e) {
+        NodeData::Literal(Bool(b)) => Some(*b),
+        // 空数组是 truthy（JS 语义）
+        NodeData::ArrayLit | NodeData::ObjLit { .. } | NodeData::New => Some(true),
+        NodeData::Literal(Str(s)) => Some(!s.is_empty()),
+        NodeData::Literal(Int(v)) => Some(*v != 0),
+        NodeData::Literal(Double(v)) => Some(*v != 0.0 && !v.is_nan()),
+        NodeData::Literal(Null) => Some(false),
+        NodeData::Paren => definitely_truthy(lang, lang.children(e).first().copied()?),
+        NodeData::Template { quasis, .. } => {
+            // 空模板 `` → '' falsy；有内容/插值 truthy（插值字符串化
+            // 恒非空？不—— `${''}` 是空——保守：有插值 → None）
+            let has_interp = !lang.children(e).is_empty();
+            if has_interp {
+                return None;
+            }
+            Some(quasis.iter().any(|q| !q.is_empty()))
+        }
+        _ => None,
+    }
+}
+
+/// **引号成员还原**：`console['log']` → `console.log`（字符串键是
+/// 合法标识符且非数字形态——数字串 `obj['0']` 与 `obj[0]` 语义不同）。
+pub struct TsMemberUnquote;
+
+impl Rule<TsAst> for TsMemberUnquote {
+    fn name(&self) -> &'static str {
+        "ts_member_unquote"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Index]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
+        let RewriteCtx { lang, .. } = ctx;
+        if matches!(lang.data(id), NodeData::Index { optional: true }) {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        if ch.len() != 2 {
+            return None;
+        }
+        let (base, idx) = (ch[0], ch[1]);
+        let key = match lang.literal(idx) {
+            Some(LitRef::Str(s)) => s.to_string(),
+            _ => return None,
+        };
+        // 合法标识符且非纯数字（'0' 下标是数字键不是成员名）
+        if key.is_empty()
+            || !key.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+            || !key.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        {
+            return None;
+        }
+        // 基座可为任意表达式（obj[...] → obj.name 语义恒等——
+        // undefined/null 基座两者同样抛 TypeError）
+        let m = lang.member(base, &key, false);
+        Some(Edit::Replace { target: id, with: m })
+    }
+}
+
+/// **常量函数内联**：`_0x5d3e(0x2)` → 函数体 return 表达式（参数字面量
+/// 替换）——字符串数组访问器/解密 helper 的调用点展开。
+pub struct TsInlineFunc;
+
+impl Rule<TsAst> for TsInlineFunc {
+    fn name(&self) -> &'static str {
+        "ts_inline_func"
+    }
+    /// 结构性（调用 → 展开体的净简化由后续折叠完成）
+    fn structural(&self) -> bool {
+        true
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Call]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
+        let RewriteCtx { lang, .. } = ctx;
+        if matches!(lang.data(id), NodeData::Call { optional: true }) {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        let callee = *ch.first()?;
+        let name = match lang.data(callee) {
+            NodeData::VarRef { name } => lang.sn(*name),
+            _ => return None,
+        };
+        let Some((params, body_expr)) = lang.inline_funcs.get(name).cloned() else {
+            return None;
+        };
+        let args = &ch[1..];
+        if args.len() != params.len() || params.is_empty() {
+            return None;
+        }
+        // 全部实参须为字面量（多引用安全——不可变；求值时机恒定）
+        for &a in args {
+            if lang.kind(a) != NodeKind::Literal {
+                return None;
+            }
+        }
+        // 参数名 → 实参节点映射（字面量节点可共享——不可变）
+        let mut map: std::collections::HashMap<String, TsId> = Default::default();
+        for (p, &a) in params.iter().zip(args.iter()) {
+            map.insert(p.clone(), a);
+        }
+        // 体表达式逐参出现须恰一次？不——字面量可安全多引用（不可变）
+        let expanded = subst_expr(lang, body_expr, &map);
+        Some(Edit::Replace { target: id, with: expanded })
+    }
+}
+
+/// 表达式的参数替换克隆（VarRef 命中参数 → 实参节点；否则按结构克隆）。
+fn subst_expr(
+    lang: &mut TsAst,
+    n: TsId,
+    map: &std::collections::HashMap<String, TsId>,
+) -> TsId {
+    if let NodeData::VarRef { name } = lang.data(n) {
+        if let Some(&arg) = map.get(lang.sn(*name)) {
+            return arg;
+        }
+    }
+    let children: Vec<TsId> = lang.children(n).to_vec();
+    let children: Vec<TsId> = children.into_iter().map(|c| subst_expr(lang, c, map)).collect();
+    lang.clone_node(n, children)
+}
+
+/// TS 规则集：引擎默认规则（Lang 钩子承担 JS 语义守卫）+ TS 专属
+/// 混淆对抗规则（常量传播/数组下标/真值折叠/成员还原/函数内联）。
 pub fn default_ts_rules() -> Vec<Box<dyn Rule<TsAst>>> {
-    cure_engine::rules::default_rules()
+    let mut rules: Vec<Box<dyn Rule<TsAst>>> = cure_engine::rules::default_rules();
+    rules.push(Box::new(TsConstPropagate));
+    rules.push(Box::new(TsStaticArrayIndex));
+    rules.push(Box::new(TsTruthyFold));
+    rules.push(Box::new(TsMemberUnquote));
+    rules.push(Box::new(TsInlineFunc));
+    rules
 }
 
 // ---------------------------------------------------------------------------

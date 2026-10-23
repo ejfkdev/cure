@@ -305,6 +305,16 @@ impl<'a> Parser<'a> {
                 return;
             }
         }
+        // export const/let/var/using/解构声明——真解析（值级可简化）
+        if self.is_kw("var")
+            || self.is_kw("let")
+            || self.is_kw("const")
+            || self.is_kw("using")
+        {
+            let stmt = self.parse_stmt();
+            self.unit.items.push(TopItem::ExportStmt(stmt));
+            return;
+        }
         if self.is_kw("class") || (self.is_kw("abstract") && self.tk_at(1).text == "class") {
             if let Some(c) = self.try_parse_class_decl(deco_raw) {
                 self.unit.items.push(TopItem::Class(c));
@@ -1085,6 +1095,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_for(&mut self) -> TsId {
+        let for_pos = self.pos; // `for` 关键字位（destruct 回退捕获用）
         self.advance();
         let is_await = if self.is_kw("await") {
             self.advance();
@@ -1155,8 +1166,10 @@ impl<'a> Parser<'a> {
                     };
                     (nm, ty)
                 } else {
-                    // 解构 for-of——整条原文
-                    self.pos = head_start;
+                    // 解构 for-of——整条原文（**从 `for` 关键字起**——
+                    // 曾从 head_start 起丢了 `for (` 前缀，打印出
+                    // `const [k] of …))` 残句——真实语料 roundtrip 抓获）
+                    self.pos = for_pos;
                     let s = self.pos;
                     self.skip_balanced_to_stmt_boundary();
                     return self.ast.raw(&self.raw_between(s, self.pos));
@@ -1558,6 +1571,11 @@ impl<'a> Parser<'a> {
         let close = self.match_paren(p)?;
         let mut q = close + 1;
         if q < self.toks.len() && self.toks[q].kind == TokKind::Punct && self.toks[q].text == ":" {
+            // 返回类型前瞻。**语句边界终止**：`;`/`,`/`}`/裸 `{` 出现在
+            // 顶层即中止——`cond ? (a ? b : c) : else` 的三元 else 冒号
+            // 曾被当类型起点扫到**后续语句**的 `=>`，跨语句吞成假箭头
+            //（真实语料 real_81 pipeProcessor 抓获：`(ctx.io === "input"
+            // ? (...) : def.out);` 之后整段错位）
             let mut depth = 0i32;
             while q < self.toks.len() {
                 let t = &self.toks[q];
@@ -1566,9 +1584,13 @@ impl<'a> Parser<'a> {
                 }
                 if t.kind == TokKind::Punct {
                     match t.text.as_str() {
-                        "<" | "(" | "[" | "{" => depth += 1,
-                        ">" | ")" | "]" | "}" => depth -= 1,
+                        "<" | "(" | "[" => depth += 1,
+                        "{" if depth > 0 => depth += 1,
+                        "}" if depth > 0 => depth -= 1,
+                        ">" | ")" | "]" => depth -= 1,
                         "=>" if depth <= 0 => break,
+                        ";" | "," if depth <= 0 => return None,
+                        "{" | "}" if depth <= 0 => return None,
                         _ => {}
                     }
                 }
@@ -1631,6 +1653,15 @@ impl<'a> Parser<'a> {
             if self.is_punct(":") {
                 self.advance();
             } else {
+                if std::env::var("CURE_DBG_COND").is_ok() {
+                    eprintln!(
+                        "[cond] L{} C{} then={:?} next={:?}",
+                        self.tk().line,
+                        self.tk().col,
+                        cure_engine::kind::NodeKind::from(self.ast.kind(then)),
+                        self.tk().text
+                    );
+                }
                 self.err_here("expected : in conditional");
             }
             let els = self.parse_assign_expr();

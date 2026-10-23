@@ -641,3 +641,90 @@ fn parse_print_roundtrip_clean() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 混淆器对抗差分（obfuscator.io 风格——常量表/内联/折叠/死项全链路）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn obf_string_array_chain() {
+    // 字符串数组 + 偏移访问器 + hex 拷贝链 + 真值噪声 + 引号成员
+    //（module 标记启用死项清除）
+    differential_edits(
+        "obf_string_array",
+        r#"
+var _0x3f2a = ['\x68\x65\x6c\x6c\x6f', '\x77\x6f\x72\x6c\x64'];
+var _0xoff = 0x1 + 0x1;
+function _0xacc(i) { return _0x3f2a[i - _0xoff]; }
+export function greet() {
+    var _0xf = !![];
+    var _0xg = ![];
+    if (_0xf) { return _0xacc(0x2) + ' ' + _0xacc(0x3) + (_0xg === false ? '!' : '?'); }
+    return '';
+}
+console.log(greet());
+"#,
+        5,
+    );
+}
+
+#[test]
+fn obf_hex_chain_and_bool() {
+    differential_edits(
+        "obf_hex_chain",
+        r#"
+var _0xk = 0x0a;
+var _0xm = _0xk * 0x03 + 0x02;
+function calc(x) {
+    var _0xt = _0xm - 0x1c;
+    var _0xu = _0xt + x;
+    return _0xu;
+}
+export function run() { return [calc(1), calc(2), ![], !![]]; }
+console.log(run().join(','));
+"#,
+        3,
+    );
+}
+
+#[test]
+fn obf_sandbox_safety() {
+    // 不可折的形态保持原样：NaN 比较、字符串数值胁迫、动态下标
+    differential(
+        "obf_safety",
+        r#"
+var _0xs = '5';
+var _0xdyn = 1;
+function keep(x) {
+    var a = x * 1;
+    var b = x - 0;
+    var arr = [10, 20, 30];
+    return [a, b, arr[_0xdyn], x !== x, x == 5, x === 5];
+}
+export function run() { return keep(_0xs).join('|'); }
+console.log(run());
+"#,
+    );
+}
+
+#[test]
+fn obf_rotation_call_chain() {
+    // 多调用点内联 + 数组折叠 + 控制流噪声
+    differential_edits(
+        "obf_rotation",
+        r#"
+var _0xtbl = ['a', 'b', 'c', 'd'];
+var _0xrot = 0x0;
+function _0xpick(i) { return _0xtbl[(i + _0xrot) % 0x4]; }
+export function run() {
+    var s = '';
+    for (var i = 0x0; i < 0x4; i++) { s = s + _0xpick(i); }
+    var flag = !![];
+    if (!!flag) { return s + '-' + _0xpick(0x0); }
+    return 'nope';
+}
+console.log(run());
+"#,
+        3,
+    );
+}
