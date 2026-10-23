@@ -5,6 +5,43 @@
 
 ## [Unreleased]
 
+### 新增
+- **TypeScript/JavaScript 后端**（v0.2.0 的主体）：`cure-ts-ast` /
+  `cure-ts-parser` / `cure-ts-print` / `cure-ts-simplify` 四 crate 全链路。
+  - 后缀 `ts/tsx/mts/cts/js/jsx/mjs/cjs` 经 CLI `LANG_BACKENDS` 注册，
+    与 Java 同享目录遍历/并行/`--check`/`--diff`/`--stats` 基础设施。
+  - **JS 值级语法**映射引擎词汇（箭头/函数表达式 → Lambda，for-of/
+    for-in → ForEach，`??`/`**`/`in`/typeof/await/delete → 引擎运算符
+    扩展），引擎 60+ 规则开箱即用；**TS 类型/装饰器/接口/枚举**以原文
+    保真（ty_raw/sig_raw）；**JSX 与类表达式**整段原文捕获（不透明）。
+  - **ECMAScript 折叠语义**：f64/ToInt32 域、±2^53 精确性回验、
+    -0/NaN/±Infinity 拒折、位运算按 ToInt32 环绕、`**` 右结合。
+  - **JS 专属安全守卫**：`var` 提升陷阱（块外引用 → 声明不透明）、
+    λ 按引用捕获名整体非局部化（闭包逃逸写杀盲区——node 差分抓获）、
+    可选链/解构模式不透明、字符串胁迫抑制（`is_exact_int` 仅字面量）、
+    `!!x` 折叠按语言裁决（JS 布尔胁迫 vs Java 类型保证——Lang 钩子
+    `double_not_sound`）。
+  - **词法/解析**：模板字面量嵌套（quasi 续接 vs 标签模板的 cont 标记）、
+    正则 vs 除法（花括号来源追踪启发式）、ASI（newline_before + 受限
+    产生式）、BigInt/数字分隔符、全现代语法（逻辑赋值、可选链、
+    静态块、私有字段、for-await-of、satisfies/as/非空断言、解构）。
+  - **打印机**：ECMA Number→String（最短往返数字 + 1e21/1e-6 指数
+    阈值——与 node 逐字节一致）、优先级驱动最小括号、幂等。
+  - **node 差分测试**（29 用例黄金集）：-0/NaN/字符串胁迫/hoisting/
+    闭包捕获/真值/ASI/松散 vs 严格相等/模板/正则/标签——原版与简化版
+    的 stdout/退出码逐字节一致。差分当场抓获 3 个真实 bug（闭包逃逸
+    写杀、`!!x` 布尔胁迫折叠、模板 quasi 双重转义）。
+
+### 修复
+- `store_kill` 异常窗口守卫精化：仅当**存在包围 Try** 时窗口内可能抛
+  的语句才构成障碍（无 try 时异常直接出方法、局部变量不可见）——
+  ddc 0.1.33 的「声明序列 → new 对象 → 击杀赋值」形态恢复清理。
+- `while_iterator_to_for_each`：Map 族 `keySet()/values()` 接收位合成
+  `Set<K>/Collection<V>` 静态类型（链式调用接收位曾被 var_type 门
+  一律拒绝）。
+- 传播守卫 `typed_position` 精化：值的声明类型未解析（反编译自由名）
+  或与 cast 类型同名/Object → 恒可编译（形状层守卫曾一律拒绝）。
+
 ## [0.1.9] - 2026-10-22
 
 ### 性能

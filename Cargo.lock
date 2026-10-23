@@ -71,6 +71,10 @@ dependencies = [
  "cure-java-parser",
  "cure-java-print",
  "cure-java-simplify",
+ "cure-ts-ast",
+ "cure-ts-parser",
+ "cure-ts-print",
+ "cure-ts-simplify",
  "io-uring",
  "predicates 1.0.8",
  "tempfile",
@@ -119,6 +123,42 @@ name = "cure-tree"
 version = "0.1.9"
 dependencies = [
  "cure-engine",
+]
+
+[[package]]
+name = "cure-ts-ast"
+version = "0.1.9"
+dependencies = [
+ "cure-engine",
+ "cure-tree",
+]
+
+[[package]]
+name = "cure-ts-parser"
+version = "0.1.9"
+dependencies = [
+ "cure-engine",
+ "cure-ts-ast",
+ "cure-ts-print",
+]
+
+[[package]]
+name = "cure-ts-print"
+version = "0.1.9"
+dependencies = [
+ "cure-engine",
+ "cure-ts-ast",
+ "cure-ts-parser",
+]
+
+[[package]]
+name = "cure-ts-simplify"
+version = "0.1.9"
+dependencies = [
+ "cure-engine",
+ "cure-ts-ast",
+ "cure-ts-parser",
+ "cure-ts-print",
 ]
 
 [[package]]

@@ -169,6 +169,13 @@ pub fn simplify<L: Lang>(
             if bit_get(&touched, lang.node_index(id)) {
                 continue;
             }
+            // 锚点不透明：语言侧宣告该节点承载规则不可见的语义
+            //（JS var 提升陷阱——块外引用的 var 声明；可选链元素……
+            // 规则以锚点形状提案，锚点自身的不可触碰性在此统一拦截。
+            // Java 中性：Java 的不透明节点（Raw/匿名类体）本无规则触发）
+            if lang.is_opaque(id) {
+                continue;
+            }
             let kind = lang.kind(id);
             let ki = kind.slot();
             debug_assert!(ki < NodeKind::SLOT_COUNT);

@@ -273,6 +273,21 @@ pub trait Lang {
     fn var_cast_position_ok(&self, _value: Self::Id, _typed: Self::Id) -> bool {
         true
     }
+    /// Paren 的**语法必要性**（paren_removal 守卫）：该内层形态在
+    /// 紧位置（二元/一元运算数位）是否必须带括号——产生式约束，
+    /// 优先级序表达不了。JS：箭头/对象字面量/Raw 形态在运算数位
+    /// 语法必需括号（`a ?? (() => true)`）。默认 false（打印层
+    /// 优先级模型完备的语言——如 Java）。
+    fn grammar_paren_required(&self, _inner: Self::Id) -> bool {
+        false
+    }
+    /// `!!x ≡ x` 恒等式在**本语言**是否成立（DoubleNot 规则守卫）。
+    /// 蕴含 x 为布尔值。Java：`!` 操作数必须 boolean——可编译的 !!x
+    /// 其 x 恒 boolean → 恒成立。JS：!x 是布尔胁迫（!!0 === false
+    /// ≠ 0）→ 仅语法级布尔（is_bool）成立。默认取 is_bool（保守）。
+    fn double_not_sound(&self, operand: Self::Id) -> bool {
+        self.is_bool(operand)
+    }
     /// 节点**负载**等价（NodeData 中的非孩子字段：New.ty/anon_raw、
     /// Cast.ty、InstanceOf.ty/bind、Lambda.params_raw、VarDecl.ty 等）。
     /// structurally_equal 用——负载不比较曾把 `cond ? new FairSync() :

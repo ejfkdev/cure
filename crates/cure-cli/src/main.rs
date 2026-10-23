@@ -1,8 +1,9 @@
 //! # cure CLI
 //!
 //! `cure` —— 容错式代码简化 / 格式化命令行工具。CLI 与引擎均语言无关，
-//! **当前实现的语言后端：Java**——新语言在 [`LANG_BACKENDS`] 登记一条
-//! （后缀 + 管线函数）即获得目录遍历 / 并行 / `--check` / `--diff` /
+//! **当前实现的语言后端：Java、TypeScript/JavaScript**（ts/tsx/mts/cts/
+//! js/jsx/mjs/cjs）——新语言在 [`LANG_BACKENDS`] 登记一条（后缀 + 管线
+//! 函数）即获得目录遍历 / 并行 / `--check` / `--diff` /
 //! `--stats` / 跨平台批量 I/O 的全部基础设施。
 //!
 //! - 输入：源码文件、目录（递归）、stdin
@@ -20,6 +21,9 @@ use cure_engine::Config;
 use cure_java_parser::parse;
 use cure_java_print::print_unit;
 use cure_java_simplify::simplify_unit;
+use cure_ts_parser::parse as ts_parse;
+use cure_ts_print::print_module as ts_print;
+use cure_ts_simplify::simplify_unit as ts_simplify_unit;
 
 mod cli_lang;
 mod help;
@@ -36,11 +40,18 @@ struct LangBackend {
 }
 
 /// 已实现的语言后端注册表。新语言 = 追加一条登记（CLI/引擎本身语言无关）。
-const LANG_BACKENDS: &[LangBackend] = &[LangBackend {
-    name: "java",
-    exts: &["java"],
-    process: process_source,
-}];
+const LANG_BACKENDS: &[LangBackend] = &[
+    LangBackend {
+        name: "java",
+        exts: &["java"],
+        process: process_source,
+    },
+    LangBackend {
+        name: "typescript/javascript",
+        exts: &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
+        process: process_source_ts,
+    },
+];
 
 /// 后缀 → 后端（O(后端数)，无哈希）。
 fn backend_for_ext(ext: &str) -> Option<&'static LangBackend> {
@@ -824,6 +835,116 @@ fn final_code_opts(any_changed: bool, any_error: bool, opts: &Options) -> ExitCo
 }
 
 /// 处理单个源码文本。
+/// TS/JS 管线（与 [`process_source`] 同构：parse → 门控简化 → 打印）。
+fn process_source_ts(
+    src: &str,
+    opts: &Options,
+    out_path: Option<PathBuf>,
+    display: &str,
+) -> Result<FileResult, String> {
+    let mut outcome = ts_parse(src);
+    let had_errors = !outcome.errors.is_empty();
+    let need_lines = opts.stats || opts.report;
+    let lines_before = if need_lines { src.lines().count() } else { 0 };
+    let before_metrics = if need_lines {
+        cure_ts_ast::unit_metrics(&outcome.ast, &outcome.unit)
+    } else {
+        Default::default()
+    };
+
+    let mut result = FileResult {
+        errored: had_errors,
+        lines_before,
+        nodes_before: before_metrics.nodes,
+        decisions_before: before_metrics.decisions,
+        depth_before: before_metrics.max_depth,
+        display: display.to_string(),
+        ..Default::default()
+    };
+
+    if !opts.format_only {
+        let mut cfg = Config::default();
+        for r in &opts.disabled {
+            cfg.disabled_rules.insert(r.clone());
+        }
+        cfg.remove_dead_methods = opts.dead_code;
+        let report = ts_simplify_unit(&mut outcome.ast, &mut outcome.unit, &cfg);
+        if need_lines {
+            let after_metrics = cure_ts_ast::unit_metrics(&outcome.ast, &outcome.unit);
+            result.nodes_after = after_metrics.nodes;
+            result.decisions_after = after_metrics.decisions;
+            result.depth_after = after_metrics.max_depth;
+        }
+        result.edits = report.edits;
+        result.by_rule = report.by_rule.iter().map(|(k, v)| (*k, *v)).collect();
+        if opts.report {
+            eprintln!(
+                "cure: {display}: {} 次改写 / {} 轮",
+                report.edits, report.iterations
+            );
+            if need_lines {
+                eprintln!(
+                    "  结构：节点 {}→{} / 判定点 {}→{} / 嵌套 {}→{}",
+                    before_metrics.nodes, result.nodes_after,
+                    before_metrics.decisions, result.decisions_after,
+                    before_metrics.max_depth, result.depth_after
+                );
+            }
+            if !report.by_rule.is_empty() {
+                let detail: Vec<String> =
+                    report.by_rule.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                eprintln!("  逐规则：{}", detail.join(", "));
+            }
+        }
+    }
+    let printed = ts_print(&outcome.ast, &outcome.unit);
+    if need_lines {
+        result.lines_after = printed.lines().count();
+        if result.nodes_before > 0 && result.nodes_after == 0 {
+            result.nodes_after = result.nodes_before;
+            result.decisions_after = result.decisions_before;
+            result.depth_after = result.depth_before;
+        }
+    }
+
+    if had_errors {
+        eprintln!(
+            "cure: {display}: {} 处语法问题已跳过（保留原文）:",
+            outcome.errors.len()
+        );
+        for e in outcome.errors.iter().take(5) {
+            eprintln!("  {display}:{}:{}: {}", e.line, e.col, e.message);
+        }
+        if outcome.errors.len() > 5 {
+            eprintln!("  … 其余 {} 处省略", outcome.errors.len() - 5);
+        }
+    }
+
+    result.changed = result.edits > 0 || printed != src;
+
+    if opts.diff && result.changed {
+        result.diff_text = unified_diff(src, &printed, display);
+    }
+
+    if opts.check {
+        return Ok(result);
+    }
+
+    match out_path {
+        Some(p) => fs::write(&p, printed).map_err(|e| format!("写入 {} 失败: {e}", p.display()))?,
+        None => {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(printed.as_bytes())
+                .map_err(|e| format!("写出失败: {e}"))?;
+            if !printed.ends_with('\n') {
+                let _ = stdout.write_all(b"\n");
+            }
+        }
+    }
+    Ok(result)
+}
+
 fn process_source(
     src: &str,
     opts: &Options,

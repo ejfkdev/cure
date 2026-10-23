@@ -1,0 +1,2141 @@
+//! # cure-ts-ast
+//!
+//! TypeScript/JavaScript AST（arena + TsId）+ 模块/类/函数结构 + builder
+//! + [`cure_engine::Lang`] 实现。
+//!
+//! 设计原则（与 cure-java-ast 同构，词汇面向 JS）：
+//! - **JS 值级语法**映射引擎词汇：箭头/函数表达式 → Lambda（params_raw），
+//!   for-of/for-in → ForEach，`?.`/`??`/`**`/`in`/`instanceof`/typeof/
+//!   await/delete/void → 引擎 BinOp/UnOp 扩展变体，`++`/`--` → Pre/Post
+//!   Inc/Dec，逻辑赋值 `&&=`/`||=`/`??=` → Assign{op:Some}（复合赋值
+//!   读语义恰好覆盖「读+条件写」的保守面）。
+//! - **TS/JS 特有构造**走 NodeData 专属变体 + `NodeKind::Custom(u16)`
+//!   （引擎规则永不触碰；区域事件/作用域扫描正常下钻孩子）：模板
+//!   字面量、对象字面量、展开、解构模式、TS as/satisfies/非空断言、
+//!   嵌套函数声明。
+//! - **TS 类型系统**（注解/泛型/装饰器/接口/枚举/命名空间）以**原文**
+//!   字符串保真（ty_raw/sig_raw/head_raw），与 Java mods/throws 同策略
+//!   ——最新语法靠原始保真，值级简化不受影响。
+//! - **JS 语义守卫**内建：`var` 提升陷阱（函数级作用域 × 块级扫描的
+//!   裂缝——prepare 计算块外引用并标记 is_opaque）、可选链不透明、
+//!   NaN/undefined/Infinity 是全局名而非字面量。
+//!
+//! 零外部依赖（仅 cure-engine / cure-tree）。
+//!
+//! arena 不变量：children 永远先于父节点入 arena（index 递增）。
+
+use std::collections::{HashMap, HashSet};
+
+use cure_engine::analysis::{subtree_metrics, TreeMetrics};
+use cure_engine::lang::{ReassocOutcome, StmtKill};
+use cure_engine::Lang;
+pub use cure_tree::ChildList;
+use cure_tree::{EventStore, NameTable};
+
+pub use cure_engine::kind::{BinOp, LitRef, NodeKind, UnOp};
+pub use cure_engine::Effect;
+
+// ---------------------------------------------------------------------------
+// 基础类型
+// ---------------------------------------------------------------------------
+
+/// arena 句柄。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct TsId(pub u32);
+impl Default for TsId {
+    fn default() -> Self {
+        TsId(u32::MAX)
+    }
+}
+
+/// 声明种类（JS 三种 + TS using/await using 的字面量保真）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VarKind {
+    Var,
+    Let,
+    Const,
+}
+
+/// 数值字面量的解析值。
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum NumVal {
+    Int(i64),
+    Double(f64),
+}
+
+/// JS 字面量。
+#[derive(Clone, PartialEq, Debug)]
+pub enum JsLit {
+    Bool(bool),
+    Int(i64),
+    Double(f64),
+    /// 保原文的数值字面量（0x1F / 1_000 / 1.5e2 / 12n 之外的 number 形态）。
+    NumRaw { text: String, val: NumVal },
+    /// BigInt 原文（含 n 后缀）。值域无界 → 不折叠，仅保真。
+    BigInt(String),
+    Str(String),
+    /// 正则字面量原文（含 flags）。
+    Regex(String),
+    Null,
+}
+
+/// 符号（intern 名字 id）——与 Java 后端同构（高重复率名字的零分配 clone）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Sym(pub u32);
+
+// Custom(u16) 判别值注册表（本语言专属、引擎规则不触碰的构造）。
+// u16 值语言侧自定；引擎只做相等性比较。
+pub mod custom {
+    /// 模板字面量 `` `a${x}b` ``（tagged 时孩子 0 为 tag）。
+    pub const TEMPLATE: u16 = 1;
+    /// 展开运算符 `...expr`（实参/数组字面量/调用位）。
+    pub const SPREAD: u16 = 2;
+    /// 解构模式位（声明/赋值目标 `const {a} = o` 的 target 侧）。
+    pub const DESTRUCT: u16 = 3;
+    /// 对象字面量 `{ a: 1, b, ...rest }`。
+    pub const OBJ_LIT: u16 = 4;
+    /// TS `expr as T`。
+    pub const TS_AS: u16 = 5;
+    /// TS `expr satisfies T`。
+    pub const TS_SATISFIES: u16 = 6;
+    /// TS 非空断言 `expr!`。
+    pub const TS_NON_NULL: u16 = 7;
+    /// 嵌套函数声明语句 `function f(…) { … }`。
+    pub const FUNC_STMT: u16 = 8;
+    /// 类表达式（原文保真——v1 不简化类表达式体）。
+    pub const CLASS_EXPR: u16 = 9;
+    /// 解构声明/赋值语句 `const {a} = o` / `[x, y] = arr`。
+    pub const DESTRUCT_STMT: u16 = 10;
+    /// 逗号序列表达式 `a, b, c`。
+    pub const SEQ: u16 = 11;
+}
+
+/// 节点负载：children 统一放 [`Node::children`]，这里只放非节点数据。
+#[derive(Clone, PartialEq, Debug)]
+pub enum NodeData {
+    // ---- 语句 ----
+    Block,
+    /// 合成分组（无花括号、无作用域）：if/for 头多语句的承载。
+    Group,
+    Empty,
+    ExprStmt,
+    /// `let/const/var name (: ty)? = init?`；export 修饰原文并入 kind_raw。
+    /// children: `[init]?`
+    VarDecl { name: String, kind: VarKind, ty_raw: Option<String> },
+    /// `target op? value`；op=Some(And/Or/Nullish) 表示逻辑赋值
+    /// &&=/||=/??=（复合赋值读语义覆盖「读目标+条件写」）。
+    Assign { op: Option<BinOp> },
+    If,
+    While,
+    DoWhile,
+    /// children: `[init…, (cond)?, step…, body]`（inits/has_cond/steps 计数）。
+    For { inits: u8, has_cond: bool, steps: u8 },
+    /// for (const x of it) / for (x in obj)。decl=None 表示裸名形态；
+    /// await=true 为 for-await-of。
+    /// children: `[iterable, body]`
+    ForEach { name: String, of: bool, decl: Option<VarKind>, ty_raw: Option<String>, await_: bool },
+    Return,
+    Break { label: Option<String> },
+    Continue { label: Option<String> },
+    Throw,
+    /// children: `[block, catch…, (finally)?]`
+    Try,
+    /// `catch (param_raw? )`；TS `catch (e: unknown)` 整体原文。
+    /// children: `[block]`
+    Catch { param_raw: Option<String> },
+    /// children: `[subject, case…]`
+    Switch,
+    /// children: `[label…, stmts…]`（前 labels 个是 case 表达式）
+    Case { labels: u16, is_default: bool, arrow: bool },
+    /// children: `[stmt]`
+    Label { name: String },
+    /// 不可解析/不建模的原文区域：原样保留，规则不触碰。
+    Raw { text: String },
+
+    // ---- 表达式 ----
+    Binary { op: BinOp },
+    Unary { op: UnOp },
+    /// children: `[callee, arg…]`；callee 为 Custom(TEMPLATE) 时是标签模板。
+    /// optional 元素（`a?.(…)`）参与链式短路 → is_opaque。
+    Call { optional: bool },
+    /// `obj.name` / `obj?.name`。children: `[object]`。
+    /// optional 元素参与链式短路 → is_opaque（保守区域拒绝）。
+    Member { name: Sym, optional: bool },
+    /// `arr[index]` / `arr?.[index]`。children: `[array, index]`。
+    Index { optional: bool },
+    Paren,
+    Ternary,
+    /// `new Callee(args…)`。children: `[callee, arg…]`（callee 为表达式）。
+    New,
+    ArrayLit,
+    VarRef { name: Sym },
+    Literal(JsLit),
+    This,
+    /// 函数表达式 / 箭头函数。children: `[body]`（Block 或表达式）。
+    /// params_raw 保真（含 TS 类型注解/模式参数原文）。
+    Lambda { params_raw: String, arrow: bool, is_async: bool, is_generator: bool },
+    /// 模板字面量：quasis 长度 = 孩子数+1（tagged 时孩子 0 是 tag）。
+    Template { quasis: Vec<String>, tag: bool },
+    /// `...expr`。children: `[expr]`
+    Spread,
+    /// 解构模式（声明/赋值目标位）。children: `[value]`。
+    /// 模式原文含绑定名（事件系统盲区）→ is_opaque。
+    Destruct { pattern_raw: String },
+    /// 对象字面量。children 与 props 对齐（值表达式；props 含键原文）。
+    ObjLit { props: Vec<String> },
+    /// `expr as T`。children: `[expr]`
+    TsAs { ty_raw: String },
+    /// `expr satisfies T`。children: `[expr]`
+    TsSatisfies { ty_raw: String },
+    /// `expr!`。children: `[expr]`
+    TsNonNull,
+    /// 嵌套函数声明语句。children: `[body]`（Block）。params_raw 为
+    /// 圆括号内的参数原文（作用域分析用）。
+    FuncStmt { sig_raw: String, name: String, params_raw: String },
+    /// 类表达式（原文）。children: `[]`
+    ClassExpr { raw: String },
+    /// 解构声明/赋值语句。children: `[value]`。kw 为 var/let/const（赋值
+    /// 形态为空串）。模式绑定名在原文 → is_opaque。
+    DestructStmt { kw: String, pattern: String },
+    /// 逗号序列表达式。children = 各元素。
+    Seq,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Node {
+    pub data: NodeData,
+    pub children: ChildList<TsId>,
+}
+
+// ---------------------------------------------------------------------------
+// 外部事实（front-end facts）——TS 载体（结构与 Java 版同构）。
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VarFacts {
+    pub single_def: bool,
+    pub single_use: bool,
+    pub bool_valued: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TsFacts {
+    pub vars: HashMap<String, VarFacts>,
+    pub call_effects: HashMap<String, HashSet<cure_engine::Effect>>,
+}
+
+impl TsFacts {
+    pub fn var(&self, name: &str) -> VarFacts {
+        self.vars.get(name).copied().unwrap_or_default()
+    }
+}
+
+/// Per-statement 名字事实（与 Java 版同构；键 = intern id）。
+#[derive(Clone, Copy, Debug)]
+struct StmtFact {
+    key: u32,
+    refs: u32,
+    lambda_cap: bool,
+    shadow: bool,
+}
+
+/// Per-statement kill 事件（1=Read 2=Shadow 3=DomWrite）。
+#[derive(Clone, Copy, Debug)]
+struct StmtKillFact {
+    key: u32,
+    kind: u8,
+    assign: TsId,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StmtOpq {
+    opaque: bool,
+}
+
+// ---------------------------------------------------------------------------
+// 模块结构（签名层：签名保真、函数体进 arena）
+// ---------------------------------------------------------------------------
+
+/// 顶层项。
+#[derive(Clone, PartialEq, Debug)]
+pub enum TopItem {
+    /// 普通语句（含 import/export 语句的值级部分？否——import/export 走原文）。
+    Stmt(TsId),
+    /// 顶层函数声明（export/default 修饰并入 sig_raw）。
+    Func { sig_raw: String, name: String, body: Option<TsId> },
+    /// 类/接口/枚举/命名空间声明。
+    Class(ClassDecl),
+    /// import 语句原文（不建模——与外部模块的绑定关系不可分析）。
+    Import(String),
+    /// export 语句原文（export * from / export = / export default <非函数/类> 等）。
+    ExportRaw(String),
+    /// 不可解析的原文区域。
+    Raw(String),
+}
+
+/// 类形态声明（class/interface/enum/namespace——head_raw 保真全部头部）。
+#[derive(Clone, PartialEq, Debug)]
+pub struct ClassDecl {
+    /// `export default abstract class Foo<T> extends Bar implements Baz`——
+    /// 除 class 关键字外的全部头部原文（含装饰器）。
+    pub head_raw: String,
+    /// class/interface/enum/namespace 关键字本身（打印用）。
+    pub kind_kw: String,
+    pub name: String,
+    pub members: Vec<ClassMember>,
+}
+
+/// 类成员。
+#[derive(Clone, PartialEq, Debug)]
+pub enum ClassMember {
+    /// 方法/构造器/重载签名。sig_raw 保真（修饰符/装饰器/泛型/参数/
+    /// 返回类型）；body=None 表示抽象/重载声明。
+    Method { sig_raw: String, body: Option<TsId> },
+    /// 字段声明（sig_raw 含 `static readonly #x: T` 等全部前缀）。
+    Field { sig_raw: String, name: String, init: Option<TsId> },
+    /// `static { … }` 静态块。
+    StaticBlock { body: TsId },
+    /// 嵌套类型/索引签名/其他不建模成员（原文）。
+    Raw(String),
+}
+
+/// 模块单元。
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct ModuleUnit {
+    pub shebang: String,
+    pub items: Vec<TopItem>,
+}
+
+/// 解析错误（1-based 行/列）。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ParseError {
+    pub line: usize,
+    pub col: usize,
+    pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// TsAst 主体
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Debug)]
+pub struct TsAst {
+    pub(crate) nodes: Vec<Node>,
+    /// 外部事实（前端注入；None = 纯源码保守模式）。
+    pub facts: Option<TsFacts>,
+    /// prepare() 重建：TsId → 聚合效果（稠密槽）。
+    effect_cache: Vec<Option<Effect>>,
+    /// prepare() 重建：VarRef → 是否解析到**局部绑定**（作用域栈解析）。
+    /// JS 无声明类型 → var_types 退化为局部性布尔（is_local_var 的依据）。
+    local_marks: Vec<bool>,
+    /// 当前根（函数体）的参数名（作用域分析种子）。含 TS 注解剥除后的
+    /// 裸名；模式参数（解构）不进种子（保守：其中的名字不判局部）。
+    param_scope: Vec<String>,
+    /// var 提升陷阱标记（prepare 计算）：块内 `var` 声明的名字在**本根
+    /// 内其块子树之外**仍被引用（或同名再声明）→ 该声明节点 is_opaque。
+    /// JS var 是函数级作用域；引擎规则按块扫描，块外引用不可见——
+    /// 不标记则删除/传播会静默改变提升语义（块外读到 undefined）。
+    var_trap: Vec<bool>,
+    /// 被 lambda/嵌套函数**按引用捕获**的局部名（根级集合）：写杀/传播
+    /// 的扫描窗口看不见「λ 创建于窗口之前、调用在之后」的延迟读
+    ///（node 差分 closure 抓获：`x = 2` 曾被 store_kill 误杀——闭包
+    /// 在调用点读到旧值）。捕获名一律判非局部（保守拒绝触碰）。
+    captured_names: std::collections::HashSet<String>,
+    /// 名字 intern 表 + 节点名字键（NameKey = u32）。
+    names: NameTable,
+    /// 区域事件索引（B3 惰性重建）。
+    events: EventStore<TsId, u32>,
+    stmt_facts: Vec<Option<Box<[StmtFact]>>>,
+    stmt_kills: Vec<Option<Box<[StmtKillFact]>>>,
+    stmt_opq: Vec<Option<StmtOpq>>,
+    prepared_root: Option<TsId>,
+}
+
+impl TsAst {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clone_node(&mut self, id: TsId, children: Vec<TsId>) -> TsId {
+        let data = self.nodes[id.0 as usize].data.clone();
+        self.push(data, children)
+    }
+
+    fn push(&mut self, data: NodeData, children: Vec<TsId>) -> TsId {
+        let id = TsId(self.nodes.len() as u32);
+        self.nodes.push(Node { data, children: ChildList::from_vec(children) });
+        id
+    }
+
+    pub fn node(&self, id: TsId) -> &Node {
+        &self.nodes[id.0 as usize]
+    }
+    pub fn data(&self, id: TsId) -> &NodeData {
+        &self.node(id).data
+    }
+
+    /// 固有 kind（与 Lang trait 同名；供不依赖引擎的下游使用，如 printer）。
+    pub fn kind(&self, id: TsId) -> NodeKind {
+        match &self.nodes[id.0 as usize].data {
+            NodeData::Block | NodeData::Group => NodeKind::Block,
+            NodeData::Empty => NodeKind::Empty,
+            NodeData::ExprStmt => NodeKind::ExprStmt,
+            NodeData::VarDecl { .. } => NodeKind::VarDecl,
+            NodeData::Assign { .. } => NodeKind::Assign,
+            NodeData::If => NodeKind::If,
+            NodeData::While => NodeKind::While,
+            NodeData::DoWhile => NodeKind::DoWhile,
+            NodeData::For { .. } => NodeKind::For,
+            NodeData::ForEach { .. } => NodeKind::ForEach,
+            NodeData::Return => NodeKind::Return,
+            NodeData::Break { .. } => NodeKind::Break,
+            NodeData::Continue { .. } => NodeKind::Continue,
+            NodeData::Throw => NodeKind::Throw,
+            NodeData::Try => NodeKind::Try,
+            NodeData::Catch { .. } => NodeKind::Catch,
+            NodeData::Switch => NodeKind::Switch,
+            NodeData::Case { .. } => NodeKind::Case,
+            NodeData::Label { .. } => NodeKind::Label,
+            NodeData::Raw { .. } => NodeKind::Raw,
+            NodeData::Binary { .. } => NodeKind::Binary,
+            NodeData::Unary { .. } => NodeKind::Unary,
+            NodeData::Call { .. } => NodeKind::Call,
+            NodeData::Member { .. } => NodeKind::Member,
+            NodeData::Index { .. } => NodeKind::Index,
+            NodeData::Paren => NodeKind::Paren,
+            NodeData::Ternary => NodeKind::Ternary,
+            NodeData::New => NodeKind::New,
+            NodeData::ArrayLit => NodeKind::ArrayLit,
+            NodeData::VarRef { .. } => NodeKind::VarRef,
+            NodeData::Literal(_) => NodeKind::Literal,
+            NodeData::This => NodeKind::This,
+            NodeData::Lambda { .. } => NodeKind::Lambda,
+            NodeData::Template { .. } => NodeKind::Custom(custom::TEMPLATE),
+            NodeData::Spread => NodeKind::Custom(custom::SPREAD),
+            NodeData::Destruct { .. } => NodeKind::Custom(custom::DESTRUCT),
+            NodeData::ObjLit { .. } => NodeKind::Custom(custom::OBJ_LIT),
+            NodeData::TsAs { .. } => NodeKind::Custom(custom::TS_AS),
+            NodeData::TsSatisfies { .. } => NodeKind::Custom(custom::TS_SATISFIES),
+            NodeData::TsNonNull => NodeKind::Custom(custom::TS_NON_NULL),
+            NodeData::FuncStmt { .. } => NodeKind::Custom(custom::FUNC_STMT),
+            NodeData::ClassExpr { .. } => NodeKind::Custom(custom::CLASS_EXPR),
+            NodeData::DestructStmt { .. } => NodeKind::Custom(custom::DESTRUCT_STMT),
+            NodeData::Seq => NodeKind::Custom(custom::SEQ),
+        }
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn children(&self, id: TsId) -> &[TsId] {
+        self.nodes[id.0 as usize].children.as_slice()
+    }
+
+    /// 固有 set_child（供不依赖引擎 trait 的下游使用）。
+    pub fn set_child(&mut self, parent: TsId, index: usize, new: TsId) {
+        self.nodes[parent.0 as usize].children.set(index, new);
+    }
+
+    // ---- builder：语句 ----
+
+    pub fn block(&mut self, stmts: Vec<TsId>) -> TsId {
+        self.push(NodeData::Block, stmts)
+    }
+    pub fn group(&mut self, stmts: Vec<TsId>) -> TsId {
+        self.push(NodeData::Group, stmts)
+    }
+    pub fn empty(&mut self) -> TsId {
+        self.push(NodeData::Empty, vec![])
+    }
+    pub fn expr_stmt(&mut self, e: TsId) -> TsId {
+        self.push(NodeData::ExprStmt, vec![e])
+    }
+    pub fn var_decl(
+        &mut self,
+        name: &str,
+        kind: VarKind,
+        ty_raw: Option<&str>,
+        init: Option<TsId>,
+    ) -> TsId {
+        self.push(
+            NodeData::VarDecl {
+                name: name.into(),
+                kind,
+                ty_raw: ty_raw.map(Into::into),
+            },
+            init.into_iter().collect(),
+        )
+    }
+    pub fn assign(&mut self, target: TsId, value: TsId) -> TsId {
+        self.push(NodeData::Assign { op: None }, vec![target, value])
+    }
+    pub fn assign_op(&mut self, op: BinOp, target: TsId, value: TsId) -> TsId {
+        self.push(NodeData::Assign { op: Some(op) }, vec![target, value])
+    }
+    pub fn if_(&mut self, cond: TsId, then: TsId, els: Option<TsId>) -> TsId {
+        let mut ch = vec![cond, then];
+        ch.extend(els);
+        self.push(NodeData::If, ch)
+    }
+    pub fn while_(&mut self, cond: TsId, body: TsId) -> TsId {
+        self.push(NodeData::While, vec![cond, body])
+    }
+    pub fn do_while(&mut self, body: TsId, cond: TsId) -> TsId {
+        self.push(NodeData::DoWhile, vec![body, cond])
+    }
+    pub fn for_(
+        &mut self,
+        inits: Vec<TsId>,
+        cond: Option<TsId>,
+        steps: Vec<TsId>,
+        body: TsId,
+    ) -> TsId {
+        let ni = inits.len();
+        let ns = steps.len();
+        let mut ch = inits;
+        let has_cond = cond.is_some();
+        ch.extend(cond);
+        ch.extend(steps);
+        ch.push(body);
+        self.push(
+            NodeData::For {
+                inits: ni as u8,
+                has_cond,
+                steps: ns as u8,
+            },
+            ch,
+        )
+    }
+    pub fn for_each(
+        &mut self,
+        name: &str,
+        of: bool,
+        decl: Option<VarKind>,
+        ty_raw: Option<&str>,
+        iterable: TsId,
+        body: TsId,
+        await_: bool,
+    ) -> TsId {
+        self.push(
+            NodeData::ForEach {
+                name: name.into(),
+                of,
+                decl,
+                ty_raw: ty_raw.map(Into::into),
+                await_,
+            },
+            vec![iterable, body],
+        )
+    }
+    pub fn ret(&mut self, value: Option<TsId>) -> TsId {
+        self.push(NodeData::Return, value.into_iter().collect())
+    }
+    pub fn break_(&mut self, label: Option<&str>) -> TsId {
+        self.push(
+            NodeData::Break { label: label.map(Into::into) },
+            vec![],
+        )
+    }
+    pub fn continue_(&mut self, label: Option<&str>) -> TsId {
+        self.push(
+            NodeData::Continue { label: label.map(Into::into) },
+            vec![],
+        )
+    }
+    pub fn throw(&mut self, e: TsId) -> TsId {
+        self.push(NodeData::Throw, vec![e])
+    }
+    pub fn try_(
+        &mut self,
+        try_block: TsId,
+        catches: Vec<TsId>,
+        finally: Option<TsId>,
+    ) -> TsId {
+        let mut ch = vec![try_block];
+        ch.extend(catches);
+        ch.extend(finally);
+        self.push(NodeData::Try, ch)
+    }
+    pub fn catch_(&mut self, param_raw: Option<&str>, block: TsId) -> TsId {
+        self.push(
+            NodeData::Catch { param_raw: param_raw.map(Into::into) },
+            vec![block],
+        )
+    }
+    pub fn switch_(&mut self, subject: TsId, cases: Vec<TsId>) -> TsId {
+        let mut ch = vec![subject];
+        ch.extend(cases);
+        self.push(NodeData::Switch, ch)
+    }
+    pub fn case_(
+        &mut self,
+        labels: Vec<TsId>,
+        is_default: bool,
+        arrow: bool,
+        stmts: Vec<TsId>,
+    ) -> TsId {
+        let n = labels.len() as u16;
+        let mut ch = labels;
+        ch.extend(stmts);
+        self.push(
+            NodeData::Case {
+                labels: n,
+                is_default,
+                arrow,
+            },
+            ch,
+        )
+    }
+    pub fn label(&mut self, name: &str, stmt: TsId) -> TsId {
+        self.push(NodeData::Label { name: name.into() }, vec![stmt])
+    }
+    pub fn raw(&mut self, text: &str) -> TsId {
+        self.push(NodeData::Raw { text: text.into() }, vec![])
+    }
+
+    // ---- builder：表达式 ----
+
+    pub fn bin(&mut self, op: BinOp, l: TsId, r: TsId) -> TsId {
+        self.push(NodeData::Binary { op }, vec![l, r])
+    }
+    pub fn un(&mut self, op: UnOp, e: TsId) -> TsId {
+        self.push(NodeData::Unary { op }, vec![e])
+    }
+    pub fn call(&mut self, callee: TsId, args: Vec<TsId>) -> TsId {
+        let mut ch = vec![callee];
+        ch.extend(args);
+        self.push(NodeData::Call { optional: false }, ch)
+    }
+
+    /// 可选调用 `callee?.(args)`。
+    pub fn opt_call(&mut self, callee: TsId, args: Vec<TsId>) -> TsId {
+        let mut ch = vec![callee];
+        ch.extend(args);
+        self.push(NodeData::Call { optional: true }, ch)
+    }
+
+    /// 解构声明/赋值语句。kw: "var"/"let"/"const"（赋值形态空串）。
+    pub fn destruct_stmt(&mut self, kw: &str, pattern: &str, value: TsId) -> TsId {
+        self.push(
+            NodeData::DestructStmt {
+                kw: kw.into(),
+                pattern: pattern.into(),
+            },
+            vec![value],
+        )
+    }
+
+    /// 逗号序列表达式。
+    pub fn seq(&mut self, elems: Vec<TsId>) -> TsId {
+        self.push(NodeData::Seq, elems)
+    }
+    pub fn member(&mut self, obj: TsId, name: &str, optional: bool) -> TsId {
+        let sym = self.intern_sym(name);
+        self.push(NodeData::Member { name: sym, optional }, vec![obj])
+    }
+    pub fn index(&mut self, arr: TsId, idx: TsId, optional: bool) -> TsId {
+        self.push(NodeData::Index { optional }, vec![arr, idx])
+    }
+    pub fn paren(&mut self, e: TsId) -> TsId {
+        self.push(NodeData::Paren, vec![e])
+    }
+    pub fn ternary(&mut self, c: TsId, a: TsId, b: TsId) -> TsId {
+        self.push(NodeData::Ternary, vec![c, a, b])
+    }
+    pub fn new_(&mut self, callee: TsId, args: Vec<TsId>) -> TsId {
+        let mut ch = vec![callee];
+        ch.extend(args);
+        self.push(NodeData::New, ch)
+    }
+    pub fn array_lit(&mut self, elems: Vec<TsId>) -> TsId {
+        self.push(NodeData::ArrayLit, elems)
+    }
+    pub fn var(&mut self, name: &str) -> TsId {
+        let sym = self.intern_sym(name);
+        self.push(NodeData::VarRef { name: sym }, vec![])
+    }
+    pub fn lit(&mut self, l: JsLit) -> TsId {
+        self.push(NodeData::Literal(l), vec![])
+    }
+    pub fn this(&mut self) -> TsId {
+        self.push(NodeData::This, vec![])
+    }
+    pub fn lambda(
+        &mut self,
+        params_raw: &str,
+        body: TsId,
+        arrow: bool,
+        is_async: bool,
+        is_generator: bool,
+    ) -> TsId {
+        self.push(
+            NodeData::Lambda {
+                params_raw: params_raw.into(),
+                arrow,
+                is_async,
+                is_generator,
+            },
+            vec![body],
+        )
+    }
+    /// 模板字面量。quasis.len() 必须 == children.len() + 1（无 tag）。
+    pub fn template(&mut self, quasis: Vec<String>, interps: Vec<TsId>) -> TsId {
+        self.push(NodeData::Template { quasis, tag: false }, interps)
+    }
+    /// 标签模板 `` tag`a${x}` ``。quasis.len() == children.len()（孩子 0 为 tag）。
+    pub fn tagged_template(
+        &mut self,
+        tag: TsId,
+        quasis: Vec<String>,
+        interps: Vec<TsId>,
+    ) -> TsId {
+        let mut ch = vec![tag];
+        ch.extend(interps);
+        self.push(NodeData::Template { quasis, tag: true }, ch)
+    }
+    pub fn spread(&mut self, e: TsId) -> TsId {
+        self.push(NodeData::Spread, vec![e])
+    }
+    pub fn destruct(&mut self, pattern_raw: &str, value: TsId) -> TsId {
+        self.push(
+            NodeData::Destruct { pattern_raw: pattern_raw.into() },
+            vec![value],
+        )
+    }
+    /// 对象字面量。props[i] 为键原文（含冒号后的空格约定由 printer 处理）；
+    /// children[i] 为值。
+    pub fn obj_lit(&mut self, props: Vec<String>, values: Vec<TsId>) -> TsId {
+        debug_assert_eq!(props.len(), values.len());
+        self.push(NodeData::ObjLit { props }, values)
+    }
+    pub fn ts_as(&mut self, ty_raw: &str, e: TsId) -> TsId {
+        self.push(NodeData::TsAs { ty_raw: ty_raw.into() }, vec![e])
+    }
+    pub fn ts_satisfies(&mut self, ty_raw: &str, e: TsId) -> TsId {
+        self.push(NodeData::TsSatisfies { ty_raw: ty_raw.into() }, vec![e])
+    }
+    pub fn ts_non_null(&mut self, e: TsId) -> TsId {
+        self.push(NodeData::TsNonNull, vec![e])
+    }
+    /// 嵌套函数声明语句。
+    pub fn func_stmt(&mut self, sig_raw: &str, name: &str, params_raw: &str, body: TsId) -> TsId {
+        self.push(
+            NodeData::FuncStmt {
+                sig_raw: sig_raw.into(),
+                name: name.into(),
+                params_raw: params_raw.into(),
+            },
+            vec![body],
+        )
+    }
+    pub fn class_expr(&mut self, raw: &str) -> TsId {
+        self.push(NodeData::ClassExpr { raw: raw.into() }, vec![])
+    }
+
+    // ---- 便捷 ----
+
+    /// `obj.name(args…)`。
+    pub fn method_call(&mut self, obj: TsId, name: &str, args: Vec<TsId>) -> TsId {
+        let m = self.member(obj, name, false);
+        self.call(m, args)
+    }
+    /// 裸调用 `name(args…)`。
+    pub fn plain_call(&mut self, name: &str, args: Vec<TsId>) -> TsId {
+        let f = self.var(name);
+        self.call(f, args)
+    }
+
+    /// 参数作用域种子注入（simplify 门面按体设置）。
+    pub fn param_scope_set(&mut self, params: &[String]) {
+        self.param_scope = params.to_vec();
+    }
+    /// 参数作用域清空。
+    pub fn param_scope_clear(&mut self) {
+        self.param_scope.clear();
+    }
+
+    /// intern 名字 → Sym。
+    pub fn intern_sym(&mut self, name: &str) -> Sym {
+        Sym(self.names.intern(name))
+    }
+    /// Sym → 名字原文。
+    pub fn sn(&self, sym: Sym) -> &str {
+        self.names.name(sym.0)
+    }
+
+    /// 作用域解析后的 VarRef 局部性（prepare 之后有效）。
+    pub fn is_local_ref(&self, id: TsId) -> bool {
+        self.local_marks.get(id.0 as usize).copied().unwrap_or(false)
+    }
+
+    // ---- 语句事实收集（与 Java 版同构）----
+
+    fn collect_stmt_facts(&self, root: TsId) -> Box<[StmtFact]> {
+        let mut counts: HashMap<u32, u32> = HashMap::new();
+        let mut caps: HashSet<u32> = HashSet::new();
+        let mut shadows: HashSet<u32> = HashSet::new();
+        let mut stack: Vec<(TsId, bool)> = vec![(root, false)];
+        while let Some((id, in_lambda)) = stack.pop() {
+            let node = &self.nodes[id.0 as usize];
+            let is_lambda = matches!(node.data, NodeData::Lambda { .. } | NodeData::FuncStmt { .. });
+            let is_named_decl = matches!(
+                node.data,
+                NodeData::VarDecl { .. }
+                    | NodeData::ForEach { .. }
+                    | NodeData::Catch { .. }
+                    | NodeData::Destruct { .. }
+            );
+            if matches!(node.data, NodeData::VarRef { .. }) {
+                if let Some(key) = self.names.var_key(id.0 as usize) {
+                    *counts.entry(key).or_insert(0) += 1;
+                    if in_lambda {
+                        caps.insert(key);
+                    }
+                }
+            } else if is_named_decl {
+                if let Some(key) = self.names.var_key(id.0 as usize) {
+                    shadows.insert(key);
+                }
+            }
+            let child_in_lambda = in_lambda || is_lambda;
+            for &c in node.children.as_slice() {
+                stack.push((c, child_in_lambda));
+            }
+        }
+        let mut keys: HashSet<u32> = counts.keys().copied().collect();
+        keys.extend(shadows.iter().copied());
+        let mut facts: Vec<StmtFact> = keys
+            .into_iter()
+            .map(|key| StmtFact {
+                key,
+                refs: counts.get(&key).copied().unwrap_or(0),
+                lambda_cap: caps.contains(&key),
+                shadow: shadows.contains(&key),
+            })
+            .collect();
+        facts.sort_unstable_by_key(|f| f.key);
+        facts.into_boxed_slice()
+    }
+
+    fn stmt_opaque_fact(&self, root: TsId) -> Option<StmtOpq> {
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if self.is_opaque(id) {
+                return Some(StmtOpq { opaque: true });
+            }
+            for &c in self.nodes[id.0 as usize].children.as_slice() {
+                stack.push(c);
+            }
+        }
+        Some(StmtOpq { opaque: false })
+    }
+
+    fn collect_stmt_kill_facts(&self, root: TsId) -> Box<[StmtKillFact]> {
+        let mut facts: Vec<StmtKillFact> = cure_engine::rules::collect_stmt_kill_events(self, root)
+            .into_iter()
+            .map(|(key, event)| match event {
+                StmtKill::None => unreachable!("collector only records real events"),
+                StmtKill::Read => StmtKillFact { key, kind: 1, assign: TsId(0) },
+                StmtKill::Shadow => StmtKillFact { key, kind: 2, assign: TsId(0) },
+                StmtKill::DomWrite(assign) => StmtKillFact { key, kind: 3, assign },
+            })
+            .collect();
+        facts.sort_unstable_by_key(|f| f.key);
+        facts.into_boxed_slice()
+    }
+
+    /// root 相关作用域分析：VarRef → 局部性 + var 提升陷阱标记。
+    ///
+    /// 作用域栈：Block/For/Try/Lambda/FuncStmt 推新层（JS switch 与
+    /// 合成 Group **不**推——switch 的 case 共享一个块作用域，Group 是
+    /// 解析器合成容器非真实花括号）；let/const 声明插入当前层；简单参数
+    /// 进新层（闭包可见外层）；模式参数不入（保守）。
+    ///
+    /// var 提升陷阱：`var` 是**函数级**作用域而引擎规则按**块**扫描。
+    /// 声明 d（在块 C 的第 di 个孩子位）的名字若在 root 内出现在
+    /// 「C 的第 di+1.. 个孩子的子树」之外（更早兄弟/祖先块/兄弟块/
+    /// 其他嵌套函数），块扫描看不见该出现 → 声明标记 is_opaque（规则
+    /// 拒绝触碰；var_trap）。全部出现都在可见窗口内 → 正常局部处理。
+    pub(crate) fn rebuild_local_marks(&mut self, root: TsId) {
+        self.local_marks.clear();
+        self.local_marks.resize(self.nodes.len(), false);
+
+        // ---- 第 1 遍：父表 + 作用域栈局部性 ----
+        let mut parents: Vec<(TsId, usize)> = vec![(root, usize::MAX); self.nodes.len()];
+        enum Frame {
+            Enter(TsId),
+            Bind(String),
+            PopScope,
+            Exit,
+            ExitLambda,
+        }
+        let mut base: HashSet<String> = HashSet::new();
+        for n in &self.param_scope {
+            base.insert(n.clone());
+        }
+        let mut scopes: Vec<HashSet<String>> = vec![base];
+        let mut stack = vec![Frame::Enter(root)];
+        let mut lambda_depth = 0i32;
+        let mut captured: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(f) = stack.pop() {
+            match f {
+                Frame::Enter(id) => {
+                    let node = &self.nodes[id.0 as usize];
+                    enum Action {
+                        None,
+                        Bind(Vec<String>),
+                    }
+                    let action = match &node.data {
+                        NodeData::Block | NodeData::For { .. } | NodeData::Try => {
+                            let mut a = Action::None;
+                            // For 头部的 let 声明进新层（for (let i…））
+                            if let NodeData::For { inits, .. } = &node.data {
+                                // 逐个 init 若是 let VarDecl 则 bind 进新层
+                                let mut names = Vec::new();
+                                for &c in node.children.as_slice().iter().take(*inits as usize) {
+                                    if let NodeData::VarDecl { name, kind: VarKind::Let, .. } =
+                                        &self.nodes[c.0 as usize].data
+                                    {
+                                        names.push(name.clone());
+                                    }
+                                }
+                                if !names.is_empty() {
+                                    a = Action::Bind(names);
+                                }
+                            }
+                            a
+                        }
+                        NodeData::VarDecl { name, .. } => {
+                            scopes.last_mut().unwrap().insert(name.clone());
+                            Action::None
+                        }
+                        NodeData::VarRef { name } => {
+                            if scopes.iter().rev().any(|s| s.contains(self.sn(*name))) {
+                                self.local_marks[id.0 as usize] = true;
+                                // λ 体内解析到外层绑定 = 按引用捕获——
+                                // 延迟读对写杀/传播不可见 → 名字整体保守化
+                                if lambda_depth > 0 {
+                                    captured.insert(self.sn(*name).to_string());
+                                }
+                            }
+                            Action::None
+                        }
+                        NodeData::Catch { param_raw } => match param_raw
+                            .as_deref()
+                            .and_then(simple_binding_name)
+                        {
+                            Some(n) => Action::Bind(vec![n]),
+                            None => Action::None,
+                        },
+                        NodeData::ForEach { name, decl, .. } => {
+                            if decl.is_some() {
+                                Action::Bind(vec![name.clone()])
+                            } else {
+                                // 裸名 for (x in o)：x 是既有绑定的读+条件写
+                                // ——非声明，不 bind；其读语义由区域事件的
+                                // Write/Shadow 记录保守覆盖
+                                Action::None
+                            }
+                        }
+                        NodeData::Lambda { params_raw, .. }
+                        | NodeData::FuncStmt { params_raw, .. } => match simple_params(params_raw)
+                        {
+                            Some(names) => Action::Bind(names),
+                            None => Action::Bind(vec![]), // 模式参数——空 bind（推层不种名）
+                        },
+                        _ => Action::None,
+                    };
+                    // λ 边界：进入时 depth+1，Exit 时 -1
+                    let is_lambda_node =
+                        matches!(node.data, NodeData::Lambda { .. } | NodeData::FuncStmt { .. });
+                    if is_lambda_node {
+                        lambda_depth += 1;
+                        stack.push(Frame::ExitLambda);
+                    } else {
+                        stack.push(Frame::Exit);
+                    }
+                    let binds = match action {
+                        Action::Bind(names) => {
+                            scopes.push(HashSet::new());
+                            stack.push(Frame::PopScope);
+                            names
+                        }
+                        Action::None => vec![],
+                    };
+                    // 父表：记录每个孩子在父内的下标
+                    let ch = node.children.as_slice();
+                    for (i, &c) in ch.iter().enumerate().rev() {
+                        parents[c.0 as usize] = (id, i);
+                        stack.push(Frame::Enter(c));
+                    }
+                    for n in binds.into_iter().rev() {
+                        stack.push(Frame::Bind(n));
+                    }
+                }
+                Frame::Bind(name) => {
+                    scopes.last_mut().unwrap().insert(name);
+                }
+                Frame::PopScope => {
+                    scopes.pop();
+                }
+                Frame::ExitLambda => {
+                    lambda_depth -= 1;
+                }
+                Frame::Exit => {}
+            }
+        }
+        self.captured_names = captured;
+
+        // ---- 第 2 遍：var 提升陷阱 ----
+        // 每个名字（VarDecl-let/const/var、VarRef、简单 ForEach/Catch/
+        // FuncStmt 名）的全部出现节点；var 声明的可见性判定见上。
+        self.var_trap.clear();
+        self.var_trap.resize(self.nodes.len(), false);
+        // 名字 → 出现节点列表（var_name 持有者；键克隆避免借用冲突）
+        let mut occ: HashMap<String, Vec<TsId>> = HashMap::new();
+        let mut walk = vec![root];
+        while let Some(id) = walk.pop() {
+            if let Some(nm) = self.var_name(id) {
+                if self.names.var_key(id.0 as usize).is_some() {
+                    occ.entry(nm.to_string()).or_default().push(id);
+                }
+            }
+            for &c in self.nodes[id.0 as usize].children.as_slice() {
+                walk.push(c);
+            }
+        }
+        for (i, node) in self.nodes.iter().enumerate() {
+            if let NodeData::VarDecl { name, kind: VarKind::Var, .. } = &node.data {
+                let decl = TsId(i as u32);
+                // 声明所在块（最近 Block/Group 祖先）与块内下标
+                let Some((block, dpos)) = ancestor_block_pos(&self.nodes, &parents, decl) else {
+                    self.var_trap[i] = true; // 无块容器（防御）
+                    continue;
+                };
+                let name = name.as_str();
+                let mut trap = false;
+                if let Some(list) = occ.get(name) {
+                    for &o in list {
+                        if o == decl {
+                            continue;
+                        }
+                        if !inside_later_sibling(&parents, o, block, dpos) {
+                            trap = true;
+                            break;
+                        }
+                    }
+                }
+                if trap {
+                    self.var_trap[i] = true;
+                }
+            }
+        }
+    }
+}
+
+/// 节点的最近 Block 祖先（Block/Group 同映射 NodeKind::Block）及其
+/// 在其中的孩子下标。
+fn ancestor_block_pos(nodes: &[Node], parents: &[(TsId, usize)], node: TsId) -> Option<(TsId, usize)> {
+    let mut cur = node;
+    loop {
+        let (p, i) = parents[cur.0 as usize];
+        if i == usize::MAX {
+            return None; // 到根
+        }
+        if matches!(
+            &nodes[p.0 as usize].data,
+            NodeData::Block | NodeData::Group
+        ) {
+            return Some((p, i));
+        }
+        cur = p;
+    }
+}
+
+/// o 是否在块 block 的第 dpos+1.. 个孩子的子树内（规则扫描可见窗口）。
+fn inside_later_sibling(parents: &[(TsId, usize)], o: TsId, block: TsId, dpos: usize) -> bool {
+    let mut cur = o;
+    loop {
+        let (p, i) = parents[cur.0 as usize];
+        if i == usize::MAX {
+            return false;
+        }
+        if p == block {
+            return i > dpos;
+        }
+        cur = p;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 辅助：简单参数/绑定名提取（模式 → None）
+// ---------------------------------------------------------------------------
+
+/// `catch` 参数原文 → 简单绑定名（`e` → Some("e")；`{a}`/`e: T` → None）。
+pub fn simple_binding_name(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let ident: String = t
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .collect();
+    if !ident.is_empty() && ident.chars().next().is_some_and(|c| !c.is_ascii_digit())
+        && t == ident {
+            return Some(ident);
+        }
+    None
+}
+
+/// 参数原文 → 简单参数名列表（全部为裸标识符时；含模式/默认值/注解 → None）。
+pub fn simple_params(raw: &str) -> Option<Vec<String>> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Some(vec![]);
+    }
+    // 顶层逗号拆分（尖/圆/花括号深度感知）
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in t.chars() {
+        match c {
+            '(' | '[' | '{' | '<' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' | ']' | '}' | '>' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if depth == 0 => {
+                parts.push(cur.clone());
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    let mut names = Vec::new();
+    for p in parts {
+        // 剥除类型注解（顶层 `:`——TS `x: T`）
+        let mut base = p.as_str();
+        if let Some(colon) = find_top_colon(p.as_str()) {
+            base = &p[..colon];
+        }
+        let base = base.trim();
+        if base.is_empty() {
+            return None; // 尾随逗号等畸形
+        }
+        let ident: String = base
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+            .collect();
+        if ident != base {
+            return None; // 模式/默认值/rest/修饰——保守放弃
+        }
+        names.push(ident);
+    }
+    Some(names)
+}
+
+fn find_top_colon(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '}' | '>' => depth -= 1,
+            ':' if depth == 0 => return Some(i),
+            '?' if depth == 0 && s[i..].starts_with('?') => {
+                // `x?: T` 的可选标记——继续找冒号
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Lang 实现
+// ---------------------------------------------------------------------------
+
+impl Lang for TsAst {
+    type Id = TsId;
+    type NameKey = u32;
+
+    fn kind(&self, id: TsId) -> NodeKind {
+        TsAst::kind(self, id)
+    }
+    fn children(&self, id: TsId) -> &[TsId] {
+        TsAst::children(self, id)
+    }
+    fn set_child(&mut self, parent: TsId, index: usize, new: TsId) {
+        self.nodes[parent.0 as usize].children.set(index, new);
+    }
+    fn remove_child(&mut self, parent: TsId, index: usize) {
+        self.nodes[parent.0 as usize].children.remove(index);
+    }
+    fn splice(&mut self, node: TsId, index: usize, remove: usize, insert: Vec<TsId>) {
+        self.nodes[node.0 as usize].children.splice(index, remove, insert);
+    }
+
+    fn build_return(&mut self, value: Option<TsId>) -> TsId {
+        self.ret(value)
+    }
+    fn build_block(&mut self, stmts: Vec<TsId>) -> TsId {
+        self.block(stmts)
+    }
+    fn build_unary(&mut self, op: UnOp, operand: TsId) -> TsId {
+        self.un(op, operand)
+    }
+    fn build_bool(&mut self, v: bool) -> TsId {
+        self.lit(JsLit::Bool(v))
+    }
+    fn build_int(&mut self, v: i64, _long: bool) -> TsId {
+        self.lit(JsLit::Int(v))
+    }
+    fn build_bin(&mut self, op: BinOp, l: TsId, r: TsId) -> TsId {
+        self.bin(op, l, r)
+    }
+    fn build_ternary(&mut self, c: TsId, a: TsId, b: TsId) -> TsId {
+        self.ternary(c, a, b)
+    }
+    fn build_assign(&mut self, target: TsId, value: TsId) -> TsId {
+        self.assign(target, value)
+    }
+    fn build_str(&mut self, s: &str) -> TsId {
+        self.lit(JsLit::Str(s.to_string()))
+    }
+    fn build_char(&mut self, c: char) -> TsId {
+        self.lit(JsLit::Str(c.to_string()))
+    }
+
+    // ---- 字面量折叠语义（ECMAScript；引擎侧只做形态匹配）----
+
+    fn fold_lit_bin(&mut self, op: BinOp, l: TsId, r: TsId) -> Option<TsId> {
+        let ll = self.literal(l)?;
+        let rr = self.literal(r)?;
+        // NaN / ±Inf / -0 操作数（IEEE 雷区：NaN 比较、-0 打印/1÷-0）不折
+        if num_hazard(ll) || num_hazard(rr) {
+            return None;
+        }
+        // 字符串拼接（Str+Str / Str+Int —— Int 走 JS 整数字符串化）
+        if op == BinOp::Add {
+            if let (LitRef::Str(a), LitRef::Str(b)) = (ll, rr) {
+                return Some(self.build_str(&format!("{a}{b}")));
+            }
+            if let (LitRef::Str(a), LitRef::Int(v)) = (ll, rr) {
+                if js_int_representable(v) {
+                    return Some(self.build_str(&format!("{a}{v}")));
+                }
+            }
+            if let (LitRef::Int(v), LitRef::Str(b)) = (ll, rr) {
+                if js_int_representable(v) {
+                    return Some(self.build_str(&format!("{v}{b}")));
+                }
+            }
+        }
+        // 数值运算：JS number 域 = f64。位运算/移位走 ToInt32/ToUint32
+        // 环绕域；算术在 ±2^53 精确域（非精确/非整数 → Double 或拒绝）。
+        let int_of = |x: LitRef<'_>| -> Option<i64> {
+            match x {
+                LitRef::Int(v) => Some(v),
+                _ => None,
+            }
+        };
+        let (a, b) = (int_of(ll)?, int_of(rr)?);
+        if !js_int_representable(a) || !js_int_representable(b) {
+            return None;
+        }
+        // i32 域（ToInt32 环绕）
+        let i32v: Option<i64> = match op {
+            BinOp::BitAnd => Some(((a as i32) & (b as i32)) as i64),
+            BinOp::BitOr => Some(((a as i32) | (b as i32)) as i64),
+            BinOp::BitXor => Some(((a as i32) ^ (b as i32)) as i64),
+            BinOp::Shl => {
+                let s = (b as i32) & 31;
+                Some(((a as i32).wrapping_shl(s as u32)) as i64)
+            }
+            BinOp::Shr => {
+                let s = (b as i32) & 31;
+                Some(((a as i32).wrapping_shr(s as u32)) as i64)
+            }
+            BinOp::UShr => {
+                let s = (b as i32) & 31;
+                Some((((a as i32) as u32).wrapping_shr(s as u32)) as i64)
+            }
+            _ => None,
+        };
+        if let Some(v) = i32v {
+            return Some(self.build_int(v, false));
+        }
+        // f64 精确域算术（Add/Sub/Mul/Pow/Div/Rem）
+        let r = arith_f64(op, a, b)?;
+        if let Some(v) = r {
+            return Some(self.build_int(v, false));
+        }
+        // 非整/超域结果 → Double 字面量（打印走 JS number 格式化）
+        let rf = match op {
+            BinOp::Add => a as f64 + b as f64,
+            BinOp::Sub => a as f64 - b as f64,
+            BinOp::Mul => a as f64 * b as f64,
+            BinOp::Pow => {
+                let e = b.clamp(-1024, 1024);
+                (a as f64).powi(e as i32)
+            }
+            BinOp::Div => {
+                if b == 0 {
+                    return None; // ±Infinity——保真不折
+                }
+                a as f64 / b as f64
+            }
+            BinOp::Rem => {
+                if b == 0 {
+                    return None; // NaN
+                }
+                let v = (a as f64) % (b as f64);
+                if v == 0.0 && v.is_sign_negative() {
+                    return None; // -0（fmod(-5,5)）——打印敏感
+                }
+                v
+            }
+            _ => return None,
+        };
+        if rf.is_nan() || rf.is_infinite() {
+            return None;
+        }
+        if rf == 0.0 && rf.is_sign_negative() {
+            return None; // -0（-2*0 等）
+        }
+        Some(self.lit(JsLit::Double(rf)))
+    }
+
+    fn fold_lit_cmp(&mut self, op: BinOp, l: TsId, r: TsId) -> Option<bool> {
+        let ll = self.literal(l)?;
+        let rr = self.literal(r)?;
+        // JS ===/== 的字面量域：number-string 不等、NaN 恒不等、
+        // undefined 非字面量。这里只折「同类型字面量」：
+        // number(整数域) 与 number、bool 与 bool、string 与 string（
+        // 值相等）、null 与 null。
+        let num_bad = |x: LitRef<'_>| match x {
+            LitRef::Double(d) => d.is_nan() || d.is_infinite() || (d == 0.0 && d.is_sign_negative()),
+            _ => false,
+        };
+        if num_bad(ll) || num_bad(rr) {
+            return None;
+        }
+        let eq_like = matches!(op, BinOp::Eq | BinOp::Ne | BinOp::StrictEq | BinOp::StrictNe);
+        if !eq_like && !matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+            return None;
+        }
+        let int_of = |x: LitRef<'_>| -> Option<i64> {
+            match x {
+                LitRef::Int(v) => Some(v),
+                _ => None,
+            }
+        };
+        if let (Some(x), Some(y)) = (int_of(ll), int_of(rr)) {
+            if eq_like {
+                return Some(if matches!(op, BinOp::Eq | BinOp::StrictEq) { x == y } else { x != y });
+            }
+            return cmp_i64(op, x, y);
+        }
+        // 布尔相等（JS true/false 是规范值——== 与 === 一致）
+        if let (LitRef::Bool(x), LitRef::Bool(y)) = (ll, rr) {
+            if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::StrictEq | BinOp::StrictNe) {
+                return Some(if matches!(op, BinOp::Eq | BinOp::StrictEq) { x == y } else { x != y });
+            }
+        }
+        // 字符串值比较（== 与 === 对 string 都是值比较）
+        if let (LitRef::Str(x), LitRef::Str(y)) = (ll, rr) {
+            if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::StrictEq | BinOp::StrictNe) {
+                return Some(if matches!(op, BinOp::Eq | BinOp::StrictEq) { x == y } else { x != y });
+            }
+            return match op {
+                BinOp::Lt => Some(x < y),
+                BinOp::Le => Some(x <= y),
+                BinOp::Gt => Some(x > y),
+                BinOp::Ge => Some(x >= y),
+                _ => None,
+            };
+        }
+        // null == null
+        if let (LitRef::Null, LitRef::Null) = (ll, rr) {
+            if matches!(op, BinOp::Eq | BinOp::StrictEq) {
+                return Some(true);
+            }
+            if matches!(op, BinOp::Ne | BinOp::StrictNe) {
+                return Some(false);
+            }
+        }
+        None
+    }
+
+    fn fold_lit_neg(&mut self, v: i64, _wide: bool) -> Option<i64> {
+        // JS：数值字面量取负仍是精确 number（-0 走 Double 路径不进这）。
+        // 2^53 边界：-v 超域 → f64 不精确 → 拒绝
+        let n = -v;
+        if !js_int_representable(n) {
+            return None;
+        }
+        Some(n)
+    }
+
+    fn reassoc_delta(
+        &mut self,
+        op1: BinOp,
+        k1: i64,
+        op2: BinOp,
+        k2: i64,
+        _wide: bool,
+    ) -> Option<ReassocOutcome<TsId>> {
+        use BinOp::*;
+        // JS 无 int 环绕——加/减 delta 合并须全程在 ±2^53 精确域
+        let raw: i64 = match (op1, op2) {
+            (a, b) if matches!(a, Add | Sub) && matches!(b, Add | Sub) => {
+                let sign = |o: BinOp| if o == Sub { -1i64 } else { 1i64 };
+                sign(a) * k1 + sign(b) * k2
+            }
+            // 位异或不结合于 JS 的 f64 语义域？——JS ^ 是 i32 位运算，
+            // 环绕恒等成立；但操作数须同为整数域（规则侧已保证字面量）
+            (BitXor, BitXor) => k1 ^ k2,
+            _ => return None,
+        };
+        if !js_int_representable(raw) {
+            return None;
+        }
+        let d = raw;
+        if d == 0 {
+            return Some(ReassocOutcome::Neutral);
+        }
+        if op1 == BitXor && op2 == BitXor {
+            return Some(ReassocOutcome::Lit(self.build_int(d, false), BitXor));
+        }
+        if d > 0 {
+            Some(ReassocOutcome::Lit(self.build_int(d, false), Add))
+        } else {
+            let nd = -d;
+            if nd > 0 {
+                Some(ReassocOutcome::Lit(self.build_int(nd, false), Sub))
+            } else {
+                Some(ReassocOutcome::Lit(self.build_int(d, false), Add))
+            }
+        }
+    }
+
+    fn copy_subtree(&mut self, id: TsId) -> TsId {
+        let old_children: Vec<TsId> = self.nodes[id.0 as usize].children.as_slice().to_vec();
+        let mut children = Vec::with_capacity(old_children.len());
+        for c in old_children {
+            children.push(self.copy_subtree(c));
+        }
+        let data = self.nodes[id.0 as usize].data.clone();
+        self.push(data, children)
+    }
+
+    fn effect(&self, id: TsId) -> Effect {
+        if let Some(e) = self.effect_cache.get(id.0 as usize).and_then(|x| *x) {
+            return e;
+        }
+        let mut e = self.own_effect(id);
+        for &c in self.nodes[id.0 as usize].children.as_slice() {
+            e = e.worst(self.effect(c));
+        }
+        e
+    }
+
+    fn invalidate_effect(&mut self, id: TsId) {
+        if let Some(slot) = self.effect_cache.get_mut(id.0 as usize) {
+            *slot = None;
+        }
+        self.events.invalidate(id.0 as usize);
+        if let Some(slot) = self.stmt_facts.get_mut(id.0 as usize) {
+            *slot = None;
+        }
+        if let Some(slot) = self.stmt_kills.get_mut(id.0 as usize) {
+            *slot = None;
+        }
+        if let Some(slot) = self.stmt_opq.get_mut(id.0 as usize) {
+            *slot = None;
+        }
+    }
+
+    fn region_events(&self, id: TsId) -> Option<&[cure_engine::kind::RegionEvent<TsId, u32>]> {
+        self.events.slot(id.0 as usize)
+    }
+
+    fn var_key(&self, id: TsId) -> Option<u32> {
+        self.names.var_key(id.0 as usize)
+    }
+
+    fn stmt_var_ref_count(&self, stmt: TsId, key: u32) -> Option<u32> {
+        let slot = self.stmt_facts.get(stmt.0 as usize)?.as_deref()?;
+        Some(
+            slot.binary_search_by_key(&key, |f| f.key)
+                .ok()
+                .map_or(0, |i| slot[i].refs),
+        )
+    }
+
+    fn stmt_lambda_captures(&self, stmt: TsId, key: u32) -> Option<bool> {
+        let slot = self.stmt_facts.get(stmt.0 as usize)?.as_deref()?;
+        Some(
+            slot.binary_search_by_key(&key, |f| f.key)
+                .ok()
+                .is_some_and(|i| slot[i].lambda_cap),
+        )
+    }
+
+    fn stmt_kill_event(&self, stmt: TsId, key: u32) -> Option<StmtKill<TsId>> {
+        let slot = self.stmt_kills.get(stmt.0 as usize)?.as_deref()?;
+        Some(match slot.binary_search_by_key(&key, |f| f.key) {
+            Ok(i) => match slot[i].kind {
+                1 => StmtKill::Read,
+                2 => StmtKill::Shadow,
+                _ => StmtKill::DomWrite(slot[i].assign),
+            },
+            Err(_) => StmtKill::None,
+        })
+    }
+
+    fn stmt_mentions(&self, stmt: TsId, key: u32) -> Option<bool> {
+        let slot = self.stmt_facts.get(stmt.0 as usize)?.as_deref()?;
+        Some(
+            slot.binary_search_by_key(&key, |f| f.key)
+                .ok()
+                .is_some_and(|i| slot[i].refs > 0 || slot[i].shadow),
+        )
+    }
+
+    fn stmt_opaque(&self, stmt: TsId) -> Option<bool> {
+        self.stmt_opq.get(stmt.0 as usize)?.map(|f| f.opaque)
+    }
+
+    // ---- 外部事实 ----
+
+    fn fact_single_def(&self, key: u32) -> bool {
+        match (&self.facts, self.names.name(key)) {
+            (Some(f), n) => f.var(n).single_def,
+            _ => false,
+        }
+    }
+    fn fact_single_use(&self, key: u32) -> bool {
+        match (&self.facts, self.names.name(key)) {
+            (Some(f), n) => f.var(n).single_use,
+            _ => false,
+        }
+    }
+    fn fact_bool_valued(&self, key: u32) -> bool {
+        match (&self.facts, self.names.name(key)) {
+            (Some(f), n) => f.var(n).bool_valued,
+            _ => false,
+        }
+    }
+    fn fact_call_effect(&self, name: &str) -> Option<cure_engine::Effect> {
+        self.facts.as_ref().and_then(|f| {
+            f.call_effects.get(name).map(|set| {
+                set.iter().copied().fold(Effect::Pure, Effect::worst)
+            })
+        })
+    }
+
+    fn node_index(&self, id: TsId) -> usize {
+        id.0 as usize
+    }
+    fn id_of_index(&self, idx: usize) -> TsId {
+        TsId(idx as u32)
+    }
+
+    fn is_opaque(&self, id: TsId) -> bool {
+        match self.data(id) {
+            // 不可解析原文 / 类表达式原文
+            NodeData::Raw { .. } | NodeData::ClassExpr { .. } => true,
+            // 解构模式：绑定名在原文里（事件盲区）——含模式的名字必须
+            // 以不透明拒绝传播/删除
+            NodeData::Destruct { .. } | NodeData::DestructStmt { .. } => true,
+            // 可选链元素：链式短路语义（`a?.b` 短路整链）——区域分析
+            // 保守拒绝（含可选元素的子树不可搬移/内联）
+            NodeData::Member { optional: true, .. }
+            | NodeData::Index { optional: true, .. }
+            | NodeData::Call { optional: true, .. } => true,
+            // var 提升陷阱（prepare 计算的块外引用标记）
+            _ => self.var_trap.get(id.0 as usize).copied().unwrap_or(false),
+        }
+    }
+
+    fn own_effect(&self, id: TsId) -> Effect {
+        match self.data(id) {
+            NodeData::Literal(_)
+            | NodeData::This
+            | NodeData::Paren
+            | NodeData::Block
+            | NodeData::Group
+            | NodeData::Empty
+            | NodeData::VarDecl { .. }
+            | NodeData::Break { .. }
+            | NodeData::Continue { .. }
+            | NodeData::Return
+            | NodeData::Throw
+            | NodeData::If
+            | NodeData::While
+            | NodeData::DoWhile
+            | NodeData::For { .. }
+            | NodeData::ForEach { .. }
+            | NodeData::Try
+            | NodeData::Catch { .. }
+            | NodeData::Switch
+            | NodeData::Case { .. }
+            | NodeData::Label { .. }
+            | NodeData::ExprStmt
+            | NodeData::Ternary
+            | NodeData::ArrayLit
+            | NodeData::ObjLit { .. }
+            | NodeData::Template { .. }
+            | NodeData::TsAs { .. }
+            | NodeData::TsSatisfies { .. }
+            | NodeData::TsNonNull
+            | NodeData::Lambda { .. }
+            | NodeData::FuncStmt { .. }
+            | NodeData::Seq
+            | NodeData::DestructStmt { .. } => Effect::Pure,
+            // typeof 对未声明名不抛（与 Java 不同——member/new 访问可抛）
+            NodeData::Unary { op: UnOp::TypeOf } => Effect::Pure,
+            NodeData::Unary { op: UnOp::PreInc | UnOp::PreDec | UnOp::PostInc | UnOp::PostDec } => {
+                Effect::MayWrite
+            }
+            NodeData::Unary { op: UnOp::Delete } => Effect::Unknown,
+            // await：暂停期间任意副作用
+            NodeData::Unary { op: UnOp::Await } => Effect::Unknown,
+            NodeData::Unary { .. } => Effect::Pure,
+            NodeData::VarRef { .. } => Effect::MayRead,
+            // 成员读：null 基座 TypeError；optional 元素短路（子树效果
+            // 经孩子聚合）——MayThrow 与 Java 对齐
+            NodeData::Member { .. } | NodeData::Index { .. } => Effect::MayThrow,
+            // new：构造器任意副作用
+            NodeData::New => Effect::Unknown,
+            NodeData::Call { .. } => Effect::Unknown,
+            NodeData::Assign { .. } => Effect::MayWrite,
+            NodeData::Binary { op } => {
+                // JS 除法/模：除 0 不抛（±Infinity/NaN）；但 `in` /
+                // instanceof 对 null 基座抛 TypeError（与 Member 同判）
+                if matches!(op, BinOp::In | BinOp::Instanceof) {
+                    Effect::MayThrow
+                } else {
+                    Effect::Pure
+                }
+            }
+            NodeData::Raw { .. } | NodeData::ClassExpr { .. } => Effect::Unknown,
+            NodeData::Destruct { .. } => Effect::MayThrow,
+            NodeData::Spread => Effect::Pure,
+        }
+    }
+
+    fn is_bool(&self, id: TsId) -> bool {
+        // JS 语法级布尔值：比较/逻辑表达式、!、布尔字面量、instanceof、
+            // in。VarRef 一律 false（JS 变量无类型——真值不确定性交给
+        // 规则的保守守卫）
+        match self.data(id) {
+            NodeData::Literal(JsLit::Bool(_)) => true,
+            NodeData::Binary { op } => {
+                op.is_comparison() || matches!(op, BinOp::And | BinOp::Or | BinOp::Nullish)
+            }
+            NodeData::Unary { op: UnOp::Not } => true,
+            NodeData::Paren => self.is_bool(self.children(id)[0]),
+            NodeData::Ternary => {
+                let ch = self.children(id);
+                self.is_bool(ch[1]) && self.is_bool(ch[2])
+            }
+            _ => false,
+        }
+    }
+
+    fn is_exact_int(&self, id: TsId) -> bool {
+        // JS 整数域：|v| ≤ 2^53（f64 精确整数）。self_compare 等规则的
+        // 前提。NaN 场景不可能出现在 Int。
+        match self.data(id) {
+            NodeData::Literal(JsLit::Int(v)) => js_int_representable(*v),
+            NodeData::Literal(JsLit::NumRaw { val: NumVal::Int(v), .. }) => {
+                js_int_representable(*v)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_local_var(&self, id: TsId) -> bool {
+        // VarRef 须解析到局部绑定（let/const/参数/for 绑定/catch 参数）
+        // 且**未被 λ 按引用捕获**（捕获名的延迟读对块级扫描不可见——
+        // node 差分 closure 抓获）。未解析（全局/模块级/模式绑定/坏
+        // 代码）→ false（保守）。
+        if !matches!(self.data(id), NodeData::VarRef { .. }) {
+            return false;
+        }
+        if let NodeData::VarRef { name } = self.data(id) {
+            if self.captured_names.contains(self.sn(*name)) {
+                return false;
+            }
+        }
+        self.is_local_ref(id)
+    }
+
+    fn is_inferred_decl(&self, decl: TsId) -> bool {
+        // JS：全部声明无类型标注（ty_raw 只是 TS 注解）→ 剥 init 合法
+        //（`let x;` = undefined）。返回 false 让 store_kill 剥 init 生效。
+        let _ = decl;
+        false
+    }
+
+    fn has_pattern_bindings(&self, root: TsId) -> bool {
+        // 解构模式（Destruct 不透明已拦截区域分析）——本钩子用于引擎侧
+        // 模式绑定守卫（Java instanceof bind 的位置）；TS 侧解构一律
+        // 走不透明通道，返回 false 即可
+        let _ = root;
+        false
+    }
+
+    fn bin_op(&self, id: TsId) -> Option<BinOp> {
+        match self.data(id) {
+            NodeData::Binary { op } => Some(*op),
+            _ => None,
+        }
+    }
+
+    fn un_op(&self, id: TsId) -> Option<UnOp> {
+        match self.data(id) {
+            NodeData::Unary { op } => Some(*op),
+            _ => None,
+        }
+    }
+
+    fn literal(&self, id: TsId) -> Option<LitRef<'_>> {
+        match self.data(id) {
+            NodeData::Literal(JsLit::Bool(b)) => Some(LitRef::Bool(*b)),
+            NodeData::Literal(JsLit::Int(v)) => Some(LitRef::Int(*v)),
+            NodeData::Literal(JsLit::Double(v)) => Some(LitRef::Double(*v)),
+            NodeData::Literal(JsLit::NumRaw { val: NumVal::Int(v), .. }) => Some(LitRef::Int(*v)),
+            NodeData::Literal(JsLit::NumRaw { val: NumVal::Double(v), .. }) => {
+                Some(LitRef::Double(*v))
+            }
+            NodeData::Literal(JsLit::Str(s)) => Some(LitRef::Str(s.as_str())),
+            NodeData::Literal(JsLit::Null) => Some(LitRef::Null),
+            // BigInt/Regex 无值语义（引擎词汇外）
+            _ => None,
+        }
+    }
+
+    fn var_name(&self, id: TsId) -> Option<&str> {
+        match self.data(id) {
+            NodeData::VarRef { name } => Some(self.sn(*name)),
+            NodeData::VarDecl { name, .. } => Some(name),
+            NodeData::ForEach { name, .. } => Some(name),
+            // catch 参数：简单绑定名才入名字表（模式 → None，保守不可见）
+            NodeData::Catch { param_raw } => match param_raw.as_deref() {
+                // 简单名返回原文（prepare 收集期借用 &self——克隆进 intern
+                // 由 NameTable::extend_owned 完成）
+                Some(_) => None, // 见下方 catch_simple_name 预处理
+                None => None,
+            },
+            NodeData::FuncStmt { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
+    fn member_name(&self, id: TsId) -> Option<&str> {
+        match self.data(id) {
+            NodeData::Member { name, .. } => Some(self.sn(*name)),
+            _ => None,
+        }
+    }
+
+    fn payload_equal(&self, a: TsId, b: TsId) -> bool {
+        // 结构相等性用的负载比较：模板 quasis、对象键、类型原文、
+        // 字面量值（±0.0 区分——JS 1/-0 语义）
+        match (self.data(a), self.data(b)) {
+            (NodeData::Literal(x), NodeData::Literal(y)) => js_lit_value_eq(x, y),
+            (NodeData::Template { quasis: q1, tag: t1 }, NodeData::Template { quasis: q2, tag: t2 }) => {
+                q1 == q2 && t1 == t2
+            }
+            (NodeData::ObjLit { props: p1 }, NodeData::ObjLit { props: p2 }) => p1 == p2,
+            (NodeData::Member { name: n1, optional: o1 }, NodeData::Member { name: n2, optional: o2 }) => {
+                n1 == n2 && o1 == o2
+            }
+            (NodeData::Index { optional: o1 }, NodeData::Index { optional: o2 }) => o1 == o2,
+            (NodeData::TsAs { ty_raw: t1 }, NodeData::TsAs { ty_raw: t2 }) => t1 == t2,
+            (NodeData::TsSatisfies { ty_raw: t1 }, NodeData::TsSatisfies { ty_raw: t2 }) => t1 == t2,
+            (NodeData::Destruct { pattern_raw: p1 }, NodeData::Destruct { pattern_raw: p2 }) => {
+                p1 == p2
+            }
+            (NodeData::VarDecl { name: n1, kind: k1, ty_raw: t1 }, NodeData::VarDecl { name: n2, kind: k2, ty_raw: t2 }) => {
+                n1 == n2 && k1 == k2 && t1 == t2
+            }
+            (NodeData::ForEach { name: n1, of: o1, decl: d1, ty_raw: t1, await_: a1 },
+             NodeData::ForEach { name: n2, of: o2, decl: d2, ty_raw: t2, await_: a2 }) => {
+                n1 == n2 && o1 == o2 && d1 == d2 && t1 == t2 && a1 == a2
+            }
+            (NodeData::Catch { param_raw: p1 }, NodeData::Catch { param_raw: p2 }) => p1 == p2,
+            (NodeData::Assign { op: o1 }, NodeData::Assign { op: o2 }) => o1 == o2,
+            (NodeData::Binary { op: o1 }, NodeData::Binary { op: o2 }) => o1 == o2,
+            (NodeData::Unary { op: o1 }, NodeData::Unary { op: o2 }) => o1 == o2,
+            (NodeData::Break { label: l1 }, NodeData::Break { label: l2 }) => l1 == l2,
+            (NodeData::Continue { label: l1 }, NodeData::Continue { label: l2 }) => l1 == l2,
+            (NodeData::Label { name: n1 }, NodeData::Label { name: n2 }) => n1 == n2,
+            (NodeData::Case { labels: l1, is_default: d1, arrow: a1 },
+             NodeData::Case { labels: l2, is_default: d2, arrow: a2 }) => {
+                l1 == l2 && d1 == d2 && a1 == a2
+            }
+            (NodeData::For { inits: i1, has_cond: c1, steps: s1 },
+             NodeData::For { inits: i2, has_cond: c2, steps: s2 }) => {
+                i1 == i2 && c1 == c2 && s1 == s2
+            }
+            (NodeData::Lambda { params_raw: p1, arrow: a1, is_async: y1, is_generator: g1 },
+             NodeData::Lambda { params_raw: p2, arrow: a2, is_async: y2, is_generator: g2 }) => {
+                p1 == p2 && a1 == a2 && y1 == y2 && g1 == g2
+            }
+            (NodeData::FuncStmt { sig_raw: s1, name: n1, params_raw: p1 },
+             NodeData::FuncStmt { sig_raw: s2, name: n2, params_raw: p2 }) => {
+                s1 == s2 && n1 == n2 && p1 == p2
+            }
+            (NodeData::Call { optional: o1 }, NodeData::Call { optional: o2 }) => o1 == o2,
+            (NodeData::DestructStmt { kw: k1, pattern: p1 }, NodeData::DestructStmt { kw: k2, pattern: p2 }) => {
+                k1 == k2 && p1 == p2
+            }
+            (NodeData::Seq, NodeData::Seq) => true,
+            (NodeData::Raw { text: t1 }, NodeData::Raw { text: t2 }) => t1 == t2,
+            (NodeData::ClassExpr { raw: r1 }, NodeData::ClassExpr { raw: r2 }) => r1 == r2,
+            // unit 变体（std::mem::discriminant 兜底已覆盖——此处显式
+            // 列出可读性更好，但 Rust 模式不允许同绑定重复 → 改用
+            // discriminant 比较）
+            _ if std::mem::discriminant(&self.nodes[a.0 as usize].data)
+                == std::mem::discriminant(&self.nodes[b.0 as usize].data)
+                && matches!(
+                    self.data(a),
+                    NodeData::Block
+                        | NodeData::Group
+                        | NodeData::Empty
+                        | NodeData::ExprStmt
+                        | NodeData::If
+                        | NodeData::While
+                        | NodeData::DoWhile
+                        | NodeData::Return
+                        | NodeData::Throw
+                        | NodeData::Try
+                        | NodeData::Switch
+                        | NodeData::Paren
+                        | NodeData::Ternary
+                        | NodeData::New
+                        | NodeData::ArrayLit
+                        | NodeData::This
+                        | NodeData::Spread
+                        | NodeData::TsNonNull
+                ) => true,
+            _ => false,
+        }
+    }
+
+    fn is_field_name(&self, _name: &str) -> bool {
+        // JS 模块级 let/const 对其他函数可见（同 Java 字段语义）——
+        // 但本实现把它们直接判为非局部（is_local_var false），
+        // 无需再走字段读可移动性通道
+        false
+    }
+
+    fn assign_op(&self, id: TsId) -> Option<BinOp> {
+        match self.data(id) {
+            NodeData::Assign { op: Some(op) } => Some(*op),
+            _ => None,
+        }
+    }
+
+    fn grammar_paren_required(&self, inner: TsId) -> bool {
+        matches!(
+            self.kind(inner),
+            NodeKind::Lambda | NodeKind::Custom(_) | NodeKind::Raw
+        )
+    }
+
+    fn var_cast_position_ok(&self, _value: TsId, _typed: TsId) -> bool {
+        // TS as/satisfies 断言不改变可编译性的判断极弱（TS 结构类型），
+        // 且本语言无 Cast/InstanceOf 引擎节点 → 恒 true（守卫不触发）
+        true
+    }
+
+    fn prepare(&mut self, root: TsId) {
+        let n_nodes = self.nodes.len();
+        let key_slots = self.names.key_slots();
+        if key_slots < n_nodes {
+            let names: Vec<Option<String>> = (key_slots..n_nodes)
+                .map(|i| self.var_name(TsId(i as u32)).map(|n| n.to_string()))
+                .collect();
+            self.names.extend_owned(key_slots, &names);
+        }
+        self.events.resize(n_nodes);
+        self.stmt_facts.resize_with(n_nodes, || None);
+        self.stmt_kills.resize_with(n_nodes, || None);
+        self.stmt_opq.resize_with(n_nodes, || None);
+        if self.events.is_clean() {
+            if self.prepared_root == Some(root) {
+                return;
+            }
+            self.rebuild_local_marks(root);
+            self.prepared_root = Some(root);
+            return;
+        }
+        self.prepared_root = Some(root);
+        self.events.mark_clean();
+        for sr in cure_tree::stmt_roots(self, root) {
+            let idx = sr.0 as usize;
+            if self.events.slot(idx).is_none() {
+                if let Some(events) = cure_tree::collect_region_events(self, sr) {
+                    self.events.put(idx, events);
+                }
+            }
+            if self.stmt_facts.get(idx).map_or(true, |f| f.is_none()) {
+                let facts = self.collect_stmt_facts(sr);
+                self.stmt_facts[idx] = Some(facts);
+            }
+            if self.stmt_kills.get(idx).map_or(true, |f| f.is_none()) {
+                let kills = self.collect_stmt_kill_facts(sr);
+                self.stmt_kills[idx] = Some(kills);
+            }
+            if self.stmt_opq.get(idx).map_or(true, |f| f.is_none()) {
+                if let Some(opq) = self.stmt_opaque_fact(sr) {
+                    self.stmt_opq[idx] = Some(opq);
+                }
+            }
+        }
+        let effects = cure_tree::rebuild_effects(self, n_nodes);
+        self.effect_cache = effects;
+        self.rebuild_local_marks(root);
+    }
+
+    fn cost_weight(&self, kind: NodeKind) -> u64 {
+        match kind {
+            NodeKind::Raw => 60,
+            NodeKind::Custom(_) => 30,
+            NodeKind::Lambda => 20,
+            NodeKind::New | NodeKind::Call => 12,
+            NodeKind::Ternary | NodeKind::Throw | NodeKind::Try | NodeKind::Switch
+            | NodeKind::Case | NodeKind::ForEach | NodeKind::For | NodeKind::While
+            | NodeKind::DoWhile | NodeKind::If | NodeKind::Label => 6,
+            NodeKind::Binary | NodeKind::Unary | NodeKind::Assign | NodeKind::Index
+            | NodeKind::Member | NodeKind::VarDecl | NodeKind::InstanceOf => 3,
+            NodeKind::Literal | NodeKind::VarRef | NodeKind::This | NodeKind::Paren
+            | NodeKind::Block | NodeKind::Empty | NodeKind::ExprStmt | NodeKind::Return
+            | NodeKind::Break | NodeKind::Continue | NodeKind::Catch
+            | NodeKind::Synchronized | NodeKind::Yield | NodeKind::Assert
+            | NodeKind::Cast | NodeKind::MethodRef | NodeKind::NewArray
+            | NodeKind::ArrayLit => 1,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 折叠辅助
+// ---------------------------------------------------------------------------
+
+/// JS number 域精确整数：|v| ≤ 2^53。
+pub fn js_int_representable(v: i64) -> bool {
+    v.unsigned_abs() <= (1u64 << 53)
+}
+
+/// f64 算术的**精确整数**回验（Add/Sub/Mul/Pow/Div/Rem）。结果非整、
+/// 超域或为 -0 → None（调用方决定产 Double 或拒绝；-0 一律拒绝——
+/// Int 字面量无符号零，而 JS 的 1/-0 = -Infinity）。
+fn arith_f64(op: BinOp, a: i64, b: i64) -> Option<Option<i64>> {
+    let r = match op {
+        BinOp::Add => a as f64 + b as f64,
+        BinOp::Sub => a as f64 - b as f64,
+        BinOp::Mul => a as f64 * b as f64,
+        BinOp::Pow => {
+            if !(-1024..=1024).contains(&b) {
+                return None;
+            }
+            (a as f64).powi(b as i32)
+        }
+        BinOp::Div => {
+            if b == 0 {
+                return Some(None); // ±Inf → 拒绝（调用方直接放弃）
+            }
+            a as f64 / b as f64
+        }
+        BinOp::Rem => {
+            if b == 0 {
+                return Some(None);
+            }
+            (a as f64) % (b as f64)
+        }
+        _ => return None,
+    };
+    if r == 0.0 && r.is_sign_negative() {
+        return Some(None); // -0
+    }
+    if r.fract() == 0.0 && r.abs() <= (1u64 << 53) as f64 {
+        Some(Some(r as i64))
+    } else {
+        Some(None) // 非整/超域 → 调用方走 Double 分支
+    }
+}
+
+/// 数值字面量是否是 IEEE 雷区值（NaN/±Inf/-0）。
+fn num_hazard(x: LitRef<'_>) -> bool {
+    match x {
+        LitRef::Double(d) => {
+            d.is_nan() || d.is_infinite() || (d == 0.0 && d.is_sign_negative())
+        }
+        _ => false,
+    }
+}
+
+fn cmp_i64(op: BinOp, x: i64, y: i64) -> Option<bool> {
+    Some(match op {
+        BinOp::Lt => x < y,
+        BinOp::Le => x <= y,
+        BinOp::Gt => x > y,
+        BinOp::Ge => x >= y,
+        _ => return None,
+    })
+}
+
+/// JsLit 值级相等（±0.0 位区分；BigInt/Regex 原文比较）。
+fn js_lit_value_eq(x: &JsLit, y: &JsLit) -> bool {
+    fn r(l: &JsLit) -> Option<LitRef<'_>> {
+        Some(match l {
+            JsLit::Bool(b) => LitRef::Bool(*b),
+            JsLit::Int(v) => LitRef::Int(*v),
+            JsLit::Double(v) => LitRef::Double(*v),
+            JsLit::NumRaw { val: NumVal::Int(v), .. } => LitRef::Int(*v),
+            JsLit::NumRaw { val: NumVal::Double(v), .. } => LitRef::Double(*v),
+            JsLit::Str(s) => LitRef::Str(s.as_str()),
+            JsLit::Null => LitRef::Null,
+            JsLit::BigInt(_) | JsLit::Regex(_) => return None,
+        })
+    }
+    match (x, y) {
+        (JsLit::BigInt(a), JsLit::BigInt(b)) => a == b,
+        (JsLit::Regex(a), JsLit::Regex(b)) => a == b,
+        _ => match (r(x), r(y)) {
+            (Some(rx), Some(ry)) => {
+                if let (LitRef::Double(a), LitRef::Double(b)) = (rx, ry) {
+                    a == b && a.is_sign_negative() == b.is_sign_negative()
+                } else {
+                    rx == ry
+                }
+            }
+            _ => false,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 结构化指标
+// ---------------------------------------------------------------------------
+
+/// 模块全部可执行体（函数/方法/静态块/字段 init，含嵌套）的指标总和。
+pub fn unit_metrics(ast: &TsAst, unit: &ModuleUnit) -> TreeMetrics {
+    let mut total = TreeMetrics::default();
+    for item in &unit.items {
+        match item {
+            TopItem::Stmt(s) => {
+                total.add(subtree_metrics(ast, *s));
+            }
+            TopItem::Func { body: Some(b), .. } => {
+                total.add(subtree_metrics(ast, *b));
+            }
+            TopItem::Class(c) => metrics_of_class(ast, c, &mut total),
+            _ => {}
+        }
+    }
+    total
+}
+
+fn metrics_of_class(ast: &TsAst, c: &ClassDecl, total: &mut TreeMetrics) {
+    for m in &c.members {
+        match m {
+            ClassMember::Method { body: Some(b), .. } => {
+                total.add(subtree_metrics(ast, *b));
+            }
+            ClassMember::Field { init: Some(i), .. } => {
+                total.add(subtree_metrics(ast, *i));
+            }
+            ClassMember::StaticBlock { body } => {
+                total.add(subtree_metrics(ast, *body));
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_smoke() {
+        let mut a = TsAst::new();
+        let one = a.lit(JsLit::Int(1));
+        let x = a.var_decl("x", VarKind::Let, None, Some(one));
+        let xv = a.var("x");
+        let r = a.ret(Some(xv));
+        let body = a.block(vec![x, r]);
+        assert_eq!(a.kind(body), NodeKind::Block);
+        assert_eq!(a.children(body).len(), 2);
+    }
+
+    #[test]
+    fn effect_and_locality() {
+        let mut a = TsAst::new();
+        let one = a.lit(JsLit::Int(1));
+        let dx = a.var_decl("x", VarKind::Let, None, Some(one));
+        let xv = a.var("x");
+        let r = a.ret(Some(xv));
+        let body = a.block(vec![dx, r]);
+        a.prepare(body);
+        assert!(a.is_local_var(xv));
+        // console 是全局——非局部
+        let c = a.var("console");
+        assert!(!a.is_local_var(c));
+    }
+
+    #[test]
+    fn js_int_folds() {
+        let mut a = TsAst::new();
+        let two = a.lit(JsLit::Int(2));
+        let three = a.lit(JsLit::Int(3));
+        let add = a.bin(BinOp::Add, two, three);
+        a.prepare(add);
+        // 直接调用 fold 钩子
+        let folded = <TsAst as Lang>::fold_lit_bin(&mut a, BinOp::Add, two, three);
+        assert!(matches!(a.literal(folded.unwrap()), Some(LitRef::Int(5))));
+        // 2 ** 53 边界：(2^53-1)+2 = 2^53 恰好精确（f64 可表示）——
+        // 与 JS 运行时一致，允许折成 Int(2^53)
+        let big = a.lit(JsLit::Int((1i64 << 53) - 1));
+        let two_b = a.lit(JsLit::Int(2));
+        let folded = <TsAst as Lang>::fold_lit_bin(&mut a, BinOp::Add, big, two_b).unwrap();
+        assert!(matches!(a.literal(folded), Some(LitRef::Int(v)) if v == 1i64 << 53));
+        // 超出 2^53 的操作数（不可精确表示）拒绝折叠
+        let huge = a.lit(JsLit::Int(1i64 << 60));
+        assert!(<TsAst as Lang>::fold_lit_bin(&mut a, BinOp::Add, huge, two_b).is_none());
+        // 移位走 i32 环绕域：1 << 31 = -2147483648（JS ToInt32 环绕）
+        let one_l = a.lit(JsLit::Int(1));
+        let sh31 = a.lit(JsLit::Int(31));
+        let folded = <TsAst as Lang>::fold_lit_bin(&mut a, BinOp::Shl, one_l, sh31).unwrap();
+        assert!(matches!(a.literal(folded), Some(LitRef::Int(-2147483648))));
+        // 负零敏感：-2 * 0 = -0 —— 拒绝（Int 无符号零）
+        let neg2 = a.lit(JsLit::Int(-2));
+        let zero = a.lit(JsLit::Int(0));
+        assert!(<TsAst as Lang>::fold_lit_bin(&mut a, BinOp::Mul, neg2, zero).is_none());
+        // NaN 不折
+        let nan = a.lit(JsLit::Double(f64::NAN));
+        let one = a.lit(JsLit::Int(1));
+        assert!(<TsAst as Lang>::fold_lit_bin(&mut a, BinOp::Add, nan, one).is_none());
+        // 溢出环绕：0xFFFFFFFF + 1 按 f64 精确 = 4294967296（不是 i32 环绕）
+        let f = a.lit(JsLit::Int(0xFFFF_FFFF));
+        let o = a.lit(JsLit::Int(1));
+        let folded = <TsAst as Lang>::fold_lit_bin(&mut a, BinOp::Add, f, o);
+        assert!(matches!(a.literal(folded.unwrap()), Some(LitRef::Int(4294967296))));
+    }
+}

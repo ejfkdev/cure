@@ -7,6 +7,10 @@ members = [
     "crates/cure-java-print",
     "crates/cure-java-simplify",
     "crates/cure-java-parser",
+    "crates/cure-ts-ast",
+    "crates/cure-ts-parser",
+    "crates/cure-ts-print",
+    "crates/cure-ts-simplify",
     "crates/cure-cli",
 ]
 

@@ -9,8 +9,12 @@
 
 **cure** is a fault-tolerant, semantic-preserving code simplifier and
 formatter that turns decompiled code back into something a human would have
-written. The engine and CLI are language-agnostic — **Java is the backend
-implemented today**; the pipeline below shows the Java experience.
+written. The engine and CLI are language-agnostic — **Java and
+TypeScript/JavaScript** (`ts`/`tsx`/`mts`/`cts`/`js`/`jsx`/`mjs`/`cjs`) are
+the backends implemented today; the pipeline below shows the Java experience
+(the TS/JS backend ships the same engine with ECMAScript semantics: f64 /
+ToInt32 folding domains, ±2^53 exactness, `var` hoisting and closure-capture
+guards, optional-chain and destructuring opacity, ECMA number formatting).
 
 ```java
 // decompiled input                          // after cure
@@ -41,7 +45,7 @@ the same thing.
   `javac`/`java` runs, and whole-corpus re-parse/idempotency checks (details
   below). These layers caught real bugs during development; they are not
   decorative.
-- **64 simplification rules** (34 language-agnostic + 30 Java-specific),
+- **64+ simplification rules** (language-agnostic engine rules + Java/TS packs),
   including control-flow flattening recovery, statement-level
   `StringBuilder` chain recovery, XOR-noise removal, and partial evaluation
   ("virtual execution") of literal-only JDK calls.

@@ -1,0 +1,17 @@
+[package]
+name = "cure-ts-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Fault-tolerant TypeScript/JavaScript parser (lexer + ASI + modern syntax) for cure"
+repository.workspace = true
+keywords = ["typescript", "javascript", "parser", "deobfuscator"]
+categories = ["development-tools", "parser-implementations"]
+
+[dependencies]
+cure-engine = { path = "../cure-engine", version = "0.1.9" }
+cure-ts-ast = { path = "../cure-ts-ast", version = "0.1.9" }
+
+[dev-dependencies]
+cure-ts-print = { path = "../cure-ts-print", version = "0.1.9" }

@@ -1,0 +1,14 @@
+[package]
+name = "cure-ts-ast"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TypeScript/JavaScript AST (arena + TsId) for the cure simplifier engine"
+repository.workspace = true
+keywords = ["typescript", "javascript", "ast", "deobfuscator", "simplifier"]
+categories = ["development-tools"]
+
+[dependencies]
+cure-engine = { path = "../cure-engine", version = "0.1.9" }
+cure-tree = { path = "../cure-tree", version = "0.1.9" }

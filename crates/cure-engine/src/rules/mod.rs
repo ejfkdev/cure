@@ -31,6 +31,13 @@ impl<L: Lang> Rule<L> for ParenRemoval {
             return None;
         }
         let inner = *lang.children(id).first()?;
+        // 语法必需括号不删（Lang 钩子）：JS 的 Paren(箭头/Raw/自定义
+        // 形态) 在运算数位由产生式强制——删了打印机要再加，形成
+        // 「删括号→打印补→再解析成 Paren→再删」的 AST 振荡（真实
+        // 语料二轮仍 ~900 编辑的根源）。Java 优先级模型完备 → 恒 false。
+        if lang.grammar_paren_required(inner) {
+            return None;
+        }
         Some(Edit::Replace {
             target: id,
             with: inner,
@@ -441,6 +448,12 @@ impl<L: Lang> Rule<L> for DoubleNot {
             return None;
         }
         let x = *lang.children(inner).first()?;
+        // 语言裁决（Lang 钩子）：Java 的 !!x 蕴含 x:boolean（类型系统
+        // 保证，恒等式无条件成立——!!it.hasNext() 形态依赖）；JS 的
+        // !x 是布尔胁迫（!!0 === false ≠ 0）——仅语法级布尔放行
+        if !lang.double_not_sound(x) {
+            return None;
+        }
         Some(Edit::Replace {
             target: id,
             with: x,

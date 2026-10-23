@@ -15,11 +15,11 @@ pub(crate) fn print_help() {
 pub(crate) fn print_version() {
     match CliLang::detect() {
         CliLang::Zh => println!(
-            "cure {}（容错式代码简化/格式化器；当前后端：java）\n{REPO_URL}",
+            "cure {}（容错式代码简化/格式化器；后端：java、typescript/javascript）\n{REPO_URL}",
             env!("CARGO_PKG_VERSION")
         ),
         CliLang::En => println!(
-            "cure {} — fault-tolerant code simplifier/formatter (backend: java)\n{REPO_URL}",
+            "cure {} — fault-tolerant code simplifier/formatter (backends: java, typescript/javascript)\n{REPO_URL}",
             env!("CARGO_PKG_VERSION")
         ),
     }
@@ -29,7 +29,7 @@ fn print_help_en() {
     let v = env!("CARGO_PKG_VERSION");
     println!("cure {v} — fault-tolerant, semantic-preserving code simplifier/formatter");
     println!("Decompiled code in, human-written-looking code out.");
-    println!("Supported languages: java (implemented today; more to come).");
+    println!("Supported languages: java, typescript/javascript (ts/tsx/mts/cts/js/jsx/mjs/cjs).");
     println!("{REPO_URL}  (MIT license)");
     println!();
     println!("Usage:");
@@ -40,7 +40,7 @@ fn print_help_en() {
     println!("  cure help [COMMAND]                this help, or one command's");
     println!("  cure version | -h | -V");
     println!();
-    println!("Languages: java (this release). The CLI and engine are language-agnostic;");
+    println!("Languages: java, typescript/javascript (this release). The CLI and engine are");
     println!("new backends register in LANG_BACKENDS and get the whole pipeline");
     println!("(traversal, parallelism, --check/--diff/--stats, batched I/O).");
     println!();
@@ -99,7 +99,7 @@ fn print_help_zh() {
     let v = env!("CARGO_PKG_VERSION");
     println!("cure {v} — 容错式、语义保持的代码简化 / 格式化器");
     println!("反编译代码进，像人手写的代码出。");
-    println!("已支持语言：java（当前已实现；后续接入更多）。");
+    println!("已支持语言：java、typescript/javascript（ts/tsx/mts/cts/js/jsx/mjs/cjs）。");
     println!("{REPO_URL}  (MIT 许可证)");
     println!();
     println!("用法:");
@@ -110,7 +110,7 @@ fn print_help_zh() {
     println!("  cure help [子命令]                本帮助，或某子命令的帮助");
     println!("  cure version | -h | -V");
     println!();
-    println!("语言后端: java（本版）。CLI 与引擎均语言无关——新语言在");
+    println!("语言后端: java、typescript/javascript（本版）。CLI 与引擎均语言无关——");
     println!("LANG_BACKENDS 登记一条即获得全部基础设施（目录遍历/并行/");
     println!("--check/--diff/--stats/批量 I/O）。");
     println!();

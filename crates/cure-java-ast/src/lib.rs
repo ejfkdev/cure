@@ -1674,6 +1674,13 @@ impl Lang for JavaAst {
             _ => None,
         }
     }
+    fn double_not_sound(&self, _operand: JavaId) -> bool {
+        // Java：`!` 操作数必须 boolean（JLS 15.15.6）——可编译的 !!x
+        // 其 x 恒 boolean，恒等式无条件成立（hard_obfuscation 的
+        // !!it.hasNext() 迭代器形态依赖此折叠）
+        true
+    }
+
     fn var_cast_position_ok(&self, value: JavaId, typed: JavaId) -> bool {
         // 值须为 VarRef（其余形态自带类型，不走本裁决）
         if !matches!(self.data(value), NodeData::VarRef { .. }) {

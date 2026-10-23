@@ -627,7 +627,7 @@ fn map_view_synthetic_ty(lang: &JavaAst, call: JavaId) -> Option<JType> {
         '>' => d - 1,
         _ => d,
     });
-    let top = args.find(|c: char| c == ',').filter(|_| depth == 0)?;
+    let top = args.find(',').filter(|_| depth == 0)?;
     let k = args[..top].trim();
     let v = args[top + 1..].trim();
     let base = n[..lt].trim();

@@ -1,0 +1,14 @@
+[package]
+name = "cure-ts-print"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cure-engine = { path = "../cure-engine", version = "0.1.9" }
+cure-ts-ast = { path = "../cure-ts-ast", version = "0.1.9" }
+
+[dev-dependencies]
+cure-ts-parser = { path = "../cure-ts-parser", version = "0.1.9" }
