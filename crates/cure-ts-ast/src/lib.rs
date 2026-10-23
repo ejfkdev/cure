@@ -54,6 +54,9 @@ pub enum VarKind {
     Var,
     Let,
     Const,
+    /// `using`/`await using`（显式资源管理）：块尾 dispose 语义，
+    /// 声明不可删除/搬移（dispose 时机改变）。
+    Using,
 }
 
 /// 数值字面量的解析值。
@@ -178,7 +181,7 @@ pub enum NodeData {
     This,
     /// 函数表达式 / 箭头函数。children: `[body]`（Block 或表达式）。
     /// params_raw 保真（含 TS 类型注解/模式参数原文）。
-    Lambda { params_raw: String, arrow: bool, is_async: bool, is_generator: bool },
+    Lambda { params_raw: String, name: String, space: bool, arrow: bool, is_async: bool, is_generator: bool },
     /// 模板字面量：quasis 长度 = 孩子数+1（tagged 时孩子 0 是 tag）。
     Template { quasis: Vec<String>, tag: bool },
     /// `...expr`。children: `[expr]`
@@ -353,6 +356,18 @@ pub struct TsAst {
     /// JS var 是函数级作用域；引擎规则按块扫描，块外引用不可见——
     /// 不标记则删除/传播会静默改变提升语义（块外读到 undefined）。
     var_trap: Vec<bool>,
+    /// 合成 Group 的直接 VarDecl 孩子（见 is_opaque 注释）。
+    group_decls: Vec<bool>,
+    /// 根内被**改写**的名字（赋值目标/++--/裸 for-in 绑定）：局部传播
+    /// 评估「参数值在声明与使用之间是否稳定」。
+    mutated_names: std::collections::HashSet<String>,
+    /// 直接 eval 污染区（prepare 计算）：含 `eval(...)` 调用的**函数**其
+    /// 全部后代（形参默认值、函数体、嵌套闭包）标记为不可触碰——直接
+    /// eval 的 `var` 声明进入调用方函数作用域，静态作用域分析完全失效
+    /// （Test262 scope-param-elem-var-close / scope-body-lex-distinct 抓获：
+    /// 常量被传播成外层值、`let x;` 声明被当死代码删除）。顶层 eval 则
+    /// 整棵 AST 污染（可向脚本/全局注入绑定）。
+    eval_taint: Vec<bool>,
     /// 被 lambda/嵌套函数**按引用捕获**的局部名（根级集合）：写杀/传播
     /// 的扫描窗口看不见「λ 创建于窗口之前、调用在之后」的延迟读
     ///（node 差分 closure 抓获：`x = 2` 曾被 store_kill 误杀——闭包
@@ -680,6 +695,11 @@ impl TsAst {
     pub fn lit(&mut self, l: JsLit) -> TsId {
         self.push(NodeData::Literal(l), vec![])
     }
+
+    /// Double 字面量节点（规则层折叠结果构造用）。
+    pub fn clone_node_of_double(&mut self, v: f64) -> TsId {
+        self.push(NodeData::Literal(JsLit::Double(v)), vec![])
+    }
     pub fn this(&mut self) -> TsId {
         self.push(NodeData::This, vec![])
     }
@@ -691,9 +711,25 @@ impl TsAst {
         is_async: bool,
         is_generator: bool,
     ) -> TsId {
+        self.lambda_named(params_raw, body, arrow, is_async, is_generator, "", false)
+    }
+    /// 具名函数表达式：名字是函数体内的只读绑定（`function f(){…f…}`），
+    /// 打印必须保留（`fn.name` 与内部绑定语义；Test262 NFE 家族抓获）。
+    pub fn lambda_named(
+        &mut self,
+        params_raw: &str,
+        body: TsId,
+        arrow: bool,
+        is_async: bool,
+        is_generator: bool,
+        name: &str,
+        space: bool,
+    ) -> TsId {
         self.push(
             NodeData::Lambda {
                 params_raw: params_raw.into(),
+                name: name.into(),
+                space,
                 arrow,
                 is_async,
                 is_generator,
@@ -879,7 +915,137 @@ impl TsAst {
     /// 「C 的第 di+1.. 个孩子的子树」之外（更早兄弟/祖先块/兄弟块/
     /// 其他嵌套函数），块扫描看不见该出现 → 声明标记 is_opaque（规则
     /// 拒绝触碰；var_trap）。全部出现都在可见窗口内 → 正常局部处理。
+    /// 直接 eval 污染区计算（见 `eval_taint` 字段注释）。
+    ///
+    /// 根 = 无父节点的节点（模块合成根 / 独立 TopItem / 类方法体）。
+    /// 若某个根**不是**函数节点且子树含 `eval(...)` 调用 → 顶层 eval，
+    /// 整棵 AST 污染；否则含 eval 的每个函数节点其子树全部污染。
+    fn rebuild_eval_taint(&mut self, root: TsId) {
+        let n = self.nodes.len();
+        self.eval_taint.clear();
+        self.eval_taint.resize(n, false);
+        if n == 0 {
+            return;
+        }
+        let mut has_parent = vec![false; n];
+        self.group_decls.clear();
+        self.group_decls.resize(n, false);
+        for (i, node) in self.nodes.iter().enumerate() {
+            if matches!(node.data, NodeData::Group) {
+                for c in node.children.as_slice() {
+                    if (c.0 as usize) < n && matches!(self.nodes[c.0 as usize].data, NodeData::VarDecl { .. }) {
+                        self.group_decls[c.0 as usize] = true;
+                    }
+                }
+            }
+            for c in node.children.as_slice() {
+                if (c.0 as usize) < n {
+                    has_parent[c.0 as usize] = true;
+                }
+            }
+            let _ = i;
+        }
+        let mut roots: Vec<TsId> = (0..n)
+            .filter(|&i| !has_parent[i])
+            .map(|i| TsId(i as u32))
+            .collect();
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+        // 后序 contains_eval（按节点索引缓存）——森林中的节点全部可达
+        let mut contains_eval = vec![false; n];
+        for &r in &roots {
+            let mut stack = vec![(r, false)];
+            while let Some((x, exiting)) = stack.pop() {
+                let xi = x.0 as usize;
+                if exiting {
+                    let mut ce = self.is_direct_eval_call(x);
+                    if !ce {
+                        for c in self.nodes[xi].children.as_slice() {
+                            if (c.0 as usize) < n && contains_eval[c.0 as usize] {
+                                ce = true;
+                                break;
+                            }
+                        }
+                    }
+                    contains_eval[xi] = ce;
+                } else {
+                    stack.push((x, true));
+                    for c in self.nodes[xi].children.as_slice() {
+                        stack.push((*c, false));
+                    }
+                }
+            }
+        }
+        // 顶层 eval？根不是函数且 subtree 含 eval → 全树污染
+        for &r in &roots {
+            let ri = r.0 as usize;
+            if contains_eval[ri] && !self.is_function_root(r) {
+                self.eval_taint.iter_mut().for_each(|v| *v = true);
+                return;
+            }
+        }
+        // 函数子树污染（含函数节点自身）
+        for &r in &roots {
+            let mut stack = vec![(r, self.is_function_root(r) && contains_eval[r.0 as usize])];
+            while let Some((x, tainted)) = stack.pop() {
+                let xi = x.0 as usize;
+                let t = tainted || (self.is_function_root(x) && contains_eval[xi]);
+                if t {
+                    self.eval_taint[xi] = true;
+                }
+                for c in self.nodes[xi].children.as_slice() {
+                    stack.push((*c, t));
+                }
+            }
+        }
+    }
+
+    fn is_direct_eval_call(&self, id: TsId) -> bool {
+        // 形参默认值以原文保存（`((a = eval("x")) => …)`）——原文里的
+        // 直接 eval 同样污染函数（Test262 scope-param-elem-var-close）。
+        match &self.nodes[id.0 as usize].data {
+            NodeData::Lambda { params_raw, .. } => return raw_has_direct_eval(params_raw),
+            NodeData::FuncStmt { sig_raw, params_raw, .. } => {
+                return raw_has_direct_eval(params_raw) || raw_has_direct_eval(sig_raw)
+            }
+            _ => {}
+        }
+        // `arguments` 对象：参数与自变量别名（mapped arguments）——闭包/
+        // 赋值规则的作用域模型看不到这种联动，函数子树整体保守化
+        //（Test262 arguments-object/mapped 抓获）。
+        if let NodeData::VarRef { name } = &self.nodes[id.0 as usize].data {
+            if self.sn(*name) == "arguments" {
+                return true;
+            }
+        }
+        if self.kind(id) != NodeKind::Call {
+            return false;
+        }
+        let Some(&callee) = self.nodes[id.0 as usize].children.as_slice().first() else {
+            return false;
+        };
+        // `(eval)(...)` 仍是**直接** eval（括号不改变 Reference）——
+        // 曾因 Paren 包裹漏判污染，函数内 var 被当死存储删除
+        //（Test262 parenthesized-eval-is-direct 抓获）
+        let mut c = callee;
+        while let NodeData::Paren = self.nodes[c.0 as usize].data {
+            let Some(&inner) = self.nodes[c.0 as usize].children.as_slice().first() else {
+                return false;
+            };
+            c = inner;
+        }
+        matches!(self.nodes[c.0 as usize].data, NodeData::VarRef { name } if self.sn(name) == "eval")
+    }
+
+    fn is_function_root(&self, id: TsId) -> bool {
+        matches!(self.nodes[id.0 as usize].data, NodeData::FuncStmt { .. })
+            || self.kind(id) == NodeKind::Lambda
+    }
+
     pub(crate) fn rebuild_local_marks(&mut self, root: TsId) {
+        self.rebuild_eval_taint(root);
+        self.mutated_names.clear();
         self.local_marks.clear();
         self.local_marks.resize(self.nodes.len(), false);
 
@@ -899,10 +1065,33 @@ impl TsAst {
         // 模块合成根：直接 VarDecl 孩子不透明（引擎锚定拒绝——
         // 跨根安全性由 const 表规则接管）
         let module_root = matches!(self.nodes[root.0 as usize].data, NodeData::ModuleBlock);
+        // 模块级直接声明（含 Group 内一层）：**不绑定**——跨根读不可见，
+        // 绑定会让 is_local_var 为真、引擎传播/写杀规则跨根误判
+        //（execCount 被 lambda 内写、assert 读——曾被当局部常量传播
+        // Test262 Symbol.match/coerce-global 抓获）
+        let mut module_decls: HashSet<TsId> = HashSet::new();
+        if module_root {
+            for &c in self.nodes[root.0 as usize].children.as_slice() {
+                match &self.nodes[c.0 as usize].data {
+                    NodeData::VarDecl { .. } => {
+                        module_decls.insert(c);
+                    }
+                    NodeData::Group => {
+                        for &g in self.nodes[c.0 as usize].children.as_slice() {
+                            if matches!(self.nodes[g.0 as usize].data, NodeData::VarDecl { .. }) {
+                                module_decls.insert(g);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         let mut scopes: Vec<HashSet<String>> = vec![base];
         let mut stack = vec![Frame::Enter(root)];
         let mut lambda_depth = 0i32;
         let mut captured: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut mutated: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(f) = stack.pop() {
             match f {
                 Frame::Enter(id) => {
@@ -934,7 +1123,9 @@ impl TsAst {
                             a
                         }
                         NodeData::VarDecl { name, .. } => {
-                            scopes.last_mut().unwrap().insert(name.clone());
+                            if !module_decls.contains(&id) {
+                                scopes.last_mut().unwrap().insert(name.clone());
+                            }
                             Action::None
                         }
                         NodeData::VarRef { name } => {
@@ -962,14 +1153,80 @@ impl TsAst {
                                 // 裸名 for (x in o)：x 是既有绑定的读+条件写
                                 // ——非声明，不 bind；其读语义由区域事件的
                                 // Write/Shadow 记录保守覆盖
+                                mutated.insert(name.clone());
                                 Action::None
                             }
                         }
-                        NodeData::Lambda { params_raw, .. }
-                        | NodeData::FuncStmt { params_raw, .. } => match simple_params(params_raw)
-                        {
+                        NodeData::Assign { .. } => {
+                            let mut cur = node.children.as_slice()[0];
+                            while matches!(self.nodes[cur.0 as usize].data, NodeData::Paren) {
+                                let Some(&c) =
+                                    self.nodes[cur.0 as usize].children.as_slice().first()
+                                else {
+                                    break;
+                                };
+                                cur = c;
+                            }
+                            if let NodeData::VarRef { name } =
+                                &self.nodes[cur.0 as usize].data
+                            {
+                                mutated.insert(self.sn(*name).to_string());
+                            }
+                            Action::None
+                        }
+                        // 解构目标（赋值形态）的写对 AST 不可见——按
+                        // 可能变异保守处理（模式词全记）
+                        NodeData::Destruct { pattern_raw } => {
+                            for w in pattern_raw
+                                .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                            {
+                                if !w.is_empty() {
+                                    mutated.insert(w.to_string());
+                                }
+                            }
+                            Action::None
+                        }
+                        NodeData::DestructStmt { pattern, .. } => {
+                            for w in pattern
+                                .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                            {
+                                if !w.is_empty() {
+                                    mutated.insert(w.to_string());
+                                }
+                            }
+                            Action::None
+                        }
+                        NodeData::Unary { op } if op.is_incdec() => {
+                            let mut cur = node.children.as_slice()[0];
+                            while matches!(self.nodes[cur.0 as usize].data, NodeData::Paren) {
+                                let Some(&c) =
+                                    self.nodes[cur.0 as usize].children.as_slice().first()
+                                else {
+                                    break;
+                                };
+                                cur = c;
+                            }
+                            if let NodeData::VarRef { name } =
+                                &self.nodes[cur.0 as usize].data
+                            {
+                                mutated.insert(self.sn(*name).to_string());
+                            }
+                            Action::None
+                        }
+                        NodeData::Lambda { params_raw, name, .. } => {
+                            let mut names = match simple_params(params_raw) {
+                                Some(names) => names,
+                                None => vec![], // 模式参数——空 bind（推层不种名）
+                            };
+                            // NFE 名字在函数体内是绑定（`function f(){ f }`）
+                            if !name.is_empty() {
+                                names.push(name.clone());
+                            }
+                            Action::Bind(names)
+                        }
+                        NodeData::FuncStmt { params_raw, .. } => match simple_params(params_raw) {
                             Some(names) => Action::Bind(names),
-                            None => Action::Bind(vec![]), // 模式参数——空 bind（推层不种名）
+                            None => Action::Bind(vec![]),
                         },
                         _ => Action::None,
                     };
@@ -1013,6 +1270,7 @@ impl TsAst {
             }
         }
         self.captured_names = captured;
+        self.mutated_names = mutated;
 
         // ---- 第 2 遍：var 提升陷阱 ----
         // 每个名字（VarDecl-let/const/var、VarRef、简单 ForEach/Catch/
@@ -1270,6 +1528,59 @@ impl Lang for TsAst {
                 }
             }
         }
+        // 混合 Int/Double 算术（42 + 3.5 —— 解析后的字面量折叠链）：
+        // f64 域求值（Int 精确可表示时无损失），结果 Double——打印走
+        // JS 格式化。仅 + - * / % **（比较另走 fold_lit_cmp）。
+        {
+            let dbl_of = |x: LitRef<'_>| -> Option<f64> {
+                match x {
+                    LitRef::Int(v) if js_int_representable(v) => Some(v as f64),
+                    LitRef::Double(v) => Some(v),
+                    _ => None,
+                }
+            };
+            let mixed = !matches!((ll, rr), (LitRef::Int(_), LitRef::Int(_)));
+            if mixed {
+                if let (Some(a), Some(b)) = (dbl_of(ll), dbl_of(rr)) {
+                    let r = match op {
+                        BinOp::Add => Some(a + b),
+                        BinOp::Sub => Some(a - b),
+                        BinOp::Mul => Some(a * b),
+                        BinOp::Div => {
+                            if b == 0.0 {
+                                None
+                            } else {
+                                Some(a / b)
+                            }
+                        }
+                        BinOp::Rem => {
+                            if b == 0.0 {
+                                None
+                            } else {
+                                Some(a % b)
+                            }
+                        }
+                        BinOp::Pow => {
+                            if b.fract() == 0.0 && b.abs() <= 1024.0 {
+                                Some(a.powf(b))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(r) = r {
+                        if !r.is_nan() && !r.is_infinite() && !(r == 0.0 && r.is_sign_negative()) {
+                            // 整数值保持 Int（打印形态统一）
+                            if r.fract() == 0.0 && r.abs() <= (1u64 << 53) as f64 {
+                                return Some(self.build_int(r as i64, false));
+                            }
+                            return Some(self.lit(JsLit::Double(r)));
+                        }
+                    }
+                }
+            }
+        }
         // 数值运算：JS number 域 = f64。位运算/移位走 ToInt32/ToUint32
         // 环绕域；算术在 ±2^53 精确域（非精确/非整数 → Double 或拒绝）。
         let int_of = |x: LitRef<'_>| -> Option<i64> {
@@ -1386,11 +1697,17 @@ impl Lang for TsAst {
             if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::StrictEq | BinOp::StrictNe) {
                 return Some(if matches!(op, BinOp::Eq | BinOp::StrictEq) { x == y } else { x != y });
             }
+            // JS 字符串次序 = **UTF-16 码元**字典序（不是 Unicode
+            // 标量序）：U+10000 的首码元 D800 < FFFF，标量序相反
+            //（Test262 greater-than/less-than 家族抓获）
+            let xu = x.encode_utf16().collect::<Vec<u16>>();
+            let yu = y.encode_utf16().collect::<Vec<u16>>();
+            let ord = xu.cmp(&yu);
             return match op {
-                BinOp::Lt => Some(x < y),
-                BinOp::Le => Some(x <= y),
-                BinOp::Gt => Some(x > y),
-                BinOp::Ge => Some(x >= y),
+                BinOp::Lt => Some(ord.is_lt()),
+                BinOp::Le => Some(ord.is_le()),
+                BinOp::Gt => Some(ord.is_gt()),
+                BinOp::Ge => Some(ord.is_ge()),
                 _ => None,
             };
         }
@@ -1593,6 +1910,17 @@ impl Lang for TsAst {
             NodeData::Member { optional: true, .. }
             | NodeData::Index { optional: true, .. }
             | NodeData::Call { optional: true, .. } => true,
+            // `using` 声明：块尾 dispose 是隐藏副作用——删除/搬移都改变
+            // 可观察顺序（Test262 statements/using 族抓获）。
+            NodeData::VarDecl { kind: VarKind::Using, .. } => true,
+            // 合成 Group 的直接 VarDecl 孩子：Group 的 kind 是 Block，
+            // 引擎的语句表规则（dead_decl/dead_store/assign_back_fold）
+            // 会把 Group 当作用域，只扫描组内后继兄弟 → 漏掉组外引用，
+            // 曾把 `let val, err;` 整条删除（Test262 BigInt large-bit-length
+            // 与 annexB 家族抓获）。这些声明不参与优化。
+            _ if self.group_decls.get(id.0 as usize).copied().unwrap_or(false) => true,
+            // 直接 eval 污染区：整个函数子树（含形参默认值/嵌套闭包）
+            _ if self.eval_taint.get(id.0 as usize).copied().unwrap_or(false) => true,
             // var 提升陷阱（prepare 计算的块外引用标记）
             _ => self.var_trap.get(id.0 as usize).copied().unwrap_or(false),
         }
@@ -1822,9 +2150,9 @@ impl Lang for TsAst {
              NodeData::For { inits: i2, has_cond: c2, steps: s2 }) => {
                 i1 == i2 && c1 == c2 && s1 == s2
             }
-            (NodeData::Lambda { params_raw: p1, arrow: a1, is_async: y1, is_generator: g1 },
-             NodeData::Lambda { params_raw: p2, arrow: a2, is_async: y2, is_generator: g2 }) => {
-                p1 == p2 && a1 == a2 && y1 == y2 && g1 == g2
+            (NodeData::Lambda { params_raw: p1, name: n1, space: s1, arrow: a1, is_async: y1, is_generator: g1 },
+             NodeData::Lambda { params_raw: p2, name: n2, space: s2, arrow: a2, is_async: y2, is_generator: g2 }) => {
+                p1 == p2 && n1 == n2 && s1 == s2 && a1 == a2 && y1 == y2 && g1 == g2
             }
             (NodeData::FuncStmt { sig_raw: s1, name: n1, params_raw: p1 },
              NodeData::FuncStmt { sig_raw: s2, name: n2, params_raw: p2 }) => {
@@ -1881,7 +2209,175 @@ impl Lang for TsAst {
         }
     }
 
+    fn contains_hoisted_decl(&self, root: TsId) -> bool {
+        // FuncStmt（嵌套函数声明）+ var 声明（提升语义在块搬移时变化）。
+        // λ/函数体内部不下钻：那里的 var/函数声明不会漏到外层。
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            match self.data(n) {
+                NodeData::FuncStmt { .. } => return true,
+                // let/const 搬出分支会改变块级作用域/TDZ（if(true){const z}
+                // 曾变成模块级重复声明）
+                NodeData::VarDecl { .. } => return true,
+                NodeData::Lambda { .. } => continue,
+                _ => {}
+            }
+            for &c in self.children(n) {
+                stack.push(c);
+            }
+        }
+        false
+    }
+
+    fn local_propagation_value_ok(&self, _decl: TsId, value: TsId) -> bool {
+        // 安全面：字面量；或**只读未改写参数**的纯标量表达式
+        // （算术/逻辑/三元——参数未被赋值/捕获，值在声明与使用之间
+        // 稳定）。全局名/成员读/调用一律拒绝：求值时刻的值可能变化
+        //（Test262 eval/TypedArray/class 家族多次抓获）。
+        let mut stack = vec![value];
+        let mut saw_non_lit = false;
+        while let Some(n) = stack.pop() {
+            match self.data(n) {
+                NodeData::Literal(_) | NodeData::Paren => {}
+                NodeData::Unary { .. } | NodeData::Binary { .. } | NodeData::Ternary => {
+                    saw_non_lit = true;
+                }
+                NodeData::VarRef { name } => {
+                    let nm = self.sn(*name);
+                    // 值稳定：局部绑定（参数/局部变量）且未被改写/捕获。
+                    // 全局/模块名拒绝（可在声明与使用之间变化）。
+                    // 捕获不额外拒绝：嵌套 λ 内的写已由 mutated 覆盖；
+                    // 自身参数在 prepare 中 lambda_depth>0 也会被标「捕获」
+                    // （对 store_kill 保守正确，但会误挡同 λ 内的标量内联）。
+                    if !self.is_local_ref(n) || self.mutated_names.contains(nm) {
+                        return false;
+                    }
+                    saw_non_lit = true;
+                }
+                _ => return false,
+            }
+            for &c in self.children(n) {
+                stack.push(c);
+            }
+        }
+        let _ = saw_non_lit;
+        true
+    }
+
+    fn stmt_has_opaque_region(&self, stmt: TsId) -> bool {
+        let mut stack = vec![stmt];
+        while let Some(n) = stack.pop() {
+            match self.data(n) {
+                NodeData::Raw { .. }
+                | NodeData::ClassExpr { .. }
+                | NodeData::Destruct { .. }
+                | NodeData::DestructStmt { .. } => return true,
+                _ => {}
+            }
+            for &c in self.children(n) {
+                stack.push(c);
+            }
+        }
+        false
+    }
+
+    fn value_may_throw_unresolved(&self, value: TsId) -> bool {
+        // 自由 VarRef（未解析到本根局部绑定）可能是未声明全局——
+        // 读取会抛 ReferenceError，不可随死存储一并删除。
+        let mut stack = vec![value];
+        while let Some(n) = stack.pop() {
+            if matches!(self.data(n), NodeData::VarRef { .. }) && !self.is_local_ref(n) {
+                return true;
+            }
+            for &c in self.children(n) {
+                stack.push(c);
+            }
+        }
+        false
+    }
+
+    fn is_tagged_template(&self, id: TsId) -> bool {
+        matches!(self.data(id), NodeData::Template { tag: true, .. })
+    }
+
+    fn assign_target_paren_required(&self, inner: TsId) -> bool {
+        // `(fn) = function(){}` → name ''；删括号变 'fn'（Test262
+        // fn-name-lhs-cover 抓获）
+        matches!(self.data(inner), NodeData::VarRef { .. })
+    }
+
+    fn dead_decl_allowed(&self, decl: TsId) -> bool {
+        matches!(self.data(decl), NodeData::VarDecl { kind: VarKind::Var, .. })
+    }
+
+    fn receiver_propagation_unsound(
+        &self,
+        _decl: TsId,
+        value: TsId,
+        use_parent: Option<TsId>,
+        use_at_head: bool,
+    ) -> bool {
+        // `const f = obj.method; f()` → `obj.method()` 改变 this 绑定
+        //（Test262 Object/prototype/valueOf 家族：自由调用 valueOf 的
+        // this 是 undefined，成员调用是 Object.prototype）。
+        if !use_at_head {
+            return false;
+        }
+        let Some(p) = use_parent else { return false };
+        if self.kind(p) != NodeKind::Call {
+            return false;
+        }
+        matches!(
+            self.data(value),
+            NodeData::Member { .. } | NodeData::Index { .. } | NodeData::Raw { .. }
+        )
+    }
+
+    fn is_function_like(&self, id: TsId) -> bool {
+        matches!(self.data(id), NodeData::FuncStmt { .. }) || self.kind(id) == NodeKind::Lambda
+    }
+
+    fn block_hoists_decl(&self, block: TsId) -> bool {
+        // 直接孩子里含函数声明：块展开会把 Annex B 块级函数声明变成
+        // 语句级（提升/初始化时机改变——Test262 annexB 族抓获）。
+        self.children(block).iter().any(|&c| {
+            matches!(self.data(c), NodeData::FuncStmt { .. })
+                // 解构声明（DestructStmt 是 Custom，BlockFlatten 的
+                // declares 看不到）——展开会合并词法作用域
+                //（Test262 Iterator drop 双 let 解构变重复声明）
+                || matches!(self.data(c), NodeData::DestructStmt { .. })
+                || matches!(
+                    self.data(c),
+                    NodeData::VarDecl { kind: VarKind::Var | VarKind::Using, .. }
+                )
+        })
+    }
+
     fn grammar_paren_required(&self, inner: TsId) -> bool {
+        // `({x} = v)`：Assign 目标为对象字面量时语句位必需括号
+        //（否则解析成块——Iterator map 用例抓获）。
+        if let NodeData::Assign { .. } = self.data(inner) {
+            if let Some(&t) = self.children(inner).first() {
+                // ObjLit 或原文对象模式（`{__proto__ = 0} = {}` 的
+                // Destruct 形态 Raw）都需要语句位括号
+                if matches!(self.data(t), NodeData::ObjLit { .. })
+                    || matches!(self.data(t), NodeData::Raw { text } if text.trim_start().starts_with('{'))
+                {
+                    return true;
+                }
+            }
+        }
+        // `(yield)`：YieldExpression 不是 ShortCircuitExpression——
+        // `yield ? a : b` / `'' in yield` 非法，括号必需（ParenRemoval
+        // 曾删掉它；Test262 yield/in 家族抓获）。
+        if matches!(self.data(inner), NodeData::VarRef { name } if self.sn(*name) == "yield") {
+            return true;
+        }
+        // 私有名（`#f`）在 `in` 左操作数位**不能**加括号（语法要求
+        // 裸 `#x in o`；`(#x) in o` 是 SyntaxError）。
+        if matches!(self.data(inner), NodeData::Raw { text } if text.starts_with('#')) {
+            return false;
+        }
         matches!(
             self.kind(inner),
             NodeKind::Lambda | NodeKind::Custom(_) | NodeKind::Raw
@@ -1910,6 +2406,24 @@ impl Lang for TsAst {
         if self.events.is_clean() {
             if self.prepared_root == Some(root) {
                 return;
+            }
+            // 换根：区域事件清洁，但**别的根**（如同类字段 init）上次
+            // 简化后本根的语句事实可能从未构建——缺事实时规则退回保守
+            // 扫描，λ 捕获守卫漏判（class 字段存在时 `let self = this`
+            // 被内联进内层函数；Test262 private-field-access 族抓获）。
+            for sr in cure_tree::stmt_roots(self, root) {
+                let idx = sr.0 as usize;
+                if self.stmt_facts.get(idx).map_or(true, |f| f.is_none()) {
+                    self.stmt_facts[idx] = Some(self.collect_stmt_facts(sr));
+                }
+                if self.stmt_kills.get(idx).map_or(true, |f| f.is_none()) {
+                    self.stmt_kills[idx] = Some(self.collect_stmt_kill_facts(sr));
+                }
+                if self.stmt_opq.get(idx).map_or(true, |f| f.is_none()) {
+                    if let Some(opq) = self.stmt_opaque_fact(sr) {
+                        self.stmt_opq[idx] = Some(opq);
+                    }
+                }
             }
             self.rebuild_local_marks(root);
             self.prepared_root = Some(root);
@@ -1967,6 +2481,31 @@ impl Lang for TsAst {
 // ---------------------------------------------------------------------------
 // 折叠辅助
 // ---------------------------------------------------------------------------
+
+/// 原文片段是否含直接 `eval(` 调用（词边界 + 跳过空白；字符串里的
+/// 同名文本会误报——只导致保守不简化，可接受）。
+pub fn raw_has_direct_eval(raw: &str) -> bool {
+    let b = raw.as_bytes();
+    let mut i = 0;
+    while let Some(p) = raw[i..].find("eval") {
+        let at = i + p;
+        let before_ok = at == 0 || {
+            let c = b[at - 1] as char;
+            !(c.is_alphanumeric() || c == '_' || c == '$')
+        };
+        if before_ok {
+            let mut j = at + 4;
+            while j < b.len() && (b[j] as char).is_whitespace() {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'(' {
+                return true;
+            }
+        }
+        i = at + 4;
+    }
+    false
+}
 
 /// JS number 域精确整数：|v| ≤ 2^53。
 pub fn js_int_representable(v: i64) -> bool {
@@ -2103,6 +2642,50 @@ fn metrics_of_class(ast: &TsAst, c: &ClassDecl, total: &mut TreeMetrics) {
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// ECMA Number::toString（数字字面形态——打印器与规则层共用）
+// ---------------------------------------------------------------------------
+
+/// ECMA Number::toString：最短往返数字（Rust `{:e}` 与 JS 同源算法）+
+/// ECMA 指数阈值（|v| ≥ 1e21 或 < 1e-6 走指数形态）。
+/// ±0（"-0"）/ NaN / ±Infinity 按 JS 字面形态输出。
+pub fn format_js_number(v: f64) -> String {
+    if v == 0.0 {
+        return if v.is_sign_negative() { "-0".to_string() } else { "0".to_string() };
+    }
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return if v < 0.0 { "-Infinity".to_string() } else { "Infinity".to_string() };
+    }
+    let s = format!("{:e}", v);
+    let (mant, exp_s) = s.split_once('e').expect("exponent form");
+    let exp: i32 = exp_s.parse().expect("exponent");
+    let neg = mant.starts_with('-');
+    let mant = mant.trim_start_matches('-');
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let k = digits.len() as i32;
+    let n = exp + 1;
+    let body = if k <= n && n <= 21 {
+        format!("{}{}", digits, "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{}", "0".repeat((-n) as usize), digits)
+    } else if k == 1 {
+        format!("{}e{}{}", digits, if exp >= 0 { "+" } else { "-" }, exp.abs())
+    } else {
+        format!("{}.{}e{}{}", &digits[..1], &digits[1..], if exp >= 0 { "+" } else { "-" }, exp.abs())
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
 
 #[cfg(test)]
 mod tests {

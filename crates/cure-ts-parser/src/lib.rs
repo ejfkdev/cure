@@ -471,7 +471,54 @@ impl<'a> Parser<'a> {
             String::new()
         };
         let hs = self.pos;
-        while !self.at_eof() && !self.is_punct("{") && !self.is_punct(";") {
+        // 找类体 `{`：括号深度 0 且跳过 extends 里的嵌套类表达式
+        //（`class B extends class { } { … }`——曾把父类体当成本类体，
+        // 成员全部落到类外；Test262 sm/class 家族抓获）。
+        let mut pd = 0i32;
+        loop {
+            if self.at_eof() {
+                break;
+            }
+            let t = self.tk().clone();
+            if t.kind == TokKind::Punct {
+                match t.text.as_str() {
+                    "(" | "[" => {
+                        pd += 1;
+                        self.advance();
+                        continue;
+                    }
+                    ")" | "]" => {
+                        if pd == 0 {
+                            break;
+                        }
+                        pd -= 1;
+                        self.advance();
+                        continue;
+                    }
+                    ";" if pd == 0 => break,
+                    "{" if pd == 0 => break,
+                    _ => {}
+                }
+            } else if pd == 0 && t.kind == TokKind::Ident && t.text == "class" {
+                self.skip_class_expr();
+                continue;
+            } else if pd == 0 && t.kind == TokKind::Ident && t.text == "function" {
+                // extends 里的函数表达式（`class extends function(){} {}`）
+                self.advance();
+                if self.is_punct("*") {
+                    self.advance();
+                }
+                if self.tk().kind == TokKind::Ident && !self.is_punct("(") {
+                    self.advance();
+                }
+                if self.is_punct("(") {
+                    self.skip_parens();
+                }
+                if self.is_punct("{") {
+                    self.skip_braces();
+                }
+                continue;
+            }
             self.advance();
         }
         head.push_str(&self.raw_between(hs, self.pos));
@@ -524,7 +571,13 @@ impl<'a> Parser<'a> {
                 && (self.tk_at(1).kind == TokKind::Ident
                     || self.tk_at(1).kind == TokKind::Num
                     || self.tk_at(1).kind == TokKind::Str
-                    || self.is_punct_at(1, "["))
+                    || self.is_punct_at(1, "[")
+                    // `static #x` —— 私有字段/方法名以 `#` 起（Test262
+                    // class elements 族 SyntaxError 抓获）
+                    || self.is_punct_at(1, "#")
+                    // `static *gen()` —— 生成器方法（曾把 static 当独立
+                    // 字段打印，`static; *method()` 语义改变）
+                    || self.is_punct_at(1, "*"))
                 && !self.tk_at(1).newline_before
             {
                 self.advance();
@@ -596,35 +649,48 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
         }
+        let mut eq_pos = self.pos;
         let init = if self.is_punct("=") && !self.tk().newline_before {
+            eq_pos = self.pos;
             self.advance();
             Some(self.parse_assign_expr())
         } else {
             None
         };
-        // sig 到 `=` 之前（init 是 arena 节点——打印不重复）
-        let sig_end = if init.is_some() {
-            // `=` token 的下标 = 当前 pos 之前回退一个（init 表达式可能
-            // 多 token）——记录等号位置
-            self.eq_pos_back(start)
-        } else {
-            self.pos
-        };
+        // sig 到 `=` 之前（init 是 arena 节点——打印不重复）。等号位置
+        // 必须在解析 init **之前**记录：逆向搜索会命中 init 内部的
+        // `x = () => { var t = … }` 的赋值号（Test262 class field 族抓到
+        // sig 截成 `x = () => { var t`、打印时体重复）。
+        let sig_end = if init.is_some() { eq_pos } else { self.pos };
         self.consume_semi();
         let sig_raw = self.raw_between(start, sig_end);
         Some(ClassMember::Field { sig_raw, name, init })
     }
 
     /// 在 [start, pos) 找最后一个顶层 `=` 的下标（字段 sig/init 分界）。
-    fn eq_pos_back(&self, start: usize) -> usize {
-        let mut eq = self.pos;
-        for i in (start..self.pos).rev() {
-            if self.toks[i].kind == TokKind::Punct && self.toks[i].text == "=" {
-                eq = i;
-                break;
+    /// 正向找**顶层**赋值号（解构模式 `{x = 1} = v` 的内部默认值在
+    /// 括号深度内；逆向搜索会命中值表达式里的赋值）。
+    fn eq_pos_forward(&self, start: usize) -> usize {
+        let mut depth = 0i32;
+        let mut i = start;
+        while i < self.pos && i < self.toks.len() {
+            let t = &self.toks[i];
+            if t.kind == TokKind::Punct {
+                match t.text.as_str() {
+                    "(" | "[" | "{" => depth += 1,
+                    ")" | "]" | "}" => {
+                        depth -= 1;
+                        if depth < 0 {
+                            break;
+                        }
+                    }
+                    "=" if depth == 0 => return i,
+                    _ => {}
+                }
             }
+            i += 1;
         }
-        eq
+        self.pos
     }
 
     fn skip_decorator(&mut self) {
@@ -705,7 +771,14 @@ impl<'a> Parser<'a> {
         while !self.at_eof() && !self.is_punct("}") {
             let before = self.pos;
             let s = self.parse_stmt();
-            stmts.push(s);
+            // 多声明符 `let a, b;` 的 Group 在此展开为独立语句：Group 的
+            // kind 是 Block，引擎语句表规则（dead_decl 等）只扫描组内
+            // 兄弟，组外引用不可见 → 曾把声明当死代码删除。
+            if matches!(self.ast.data(s), NodeData::Group) {
+                stmts.extend(self.ast.children(s).iter().copied());
+            } else {
+                stmts.push(s);
+            }
             if self.pos == before {
                 self.advance();
             }
@@ -776,8 +849,30 @@ impl<'a> Parser<'a> {
                     self.ast.raw("debugger;")
                 }
                 "with" => {
+                    // with 的**语句体**必须一起原文捕获：体是 with 作用域
+                    // 的一部分（`with (o) var x = 1, _ = f;` 的初始化器读到
+                    // with 对象属性）。曾只捕到 `with (o)` —— 体变成后续
+                    // 语句，闭包读到外层值（Test262 with/scope-var-close 抓获）。
                     let s = self.pos;
-                    self.skip_balanced_to_stmt_boundary();
+                    self.advance();
+                    if self.is_punct("(") {
+                        self.skip_parens();
+                    }
+                    if self.is_punct("{") {
+                        self.skip_braces();
+                        self.consume_semi();
+                    } else {
+                        self.skip_balanced_to_stmt_boundary();
+                        // `else` 分支（同一行）
+                        if self.tk().kind == TokKind::Ident && self.tk().text == "else" {
+                            self.advance();
+                            if self.is_punct("{") {
+                                self.skip_braces();
+                            } else {
+                                self.skip_balanced_to_stmt_boundary();
+                            }
+                        }
+                    }
                     self.ast.raw(&self.raw_between(s, self.pos))
                 }
                 "enum" | "interface" | "namespace" | "module" => {
@@ -899,7 +994,7 @@ impl<'a> Parser<'a> {
         let kind = match kw.as_str() {
             "var" => VarKind::Var,
             "let" => VarKind::Let,
-            "using" => VarKind::Const, // using ≈ const（显式释放语义原文保真）
+            "using" => VarKind::Using,
             _ => VarKind::Const,
         };
         let kw_for_print = kw.clone();
@@ -1115,7 +1210,30 @@ impl<'a> Parser<'a> {
         let mut depth = 0i32;
         let mut of_at = None;
         let mut in_at = None;
-        let mut i = self.pos;
+        // 三元嵌套深度：`for (true ? '' in f() : g(); ; )` 的 `in`
+        // 是二元运算符，不是 for-in 分隔符（Test262 conditional
+        // in-branch 抓获）。
+        let mut qdepth = 0i32;
+        // 声明头之后的第一个标识符是**绑定名**（`for (await using of of [])`
+        // 的绑定名就是 of）——扫描分隔关键字时跳过它，否则第一个 of
+        // 被当分隔符、iterable 从第二个 of 开始错位。
+        let mut search_from = self.pos;
+        if self.toks[search_from].kind == TokKind::Ident
+            && self.toks[search_from].text == "await"
+            && self.toks.get(search_from + 1).map(|t| t.text.as_str()) == Some("using")
+        {
+            search_from += 2;
+        } else if self.toks[search_from].kind == TokKind::Ident
+            && matches!(
+                self.toks[search_from].text.as_str(),
+                "var" | "let" | "const" | "using"
+            )
+        {
+            search_from += 1;
+        }
+        let mut skip_binding_of =
+            self.toks[search_from].kind == TokKind::Ident && self.toks[search_from].text == "of";
+        let mut i = search_from;
         while i < self.toks.len() {
             let t = &self.toks[i];
             if t.kind == TokKind::Eof {
@@ -1126,11 +1244,23 @@ impl<'a> Parser<'a> {
                     "(" | "[" | "{" => depth += 1,
                     ")" if depth == 0 => break,
                     ")" | "]" | "}" => depth -= 1,
-                    ";" if depth == 0 => break,
+                    ";" if depth == 0 && qdepth == 0 => break,
+                    "?" if depth == 0 => qdepth += 1,
+                    ":" if depth == 0 && qdepth > 0 => qdepth -= 1,
                     _ => {}
                 }
-            } else if t.kind == TokKind::Ident && depth == 0 {
+            } else if t.kind == TokKind::Ident && depth == 0 && qdepth == 0 {
                 if t.text == "of" && of_at.is_none() && in_at.is_none() {
+                    // `async of => {}`（参数名为 of 的箭头）不是分隔符
+                    if self.toks.get(i + 1).is_some_and(|n| n.text == "=>") {
+                        i += 1;
+                        continue;
+                    }
+                    if i == search_from && skip_binding_of {
+                        skip_binding_of = false;
+                        i += 1;
+                        continue;
+                    }
                     of_at = Some(i);
                     break;
                 }
@@ -1144,12 +1274,22 @@ impl<'a> Parser<'a> {
         if let Some(kw_at) = of_at.or(in_at) {
             let is_of = of_at.is_some();
             let bind_raw = self.raw_between(head_start, kw_at);
+            // `for (let in obj)` 的 let 是**绑定名**（sloppy 允许 let
+            // 作标识符）——紧邻分隔符时不是声明（Test262 head-lhs-let
+            // 抓获：曾打印成 `for (let in in obj)`）。
+            let let_is_binding = self.toks[head_start].text == "let"
+                && self
+                    .toks
+                    .get(head_start + 1)
+                    .is_some_and(|t| matches!(t.text.as_str(), "in" | "of"));
             let decl = if self.toks[head_start].kind == TokKind::Ident
+                && !let_is_binding
                 && matches!(self.toks[head_start].text.as_str(), "var" | "let" | "const" | "using")
             {
                 Some(match self.toks[head_start].text.as_str() {
                     "var" => VarKind::Var,
                     "let" => VarKind::Let,
+                    "using" => VarKind::Using,
                     _ => VarKind::Const,
                 })
             } else {
@@ -1157,7 +1297,16 @@ impl<'a> Parser<'a> {
             };
             let (name, ty_raw) = if decl.is_some() {
                 let n = &self.toks[head_start + 1];
-                if n.kind == TokKind::Ident {
+                // Annex B：sloppy for-in 允许声明初始化器
+                //（`for (var a = ++effects in {})`）——初始化器只求值一次，
+                // 必须随绑定原文保留（曾被丢弃，副作用消失；
+                // Test262 nonstrict-initializer 抓获）。
+                if !is_of && n.kind == TokKind::Ident && head_start + 2 < kw_at
+                    && self.toks[head_start + 2].text == "="
+                {
+                    let bind = self.raw_between(head_start + 1, kw_at);
+                    (bind.trim().to_string(), None)
+                } else if n.kind == TokKind::Ident {
                     let nm = n.text.clone();
                     let ty = if head_start + 2 < kw_at && self.toks[head_start + 2].text == ":" {
                         Some(self.raw_between(head_start + 2, kw_at))
@@ -1446,6 +1595,15 @@ impl<'a> Parser<'a> {
         if let Some(stmt) = self.wrap_destruct_assign(e, start) {
             return stmt;
         }
+        // 裸字符串表达式语句 = 指令序言（"use strict" 等）：**原文**保留。
+        // 反转义后重新编码会把 `'use str\u0069ct'` 变成 `'use strict'`，
+        // 从而把非指令变成 use strict 指令（Test262 directive-prologue
+        // 家族抓获：转义/续行形态必须保持非严格）。
+        if matches!(self.ast.data(e), NodeData::Literal(JsLit::Str(_))) {
+            let raw = self.raw_between(start, self.pos);
+            self.consume_semi();
+            return self.ast.raw(&raw);
+        }
         self.consume_semi();
         self.ast.expr_stmt(e)
     }
@@ -1461,7 +1619,7 @@ impl<'a> Parser<'a> {
         let (target, value) = (ch[0], ch[1]);
         let pattern = match self.ast.data(target) {
             NodeData::ObjLit { .. } | NodeData::ArrayLit => {
-                let eq = self.eq_pos_back(start);
+                let eq = self.eq_pos_forward(start);
                 self.raw_between(start, eq)
             }
             _ => return None,
@@ -1488,44 +1646,71 @@ impl<'a> Parser<'a> {
         if let Some(a) = self.try_parse_arrow() {
             return a;
         }
-        if self.is_kw("yield") {
+        let left = if self.is_kw("yield") {
             // sloppy 位的 yield 标识符用法：yield = x / yield.x /
             // yield[x] / yield(x) / yield, / yield)——按 VarRef（
-            // 生成器语境外 yield 是普通名；test262 non-strict 家族）
-            // 守卫**只看前瞻 token 形态**（= . [ ( , ) ; EOF）——
-            // 绝不检查 yield 自身的 newline_before：生成器里 yield
-            // 换行开头是最常见形态（test262 annexB 抓获：曾把行首
-            // yield 误判为标识符，后续操作数全部错位）
-            if self.is_punct("=")
-                || self.is_punct(".")
-                || self.is_punct("[")
-                || self.is_punct("(")
-                || self.is_punct(",")
-                || self.is_punct(")")
-                || self.is_punct(";")
-                || self.at_eof()
+            // 生成器语境外 yield 是普通名；test262 non-strict 家族）。
+            // 标识符形态必须继续走赋值后缀（`yield = 1` 曾是
+            // `yield =; 1;` 残句——Test262 assignmenttargettype 抓获）。
+            // 前瞻 token 形态（`yield` 自身当然不是这些标点——原实现
+            // 漏了 _at(1)，`yield = 1` 一直走 yield 表达式路径产出残句）
+            // 注意：**不能**把 `[`/`(` 当作标识符判据——生成器里
+            // `yield [i, ...]` / `yield (x)` 是 yield 表达式（曾把
+            // `yield [i,a[i]]` 拆成 `yield; [ ... ]`，Test262
+            // generators/intl402 zip 抓获）。非生成器里两种解析的
+            // 原文相同（Raw 保真）。
+            if self.is_punct_at(1, "=")
+                || self.is_punct_at(1, ".")
+                || self.is_punct_at(1, ",")
+                || self.is_punct_at(1, ")")
+                || self.is_punct_at(1, ";")
+                || self.tk_at(1).kind == TokKind::Eof
             {
                 let name = self.advance().text;
-                return self.ast.var(&name);
-            }
-            // yield 表达式：原文捕获（生成器恢复 v1 不简化）
-            let s = self.pos;
-            self.advance();
-            if self.is_punct("*") {
+                self.ast.var(&name)
+            } else {
+                // yield 表达式：原文捕获（生成器恢复 v1 不简化）
+                let s = self.pos;
                 self.advance();
+                let mut starred = false;
+                if self.is_punct("*") {
+                    self.advance();
+                    starred = true;
+                }
+                // `yield *` 的换行合法（只有 yield 与 * 之间禁换行）——
+                // starred 时强制解析操作数（`yield *\n foo` 曾被截成
+                // `yield *;`，Test262 staging/sm/generators 抓获）。
+                if (starred
+                    || (!self.tk().newline_before
+                        && !matches!(self.tk().kind, TokKind::TemplateQuasi { .. })))
+                    && !self.is_punct(";")
+                    && !self.is_punct(")")
+                    && !self.is_punct("]")
+                    && !self.is_punct("}")
+                    && !self.is_punct(",")
+                    && !self.is_punct(":")
+                    && !self.is_punct("?")
+                {
+                    let _ = self.parse_assign_expr();
+                }
+                let y = self.ast.raw(&self.raw_between(s, self.pos));
+                // `yield ? a : b`：YieldExpression 可作三元条件
+                if self.is_punct("?") {
+                    self.advance();
+                    let a = self.parse_assign_expr();
+                    if self.is_punct(":") {
+                        self.advance();
+                    } else {
+                        self.err_here("expected : in conditional");
+                    }
+                    let b = self.parse_assign_expr();
+                    return self.ast.ternary(y, a, b);
+                }
+                return y;
             }
-            if !self.tk().newline_before
-                && !self.is_punct(";")
-                && !self.is_punct(")")
-                && !self.is_punct("]")
-                && !self.is_punct("}")
-                && !self.is_punct(",")
-            {
-                let _ = self.parse_assign_expr();
-            }
-            return self.ast.raw(&self.raw_between(s, self.pos));
-        }
-        let left = self.parse_conditional();
+        } else {
+            self.parse_conditional()
+        };
         if self.tk().kind == TokKind::Punct {
             if let Some(op) = assign_op_of(&self.tk().text) {
                 self.advance();
@@ -1756,6 +1941,10 @@ impl<'a> Parser<'a> {
             || self.is_punct_at(1, ",")
             || self.is_punct_at(1, ";")
             || self.is_punct_at(1, ")")
+            || self.is_kw_at(1, "instanceof")
+            || self.is_kw_at(1, "in")
+            || self.is_punct_at(1, "?")
+            || self.is_punct_at(1, ":")
     }
 
     fn parse_postfix(&mut self) -> TsId {
@@ -1814,6 +2003,11 @@ impl<'a> Parser<'a> {
                     }
                     _ => break,
                 }
+                continue;
+            }
+            if matches!(t.kind, TokKind::TemplateQuasi { cont: false, .. }) {
+                // 标签模板 `tag\`x\``（MemberExpression 后缀）
+                e = self.parse_template_after(Some(e));
                 continue;
             }
             if t.kind == TokKind::Ident
@@ -1877,6 +2071,10 @@ impl<'a> Parser<'a> {
                 } else {
                     break;
                 }
+            }
+            // `new tag\`x\``：标签模板是 MemberExpression，属于 callee
+            while matches!(self.tk().kind, TokKind::TemplateQuasi { cont: false, .. }) {
+                e = self.parse_template_after(Some(e));
             }
             let args = if self.is_punct("(") {
                 self.parse_call_args()
@@ -2040,8 +2238,12 @@ impl<'a> Parser<'a> {
             }
             TokKind::Str => {
                 self.advance();
-                let v = decode_str_lit(&t.text);
-                self.ast.lit(JsLit::Str(v))
+                match decode_str_lit(&t.text) {
+                    Some(v) => self.ast.lit(JsLit::Str(v)),
+                    // 孤立代理项：Rust String 无法表示——保留原文转义
+                    //（JSON.stringify('\uD800') 等语义依赖精确代码单元）
+                    None => self.ast.raw(&t.text),
+                }
             }
             TokKind::Regex => {
                 self.advance();
@@ -2070,6 +2272,22 @@ impl<'a> Parser<'a> {
                         self.ast.var(&t.text)
                     }
                 }
+                "yield"
+                    if self.is_punct_at(1, ";")
+                        || self.is_punct_at(1, ")")
+                        || self.is_punct_at(1, "}")
+                        || self.is_punct_at(1, "]")
+                        || self.is_punct_at(1, ",")
+                        || self.is_punct_at(1, ":")
+                        || self.tk_at(1).kind == TokKind::Eof =>
+                {
+                    // `'' in yield` / `yield ? yield : yield` 中的
+                    // 无操作数 yield（YieldExpression 是 AssignmentExpression
+                    // ——可作二元右操作数/三元条件；曾直接语法错误）
+                    let s = self.pos;
+                    self.advance();
+                    self.ast.raw(&self.raw_between(s, self.pos))
+                }
                 "this" => {
                     self.advance();
                     self.ast.this()
@@ -2083,12 +2301,15 @@ impl<'a> Parser<'a> {
                         raw.push('.');
                         raw.push_str(&self.expect_member_name());
                     } else if self.is_punct("[") {
+                        let br = self.pos;
                         self.advance();
                         let _ = self.parse_expr();
                         if self.is_punct("]") {
                             self.advance();
                         }
-                        raw.push_str(&self.raw_between(s, self.pos));
+                        // 只追加方括号段：raw_between(s, …) 含 "super" 本身，
+                        // 曾产出 `supersuper['x']`（Test262 super 家族抓获）。
+                        raw.push_str(&self.raw_between(br, self.pos));
                     } else if self.is_punct("(") {
                         let ps = self.pos;
                         self.skip_parens();
@@ -2158,9 +2379,15 @@ impl<'a> Parser<'a> {
                     self.ast.raw(&raw)
                 }
                 "#" => {
+                    // 私有名表达式（`#f in obj`）：`#` 是名字的一部分，
+                    // 打印必须保留（曾被剥成普通标识符 f——private-field
+                    // presence 族抓获）。
                     self.advance();
-                    let n = self.expect_member_name();
-                    self.ast.var(&n)
+                    let mut n = String::from("#");
+                    if self.tk().kind == TokKind::Ident {
+                        n.push_str(&self.advance().text);
+                    }
+                    self.ast.raw(&n)
                 }
                 _ => {
                     self.err_here(&format!("unexpected token {:?}", t.text));
@@ -2187,7 +2414,7 @@ impl<'a> Parser<'a> {
             is_gen = true;
             self.advance();
         }
-        let _name = if self.tk().kind == TokKind::Ident && !self.is_punct("(") {
+        let name = if self.tk().kind == TokKind::Ident && !self.is_punct("(") {
             self.advance().text
         } else {
             String::new()
@@ -2196,6 +2423,9 @@ impl<'a> Parser<'a> {
             self.err_here("expected ( after function");
             return self.ast.raw("function");
         }
+        // `function (` vs `function(`：Function.prototype.toString 与
+        // 计算属性键依赖原文，保留空档（Test262 cpn-class 家族抓获）。
+        let space = self.pos > 0 && self.tk().start > self.toks[self.pos - 1].end;
         let ps = self.pos;
         self.skip_parens();
         let full = self.raw_between(ps, self.pos);
@@ -2210,7 +2440,7 @@ impl<'a> Parser<'a> {
             self.err_here("expected { in function expression");
             self.ast.block(vec![])
         };
-        self.ast.lambda(&inner, body, false, is_async, is_gen)
+        self.ast.lambda_named(&inner, body, false, is_async, is_gen, &name, space)
     }
 
     fn parse_obj_lit(&mut self) -> TsId {
@@ -2253,12 +2483,17 @@ impl<'a> Parser<'a> {
 
     fn parse_obj_prop(&mut self) -> (String, TsId) {
         let t = self.tk().clone();
-        // 生成器方法前缀 *（{*f() {} / * [k] () {}）
+        // 生成器/异步生成器方法前缀：`*f()` / `async *f()` / `async f()`
         let mut gen_prefix = String::new();
-        if t.kind == TokKind::Punct && t.text == "*" {
-            gen_prefix = "*".to_string();
+        if t.kind == TokKind::Ident && t.text == "async" && self.is_punct_at(1, "*") {
+            self.advance(); // async
+            gen_prefix.push_str("async ");
+        }
+        if self.is_punct("*") {
+            gen_prefix.push('*');
             self.advance();
         }
+        let t = if gen_prefix.is_empty() { t } else { self.tk().clone() };
         // 访问器/异步方法：get x() / set [k]() / async 0()——整体原文
         //（前缀与键组合形态过多，v1 原文保真）。前瞻：键（Ident/`[expr]`/
         // Num/Str）之后的 `(`——计算键需跳到配对 `]` 后检查
@@ -2405,7 +2640,56 @@ impl<'a> Parser<'a> {
         if self.tk().kind == TokKind::Ident && !self.is_punct("(") {
             self.advance();
         }
-        while !self.at_eof() && !self.is_punct("{") && !self.is_punct(";") && !self.is_punct(")") && !self.is_punct(",") {
+        // 找类体 `{`：**括号/方括号深度 0** 的 `{` 才是类体。extends
+        // 里的箭头/函数体处于括号内（`class extends (() => {}) {}`）——
+        // 曾把箭头体当类体，类表达式原文被截断（Test262 heritage-arrow
+        // 家族抓获）。
+        let mut pd = 0i32;
+        loop {
+            if self.at_eof() {
+                return;
+            }
+            let t = self.tk().clone();
+            if t.kind == TokKind::Punct {
+                match t.text.as_str() {
+                    "(" | "[" => {
+                        pd += 1;
+                        self.advance();
+                        continue;
+                    }
+                    ")" | "]" => {
+                        if pd == 0 {
+                            return;
+                        }
+                        pd -= 1;
+                        self.advance();
+                        continue;
+                    }
+                    ";" | "," if pd == 0 => return,
+                    "{" if pd == 0 => break,
+                    _ => {}
+                }
+            } else if pd == 0 && t.kind == TokKind::Ident && t.text == "class" {
+                // extends 里的类表达式（`class extends class { } { … }`）
+                self.skip_class_expr();
+                continue;
+            } else if pd == 0 && t.kind == TokKind::Ident && t.text == "function" {
+                // extends 里的函数表达式（`class extends function(){} {}`）
+                self.advance();
+                if self.is_punct("*") {
+                    self.advance();
+                }
+                if self.tk().kind == TokKind::Ident && !self.is_punct("(") {
+                    self.advance();
+                }
+                if self.is_punct("(") {
+                    self.skip_parens();
+                }
+                if self.is_punct("{") {
+                    self.skip_braces();
+                }
+                continue;
+            }
             self.advance();
         }
         if self.is_punct("{") {
@@ -2541,6 +2825,16 @@ fn parse_num_lit(text: &str) -> JsLit {
         }
     }
     if !clean.contains('.') && !clean.contains('e') && !clean.contains('E') {
+        // LegacyOctalIntegerLiteral（sloppy）：`070` = 56；`08`/`09`
+        // 按十进制（NonOctalDecimalIntegerLiteral）
+        if clean.len() > 1
+            && clean.starts_with('0')
+            && clean[1..].chars().all(|c| matches!(c, '0'..='7'))
+        {
+            if let Ok(v) = i64::from_str_radix(&clean[1..], 8) {
+                return JsLit::Int(v);
+            }
+        }
         if let Ok(v) = clean.parse::<i64>() {
             return JsLit::Int(v);
         }
@@ -2554,10 +2848,10 @@ fn parse_num_lit(text: &str) -> JsLit {
 }
 
 /// 字符串字面量解码（原文含引号）。
-fn decode_str_lit(raw: &str) -> String {
+fn decode_str_lit(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     if bytes.len() < 2 {
-        return raw.to_string();
+        return Some(raw.to_string());
     }
     let inner = &raw[1..raw.len() - 1];
     let mut out = String::with_capacity(inner.len());
@@ -2574,7 +2868,31 @@ fn decode_str_lit(raw: &str) -> String {
             Some('b') => out.push('\u{0008}'),
             Some('f') => out.push('\u{000c}'),
             Some('v') => out.push('\u{000b}'),
-            Some('0') => out.push('\0'),
+            // LegacyOctalEscapeSequence（sloppy 字符串）：`\07` = U+0007。
+            // 首字符 0-3 允许最多 3 位八进制，4-7 最多 2 位（≤ 0xFF）。
+            Some(c @ '0'..='7') => {
+                let mut v = c.to_digit(8).unwrap();
+                let mut n = 1;
+                let max = if c <= '3' { 3 } else { 2 };
+                while n < max {
+                    let Some(&d) = chars.peek() else { break };
+                    match d {
+                        '0'..='7' => {
+                            let nv = v * 8 + d.to_digit(8).unwrap();
+                            if nv > 0xFF {
+                                break;
+                            }
+                            v = nv;
+                            n += 1;
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                if let Some(ch) = char::from_u32(v) {
+                    out.push(ch);
+                }
+            }
             Some('x') => {
                 let h: String = (0..2).filter_map(|_| chars.next()).collect();
                 if let Ok(v) = u32::from_str_radix(&h, 16) {
@@ -2588,25 +2906,60 @@ fn decode_str_lit(raw: &str) -> String {
                     chars.next();
                     let h: String = chars.by_ref().take_while(|c| *c != '}').collect();
                     if let Ok(v) = u32::from_str_radix(&h, 16) {
-                        if let Some(ch) = char::from_u32(v) {
-                            out.push(ch);
+                        match char::from_u32(v) {
+                            Some(ch) => out.push(ch),
+                            // `\u{D800}` 等孤立代理项 → 放弃解码，调用方保留原文
+                            None => return None,
                         }
                     }
                 } else {
                     let h: String = (0..4).filter_map(|_| chars.next()).collect();
                     if let Ok(v) = u32::from_str_radix(&h, 16) {
-                        if let Some(ch) = char::from_u32(v) {
-                            out.push(ch);
+                        // 代理对：`\uD834\uDD85` 必须合成 U+1D185。
+                        // 逐半解码会把两个高位/低位代理都丢弃（char 无法
+                        // 表示孤立代理）——字符串内容静默缩水（Test262
+                        // intl402 toLocaleLowerCase Turkish 抓获：
+                        // MUSICAL SYMBOL COMBINING DOIT 消失）。
+                        if (0xD800..=0xDBFF).contains(&v) {
+                            let mut ahead = chars.clone();
+                            if ahead.next() == Some('\\') && ahead.next() == Some('u') {
+                                let lh: String = (0..4).filter_map(|_| ahead.next()).collect();
+                                if let Ok(lo) = u32::from_str_radix(&lh, 16) {
+                                    if (0xDC00..=0xDFFF).contains(&lo) {
+                                        let cp = 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00);
+                                        if let Some(ch) = char::from_u32(cp) {
+                                            for _ in 0..6 {
+                                                chars.next();
+                                            }
+                                            out.push(ch);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        match char::from_u32(v) {
+                            Some(ch) => out.push(ch),
+                            // 孤立代理项（无配对低位代理）→ 原文保留
+                            None => return None,
                         }
                     }
                 }
             }
             Some('\n') => {}
+            // LineContinuation：反斜杠后可接 CR / CRLF / U+2028 /
+            // U+2029——整段删除（曾把 CR 原样留下，字符串内容变长）
+            Some('\r') => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            Some('\u{2028}') | Some('\u{2029}') => {}
             Some(other) => out.push(other),
             None => out.push('\\'),
         }
     }
-    out
+    Some(out)
 }
 
 #[cfg(test)]

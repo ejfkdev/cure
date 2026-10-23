@@ -121,8 +121,15 @@ otherwise the locale is auto-detected. Full option reference: `cure --help`.
 | 2. Differential testing | Original and simplified versions each compiled by `javac` and run; stdout / exit code / exception signature must match byte-for-byte (12 families: overflow, NaN, division by zero, StringBuilder, iterators, boxing, short-circuit side effects, …) | full Java-language semantics |
 | 3. Corpora | 3,999 vendored real-world files in 12 auto-discovered suites + 5,596-file external mega-corpus + the 371k-file OpenJDK source corpus | robustness (no panics), self-consistency (output re-parses cleanly), idempotency (second pass = 0 rewrites) |
 | 4. Decompiled apps | 144,592 files from 5 real-world Android APKs run through [ddc](https://github.com/ejfkdev/ddc), then cure (full + `--dead-code`) | same invariants + javac differential: every package whose ddc output compiles must still compile after cure |
+| 5. ECMAScript conformance | [Test262](https://github.com/tc39/test262) positive suite: original vs cured run in fresh `node` vm contexts, exception status + stdout compared (full sweep: 34,006 executable cases) | ECMAScript semantics: f64/ToInt32 domains, ±2^53, TDZ, Annex B hoisting, eval scoping, destructuring, generator/`yield` grammar, sparse arrays |
 
-`cargo test` runs 332 tests. Layers 1–2 caught three real semantic/parse bugs
+`cargo test` runs 429 tests. The Test262 semantic differential reaches
+**33,962/34,006 (99.87%) identical runs**; the only 44 excluded cases compare
+`Function.prototype.toString` **source text** (cure reformats function
+bodies) or use arrow functions as computed-property keys, which relies on
+that same text. A sampled 800-case version is a standing test
+(`cargo test -p cure-ts-simplify --test t262_sem`); it skips automatically
+when `/tmp/test262` or `node` is unavailable (`T262_ROOT` overrides). Layers 1–2 caught three real semantic/parse bugs
 during development (`x && true` mis-fold, `((Cast) x).method()` postfix loss,
 `new` treated as a type name).
 

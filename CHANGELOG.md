@@ -5,6 +5,67 @@
 
 ## [Unreleased]
 
+### 验证（TS/JS 语义差分——2026-10-23 第三批）
+
+- **Test262 语义差分常驻化**：`crates/cure-ts-simplify/tests/t262_sem.rs`
+  ——原版与 cure 版在全新 node vm 上下文分别执行，比较异常状态与
+  stdout；全量扫描 34,006 个可执行用例，**33,962 个逐字节一致
+  （99.87%）**，零非 toString 失配。
+- 已知不可保持面（allowlist，文档化）：`Function.prototype.toString`
+  依赖函数源码文本（cure 会重排函数体）；以箭头函数作计算属性名的
+  `{[() => {}]: v}` 经 toString 参与键比较。其余失配即硬失败。
+- 语料/环境缺失（`/tmp/test262`、`node`）时测试自动跳过；
+  `T262_ROOT`/`T262_SAMPLE` 可覆盖。手动全量：`examples/t262_sem`。
+
+### 修复（Test262 差分驱动——解析器/打印器）
+
+- **行终止符与 ASI**：CR / CRLF / U+2028 / U+2029 正确计为
+  LineTerminator（`return`/`break`/`continue`/后置换行语义）；字符串
+  行续接（反斜杠 + CR/CRLF/U+2028/2029）整段删除；模板 quasi 内的
+  多字节转义完整保留（曾 mojibake）。
+- **字面量域**：LegacyOctalIntegerLiteral（`070` = 56）与 legacy 八进制
+  字符串转义（`\07`）；`\u{D800}` 等孤立代理项保留原文（JSON.stringify
+  码元语义）；字符串序比较按 **UTF-16 码元**（非 Unicode 标量序）。
+- **生成器**：`yield` 作为表达式/三元条件/`in` 右操作数/模板插值；
+  `yield *` 换行操作数；`(yield)` 括号语义必需。
+- **类/函数边界**：`class extends class {} / function(){}` 嵌套体；
+  `new tag\`…\`` 与 `tag\`…\`` 后缀；`new (f().g)()` 的 callee 括号；
+  函数/箭头表达式源码空档（name/toString 相关）；对象字面量访问器
+  （getter 整段原文）与计算键方法识别；计算键值不再被当方法简写。
+- **语句/头部文法**：`for (let in obj)` 的 let 绑定、`async of => {}`、
+  三元内 `in` 不计 for-in 分隔、for-init 顶层 `in` 加括号、
+  `for (var a = ++effects in {})` 初始化器、`using`/`await using`
+  声明；`{__proto__ = 0} = {}` 解构语句；私有名 `#f in o`；
+  多声明符 + 解构混合 for 头共享一个 let/const。
+- **打印安全**：稀疏数组尾洞（`[,]` 长度保持）、对象模式赋值整条
+  加括号、`??` 与 `&&/||` 混合双向括号、`**` 一元操作数括号、函数体
+  `}` 后 `/` 的正则/除法判定（语句块/声明 vs 表达式）。
+
+### 修复（Test262 差分驱动——规则/引擎）
+
+- **常量传播/求值禁区**：正则字面量不作标量常量（`g` 正则 lastIndex /
+  对象同一性）；BigInt/正则实参不可随死调用丢弃；`decodeURI` 保留
+  保留字符转义；字符串方法位置参数（includes/startsWith/endsWith）
+  按 ToIntegerOrInfinity；`Number()` 的 `-0`、带符号十六进制 NaN、
+  `parseInt("−0")`、isFinite/isInteger/isSafeInteger 的类型/边界域；
+  `Math.round(±0)` 符号；`String.prototype.repeat(-1)` 不得被死调用删除。
+- **写/读不可见区**：`delete x` 的常量替换、`++(x)` 的写计数、对象
+  字面量访问器/函数表达式形参/catch 解构默认值/for-of 解构头的原文
+  写（raw_words/Lambda params）；数组逃逸上下文白名单收紧（delete/
+  update/成员赋值/ObjLit 逃逸）。
+- **作用域与提升**：直接/间接/括号 eval 全单元禁用常量传播并污染
+  eval 函数子树（含形参默认值）；`arguments` 函数子树保守化；
+  let/const/using 禁止死声明/死存储删除（TDZ/块级遮蔽/资源释放时机）；
+  `if (c) function f(){}` 的 Annex B 条件初始化与块展开守卫；
+  `(yield)`/`(fn) = function(){}` 的括号语义；合成 Group 的直接声明
+  不参与语句表规则（`let a, b;` 曾整条删除）。
+- **求值时机**：局部传播仅限字面量或「未改写本地绑定」的纯标量
+  表达式；store_kill/dead_store/assign_back_fold 遇到原文/类体/解构
+  等不可见区域即停止；`x && false` / `x || true` 仅对布尔操作数折叠
+  （JS 非布尔值与 ReferenceError）。
+- 引擎：`DeadDecl` 自引用 init 守卫（TDZ）、`static_exec` 零降本提案
+  拒绝、`reassoc_delta` i64 环绕（debug 溢出 panic）。
+
 ### 新增（TS/JS 混淆对抗——2026-10-23 第二批）
 
 - **模块级常量链传播**（`ts_const_propagate`）：混淆器拷贝链

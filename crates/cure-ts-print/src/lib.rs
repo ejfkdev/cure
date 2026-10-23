@@ -264,10 +264,20 @@ impl<'a> Printer<'a> {
                     self.out.push_str(kw);
                     self.out.push(' ');
                 }
-                self.out.push_str(pattern.trim());
+                let pat = pattern.trim();
+                // 语句位对象模式解构赋值必须括号：`{a} = x` 会被读成
+                // 块语句（Test262 assignment/dstr 族抓获）
+                let need_paren = kw.is_empty() && pat.starts_with('{');
+                if need_paren {
+                    self.out.push('(');
+                }
+                self.out.push_str(pat);
                 self.out.push_str(" = ");
                 let value = self.ast.children(s)[0];
                 self.print_expr(value, Prec::Assign);
+                if need_paren {
+                    self.out.push(')');
+                }
                 self.out.push(';');
             }
             NodeData::FuncStmt { sig_raw, .. } => {
@@ -315,23 +325,80 @@ impl<'a> Printer<'a> {
                 let all_var_decls = ch.iter().take(ni).all(|&c| {
                     matches!(self.ast.data(c), NodeData::VarDecl { .. })
                 }) && ni > 0;
-                if all_var_decls {
-                    if let NodeData::VarDecl { kind, .. } = self.ast.data(ch[0]) {
-                        self.print_var_kw(*kind);
+                let any_destruct = ch
+                    .iter()
+                    .take(ni)
+                    .any(|&c| matches!(self.ast.data(c), NodeData::DestructStmt { .. }));
+                if all_var_decls || any_destruct {
+                    // 共享一个 let/const/var：`for (let [a] = …, b = …; …)`
+                    let mut kind_kw: Option<String> = None;
+                    for &c in ch.iter().take(ni) {
+                        match self.ast.data(c) {
+                            NodeData::VarDecl { kind, .. } => {
+                                kind_kw = Some(
+                                    match kind {
+                                        VarKind::Var => "var",
+                                        VarKind::Let => "let",
+                                        VarKind::Const => "const",
+                                        VarKind::Using => "using",
+                                    }
+                                    .to_string(),
+                                );
+                                break;
+                            }
+                            NodeData::DestructStmt { kw, .. } if !kw.is_empty() => {
+                                kind_kw = Some(kw.clone());
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(k) = kind_kw {
+                        self.out.push_str(&k);
                         self.out.push(' ');
                     }
                     for (i, &c) in ch.iter().take(ni).enumerate() {
                         if i > 0 {
                             self.out.push_str(", ");
                         }
-                        self.print_declarator(c);
+                        match self.ast.data(c) {
+                            NodeData::VarDecl { .. } => self.print_declarator(c),
+                            NodeData::DestructStmt { pattern, .. } => {
+                                self.out.push_str(pattern.trim());
+                                self.out.push_str(" = ");
+                                if let Some(&v) = self.ast.children(c).first() {
+                                    self.print_expr(v, Prec::Assign);
+                                }
+                            }
+                            _ => self.print_for_head_stmt(c),
+                        }
                     }
                 } else {
                     for (i, &c) in ch.iter().take(ni).enumerate() {
                         if i > 0 {
                             self.out.push_str(", ");
                         }
-                        self.print_for_head_stmt(c);
+                        // for-init 的 [~In] 语法：顶层 `in` 表达式必须
+                        // 括号（`for ('' in f(); …)` 会被解析成 for-in；
+                        // Test262 conditional/in-branch 抓获）
+                        let inner = self
+                            .ast
+                            .children(c)
+                            .first()
+                            .copied()
+                            .filter(|_| {
+                                matches!(self.ast.data(c), NodeData::ExprStmt)
+                            });
+                        let needs = inner.is_some_and(|e| {
+                            matches!(self.ast.data(e), NodeData::Binary { op: BinOp::In })
+                        });
+                        if needs {
+                            self.out.push('(');
+                            self.print_expr(inner.unwrap(), Prec::Seq);
+                            self.out.push(')');
+                        } else {
+                            self.print_for_head_stmt(c);
+                        }
                     }
                 }
                 self.out.push(';');
@@ -464,6 +531,7 @@ impl<'a> Printer<'a> {
             VarKind::Var => "var",
             VarKind::Let => "let",
             VarKind::Const => "const",
+            VarKind::Using => "using",
         });
     }
 
@@ -484,6 +552,18 @@ impl<'a> Printer<'a> {
     /// for 头部的「语句」（去分号形式）。
     fn print_for_head_stmt(&mut self, s: TsId) {
         match self.ast.data(s) {
+            // for (var [x] = arr; …) —— 解构声明头（曾打印 /*?*/ 丢失
+            // 初始化——Test262 for/dstr 族抓获）
+            NodeData::DestructStmt { kw, pattern } => {
+                if !kw.is_empty() {
+                    self.out.push_str(kw);
+                    self.out.push(' ');
+                }
+                self.out.push_str(pattern.trim());
+                self.out.push_str(" = ");
+                let value = self.ast.children(s)[0];
+                self.print_expr(value, Prec::Assign);
+            }
             NodeData::ExprStmt => {
                 let e = self.ast.children(s)[0];
                 self.print_expr(e, Prec::Seq);
@@ -628,6 +708,11 @@ impl<'a> Printer<'a> {
             }
             NodeData::Assign { op } => {
                 let ch = self.ast.children(e).to_vec();
+                // 对象模式目标的语句位括号由**源 Paren 节点**承载
+                //（ParenRemoval 的 grammar 钩子拒绝删除语法必需括号）。
+                // 打印层不得无条件包裹：解构模式里的嵌套赋值
+                // `[{ } = yield]` 带上括号会变非法目标（Test262 dstr
+                // 家族抓获）。
                 self.print_expr(ch[0], Prec::Assign);
                 self.out.push(' ');
                 match op {
@@ -666,14 +751,42 @@ impl<'a> Printer<'a> {
             NodeData::New => {
                 let ch = self.ast.children(e).to_vec();
                 self.out.push_str("new ");
-                self.print_expr(ch[0], Prec::Member);
+                // `new (Function("…").apply)()` 与 `new Function("…").apply()`：
+                // 后者的 new 只作用于 `Function("…")` 的结果、再取 .apply
+                // ——语义完全不同。callee 成员链基座含调用时必须括号
+                //（Test262 Function/prototype/apply|call 家族抓获）。
+                if self.new_callee_needs_parens(ch[0]) {
+                    self.out.push('(');
+                    self.print_expr(ch[0], Prec::Seq);
+                    self.out.push(')');
+                } else {
+                    self.print_expr(ch[0], Prec::Member);
+                }
                 self.out.push('(');
                 self.print_args(&ch[1..]);
                 self.out.push(')');
             }
             NodeData::Member { name, optional } => {
                 let ch = self.ast.children(e).to_vec();
-                self.print_expr(ch[0], Prec::Member);
+                // 整数字面量接收者必须括号：打印形态无小数点/指数时
+                // `7.toFixed` 会被词法读成 `7.` + `toFixed`（Test262
+                // toPrecision 抓获）；`0..toString` 解析出的 Double(0.0)
+                // 打印 "0" 同样裸奔（radix-31 抓获）
+                let base_is_bare_int = match self.ast.data(ch[0]) {
+                    NodeData::Literal(JsLit::Int(_)) => true,
+                    NodeData::Literal(JsLit::Double(v)) => {
+                        let t = format_js_number(*v);
+                        !t.contains('.') && !t.contains('e') && !t.contains('E')
+                    }
+                    _ => false,
+                };
+                if base_is_bare_int {
+                    self.out.push('(');
+                    self.print_expr_inner(ch[0], Prec::Member);
+                    self.out.push(')');
+                } else {
+                    self.print_expr(ch[0], Prec::Member);
+                }
                 if *optional {
                     self.out.push_str("?.");
                 } else {
@@ -701,6 +814,12 @@ impl<'a> Printer<'a> {
                     }
                     self.print_expr(c, Prec::Assign);
                 }
+                // 尾部空槽（`[,]` 长度 1、`[,,]` 长度 2）——洞用空 Raw 表示，
+                // 直接闭合会把洞吞掉（`[,]` → `[]` 长度 0；Test262
+                // Array/prototype/map 稀疏数组家族抓获）。尾洞必须补逗号。
+                if ch.last().is_some_and(|&c| matches!(self.ast.data(c), NodeData::Raw { text } if text.is_empty())) {
+                    self.out.push(',');
+                }
                 self.out.push(']');
             }
             NodeData::ObjLit { props } => {
@@ -720,20 +839,30 @@ impl<'a> Printer<'a> {
                         continue;
                     }
                     self.out.push_str(p.trim());
-                    if p.contains('(') {
-                        // 方法简写：值是 Lambda——prop 已带 (params)
-                        if let Some(&b) = self.ast.children(*v).first() {
-                            self.out.push(' ');
-                            self.print_block_like_expr(b);
+                    if has_toplevel_paren(p) {
+                        // 方法简写：值是 Lambda——prop 已带 (params)。
+                        // 访问器（`get x() {…}`）的整段原文在 prop 里、
+                        // 值是空 Raw——原样打印 prop。
+                        // 值不是二者时，`p` 的括号可能来自**计算键**
+                        //（`[ID(2)]: v`）——照常打印值（Test262
+                        // computed-property-names 抓获）。
+                        if self.ast.kind(*v) == cure_engine::NodeKind::Lambda {
+                            if let Some(&b) = self.ast.children(*v).first() {
+                                self.out.push(' ');
+                                self.print_block_like_expr(b);
+                            }
+                            continue;
                         }
-                        continue;
+                        if matches!(self.ast.data(*v), NodeData::Raw { text } if text.is_empty()) {
+                            continue;
+                        }
                     }
                     self.out.push_str(": ");
                     self.print_expr(*v, Prec::Assign);
                 }
                 self.out.push('}');
             }
-            NodeData::Lambda { params_raw, arrow, is_async, is_generator } => {
+            NodeData::Lambda { params_raw, name, space, arrow, is_async, is_generator } => {
                 if *is_async {
                     self.out.push_str("async ");
                 }
@@ -756,6 +885,13 @@ impl<'a> Printer<'a> {
                     self.out.push_str("function");
                     if *is_generator {
                         self.out.push('*');
+                    }
+                    if !name.is_empty() {
+                        self.out.push(' ');
+                        self.out.push_str(name);
+                    }
+                    if *space {
+                        self.out.push(' ');
                     }
                     self.out.push('(');
                     self.out.push_str(params_raw.trim());
@@ -826,6 +962,21 @@ impl<'a> Printer<'a> {
     }
 
     /// `{ x: x }` → `{ x }` 简写判定。
+    /// new 的 callee 是「成员链基座含调用」形态（`f().g`）→ 必须括号。
+    fn new_callee_needs_parens(&self, e: TsId) -> bool {
+        let mut cur = e;
+        loop {
+            match self.ast.data(cur) {
+                NodeData::Member { .. } | NodeData::Index { .. } => {
+                    let Some(&b) = self.ast.children(cur).first() else { return false };
+                    cur = b;
+                }
+                NodeData::Call { .. } | NodeData::New => return true,
+                _ => return false,
+            }
+        }
+    }
+
     fn is_shorthand(&self, v: TsId, key: &str) -> bool {
         if let NodeData::VarRef { name } = self.ast.data(v) {
             let k = key.trim();
@@ -851,42 +1002,46 @@ impl<'a> Printer<'a> {
         // 左操作数：同层平铺（** 的左结合限制由右侧括号规则 +
         // expr_prec < 检查覆盖——(a**b)**c 的左 Binary(Pow) 层相等走
         // print_expr 的 my_prec < prec 判定加括号）
-        let lp = my_prec;
-        self.print_expr(l, lp);
+        // ?? 与 &&/|| 的混合禁令是**对称**的，且优先级序表达不了
+        // 「必须括号」——显式包裹两操作数（`(null ?? 42) || 43`；
+        // Test262 coalesce 家族抓获）。右操作数另有结合性括号。
+        let left_mixed = match (op, &self.ast.data(l)) {
+            (BinOp::Nullish, NodeData::Binary { op: ro }) => matches!(ro, BinOp::And | BinOp::Or),
+            (BinOp::And | BinOp::Or, NodeData::Binary { op: BinOp::Nullish }) => true,
+            _ => false,
+        };
+        let pow_left_unary = op == BinOp::Pow
+            && matches!(self.ast.data(l), NodeData::Unary { .. });
+        if left_mixed || pow_left_unary {
+            self.out.push('(');
+            self.print_expr(l, Prec::Seq);
+            self.out.push(')');
+        } else {
+            self.print_expr(l, my_prec);
+        }
         self.out.push(' ');
         self.out.push_str(bin_symbol(op));
         self.out.push(' ');
-        let rp = if op == BinOp::Pow {
-            my_prec // 右结合：右侧同层平铺
-        } else {
-            succ(my_prec) // 左结合：右侧同层括号
+        let right_mixed = match (op, &self.ast.data(r)) {
+            (BinOp::Nullish, NodeData::Binary { op: ro }) => matches!(ro, BinOp::And | BinOp::Or),
+            (BinOp::And | BinOp::Or, NodeData::Binary { op: BinOp::Nullish }) => true,
+            _ => false,
         };
-        // 混合禁令覆盖：?? 的右操作数 &&/||（层更高但语法禁括号省）
-        let rp_final = if op == BinOp::Nullish {
-            if let NodeData::Binary { op: ro } = self.ast.data(r) {
-                if matches!(ro, BinOp::And | BinOp::Or | BinOp::Nullish) {
-                    Prec::Assign // 强制括号（低于一切二元）
-                } else {
-                    rp
-                }
-            } else {
-                rp
-            }
-        } else if matches!(op, BinOp::And | BinOp::Or) {
-            // a && (b ?? c) 合法但 a && b ?? c 非法——右操作数 ?? 需括号
-            if let NodeData::Binary { op: ro } = self.ast.data(r) {
-                if matches!(ro, BinOp::Nullish) {
-                    Prec::Assign
-                } else {
-                    rp
-                }
-            } else {
-                rp
-            }
+        let pow_right_unary = op == BinOp::Pow
+            && matches!(self.ast.data(r), NodeData::Unary { .. });
+        if right_mixed || pow_right_unary {
+            self.out.push('(');
+            self.print_expr(r, Prec::Seq);
+            self.out.push(')');
         } else {
-            rp
-        };
-        self.print_expr(r, rp_final);
+            // ** 右结合：左侧同层括号；左结合：右侧同层括号
+            let rp = if op == BinOp::Pow {
+                my_prec
+            } else {
+                succ(my_prec)
+            };
+            self.print_expr(r, rp);
+        }
     }
 
     fn print_unary(&mut self, e: TsId, op: UnOp) {
@@ -1093,42 +1248,7 @@ fn print_quasi(q: &str) -> String {
     q.to_string()
 }
 
-/// ECMA Number::toString（JS 数字字面形态）。
-pub fn format_js_number(v: f64) -> String {
-    if v == 0.0 {
-        return if v.is_sign_negative() { "-0".to_string() } else { "0".to_string() };
-    }
-    if v.is_nan() {
-        return "NaN".to_string();
-    }
-    if v.is_infinite() {
-        return if v < 0.0 { "-Infinity".to_string() } else { "Infinity".to_string() };
-    }
-    let s = format!("{:e}", v);
-    let (mant, exp_s) = s.split_once('e').expect("exponent form");
-    let exp: i32 = exp_s.parse().expect("exponent");
-    let neg = mant.starts_with('-');
-    let mant = mant.trim_start_matches('-');
-    let digits: String = mant.chars().filter(|c| *c != '.').collect();
-    let k = digits.len() as i32;
-    let n = exp + 1;
-    let body = if k <= n && n <= 21 {
-        format!("{}{}", digits, "0".repeat((n - k) as usize))
-    } else if 0 < n && n <= 21 {
-        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
-    } else if -6 < n && n <= 0 {
-        format!("0.{}{}", "0".repeat((-n) as usize), digits)
-    } else if k == 1 {
-        format!("{}e{}{}", digits, sign(exp), exp.abs())
-    } else {
-        format!("{}.{}e{}{}", &digits[..1], &digits[1..], sign(exp), exp.abs())
-    };
-    if neg {
-        format!("-{body}")
-    } else {
-        body
-    }
-}
+pub use cure_ts_ast::format_js_number;
 
 fn sign(exp: i32) -> &'static str {
     if exp >= 0 {
@@ -1231,4 +1351,23 @@ mod tests {
         assert!(out.contains("} finally {"));
         assert!(out.contains("case 1:"));
     }
+}
+
+/// prop 原文是否含**括号深度 0** 的 `(`（方法简写形态）。计算键
+/// `[foo(1)]` 里的括号在 `[]` 内 → 不是方法形态。
+fn has_toplevel_paren(p: &str) -> bool {
+    let mut depth = 0i32;
+    for c in p.chars() {
+        match c {
+            '[' | '{' | '(' => {
+                if c == '(' && depth == 0 {
+                    return true;
+                }
+                depth += 1;
+            }
+            ']' | '}' | ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    false
 }

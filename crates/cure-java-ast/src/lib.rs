@@ -1207,7 +1207,11 @@ impl Lang for JavaAst {
             (BitXor, BitXor) => k1 ^ k2,
             (a, b) if matches!(a, Add | Sub) && matches!(b, Add | Sub) => {
                 let sign = |o: BinOp| if o == Sub { -1i64 } else { 1i64 };
-                sign(a) * k1 + sign(b) * k2
+                // 宽整数域回绕：JLS long 加法模 2^64；debug 下的 i64
+                // 溢出会 panic（`(x + 9223372036854775806L) + 2L`）
+                sign(a)
+                    .wrapping_mul(k1)
+                    .wrapping_add(sign(b).wrapping_mul(k2))
             }
             _ => return None,
         };

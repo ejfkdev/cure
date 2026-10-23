@@ -26,11 +26,19 @@ impl<L: Lang> Rule<L> for ParenRemoval {
         &[NodeKind::Paren]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
-        let RewriteCtx { lang, walk: _ } = ctx;
+        let RewriteCtx { lang, walk } = ctx;
         if lang.kind(id) != NodeKind::Paren {
             return None;
         }
         let inner = *lang.children(id).first()?;
+        // 赋值目标位的括号可能语义显著（JS 具名求值）
+        if lang.assign_target_paren_required(inner) {
+            if let Some((p, i)) = walk.parents.get(&id) {
+                if lang.kind(*p) == NodeKind::Assign && *i == 0 {
+                    return None;
+                }
+            }
+        }
         // 语法必需括号不删（Lang 钩子）：JS 的 Paren(箭头/Raw/自定义
         // 形态) 在运算数位由产生式强制——删了打印机要再加，形成
         // 「删括号→打印补→再解析成 Paren→再删」的 AST 振荡（真实
@@ -90,10 +98,15 @@ impl<L: Lang> Rule<L> for ConstCondition {
                 //（InputArrayTrailingComma 抓获；unreachable_after_terminal
                 // 是 --dead-code 门控，默认模式依赖本规则自洽）
                 let then = ch.get(1).copied()?;
+                // 可提升声明（JS 的 if (c) function f(){}——Annex B 条件
+                // 初始化）不可搬出分支（Test262 annexB 族抓获）
+                if lang.contains_hoisted_decl(then) {
+                    return None;
+                }
                 // R15 P0-1（o4 形态）抓获：被丢弃的 else 含 yield → switch
                 // 表达式产出集缩小 → 静态类型变化（var 推断破坏）→ 拒绝
                 if let Some(&els) = ch.get(2) {
-                    if contains_yield(&*lang, els) {
+                    if contains_yield(&*lang, els) || lang.contains_hoisted_decl(els) {
                         return None;
                     }
                 }
@@ -155,6 +168,13 @@ impl<L: Lang> Rule<L> for ConstCondition {
                 let then = *ch.get(1)?;
                 if contains_yield(&*lang, then) {
                     return None;
+                }
+                // 选中的 else 含可提升声明 → 搬出分支改变初始化时机
+                //（Test262 annexB if-decl-else-decl 家族抓获）
+                if let Some(&els) = ch.get(2) {
+                    if lang.contains_hoisted_decl(els) {
+                        return None;
+                    }
                 }
                 let els = ch.get(2).copied();
                 if let (Some(parent), Some(index)) = (walk.parent(id), walk.index(id)) {
@@ -565,11 +585,25 @@ impl<L: Lang> Rule<L> for DeadDecl {
         if lang.kind(id) != NodeKind::VarDecl {
             return None;
         }
+        if !lang.dead_decl_allowed(id) {
+            return None;
+        }
         let ch = lang.children(id).to_vec();
         // 有 init：V 的求值会被一并删除——仅纯/只读可删（MayThrow 不行：
         // `int x = 1/0;` 删掉会失去异常）
         if let Some(&v) = ch.first() {
             if lang.effect(v) > Effect::MayRead {
+                return None;
+            }
+            if lang.value_may_throw_unresolved(v) {
+                return None;
+            }
+            // 自引用 init（JS TDZ：`let x = x + 1` 抛 ReferenceError）——
+            // 删除声明会吞掉异常（Test262 let/const use-before-init 抓获）。
+            let name_s = lang.var_name(id).unwrap_or("");
+            if subtree_contains(&*lang, v, |n| {
+                lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name_s)
+            }) {
                 return None;
             }
         }
@@ -587,6 +621,10 @@ impl<L: Lang> Rule<L> for DeadDecl {
         let name_str = lang.var_name(id)?.to_string();
         let name_key = lang.var_key(id)?;
         for &s in &stmts[idx + 1..] {
+            // 原文/类体可能读该名字（不可见）→ 不可判定零用途
+            if lang.stmt_has_opaque_region(s) {
+                return None;
+            }
             match (lang.stmt_mentions(s, name_key), lang.stmt_opaque(s)) {
                 (Some(mentions), Some(opaque)) => {
                     // Any VarRef (including event-blind write targets),
@@ -683,6 +721,12 @@ impl<L: Lang> Rule<L> for AssignBackFold {
                     referenced || w.opaque || w.shadowed
                 }
             };
+            // 不透明区间（原文/类表达式/未知调用）可能读 x——不可折回
+            //（Test262 TypedArray speciesctor：class 体内读 flag，
+            // 折回把 `flag=false; …; flag=true` 变成声明即 true）
+            if lang.effect(s) == Effect::Unknown {
+                return None;
+            }
             if !touched {
                 continue; // 与 x 无关的语句，跳过
             }
@@ -978,6 +1022,9 @@ impl<L: Lang> Rule<L> for LocalPropagation {
             return None;
         }
 
+        if !lang.local_propagation_value_ok(id, value) {
+            return None;
+        }
         // 扫描 decl 之后的区域（用途/遮蔽全区间；写冲突窗口见下）。
         // 句法引用计数兜底事件盲区：赋值目标内的读（t[k]=… 的 t）
         // 对事件索引不可见——bd.java 差分抓获：load 被替换而 store
@@ -1003,7 +1050,7 @@ impl<L: Lang> Rule<L> for LocalPropagation {
                     let mut n = 0usize;
                     count_var_refs(&*lang, st, &name_str, &mut n);
                     let cap = subtree_contains(&*lang, st, |n| {
-                        if lang.kind(n) == NodeKind::Lambda {
+                        if lang.is_function_like(n) {
                             return subtree_contains(&*lang, n, |m| {
                                 lang.kind(m) == NodeKind::VarRef
                                     && lang.var_name(m) == Some(name_str.as_str())
@@ -1025,6 +1072,10 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         }
         let mut wa = Watch::<L>::new(name_key, &[]);
         for &s in &stmts[index + 1..] {
+            // 类体/原文里的读不可见——声明删除会让其悬挂
+            if lang.stmt_has_opaque_region(s) {
+                return None;
+            }
             scan_region(&*lang, s, &mut wa);
         }
         if wa.opaque || wa.shadowed || wa.uses.len() != 1 {
@@ -1463,6 +1514,14 @@ fn straight_path<L: Lang>(lang: &L, root: L::Id, target: L::Id) -> bool {
 //   x && false → false / x || true → true（x 的求值被丢弃，需 effect ≤ MayRead）
 // ---------------------------------------------------------------------------
 
+/// id 是否位于标签模板 tag 位（Custom(Template) 的 child 0）。
+fn in_tag_position<L: Lang>(lang: &L, walk: &crate::walk::Walk<L>, id: L::Id) -> bool {
+    let Some((p, i)) = walk.parents.get(&id) else { return false };
+    *i == 0
+        && lang.kind(*p) == NodeKind::Custom(1) // custom::TEMPLATE
+        && lang.is_tagged_template(*p)
+}
+
 pub struct BoolShortCircuit;
 
 impl<L: Lang> Rule<L> for BoolShortCircuit {
@@ -1473,13 +1532,24 @@ impl<L: Lang> Rule<L> for BoolShortCircuit {
         &[NodeKind::Binary]
     }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
-        let RewriteCtx { lang, walk: _ } = ctx;
+        let RewriteCtx { lang, walk } = ctx;
         if lang.kind(id) != NodeKind::Binary {
             return None;
         }
         let op = lang.bin_op(id)?;
         if !op.is_short_circuit() {
             return None;
+        }
+        // `delete (a && b)` 的 delete 语义是「非引用 → true」，折叠成
+        // `delete b` 会真的尝试删除（返回值改变）；
+        // 标签位折臂会改变 tag 的 Reference/this 绑定。
+        if in_tag_position(&*lang, &walk, id) {
+            return None;
+        }
+        if let Some((p, i)) = walk.parents.get(&id) {
+            if *i == 0 && lang.kind(*p) == NodeKind::Unary && lang.un_op(*p) == Some(UnOp::Delete) {
+                return None;
+            }
         }
         let ch = lang.children(id);
         let (l, r) = (*ch.first()?, *ch.get(1)?);
@@ -1493,11 +1563,18 @@ impl<L: Lang> Rule<L> for BoolShortCircuit {
             _ => {
                 // 右侧字面量：x && true → x / x || false → x（x 保留求值，恒安全）；
                 // x && false → false / x || true → true（x 的求值被丢弃，需可丢弃）
+                // x && true → x / x || false → x **仅当 x 是布尔值**：
+                // JS 里 `sym && true` 对 truthy 的非布尔 x 返回 true 而不是
+                // x（Test262 logical-and/symbol 抓获；Java 类型系统恒真）。
                 match (op, is_lit(r, true), is_lit(r, false)) {
-                    (BinOp::And, true, _) => l,
-                    (BinOp::Or, _, true) => l,
+                    (BinOp::And, true, _) if lang.is_bool(l) => l,
+                    (BinOp::Or, _, true) if lang.is_bool(l) => l,
+                    // x && false → false / x || true → true **仅当 x 布尔**：
+                    // JS 里 truthy/falsy 非布尔 x 返回 x（`null && false`
+                    // === null），且未解析引用求值会抛 ReferenceError
+                    //（Test262 logical 家族抓获）
                     (BinOp::And, _, true) | (BinOp::Or, true, _)
-                        if lang.effect(l) <= Effect::MayRead => {
+                        if lang.is_bool(l) && lang.effect(l) <= Effect::MayRead => {
                             r
                         }
                     _ => return None,
@@ -1595,6 +1672,9 @@ impl<L: Lang> Rule<L> for TernaryFold {
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk } = ctx;
         if lang.kind(id) != NodeKind::Ternary {
+            return None;
+        }
+        if in_tag_position(&*lang, &walk, id) {
             return None;
         }
         let ch = lang.children(id);
@@ -1728,8 +1808,13 @@ impl<L: Lang> Rule<L> for ArithZero {
         let (l, r) = (*ch.first()?, *ch.get(1)?);
         let int_lit = |n: L::Id, v: i64| lang.literal(n).and_then(|x| x.as_int()) == Some(v);
 
-        // 移位 0：x << 0 → x（恒等）
+        // 移位 0：x << 0 → x（恒等）。**需精确整数域**：JS 的移位是
+        // ToInt32 胁迫——`-4294967295 << 0 === 1` 而非原值（Test262
+        // left-shift 族抓获）。Java 的 int/long 解析为真 → 中性。
         if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::UShr) && int_lit(r, 0) {
+            if !lang.is_exact_int(l) {
+                return None;
+            }
             return Some(Edit::Replace {
                 target: id,
                 with: l,
@@ -1938,6 +2023,11 @@ impl<L: Lang> Rule<L> for DeadStore {
             }
             _ => return None,
         };
+        if decl_form && !lang.dead_decl_allowed(id) {
+            // 声明形态的死存储删除同受语言侧约束（TS 的 let/const 删除
+            // 改变 TDZ/词法遮蔽——annexB block-decl 家族抓获）
+            return None;
+        }
         let first_value = if decl_form {
             *lang.children(id).first()?
         } else {
@@ -1947,6 +2037,9 @@ impl<L: Lang> Rule<L> for DeadStore {
             }
             *lang.children(a).get(1)?
         };
+        if lang.value_may_throw_unresolved(first_value) {
+            return None;
+        }
 
         // 父 Block + 相邻下一条语句
         let parent = walk.parent(id)?;
@@ -2010,6 +2103,14 @@ impl<L: Lang> Rule<L> for DeadStore {
             if !declared_in_this_block {
                 return None;
             }
+            // 块内**之前**的原文/类体可能捕获该名字并在之后调用时读
+            //（`class A{constructor(){flag…}}; flag=true; new A()`——
+            // 之后语句看不到类体里的读；Test262 TypedArray 家族抓获）
+            for &s in &stmts[..idx] {
+                if lang.stmt_has_opaque_region(s) {
+                    return None;
+                }
+            }
             let name_key0 = lang.var_key(name_node)?;
             // Indexed: a statement that neither mentions the name (any
             // VarRef, including event-blind assignment targets, or a
@@ -2017,6 +2118,9 @@ impl<L: Lang> Rule<L> for DeadStore {
             // write or shadow it. The recursive event scan remains the
             // fallback for unindexed nodes.
             for &s in &stmts[idx + 1..] {
+                if lang.stmt_has_opaque_region(s) {
+                    return None;
+                }
                 match (lang.stmt_mentions(s, name_key0), lang.stmt_opaque(s)) {
                     (Some(mentions), Some(opaque)) => {
                         if mentions || opaque {
@@ -2134,6 +2238,10 @@ impl<L: Lang> Rule<L> for BlockFlatten {
             )
         };
         if inner.iter().any(|&s| declares(s)) {
+            return None;
+        }
+        // JS：直接孩子的函数声明同理（Annex B 提升/初始化时机改变）
+        if lang.block_hoists_decl(id) {
             return None;
         }
         // 模式绑定流作用域（R15 三角化根因 1——BindingsTest1 抓获）：
@@ -2766,6 +2874,9 @@ impl<L: Lang> Rule<L> for AssignPropagation {
         }
         let mut wa = Watch::<L>::new(name_key, &[]);
         for &s in &stmts[idx + 1..] {
+            if lang.stmt_has_opaque_region(s) {
+                return None;
+            }
             scan_region(&*lang, s, &mut wa);
         }
         if wa.opaque || wa.shadowed || wa.uses.len() != 1 {
@@ -3448,6 +3559,12 @@ impl<L: Lang> Rule<L> for StoreKill {
         // 扫描：读（任意路径）→ 保活；支配写 → 击杀；条件写 → 继续
         let mut killed_by: Option<(usize, L::Id)> = None;
         for (si, &s) in stmts.iter().enumerate().skip(idx + 1) {
+            // 原文/类体等不可见区域可能读本变量——击杀不得跨越
+            //（Test262 TypedArray：class 构造器读 flag，首个 store 被杀，
+            // flag 变成声明即 true）
+            if lang.stmt_has_opaque_region(s) {
+                return None;
+            }
             let event = lang
                 .stmt_kill_event(s, name_key)
                 .unwrap_or_else(|| scan_kill_event(&*lang, s, &name, true));

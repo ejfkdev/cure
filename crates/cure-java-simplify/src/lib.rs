@@ -1427,11 +1427,17 @@ impl Rule<JavaAst> for StaticExec {
             return None;
         }
         // 纯死段（无输出无逃逸整段删除）等历史形态由空 insert splice 承载
-        if edits.len() == 1 {
-            Some(edits.pop().unwrap())
+        let candidate = if edits.len() == 1 {
+            edits.pop().unwrap()
         } else {
-            Some(Edit::Multi(edits))
+            Edit::Multi(edits)
+        };
+        // 零降本提案（打印等价但成本相同的重排）在 release 会被引擎跳过，
+        // debug 断言会 panic。规则侧直接拒绝（BindingsTest1 语料抓获）。
+        if candidate.cost_reduction(lang) <= 0 {
+            return None;
         }
+        Some(candidate)
     }
 }
 

@@ -273,6 +273,57 @@ pub trait Lang {
     fn var_cast_position_ok(&self, _value: Self::Id, _typed: Self::Id) -> bool {
         true
     }
+    /// 子树是否含**可提升/条件初始化声明**（JS 的 `if (c) function f(){}`
+    /// ——Annex B：绑定被 var 提升但初始化条件化；搬移/删除该声明改变
+    /// 语义）。ConstCondition 的 then 解包 / else 丢弃需拒绝。
+    /// 默认 false（Java 无嵌套函数声明）。
+    fn contains_hoisted_decl(&self, _root: Self::Id) -> bool {
+        false
+    }
+    /// 块展开是否改变 Annex B 块级函数声明的提升语义（TS 判直接孩子；
+    /// Java 恒 false）。
+    fn block_hoists_decl(&self, _block: Self::Id) -> bool {
+        false
+    }
+    /// 是否为**标签模板**节点（tagged template literal）。标签位的
+    /// `this` 绑定取决于 tag 是 Reference 还是值——折臂/短路改写会
+    /// 改变 this（`(true ? obj.f : null)\`\`` vs `obj.f\`\``）。
+    fn is_tagged_template(&self, _id: Self::Id) -> bool {
+        false
+    }
+    /// 赋值目标位的 Paren 是否**语义显著**（JS 具名求值：`(fn) = function(){}`
+    /// 不推断 name，删括号会改变 Function.prototype.name）。
+    fn assign_target_paren_required(&self, _inner: Self::Id) -> bool {
+        false
+    }
+    /// 局部传播的值形态是否**稳定**（复制到使用点不改变求值时间语义）。
+    /// Java：任意表达式（类型系统/纯读假设——引擎既有扫描保证）。
+    /// JS：仅字面量（全局/闭包变量可在外层被改写；`var local2 = y; …
+    /// y 变化 …; return {local2}` 内联会读到新值——Test262 eval 家族抓获）。
+    fn local_propagation_value_ok(&self, _decl: Self::Id, _value: Self::Id) -> bool {
+        true
+    }
+    /// 语句子树是否含**规则不可见**的原文区域（Raw/类表达式/解构模式）。
+    fn stmt_has_opaque_region(&self, _stmt: Self::Id) -> bool {
+        false
+    }
+    /// 值子树是否读取**可能未解析**的名字（未声明全局 → 求值抛
+    /// ReferenceError）。死存储/死声明删除会把这次抛异常一并删掉
+    ///（JS `var o = {notDefined};`——Test262 object/not-defined 抓获）。
+    fn value_may_throw_unresolved(&self, _value: Self::Id) -> bool {
+        false
+    }
+    /// 声明删除规则（dead_decl）是否允许删除该声明。Java：允许；
+    /// TS：仅 `var`（let/const/using 的 TDZ/词法遮蔽/dispose 语义会因
+    /// 删除而改变——Test262 annexB block-decl 家族抓获）。
+    fn dead_decl_allowed(&self, _decl: Self::Id) -> bool {
+        true
+    }
+    /// 函数边界（λ 捕获扫描用）：Java 为 Lambda；TS 还含函数声明
+    /// （FuncStmt——`function i(){ use(x) }` 对 x 是按引用捕获）。
+    fn is_function_like(&self, id: Self::Id) -> bool {
+        self.kind(id) == NodeKind::Lambda
+    }
     /// Paren 的**语法必要性**（paren_removal 守卫）：该内层形态在
     /// 紧位置（二元/一元运算数位）是否必须带括号——产生式约束，
     /// 优先级序表达不了。JS：箭头/对象字面量/Raw 形态在运算数位

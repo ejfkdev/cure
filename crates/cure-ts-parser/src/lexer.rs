@@ -77,7 +77,11 @@ enum Prev {
 
 /// 正则引导关键字（后随表达式位置——`/re/` 可能）。
 const REGEX_LEAD: &[&str] = &[
-    "return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
+    // `of` 是上下文关键字（可作普通标识符——`a/of/g` 是除法链）；
+    // 若算作正则引导词，`instance/of/g` 会被词法成 `/g/` 正则
+    //（Test262 division/no-magic-asi 抓获）。`for (x of /re/)` 这种
+    // 极罕见形态牺牲掉（parser 容错）。
+    "return", "typeof", "instanceof", "in", "new", "delete", "void",
     "case", "do", "else", "yield", "await", "throw", "if", "while", "for",
     "switch", "try", "finally",
 ];
@@ -96,8 +100,19 @@ pub struct Lexer<'a> {
     last_brace_block: bool,
     /// 模板插值模式栈：每层的花括号深度（0 = 该层插值的 `}` 即终结）。
     template_stack: Vec<i32>,
-    /// `{` 块式栈（正则启发的 `}` 分支）。
-    brace_stack: Vec<bool>,
+    /// `{` 栈：(块式, 其后是否允许正则)。函数**表达式**体/对象字面量
+    /// 之后是除法；语句块/函数声明体/类声明体之后可起正则语句。
+    brace_stack: Vec<(bool, bool)>,
+    /// 括号栈（记录每个 `(` 之前的 token 文本——判定 `)` 后 `{` 是否
+    /// 控制语句体：if/for/while/switch/catch/with）。
+    parens: Vec<String>,
+    last_close_paren_pre: String,
+    /// 最近一个 `function` 是否为表达式形态（Some 表示等待其体 `{`）。
+    pending_fn: Option<bool>,
+    /// 最近一个 `class` 是否为表达式形态。
+    pending_class: Option<bool>,
+    /// 最近闭合的 `}` 之后是否允许正则。
+    last_brace_regex: bool,
     errors: Vec<LexError>,
 }
 
@@ -113,6 +128,11 @@ impl<'a> Lexer<'a> {
             last_brace_block: true,
             template_stack: Vec::new(),
             brace_stack: Vec::new(),
+            parens: Vec::new(),
+            last_close_paren_pre: String::new(),
+            pending_fn: None,
+            pending_class: None,
+            last_brace_regex: false,
             errors: Vec::new(),
         }
     }
@@ -182,8 +202,18 @@ impl<'a> Lexer<'a> {
                 return newline;
             }
             match self.peek() {
-                b' ' | b'\t' | b'\r' | 0x0b | 0x0c => {
+                b' ' | b'\t' | 0x0b | 0x0c => {
                     self.pos += 1;
+                }
+                b'\r' => {
+                    // CR / CRLF 是 LineTerminator（ASI/return/break 判定
+                    // 依赖）：曾当普通空白 → `return\r1` 被拼成 return 1
+                    //（Test262 line-terminators 家族抓获）
+                    newline = true;
+                    self.bump();
+                    if !self.at_end() && self.peek() == b'\n' {
+                        self.bump();
+                    }
                 }
                 c2 if c2 >= 0x80 => {
                     // Unicode 空白（NBSP/U+2028/U+FEFF 等）：解码判定
@@ -193,7 +223,10 @@ impl<'a> Lexer<'a> {
                         .chars()
                         .next()
                         .unwrap_or('\u{fffd}');
-                    if ch.is_whitespace() || ch == '\u{feff}' {
+                    if ch == '\u{2028}' || ch == '\u{2029}' {
+                        newline = true;
+                        self.pos = end;
+                    } else if ch.is_whitespace() || ch == '\u{feff}' {
                         self.pos = end;
                     } else {
                         return newline;
@@ -310,22 +343,46 @@ impl<'a> Lexer<'a> {
         let text: String;
         match c {
             b'{' => {
-                let block_like = self.brace_block_like();
-                self.last_brace_block_push(block_like);
+                // 块式 + 「其后可否起正则」判定：
+                // - function/class 体按关键字出现位置区分声明 vs 表达式
+                // - 控制语句（if/for/…）的 `{` 后可起正则
+                // - 块语句/对象字面量按上下文
+                let (block_like, regex_after);
+                if let Some(expr) = self.pending_fn.take() {
+                    block_like = true;
+                    regex_after = !expr;
+                } else if let Some(expr) = self.pending_class.take() {
+                    block_like = true;
+                    regex_after = !expr;
+                } else if matches!(self.prev, Prev::CloseParen) {
+                    block_like = true;
+                    regex_after = matches!(
+                        self.last_close_paren_pre.as_str(),
+                        "if" | "for" | "while" | "switch" | "catch" | "with"
+                    );
+                } else {
+                    block_like = self.brace_block_like();
+                    regex_after = block_like && self.prev_text.as_str() != "=>";
+                }
+                self.brace_stack.push((block_like, regex_after));
+                self.last_brace_block = block_like;
                 self.bump();
                 kind = TokKind::Punct;
                 text = "{".to_string();
                 self.set_prev(Prev::Punct, "{");
             }
             b'}' => {
-                self.last_brace_block = self.pop_brace_kind();
+                if let Some((b, rx)) = self.brace_stack.pop() {
+                    self.last_brace_block = b;
+                    self.last_brace_regex = rx;
+                }
                 self.bump();
                 kind = TokKind::Punct;
                 text = "}".to_string();
                 self.set_prev(Prev::CloseBrace, "}");
             }
             b'/' => {
-                if self.regex_allowed() {
+                if self.regex_allowed(newline) {
                     let r = self.scan_regex();
                     self.set_prev(Prev::Regex, "");
                     let end = self.pos;
@@ -379,17 +436,11 @@ impl<'a> Lexer<'a> {
                     if c == b'\\' && self.peek2() == b'u' {
                         match decode_unicode_escape(self.src, self.pos + 1) {
                             Some((ch, len)) => {
-                                // 白名单与高字节分支**严格一致**（含 ZWJ/
-                                // ZWNJ 续接符——`‌` 曾因两分支白名单
-                                // 不一致被本分支 break 且零消费——空 ident
-                                // token 无限累积 → 100GB OOM，test262
-                                // unicode-property-names 抓获）
-                                if !(ch.is_alphanumeric()
-                                    || ch == '_'
-                                    || ch == '$'
-                                    || ch == '\u{200c}'
-                                    || ch == '\u{200d}')
-                                {
+                                // 白名单与字节分支一致：非空白即可
+                                // （Unicode ID 表无法零依赖内置——℘ 等
+                                // Other_ID_Start 必须放行；本分支曾较窄
+                                // 而零消费 → 100GB OOM + 其成员名崩塌）
+                                if ch.is_whitespace() {
                                     break;
                                 }
                                 word.push(ch);
@@ -420,9 +471,21 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 let word = word;
-                self.pos = self.pos;
                 kind = TokKind::Ident;
                 text = word.clone();
+                if word == "function" || word == "class" {
+                    // 声明 vs 表达式：语句起点后是声明；否则是表达式
+                    let stmt_start = matches!(self.prev, Prev::Start | Prev::CloseBrace)
+                        || (matches!(self.prev, Prev::Punct)
+                            && matches!(self.prev_text.as_str(), ";" | "{" | "}" | ":"))
+                        || (matches!(self.prev, Prev::Keyword)
+                            && matches!(self.prev_text.as_str(), "else" | "do" | "try" | "finally"));
+                    if word == "function" {
+                        self.pending_fn = Some(!stmt_start);
+                    } else {
+                        self.pending_class = Some(!stmt_start);
+                    }
+                }
                 self.set_prev(
                     if REGEX_LEAD.contains(&word.as_str()) {
                         Prev::Keyword
@@ -434,6 +497,19 @@ impl<'a> Lexer<'a> {
             }
             _ => {
                 let p = self.scan_punct();
+                let pre = self.prev_text.clone();
+                match p.as_str() {
+                    "(" => self.parens.push(pre),
+                    ")" => {
+                        self.last_close_paren_pre = self.parens.pop().unwrap_or_default();
+                    }
+                    ";" => {
+                        // 无体的 function/class 声明（TS declare 等）
+                        self.pending_fn = None;
+                        self.pending_class = None;
+                    }
+                    _ => {}
+                }
                 kind = TokKind::Punct;
                 self.set_prev(
                     match p.as_str() {
@@ -499,17 +575,22 @@ impl<'a> Lexer<'a> {
 
     /// 块式栈（`{` 压入、`}` 弹出）。
     fn last_brace_block_push(&mut self, block_like: bool) {
-        self.brace_stack.push(block_like);
+        self.brace_stack.push((block_like, false));
     }
     fn pop_brace_kind(&mut self) -> bool {
-        self.brace_stack.pop().unwrap_or(true)
+        self.brace_stack.pop().map(|(b, _)| b).unwrap_or(true)
     }
 
     /// 正则启发式。
-    fn regex_allowed(&self) -> bool {
+    fn regex_allowed(&self, newline: bool) -> bool {
         match self.prev {
             Prev::Start | Prev::Keyword | Prev::Template => true,
-            Prev::CloseBrace => self.last_brace_block,
+            // `}` 后按**除法**处理：函数表达式体/对象字面量后的 `/`
+            // 绝大多数是除法（`{} / f()`）；块后行首正则极罕见。
+            // `}` 后：换行 = 语句边界（正则可起始语句——
+            // statementList/block-regexp-literal 族）；同行 = 表达式
+            // 继续（`{} / f()` 除法——division 家族）。
+            Prev::CloseBrace => self.last_brace_regex,
             // 后缀 ++/-- 是表达式结尾 → 除法；`<` 后是 JSX 闭标签/
             // 泛型（不可能是除法左操作数）→ 拒绝正则；其余标点开
             // 表达式 → 正则
@@ -542,10 +623,28 @@ impl<'a> Lexer<'a> {
                 b'\\' => {
                     self.bump();
                     if !self.at_end() {
-                        let e = self.bump();
-                        q.push('\\');
-                        q.push(if e == b'\r' { '\r' } else { e as char });
-                        // CR LF 保持原文（打印机保真）
+                        let e = self.peek();
+                        if e == b'\r' {
+                            self.bump();
+                            q.push_str("\\\r");
+                            if !self.at_end() && self.peek() == b'\n' {
+                                self.bump();
+                                q.push('\n');
+                            }
+                        } else if e >= 0x80 {
+                            // 多字节转义字符整段拷贝（逐字节 as char 会
+                            // 产出 mojibake——Test262 tv-line-continuation
+                            // 的 U+2028 抓获）
+                            let l = utf8_len(e);
+                            let end = (self.pos + l).min(self.src.len());
+                            q.push('\\');
+                            q.push_str(&String::from_utf8_lossy(&self.src[self.pos..end]));
+                            self.pos = end;
+                        } else {
+                            self.bump();
+                            q.push('\\');
+                            q.push(e as char);
+                        }
                     } else {
                         q.push('\\');
                     }
@@ -581,7 +680,22 @@ impl<'a> Lexer<'a> {
             if c == b'\\' {
                 self.bump();
                 if !self.at_end() {
-                    self.bump();
+                    let e = self.peek();
+                    if e == b'\r' {
+                        // LineContinuation: backslash + CR [LF]
+                        self.bump();
+                        if !self.at_end() && self.peek() == b'\n' {
+                            self.bump();
+                        }
+                    } else if e == b'\n' {
+                        self.bump();
+                    } else if e >= 0x80 {
+                        // 多字节字符（U+2028/2029 等）整段消费
+                        let l = utf8_len(e);
+                        self.pos = (self.pos + l).min(self.src.len());
+                    } else {
+                        self.bump();
+                    }
                 }
                 continue;
             }
