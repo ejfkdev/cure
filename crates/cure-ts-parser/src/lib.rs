@@ -227,10 +227,14 @@ impl<'a> Parser<'a> {
             deco_raw.push_str(&self.raw_between(start, self.pos));
             deco_raw.push(' ');
         }
-        if self.is_kw("import") {
-            let start = self.pos;
-            self.skip_balanced_to_stmt_boundary();
-            let raw = self.raw_between(start, self.pos);
+        // 仅**静态** import 语句走原文捕获；`import(...)`（动态导入）
+        // 与 `import.meta` 是表达式（曾有 `.then` 被拆成残句——
+        // Test262 dynamic-import/import-attributes 家族抓获）。
+        if self.is_kw("import")
+            && !self.is_punct_at(1, "(")
+            && !self.is_punct_at(1, ".")
+        {
+            let raw = self.capture_module_stmt();
             self.unit.items.push(TopItem::Import(raw));
             return;
         }
@@ -282,11 +286,14 @@ impl<'a> Parser<'a> {
         self.advance(); // export
         if self.is_kw("default") {
             self.advance();
-            if let Some(f) = self.try_parse_function_decl(String::new(), true) {
+            // `export default function [name](){}`——default 关键字随
+            // sig 原文保留（匿名默认导出曾丢 default 变成非法
+            // `export function() {}`）
+            if let Some(f) = self.try_parse_function_decl("export default".into(), false) {
                 self.unit.items.push(f);
                 return;
             }
-            if let Some(c) = self.try_parse_class_decl(String::new()) {
+            if let Some(c) = self.try_parse_class_decl("export default".into()) {
                 self.unit.items.push(TopItem::Class(c));
                 return;
             }
@@ -316,15 +323,66 @@ impl<'a> Parser<'a> {
             return;
         }
         if self.is_kw("class") || (self.is_kw("abstract") && self.tk_at(1).text == "class") {
-            if let Some(c) = self.try_parse_class_decl(deco_raw) {
+            let mut pre = deco_raw;
+            pre.push_str("export");
+            if let Some(c) = self.try_parse_class_decl(pre) {
                 self.unit.items.push(TopItem::Class(c));
                 return;
             }
         }
-        let start = kw_pos;
-        self.skip_balanced_to_stmt_boundary();
-        let raw = self.raw_between(start, self.pos);
+        let raw = self.capture_module_stmt_from(kw_pos);
         self.unit.items.push(TopItem::ExportRaw(raw));
+    }
+
+    /// import/export 语句原文捕获：支持行首 `with`/`assert` 导入属性
+    /// 子句（ASI 在 `with` 前不生效）；其余行终止符按 ASI 结束语句。
+    fn capture_module_stmt(&mut self) -> String {
+        let start = self.pos;
+        self.capture_module_stmt_from(start)
+    }
+
+    fn capture_module_stmt_from(&mut self, start: usize) -> String {
+        let mut depth = 0i32;
+        let mut first = true;
+        // 导入属性子句（`with {…}`）内允许任意换行（ASI 不适用——
+        // Test262 import-attribute-newlines 抓获：`with` 与 `{`/属性
+        // 名/值之间都可换行）
+        let mut attrs = false;
+        loop {
+            if self.at_eof() {
+                break;
+            }
+            let t = self.tk().clone();
+            if !first && depth == 0 {
+                if t.kind == TokKind::Punct && t.text == ";" {
+                    self.advance();
+                    break;
+                }
+                if !attrs
+                    && t.newline_before
+                    && !(t.kind == TokKind::Ident
+                        && matches!(t.text.as_str(), "with" | "assert"))
+                {
+                    break;
+                }
+            }
+            first = false;
+            if depth == 0
+                && t.kind == TokKind::Ident
+                && matches!(t.text.as_str(), "with" | "assert")
+            {
+                attrs = true;
+            }
+            if t.kind == TokKind::Punct {
+                match t.text.as_str() {
+                    "{" | "(" | "[" => depth += 1,
+                    "}" | ")" | "]" => depth -= 1,
+                    _ => {}
+                }
+            }
+            self.advance();
+        }
+        self.raw_between(start, self.pos)
     }
 
     /// 平衡扫描到语句边界（`;`/同层 `}`/EOF；深度感知）。
@@ -448,14 +506,15 @@ impl<'a> Parser<'a> {
 
     fn try_parse_class_decl(&mut self, deco_raw: String) -> Option<ClassDecl> {
         let start = self.pos;
-        let mut head = String::new();
+        let mut prefix = String::new();
         if !deco_raw.is_empty() {
-            head = deco_raw;
-            head.push(' ');
+            prefix.push_str(deco_raw.trim_end());
+            prefix.push(' ');
         }
+        let mut head = String::new();
         let mut kind_kw = String::new();
         if self.is_kw("abstract") && self.tk_at(1).text == "class" {
-            head.push_str("abstract ");
+            prefix.push_str("abstract ");
             self.advance();
         }
         if self.is_kw("class") {
@@ -540,7 +599,7 @@ impl<'a> Parser<'a> {
         if self.is_punct("}") {
             self.advance();
         }
-        Some(ClassDecl { head_raw: head, kind_kw, name, members })
+        Some(ClassDecl { prefix, head_raw: head, kind_kw, name, members })
     }
 
     fn parse_class_member(&mut self) -> Option<ClassMember> {
@@ -1344,6 +1403,14 @@ impl<'a> Parser<'a> {
                 is_await,
             );
         }
+        // 经典 for 头以 `await using` 声明开头（资源在每轮末异步释放）：
+        // 整条 for 原文保真（表达式级改写会拆散 head 的 `;`——
+        // Test262 await-using forstatement 家族 SyntaxError 抓获）
+        if self.is_kw("await") && self.tk_at(1).text == "using" {
+            self.pos = for_pos;
+            self.skip_balanced_to_stmt_boundary();
+            return self.ast.raw(&self.raw_between(for_pos, self.pos));
+        }
         // 经典 for：init（声明已含 `;` 消费）
         let mut inits: Vec<TsId> = Vec::new();
         if !self.is_punct(";") {
@@ -1937,7 +2004,6 @@ impl<'a> Parser<'a> {
         self.is_punct_at(1, "(")
             || self.is_punct_at(1, ".")
             || self.is_punct_at(1, "=")
-            || self.is_punct_at(1, "[")
             || self.is_punct_at(1, ",")
             || self.is_punct_at(1, ";")
             || self.is_punct_at(1, ")")

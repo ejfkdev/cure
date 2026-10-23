@@ -5,6 +5,37 @@
 
 ## [Unreleased]
 
+### 验证（TS/JS 编译差分——2026-10-23 第四批）
+
+- **Test262 全量编译差分**（`examples/t262_compile` +
+  `tests/t262_compile.rs` + `scripts/t262_compile_driver.mjs`）：全部
+  49,266 个文件（含 async/module/negative）解析→简化→打印后，原版与
+  cure 输出各自在 node 中编译（script `vm.Script` / module
+  `vm.SourceTextModule`，只编译不执行）。**49,165 个合法原版文件在
+  cure 后全部仍可编译（0 破坏）**。负向语法用例不计入断言（容错输出
+  重新可编译不属于语义保持面）。抽样 1200 例已固化为常驻测试。
+- 全量分块（`T262_OFFSET/T262_LIMIT`）避免一次性构建 5 万用例占内存。
+
+### 修复（编译差分驱动——ESM/Annex B 语法）
+
+- **Annex B HTML 注释**：`<!--`（任意位置）与行首 `-->`（含前导
+  多行注释内含行终止符的 `0/*\n*/-->` 形态）按注释跳过——曾把
+  `-->` 解析成 `--`/`>` 残句（annexB comments 家族 7 例 SyntaxError）。
+- **ESM 头部**：`export default class/function` 保留 `export default`
+  （匿名默认导出曾丢 default 变成非法 `export function() {}`）；
+  `export * from …` 不再丢 `export`（raw 捕获起始位）；
+  `ClassDecl` 新增 `prefix` 字段承载装饰器/export/default/abstract。
+- **动态导入**：顶层 `import(...)` / `import.meta` 不再被当静态 import
+  原文捕获（`.then` 链曾被拆散）；静态 import/export 原文捕获支持
+  跨行导入属性 `with {…}`（属性子句内换行不触发 ASI）。
+- **顶层 await**：`await [..]` 按一元 await 解析（曾走标识符索引路径
+  产出 `await[]]`）；`for (await using …; …; …)` 经典 for 头整条原文
+  保真（await-using forstatement 家族 SyntaxError）。
+- **规则锚点守卫**：`fold_root` 对 VarDecl init 根逐个规则直调（绕过
+  kind 分派）——`ts_try_cleanup` 等 ported 规则补 `kind(id)` 自证，
+  曾把 `await function() {}` 的 init 一路替换成函数体 `Block`
+  （输出 `/*?*/`）。
+
 ### 验证（TS/JS 语义差分——2026-10-23 第三批）
 
 - **Test262 语义差分常驻化**：`crates/cure-ts-simplify/tests/t262_sem.rs`

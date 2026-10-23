@@ -1116,6 +1116,9 @@ impl Rule<TsAst> for TsConstPropagate {
         &[NodeKind::VarRef]
     }
     fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
+        if ctx.lang.kind(id) != NodeKind::VarRef {
+            return None;
+        }
         // 目标位检查先行（ctx 借用结束后再拿 lang 的可变借用）
         if let Some(p) = ctx.parent(id) {
             let k = ctx.lang.kind(p);
@@ -1175,6 +1178,9 @@ impl Rule<TsAst> for TsStaticArrayIndex {
     }
     fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
         let RewriteCtx { lang, .. } = ctx;
+        if lang.kind(id) != NodeKind::Index {
+            return None;
+        }
         let ch = lang.children(id).to_vec();
         if ch.len() != 2 {
             return None;
@@ -1281,6 +1287,9 @@ impl Rule<TsAst> for TsMemberUnquote {
     }
     fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
         let RewriteCtx { lang, .. } = ctx;
+        if lang.kind(id) != NodeKind::Member {
+            return None;
+        }
         if matches!(lang.data(id), NodeData::Index { optional: true }) {
             return None;
         }
@@ -1324,6 +1333,9 @@ impl Rule<TsAst> for TsInlineFunc {
     }
     fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
         let RewriteCtx { lang, .. } = ctx;
+        if lang.kind(id) != NodeKind::Call {
+            return None;
+        }
         if matches!(lang.data(id), NodeData::Call { optional: true }) {
             return None;
         }

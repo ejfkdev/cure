@@ -287,8 +287,11 @@ pub enum TopItem {
 /// 类形态声明（class/interface/enum/namespace——head_raw 保真全部头部）。
 #[derive(Clone, PartialEq, Debug)]
 pub struct ClassDecl {
-    /// `export default abstract class Foo<T> extends Bar implements Baz`——
-    /// 除 class 关键字外的全部头部原文（含装饰器）。
+    /// class 关键字**之前**的原文（装饰器 / `export` / `export default` /
+    /// `abstract`）。
+    pub prefix: String,
+    /// class 关键字与名字**之后**的头部原文（类型参数 / extends /
+    /// implements）。
     pub head_raw: String,
     /// class/interface/enum/namespace 关键字本身（打印用）。
     pub kind_kw: String,

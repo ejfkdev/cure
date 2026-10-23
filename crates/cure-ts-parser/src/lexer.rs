@@ -113,6 +113,9 @@ pub struct Lexer<'a> {
     pending_class: Option<bool>,
     /// 最近闭合的 `}` 之后是否允许正则。
     last_brace_regex: bool,
+    /// 当前是否处于「行首」（自上次行终止符以来只有空白/注释）。
+    /// Annex B HTML 闭合注释 `-->` 只在此位置生效。
+    at_line_start: bool,
     errors: Vec<LexError>,
 }
 
@@ -133,6 +136,7 @@ impl<'a> Lexer<'a> {
             pending_fn: None,
             pending_class: None,
             last_brace_regex: false,
+            at_line_start: true,
             errors: Vec::new(),
         }
     }
@@ -210,6 +214,7 @@ impl<'a> Lexer<'a> {
                     // 依赖）：曾当普通空白 → `return\r1` 被拼成 return 1
                     //（Test262 line-terminators 家族抓获）
                     newline = true;
+                    self.at_line_start = true;
                     self.bump();
                     if !self.at_end() && self.peek() == b'\n' {
                         self.bump();
@@ -225,6 +230,7 @@ impl<'a> Lexer<'a> {
                         .unwrap_or('\u{fffd}');
                     if ch == '\u{2028}' || ch == '\u{2029}' {
                         newline = true;
+                        self.at_line_start = true;
                         self.pos = end;
                     } else if ch.is_whitespace() || ch == '\u{feff}' {
                         self.pos = end;
@@ -234,6 +240,7 @@ impl<'a> Lexer<'a> {
                 }
                 b'\n' => {
                     newline = true;
+                    self.at_line_start = true;
                     self.bump();
                 }
                 b'\\' if self.peek2() == b'\n' => {
@@ -247,6 +254,18 @@ impl<'a> Lexer<'a> {
                         self.pos += 1;
                     }
                 }
+                // Annex B HTML 注释：`<!--`（任意位置）与行首 `-->`
+                b'<' if self.src[self.pos..].starts_with(b"<!--") => {
+                    while !self.at_end() && self.peek() != b'\n' {
+                        self.pos += 1;
+                    }
+                }
+                b'-' if self.at_line_start && self.src[self.pos..].starts_with(b"-->") =>
+                {
+                    while !self.at_end() && self.peek() != b'\n' {
+                        self.pos += 1;
+                    }
+                }
                 b'/' if self.peek2() == b'*' => {
                     self.pos += 2;
                     while !self.at_end() {
@@ -254,8 +273,19 @@ impl<'a> Lexer<'a> {
                             self.pos += 2;
                             break;
                         }
-                        if self.peek() == b'\n' {
+                        if self.peek() == b'\n' || self.peek() == b'\r' {
                             newline = true;
+                            // 块注释内的行终止符同样开启「行首」——Annex B
+                            // 允许 `0/*\n*/-->` 的 HTML 闭合注释
+                            //（spec 的 LineTerminatorSequence 可落在前导
+                            // MultiLineComment 内；Test262 专门覆盖 V8 旧 bug）
+                            self.at_line_start = true;
+                        } else if self.peek() == 0xE2
+                            && self.peek2() == 0x80
+                            && matches!(self.src.get(self.pos + 2), Some(b'\xA8') | Some(b'\xA9'))
+                        {
+                            newline = true;
+                            self.at_line_start = true;
                         }
                         self.bump();
                     }
@@ -554,6 +584,8 @@ impl<'a> Lexer<'a> {
     }
 
     fn set_prev(&mut self, p: Prev, text: &str) {
+        // 任何真实 token 都结束行首状态（注释不经过 set_prev）
+        self.at_line_start = false;
         self.prev = p;
         if !text.is_empty() || matches!(p, Prev::Keyword) {
             self.prev_text = text.to_string();

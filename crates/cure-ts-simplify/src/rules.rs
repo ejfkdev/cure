@@ -1226,6 +1226,12 @@ impl Rule<TsAst> for TsTryCleanup {
     }
     fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
         let RewriteCtx { lang, .. } = ctx;
+        // fold_root 绕过 kind 分派（对 VarDecl init 根逐个规则直调）——
+        // 规则必须自证锚点形态（曾把 `await function(){}` 的 init
+        // 一路替换成函数体 Block）
+        if lang.kind(id) != NodeKind::Try {
+            return None;
+        }
         let ch = lang.children(id).to_vec();
         let try_block = *ch.first()?;
         let mut catch = None;
@@ -1292,6 +1298,9 @@ impl Rule<TsAst> for TsTrailingElseFlatten {
         true
     }
     fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
+        if ctx.lang.kind(id) != NodeKind::If {
+            return None;
+        }
         let parent = ctx.parent(id)?;
         let idx = ctx.index(id)?;
         let RewriteCtx { lang, .. } = ctx;
@@ -1442,6 +1451,9 @@ impl Rule<TsAst> for TsDeadPureCall {
     }
     fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
         let RewriteCtx { lang, .. } = ctx;
+        if lang.kind(id) != NodeKind::ExprStmt {
+            return None;
+        }
         let ch = lang.children(id).to_vec();
         if ch.len() != 1 || lang.kind(ch[0]) != NodeKind::Call {
             return None;

@@ -154,6 +154,11 @@ impl<'a> Printer<'a> {
 
     fn print_class(&mut self, c: &ClassDecl) {
         let head = c.head_raw.trim();
+        let prefix = c.prefix.trim();
+        if !prefix.is_empty() {
+            self.out.push_str(prefix);
+            self.out.push(' ');
+        }
         self.out.push_str(&c.kind_kw);
         if !c.name.is_empty() {
             self.out.push(' ');
