@@ -5,6 +5,18 @@
 
 ## [Unreleased]
 
+### 验证（TS/JS module 语义差分——2026-10-23 第六批）
+
+- **Test262 module 语义差分**（`examples/t262_module_sem` +
+  `tests/t262_module.rs` + `scripts/t262_module_driver.mjs`）：module
+  用例作为 ESM 在独立 vm 上下文链接（相对 fixture 由文件系统加载，
+  含 async module 的 `$DONE`/定时器）并求值——**358/358 个可执行用例
+  结果一致（0 失配）**，233 个原版自身失败（fixture/JSON 导入等）跳过。
+- 修复：块展开守卫把**原文语句（Raw）**视为潜在词法声明——
+  `{ await using z = …; }` 曾被展开合并作用域导致重复声明
+  SyntaxError（module/await-using 用例抓获）；await using 语句以
+  Raw 保真后必须阻止 BlockFlatten。
+
 ### 验证（TS/JS async 语义差分——2026-10-23 第五批）
 
 - **Test262 async 语义差分**（`examples/t262_async_sem` +

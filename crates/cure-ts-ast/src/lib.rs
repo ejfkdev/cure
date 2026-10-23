@@ -2349,6 +2349,10 @@ impl Lang for TsAst {
                 // declares 看不到）——展开会合并词法作用域
                 //（Test262 Iterator drop 双 let 解构变重复声明）
                 || matches!(self.data(c), NodeData::DestructStmt { .. })
+                // 原文语句可能声明词法绑定（`await using z = …` 以 Raw
+                // 保真）——展开块会合并作用域（await-using 模块用例
+                // 同块重复声明 SyntaxError 抓获）
+                || matches!(self.data(c), NodeData::Raw { .. })
                 || matches!(
                     self.data(c),
                     NodeData::VarDecl { kind: VarKind::Var | VarKind::Using, .. }
