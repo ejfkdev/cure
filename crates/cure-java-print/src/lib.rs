@@ -47,6 +47,8 @@ fn bin_prec(op: BinOp) -> u8 {
         Shl | Shr | UShr => prec::SHIFT,
         Add | Sub => prec::ADDITIVE,
         Mul | Div | Rem => prec::MULTIPLICATIVE,
+        // JS 专用符号（Java 打印器永不遇到——占位防穷尽失败）
+        Pow | Nullish | StrictEq | StrictNe | In | Instanceof => prec::MULTIPLICATIVE,
     }
 }
 
@@ -72,6 +74,13 @@ fn bin_symbol(op: BinOp) -> &'static str {
         BitOr => "|",
         And => "&&",
         Or => "||",
+        // JS 专用（Java 不可达——防穷尽失败的占位）
+        Pow => "**",
+        StrictEq => "===",
+        StrictNe => "!==",
+        Nullish => "??",
+        In => "in",
+        Instanceof => "instanceof",
     }
 }
 
@@ -90,6 +99,11 @@ fn un_symbol(op: UnOp) -> &'static str {
         UnOp::BitNot => "~",
         UnOp::PreInc | UnOp::PostInc => "++",
         UnOp::PreDec | UnOp::PostDec => "--",
+        // JS 专用（Java 不可达）
+        UnOp::TypeOf => "typeof ",
+        UnOp::Void => "void ",
+        UnOp::Delete => "delete ",
+        UnOp::Await => "await ",
     }
 }
 

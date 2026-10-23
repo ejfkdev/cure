@@ -191,14 +191,40 @@ pub enum BinOp {
     BitOr,
     And,
     Or,
+    // ---- JS 专用（语言映射词汇；Java 不产生）----
+    /// `**`（幂）。右结合且非结合律——重结合类规则须跳过。
+    Pow,
+    /// `===`（严格相等）。与 [`BinOp::Eq`]（宽松 `==`）语义不同：
+    /// 折叠规则必须按语言语义分别处理。
+    StrictEq,
+    /// `!==`（严格不等）。
+    StrictNe,
+    /// `??`（空值合并——**非短路布尔**：返回操作数值而非布尔）。
+    Nullish,
+    /// `in`（属性存在性，二元关系）。
+    In,
+    /// `instanceof`（JS 的二元运算形态，RHS 是任意表达式）。
+    Instanceof,
 }
 
 impl BinOp {
     pub fn is_comparison(self) -> bool {
-        matches!(self, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne)
+        matches!(
+            self,
+            BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::Eq
+                | BinOp::Ne
+                | BinOp::StrictEq
+                | BinOp::StrictNe
+                | BinOp::In
+                | BinOp::Instanceof
+        )
     }
     pub fn is_short_circuit(self) -> bool {
-        matches!(self, BinOp::And | BinOp::Or)
+        matches!(self, BinOp::And | BinOp::Or | BinOp::Nullish)
     }
     /// 可能因除零抛异常的运算。
     pub fn may_div_zero(self) -> bool {
@@ -229,6 +255,15 @@ pub enum UnOp {
     Not,
     Neg,
     BitNot,
+    // ---- JS 专用（语言映射词汇；Java 不产生）----
+    /// `typeof x`（值恒为字符串；对未声明变量**不抛**——效果 Pure）。
+    TypeOf,
+    /// `void x`（求值操作数、返回 undefined——效果含操作数）。
+    Void,
+    /// `delete x`（可能写：删属性）。
+    Delete,
+    /// `await x`（仅在 async 函数内；暂停语义——效果 Unknown）。
+    Await,
     /// 一元 `+`（数值提升——char/byte/short 提升 int；装箱类型改变
     /// `Object o = +c` → Integer 而非 Character）。恒等但**静态类型敏感**，
     /// 不可丢弃。

@@ -263,6 +263,16 @@ pub trait Lang {
     fn member_name(&self, _id: Self::Id) -> Option<&str> {
         None
     }
+    /// VarRef 值替换进 cast/instanceof 类型判定位后的**可编译性**裁决
+    /// （传播守卫）。引擎只判形状（沿 Paren 链首遇 Cast/InstanceOf，
+    /// 见 typed_position）——类型相容性归语言侧：值的声明类型未解析
+    /// （自由名——反编译残缺作用域常态）→ 未知类型可 cast 到任何
+    /// 引用类型，恒可编译；声明类型与目标类型同名 → 恒合法；其余
+    /// 交给语言的类型知识（Java：Object 任一侧放行，否则保守拒绝——
+    /// interface/子类关系不可判）。默认 true（无静态类型判定位的语言）。
+    fn var_cast_position_ok(&self, _value: Self::Id, _typed: Self::Id) -> bool {
+        true
+    }
     /// 节点**负载**等价（NodeData 中的非孩子字段：New.ty/anon_raw、
     /// Cast.ty、InstanceOf.ty/bind、Lambda.params_raw、VarDecl.ty 等）。
     /// structurally_equal 用——负载不比较曾把 `cond ? new FairSync() :

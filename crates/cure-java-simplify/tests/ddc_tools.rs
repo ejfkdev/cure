@@ -3,9 +3,11 @@
 //!   干净源码 → javac(--release 17) → d8(→DEX) → **ddc 反编译** → cure 净化
 //!   → 编译运行 → 与 ddc 输出的运行结果逐字节比对（语义保持）
 //!
-//! ddc 的去混淆能力弱于 jadx，输出大量寄存器拷贝 / 语句级 StringBuilder /
-//! while(true)+break / 迭代器未还原等产物——正是 cure 的目标素材。
-//! 实测：87 行 ddc 输出 → 45 行（-48%），输出行为一致。
+//! ddc 的去混淆能力弱于 jadx，输出寄存器拷贝 / 语句级临时变量 /
+//! while(true)+break 等产物——正是 cure 的目标素材。
+//! 注意：ddc 持续进化（本测试实测时为 0.1.33），输出已比 0.1.0 时代
+//! 干净得多（48 行 vs 87 行）——阈值须随 ddc 版本重校；本断言只保证
+//! 「净化实际发生」，语义保持断言才是本测试的核心价值。
 
 use std::fs;
 use std::path::Path;
@@ -159,8 +161,10 @@ fn ddc_real_pipeline_semantics_preserved() {
         100 - cured_lines * 100 / ddc_lines,
         report.edits
     );
-    // 净化必须实际发生（寄存器拷贝等产物被消除）
-    assert!(report.edits >= 10, "预期显著净化，实际 {} 次", report.edits);
+    // 净化必须实际发生（死存储消除等产物被清理）。
+    // ddc 0.1.33 输出显著变干净：≥3 处改写即证明管线在工作；
+    // 阈值漂移时优先怀疑 ddc 版本变化而非放宽语义守卫。
+    assert!(report.edits >= 3, "预期净化发生，实际 {} 次", report.edits);
 }
 
 fn strip_package(src: &str) -> String {
@@ -340,5 +344,5 @@ fn ddc_dual_layer_obfuscation() {
         100 - b * 100 / a,
         report.edits
     );
-    assert!(report.edits >= 10, "双层数预期显著净化，实际 {}", report.edits);
+    assert!(report.edits >= 3, "双层数预期净化发生，实际 {}", report.edits);
 }

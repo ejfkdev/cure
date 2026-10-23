@@ -1674,6 +1674,33 @@ impl Lang for JavaAst {
             _ => None,
         }
     }
+    fn var_cast_position_ok(&self, value: JavaId, typed: JavaId) -> bool {
+        // 值须为 VarRef（其余形态自带类型，不走本裁决）
+        if !matches!(self.data(value), NodeData::VarRef { .. }) {
+            return true;
+        }
+        // 声明类型未解析（自由名——反编译残缺作用域常态）→ 未知类型
+        // 可 cast 到任何引用类型，恒可编译（golden redundant_typed_cast：
+        // `String s = value; return (String) s;` → `(String) value` 保留）
+        let Some(d) = self.var_type(value).cloned() else {
+            return true;
+        };
+        let t = match self.data(typed) {
+            NodeData::Cast { ty } => ty.clone(),
+            NodeData::InstanceOf { ty, .. } => ty.clone(),
+            _ => return true,
+        };
+        if d == t {
+            return true;
+        }
+        // Object 任一侧 → cast/instanceof 恒合法；其余已解析的不同名
+        // 类型（基元混搭/两个具体引用）→ interface/子类关系不可判，
+        // 保守拒绝（ddc weixin dt/k 的原始守卫语义保持）
+        let obj = |ty: &JType| {
+            matches!(ty, JType::Ref(r) if r == "java.lang.Object" || r == "Object")
+        };
+        obj(&d) || obj(&t)
+    }
     fn is_field_name(&self, name: &str) -> bool {
         self.field_types.contains_key(name)
     }

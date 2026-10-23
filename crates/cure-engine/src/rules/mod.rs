@@ -853,16 +853,21 @@ fn null_unsafe_position<L: Lang>(lang: &L, walk: &Walk<L>, use_id: L::Id) -> boo
 /// 中转变量被传播进 narrowing cast）。沿 Paren 链向上，首遇 Cast /
 /// InstanceOf 即命中；其余位置类型语境与变量无关 → 放行。字面量自带
 /// 类型不受此限（null 走 null_unsafe_position）。
-fn typed_position_unsafe<L: Lang>(lang: &L, walk: &Walk<L>, use_id: L::Id) -> bool {
+///
+/// 返回命中的 Cast/InstanceOf 节点（形状层）；类型相容性由 Lang 钩子
+/// var_cast_position_ok 裁决——声明类型未解析（反编译自由名）或与目标
+/// 类型同名 → 恒可编译，放行（golden redundant_typed_cast：
+/// `String s = value; return (String) s;` → `(String) value`）。
+fn typed_position<L: Lang>(lang: &L, walk: &Walk<L>, use_id: L::Id) -> Option<L::Id> {
     let mut cur = use_id;
     while let Some(&(p, _)) = walk.parents.get(&cur) {
         match lang.kind(p) {
             NodeKind::Paren => cur = p,
-            NodeKind::Cast | NodeKind::InstanceOf => return true,
-            _ => return false,
+            NodeKind::Cast | NodeKind::InstanceOf => return Some(p),
+            _ => return None,
         }
     }
-    false
+    None
 }
 
 fn count_var_refs<L: Lang>(lang: &L, node: L::Id, name: &str, n: &mut usize) {
@@ -1107,9 +1112,11 @@ impl<L: Lang> Rule<L> for LocalPropagation {
             return None;
         }
         // VarRef 值不得内联进 cast/instanceof 类型判定位（声明类型即合法
-        // 性依据——同 null 实参位的族）
+        // 性依据——同 null 实参位的族）；声明类型未解析或与目标类型
+        // 同名时恒可编译（var_cast_position_ok 钩子裁决）
         if lang.kind(value) == NodeKind::VarRef
-            && typed_position_unsafe(&*lang, walk, use_id)
+            && typed_position(&*lang, walk, use_id)
+                .is_some_and(|t| !lang.var_cast_position_ok(value, t))
         {
             return None;
         }
@@ -2764,9 +2771,11 @@ impl<L: Lang> Rule<L> for AssignPropagation {
             return None;
         }
         // VarRef 值不得内联进 cast/instanceof 类型判定位（声明类型即合法
-        // 性依据——同 null 实参位的族）
+        // 性依据——同 null 实参位的族）；声明类型未解析或与目标类型
+        // 同名时恒可编译（var_cast_position_ok 钩子裁决）
         if lang.kind(value) == NodeKind::VarRef
-            && typed_position_unsafe(&*lang, walk, use_id)
+            && typed_position(&*lang, walk, use_id)
+                .is_some_and(|t| !lang.var_cast_position_ok(value, t))
         {
             return None;
         }
@@ -3030,10 +3039,9 @@ impl<L: Lang> Rule<L> for MultiUseCopyPropagation {
         // k3Var; s = (String) x;` 合法，替换成 `(String) k3Var` 引用类型
         // 不相关即不可编译（ddc weixin dt/k 复现）。任一使用点命中 →
         // 整体拒绝（多用途替换不可拆单点）。
-        if w1.uses
-            .iter()
-            .any(|&u| typed_position_unsafe(&*lang, walk, u))
-        {
+        if w1.uses.iter().any(|&u| {
+            typed_position(&*lang, walk, u).is_some_and(|t| !lang.var_cast_position_ok(value, t))
+        }) {
             return None;
         }
 
@@ -3460,10 +3468,30 @@ impl<L: Lang> Rule<L> for StoreKill {
         // MayRead），异常路径会绕过击杀点直达 finally/catch——后者可能
         // 在「中间值」状态读到本变量（finally-flag 恢复模式：
         // v=true; setSoTimeout(1); v=false; finally{if(v)…}——差分
-        // 抓获：v=true 曾被杀，异常路径的恢复逻辑变死代码）
-        for &s in &stmts[idx + 1..si] {
-            if lang.effect(s) > Effect::MayRead {
-                return None;
+        // 抓获：v=true 曾被杀，异常路径的恢复逻辑变死代码）。
+        //
+        // 精化：异常只可能被**包围本块的 Try** 的 handler 截获；无包围
+        // Try 时异常直接出方法，局部变量对外不可见——中间值无人可观
+        // 察，窗口内的不纯语句不构成障碍（ddc 0.1.33 形态：声明序列 →
+        // new 对象 → 击杀赋值，构造调用恰在窗口内）。窗口内嵌套 try
+        // 的 handler 读已由 per-statement 事件扫描以 Read 击退，不在
+        // 此列。
+        let mut has_try_ancestor = false;
+        {
+            let mut cur = stmt_node;
+            while let Some(&(p, _)) = walk.parents.get(&cur) {
+                if lang.kind(p) == NodeKind::Try {
+                    has_try_ancestor = true;
+                    break;
+                }
+                cur = p;
+            }
+        }
+        if has_try_ancestor {
+            for &s in &stmts[idx + 1..si] {
+                if lang.effect(s) > Effect::MayRead {
+                    return None;
+                }
             }
         }
 

@@ -584,6 +584,82 @@ fn statically_iterable(ty: &JType) -> bool {
     }
 }
 
+/// 链式 Map 视图调用的**合成静态类型**：`<Map 族>.keySet()` →
+/// `java.util.Set<K>`、`.values()` → `java.util.Collection<V>`（两者皆
+/// Iterable，泛型实参沿袭 Map 声明）。仅当接收者是**声明类型可解析的
+/// Map 族 VarRef** 且视图方法无实参时合成——entrySet 的 Map.Entry<K,V>
+/// 嵌套泛型会让 generic_elem_ty 兜底 Object（保守），不合成。
+/// 98c34d9 的 var_type 门只覆盖裸 VarRef 接收位，`m.keySet().iterator()`
+/// 形态因 Call 无类型被一律拒绝（new_rules iterator_element_type 抓获）。
+fn map_view_synthetic_ty(lang: &JavaAst, call: JavaId) -> Option<JType> {
+    if lang.kind(call) != NodeKind::Call {
+        return None;
+    }
+    let ch = lang.children(call).to_vec();
+    if ch.len() != 1 {
+        return None; // 视图方法无实参
+    }
+    let callee = *ch.first()?;
+    let NodeData::Member { name } = lang.data(callee) else { return None };
+    let view = lang.sn(*name);
+    if !matches!(view, "keySet" | "values") {
+        return None;
+    }
+    let recv = lang.children(callee).first().copied()?;
+    let NodeData::VarRef { name } = lang.data(recv) else { return None };
+    // 局部/参数作用域优先；未解析（字段接收位）回退 field_types——
+    // 同名二见已被 collect_field_types 移除，命中即全单元唯一声明
+    //（与调用点实参类型解析同一回退惯用法）
+    let recv_ty = lang
+        .var_type(recv)
+        .cloned()
+        .or_else(|| lang.field_types.get(lang.sn(*name)).cloned())?;
+    let JType::Ref(n) = recv_ty else { return None };
+    let lt = n.find('<')?;
+    let gt = n.rfind('>')?;
+    if gt <= lt {
+        return None; // 裸 Map：元素类型未知 → 不合成（保守拒绝）
+    }
+    // 顶层逗号拆分 Map<K, V>（嵌套泛型实参由 generic_elem_ty 兜底）
+    let args = n[lt + 1..gt].trim();
+    let depth = args.chars().fold(0i32, |d, c| match c {
+        '<' => d + 1,
+        '>' => d - 1,
+        _ => d,
+    });
+    let top = args.find(|c: char| c == ',').filter(|_| depth == 0)?;
+    let k = args[..top].trim();
+    let v = args[top + 1..].trim();
+    let base = n[..lt].trim();
+    let last = base.rsplit('.').next().unwrap_or(base);
+    let map_family = matches!(
+        last,
+        "Map"
+            | "SortedMap"
+            | "NavigableMap"
+            | "HashMap"
+            | "LinkedHashMap"
+            | "TreeMap"
+            | "Hashtable"
+            | "Properties"
+            | "ConcurrentMap"
+            | "ConcurrentHashMap"
+            | "ConcurrentSkipListMap"
+            | "ConcurrentNavigableMap"
+            | "EnumMap"
+            | "WeakHashMap"
+            | "IdentityHashMap"
+            | "AbstractMap"
+    );
+    if !map_family || k.is_empty() || v.is_empty() {
+        return None;
+    }
+    match view {
+        "keySet" => Some(JType::Ref(format!("java.util.Set<{k}>"))),
+        _ => Some(JType::Ref(format!("java.util.Collection<{v}>"))),
+    }
+}
+
 /// for-each 元素类型合法性：`?`/`? extends …`/`? super …`（通配符）不是
 /// 合法变量类型 → Object（jdk-sources Subject 抓获：`Iterator<?> ce =
 /// c.iterator()` 还原成 `for (? e2 : c)` 非法 Java）
@@ -1794,8 +1870,14 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         // k6.h0 复现）。类型未知或不在已知 Iterable 族白名单 → 保守拒
         // 绝（保留 while 形态，语义不变）。
         {
-            let ty = lang.var_type(iterable);
-            let ok = ty.is_some_and(|t| statically_iterable(t));
+            // 裸 VarRef 接收位：声明类型白名单；链式 Map 视图调用
+            // （`m.keySet().iterator()`——Call 无 var_type）按方法名 +
+            // 接收者 Map 族声明裁决（98c34d9 的门曾一律拒绝该形态，
+            // new_rules iterator_element_type_from_declaration 抓获）
+            let ok = match lang.var_type(iterable) {
+                Some(t) => statically_iterable(t),
+                None => map_view_synthetic_ty(lang, iterable).is_some(),
+            };
             if !ok {
                 return None;
             }
@@ -1904,12 +1986,16 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
                         | NodeKind::Try
                         | NodeKind::Catch
                         | NodeKind::Synchronized
-                        | NodeKind::ForEach => return None,
+                        | NodeKind::ForEach => {
+                            return None;
+                        }
                         // Lambda 体：延迟求值（可能永不调用）——R13 T2d/
                         // T2f 抓获：() -> it.next() 传给从不调的方法曾被
                         // 折进 for-each 隐式消费（11→3）；Assert：仅在断言
                         // 启用且到达时求值（默认禁用 = 0 消费）——T2e
-                        NodeKind::Lambda | NodeKind::Assert => return None,
+                        NodeKind::Lambda | NodeKind::Assert => {
+                            return None;
+                        }
                         _ => {} // Call 实参/New 实参/Assign/Cast/Paren/Index…
                     }
                     cur = par;
@@ -2024,7 +2110,10 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
         // 裸集合（元素 Object）上 for (更窄类型 e : raw) 非法 → 保守拒绝
         let elem_is_object = match lang.var_type(iterable) {
             Some(it_t) => generic_elem_ty(it_t).is_none(),
-            None => true,
+            None => map_view_synthetic_ty(lang, iterable)
+                .as_ref()
+                .and_then(generic_elem_ty)
+                .is_none(),
         };
         if elem_is_object && ty != JType::Ref("Object".into()) {
             return None;
