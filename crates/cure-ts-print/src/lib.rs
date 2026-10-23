@@ -129,7 +129,8 @@ impl<'a> Printer<'a> {
         match item {
             TopItem::Stmt(s) => self.print_stmt(*s),
             TopItem::Func { sig_raw, body, .. } => {
-                self.out.push_str(sig_raw.trim_end());
+                let sig = sig_raw.trim_end().to_string();
+                self.push_raw(&sig);
                 self.out.push(' ');
                 match body {
                     Some(b) => self.print_block_like(*b),
@@ -152,6 +153,17 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// 原文段内联输出：若末行含 `//` 行注释，补换行——否则后续
+    /// `)`/`{`/` = ` 等会被注释吞掉（真实库 vitest diff.js 的参数
+    /// 尾注释曾把 `) => {` 吃掉）。
+    fn push_raw(&mut self, s: &str) {
+        self.out.push_str(s);
+        let tail = s.rsplit('\n').next().unwrap_or(s);
+        if tail.contains("//") {
+            self.out.push('\n');
+        }
+    }
+
     fn print_class(&mut self, c: &ClassDecl) {
         let head = c.head_raw.trim();
         let prefix = c.prefix.trim();
@@ -166,7 +178,7 @@ impl<'a> Printer<'a> {
         }
         if !head.is_empty() {
             self.out.push(' ');
-            self.out.push_str(head);
+            self.push_raw(head);
         }
         self.out.push_str(" {");
         if c.members.is_empty() {
@@ -186,8 +198,8 @@ impl<'a> Printer<'a> {
         self.nl_indent();
         match m {
             ClassMember::Method { sig_raw, body } => {
-                let sig = sig_raw.trim_end().trim_end_matches(';');
-                self.out.push_str(sig);
+                let sig = sig_raw.trim_end().trim_end_matches(';').to_string();
+                self.push_raw(&sig);
                 self.out.push(' ');
                 match body {
                     Some(b) => self.print_block_like(*b),
@@ -195,8 +207,8 @@ impl<'a> Printer<'a> {
                 }
             }
             ClassMember::Field { sig_raw, init, .. } => {
-                let sig = sig_raw.trim().trim_end();
-                self.out.push_str(sig);
+                let sig = sig_raw.trim().trim_end().to_string();
+                self.push_raw(&sig);
                 if let Some(i) = init {
                     if !sig.ends_with('=') {
                         self.out.push_str(" = ");
@@ -276,7 +288,7 @@ impl<'a> Printer<'a> {
                 if need_paren {
                     self.out.push('(');
                 }
-                self.out.push_str(pat);
+                self.push_raw(pat);
                 self.out.push_str(" = ");
                 let value = self.ast.children(s)[0];
                 self.print_expr(value, Prec::Assign);
@@ -286,7 +298,8 @@ impl<'a> Printer<'a> {
                 self.out.push(';');
             }
             NodeData::FuncStmt { sig_raw, .. } => {
-                self.out.push_str(sig_raw.trim_end());
+                let sig = sig_raw.trim_end().to_string();
+                self.push_raw(&sig);
                 self.out.push(' ');
                 let body = self.ast.children(s)[0];
                 self.print_block_like(body);
@@ -434,9 +447,9 @@ impl<'a> Printer<'a> {
                     self.print_var_kw(*k);
                     self.out.push(' ');
                 }
-                self.out.push_str(name);
+                self.push_raw(name);
                 if let Some(t) = ty_raw {
-                    self.out.push_str(t);
+                    self.push_raw(t);
                 }
                 self.out.push_str(if *of { " of " } else { " in " });
                 self.print_expr(ch[0], Prec::Seq);
@@ -878,10 +891,11 @@ impl<'a> Printer<'a> {
                     } else {
                         // 多参/模式/默认值/类型注解——括号必需
                         if ps.starts_with('(') && ps.ends_with(')') {
-                            self.out.push_str(ps);
+                            self.push_raw(ps);
                         } else {
                             self.out.push('(');
-                            self.out.push_str(ps);
+                            let ps2 = ps.to_string();
+                            self.push_raw(&ps2);
                             self.out.push(')');
                         }
                     }
@@ -899,7 +913,8 @@ impl<'a> Printer<'a> {
                         self.out.push(' ');
                     }
                     self.out.push('(');
-                    self.out.push_str(params_raw.trim());
+                    let pr = params_raw.trim().to_string();
+                    self.push_raw(&pr);
                     self.out.push_str(") ");
                 }
                 let body = self.ast.children(e)[0];
@@ -928,7 +943,8 @@ impl<'a> Printer<'a> {
                 self.print_expr(v, Prec::Assign);
             }
             NodeData::Destruct { pattern_raw } => {
-                self.out.push_str(pattern_raw.trim());
+                let pr = pattern_raw.trim().to_string();
+                self.push_raw(&pr);
                 self.out.push_str(" = ");
                 let v = self.ast.children(e)[0];
                 self.print_expr(v, Prec::Assign);
@@ -937,13 +953,15 @@ impl<'a> Printer<'a> {
                 let v = self.ast.children(e)[0];
                 self.print_expr(v, Prec::Shift);
                 self.out.push_str(" as ");
-                self.out.push_str(ty_raw.trim());
+                let ty = ty_raw.trim().to_string();
+                self.push_raw(&ty);
             }
             NodeData::TsSatisfies { ty_raw } => {
                 let v = self.ast.children(e)[0];
                 self.print_expr(v, Prec::Shift);
                 self.out.push_str(" satisfies ");
-                self.out.push_str(ty_raw.trim());
+                let ty = ty_raw.trim().to_string();
+                self.push_raw(&ty);
             }
             NodeData::TsNonNull => {
                 let v = self.ast.children(e)[0];
@@ -961,7 +979,10 @@ impl<'a> Printer<'a> {
             }
             NodeData::Raw { text } => self.out.push_str(text.trim()),
             NodeData::ClassExpr { raw } => self.out.push_str(raw.trim()),
-            NodeData::FuncStmt { sig_raw, .. } => self.out.push_str(sig_raw.trim()),
+            NodeData::FuncStmt { sig_raw, .. } => {
+                let sig = sig_raw.trim().to_string();
+                self.push_raw(&sig);
+            }
             _ => self.out.push_str("/*?*/"),
         }
     }

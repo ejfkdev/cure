@@ -203,10 +203,58 @@ fn remove_dead_module_items(ast: &mut TsAst, unit: &mut ModuleUnit) -> usize {
     };
     let mut removed = 0usize;
     let mut drop_indices: Vec<usize> = Vec::new();
+    // Group 项（`var a=…,b=…`）：逐声明判定，保留存活声明重建 Group。
+    // 组内引用必须**排除候选自身**、保留其它兄弟（`var p=…,e=f(p)`：
+    // 整项引用并集排除会误判 p 未引用）。
+    let mut group_rebuild: Vec<(usize, Option<TsId>)> = Vec::new();
     for (i, item) in unit.items.iter().enumerate() {
         match item {
             TopItem::Stmt(s) => {
-                if let NodeData::VarDecl { name, .. } = ast.data(*s) {
+                if let NodeData::Group = ast.data(*s) {
+                    let kids = ast.children(*s).to_vec();
+                    let mut keep: Vec<TsId> = Vec::new();
+                    let mut changed = false;
+                    for (k, &kid) in kids.iter().enumerate() {
+                        let dead = if let NodeData::VarDecl { name, .. } = ast.data(kid) {
+                            if ast.const_fields.contains_key(name) {
+                                // 其它兄弟的引用
+                                let mut sibling_hit = false;
+                                for (j, &o) in kids.iter().enumerate() {
+                                    if j == k {
+                                        continue;
+                                    }
+                                    let mut refs = HashSet::new();
+                                    let mut raws = Vec::new();
+                                    collect_refs_and_raws(ast, o, &mut refs, &mut raws);
+                                    if refs.contains(name) {
+                                        sibling_hit = true;
+                                        break;
+                                    }
+                                }
+                                !sibling_hit && !all_words(Some(i)).contains(name)
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if dead {
+                            changed = true;
+                        } else {
+                            keep.push(kid);
+                        }
+                    }
+                    if changed {
+                        let new_group = if keep.is_empty() {
+                            None
+                        } else if keep.len() == 1 {
+                            Some(keep[0])
+                        } else {
+                            Some(ast.group(keep))
+                        };
+                        group_rebuild.push((i, new_group));
+                    }
+                } else if let NodeData::VarDecl { name, .. } = ast.data(*s) {
                     if ast.const_fields.contains_key(name)
                         && !all_words(Some(i)).contains(name)
                     {
@@ -225,9 +273,22 @@ fn remove_dead_module_items(ast: &mut TsAst, unit: &mut ModuleUnit) -> usize {
             _ => {}
         }
     }
-    removed = drop_indices.len();
+    removed = 0;
+    // 先应用到 Group（不改项数），再删除整项（逆序保下标）
+    for (i, new_item) in group_rebuild {
+        match new_item {
+            Some(g) => {
+                unit.items[i] = TopItem::Stmt(g);
+                removed += 1;
+            }
+            None => drop_indices.push(i),
+        }
+    }
+    drop_indices.sort_unstable();
+    drop_indices.dedup();
     for &i in drop_indices.iter().rev() {
         unit.items.remove(i);
+        removed += 1;
     }
     removed
 }
@@ -400,32 +461,47 @@ pub fn collect_unit_consts(ast: &mut TsAst, unit: &ModuleUnit) {
     for item in &unit.items {
         match item {
             TopItem::Stmt(s) | TopItem::ExportStmt(s) => {
-                // 根声明计数（唯一性）；根的解构模式词也计数（重声明）
-                match ast.data(*s) {
-                    NodeData::VarDecl { name, .. } => {
-                        *decl_counts.entry(name.clone()).or_insert(0) += 1;
-                    }
-                    NodeData::DestructStmt { pattern, .. } => {
-                        for w in pattern
-                            .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
-                        {
-                            if !w.is_empty() {
-                                *decl_counts.entry(w.to_string()).or_insert(0) += 1;
+                // 根声明计数（唯一性）；多声明符 Group 的每个声明也要
+                // 计数（否则 `var p=…,a=p+…,e=…` 全部无法接纳 → 首轮
+                // 不传播、打印拆开后第二轮才传播 = 非幂等）
+                let roots: Vec<TsId> = if matches!(ast.data(*s), NodeData::Group) {
+                    ast.children(*s).to_vec()
+                } else {
+                    vec![*s]
+                };
+                for d in roots {
+                    match ast.data(d) {
+                        NodeData::VarDecl { name, .. } => {
+                            *decl_counts.entry(name.clone()).or_insert(0) += 1;
+                        }
+                        NodeData::DestructStmt { pattern, .. } => {
+                            for w in pattern.split(|c: char| {
+                                !(c.is_alphanumeric() || c == '_' || c == '$')
+                            }) {
+                                if !w.is_empty() {
+                                    *decl_counts.entry(w.to_string()).or_insert(0) += 1;
+                                }
                             }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
                 // 初始化表达式**内部**（lambda 参数等）是遮蔽者；整个
                 // 子树的写也要计。skip_root_decl 只对模块声明根生效——
                 // `for (let x in …)` 的 ForEach 根自身名 x 必须计入
                 // 遮蔽（否则模块 let x 被当常量传播进循环头/体，
                 // Test262 for-in/of scope-head 家族抓获）。
-                let skip_root_decl = matches!(
-                    ast.data(*s),
-                    NodeData::VarDecl { .. } | NodeData::Group
-                );
-                walk_interior(ast, *s, skip_root_decl, &mut shadowed, &mut write_counts);
+                if matches!(ast.data(*s), NodeData::Group) {
+                    // Group 的每个孩子都是模块声明根——逐个按
+                    // skip_root_decl 行走（否则孩子自身名字进 shadowed，
+                    // 多声明符常量永远无法接纳）
+                    for &c in ast.children(*s) {
+                        walk_interior(ast, c, true, &mut shadowed, &mut write_counts);
+                    }
+                } else {
+                    let skip_root_decl = matches!(ast.data(*s), NodeData::VarDecl { .. });
+                    walk_interior(ast, *s, skip_root_decl, &mut shadowed, &mut write_counts);
+                }
             }
             TopItem::Func { body: Some(b), .. } => {
                 walk_interior(ast, *b, false, &mut shadowed, &mut write_counts);
@@ -599,9 +675,16 @@ pub fn collect_unit_consts(ast: &mut TsAst, unit: &ModuleUnit) {
             _ => {}
         }
         if let TopItem::Stmt(s) | TopItem::ExportStmt(s) = item {
-            if let NodeData::VarDecl { name, .. } = ast.data(*s) {
+            // 多声明符 Group：按声明序逐个接纳（`var p=…, a=p+…, e=…`）
+            let cands: Vec<TsId> = if matches!(ast.data(*s), NodeData::Group) {
+                ast.children(*s).to_vec()
+            } else {
+                vec![*s]
+            };
+            for d in cands {
+            if let NodeData::VarDecl { name, .. } = ast.data(d) {
                 let name = name.clone();
-                let init = ast.children(*s).first().copied();
+                let init = ast.children(d).first().copied();
                 let candidate = init.is_some_and(|init| {
                     decl_counts.get(&name).copied().unwrap_or(0) == 1
                         && !shadowed.contains(&name)
@@ -620,6 +703,7 @@ pub fn collect_unit_consts(ast: &mut TsAst, unit: &ModuleUnit) {
                     }
                     accepted.insert(name);
                 }
+            }
             }
         }
         earlier_refs.extend(refs);

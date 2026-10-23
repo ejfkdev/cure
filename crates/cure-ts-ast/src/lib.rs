@@ -927,51 +927,59 @@ impl TsAst {
         let n = self.nodes.len();
         self.eval_taint.clear();
         self.eval_taint.resize(n, false);
+        self.group_decls.clear();
+        self.group_decls.resize(n, false);
         if n == 0 {
             return;
         }
-        let mut has_parent = vec![false; n];
-        self.group_decls.clear();
-        self.group_decls.resize(n, false);
-        for (i, node) in self.nodes.iter().enumerate() {
-            if matches!(node.data, NodeData::Group) {
-                for c in node.children.as_slice() {
-                    if (c.0 as usize) < n && matches!(self.nodes[c.0 as usize].data, NodeData::VarDecl { .. }) {
+        // 只处理**从当前根可达**的节点：解析器在 parse_block 展开 Group 后
+        // 仍把 Group 节点留在 arena（孩子已上提）——若扫描全部 arena，
+        // 会把这些已脱离树的孩子误标为 group_decls 不透明，导致首轮
+        // 无法优化、打印重解析后才生效（非幂等）。
+        let mut reachable = vec![false; n];
+        let mut stack = vec![root];
+        while let Some(x) = stack.pop() {
+            let xi = x.0 as usize;
+            if xi >= n || reachable[xi] {
+                continue;
+            }
+            reachable[xi] = true;
+            if matches!(self.nodes[xi].data, NodeData::Group) {
+                for c in self.nodes[xi].children.as_slice() {
+                    // 只标记 var/using：语句表规则（dead_decl/dead_store）
+                    // 对它们没有安全的组外引用视野；let/const 的删除已被
+                    // dead_decl_allowed 拒绝，标记会连带禁止声明初始化式的
+                    // 纯折叠（首轮不折、打印重解析后二轮才折——非幂等）。
+                    if (c.0 as usize) < n
+                        && matches!(
+                            self.nodes[c.0 as usize].data,
+                            NodeData::VarDecl { kind: VarKind::Var | VarKind::Using, .. }
+                        )
+                    {
                         self.group_decls[c.0 as usize] = true;
                     }
                 }
             }
-            for c in node.children.as_slice() {
-                if (c.0 as usize) < n {
-                    has_parent[c.0 as usize] = true;
-                }
+            for c in self.nodes[xi].children.as_slice() {
+                stack.push(*c);
             }
-            let _ = i;
         }
-        let mut roots: Vec<TsId> = (0..n)
-            .filter(|&i| !has_parent[i])
-            .map(|i| TsId(i as u32))
-            .collect();
-        if !roots.contains(&root) {
-            roots.push(root);
-        }
-        // 后序 contains_eval（按节点索引缓存）——森林中的节点全部可达
-        let mut contains_eval = vec![false; n];
-        for &r in &roots {
-            let mut stack = vec![(r, false)];
+        let contains_eval = {
+            let mut ce = vec![false; n];
+            let mut stack = vec![(root, false)];
             while let Some((x, exiting)) = stack.pop() {
                 let xi = x.0 as usize;
                 if exiting {
-                    let mut ce = self.is_direct_eval_call(x);
-                    if !ce {
+                    let mut hit = self.is_direct_eval_call(x);
+                    if !hit {
                         for c in self.nodes[xi].children.as_slice() {
-                            if (c.0 as usize) < n && contains_eval[c.0 as usize] {
-                                ce = true;
+                            if (c.0 as usize) < n && ce[c.0 as usize] {
+                                hit = true;
                                 break;
                             }
                         }
                     }
-                    contains_eval[xi] = ce;
+                    ce[xi] = hit;
                 } else {
                     stack.push((x, true));
                     for c in self.nodes[xi].children.as_slice() {
@@ -979,27 +987,26 @@ impl TsAst {
                     }
                 }
             }
-        }
-        // 顶层 eval？根不是函数且 subtree 含 eval → 全树污染
-        for &r in &roots {
-            let ri = r.0 as usize;
-            if contains_eval[ri] && !self.is_function_root(r) {
-                self.eval_taint.iter_mut().for_each(|v| *v = true);
-                return;
+            ce
+        };
+        if contains_eval[root.0 as usize] && !self.is_function_root(root) {
+            // 根作用域里的直接 eval → 整个根子树污染
+            for i in 0..n {
+                if reachable[i] {
+                    self.eval_taint[i] = true;
+                }
             }
+            return;
         }
-        // 函数子树污染（含函数节点自身）
-        for &r in &roots {
-            let mut stack = vec![(r, self.is_function_root(r) && contains_eval[r.0 as usize])];
-            while let Some((x, tainted)) = stack.pop() {
-                let xi = x.0 as usize;
-                let t = tainted || (self.is_function_root(x) && contains_eval[xi]);
-                if t {
-                    self.eval_taint[xi] = true;
-                }
-                for c in self.nodes[xi].children.as_slice() {
-                    stack.push((*c, t));
-                }
+        let mut stack = vec![(root, self.is_function_root(root) && contains_eval[root.0 as usize])];
+        while let Some((x, tainted)) = stack.pop() {
+            let xi = x.0 as usize;
+            let t = tainted || (self.is_function_root(x) && contains_eval[xi]);
+            if t {
+                self.eval_taint[xi] = true;
+            }
+            for c in self.nodes[xi].children.as_slice() {
+                stack.push((*c, t));
             }
         }
     }
@@ -1586,9 +1593,18 @@ impl Lang for TsAst {
         }
         // 数值运算：JS number 域 = f64。位运算/移位走 ToInt32/ToUint32
         // 环绕域；算术在 ±2^53 精确域（非精确/非整数 → Double 或拒绝）。
+        // 整值 Double 也进入 ToInt32 域：`1e3 >> 1` 与 `1000 >> 1` 同为
+        // 500。只接受 ±2^53 内整值——`v as i64` 精确，随后 `as i32`
+        // 即 JS 的模 2^32 环绕（曾拒折 → 常量传播后首轮不折、二轮打印
+        // 成 Int 才折，幂等差分抓获）。
         let int_of = |x: LitRef<'_>| -> Option<i64> {
             match x {
                 LitRef::Int(v) => Some(v),
+                LitRef::Double(v)
+                    if v.is_finite() && v.fract() == 0.0 && v.abs() <= (1u64 << 53) as f64 =>
+                {
+                    Some(v as i64)
+                }
                 _ => None,
             }
         };
@@ -1677,9 +1693,16 @@ impl Lang for TsAst {
         if !eq_like && !matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
             return None;
         }
+        // 整值 Double 参与比较折叠：`1e3 === 1000` 为真。±2^53 内整值
+        // 转 i64 精确；任一侧非整值（1000.5）→ 不折（不落到 i64 比较）。
         let int_of = |x: LitRef<'_>| -> Option<i64> {
             match x {
                 LitRef::Int(v) => Some(v),
+                LitRef::Double(v)
+                    if v.is_finite() && v.fract() == 0.0 && v.abs() <= (1u64 << 53) as f64 =>
+                {
+                    Some(v as i64)
+                }
                 _ => None,
             }
         };
@@ -2383,6 +2406,13 @@ impl Lang for TsAst {
         // 私有名（`#f`）在 `in` 左操作数位**不能**加括号（语法要求
         // 裸 `#x in o`；`(#x) in o` 是 SyntaxError）。
         if matches!(self.data(inner), NodeData::Raw { text } if text.starts_with('#')) {
+            return false;
+        }
+        // `super.x` / `super[x]` / `super(...)` 原文是成员/调用链基座：
+        // 优先级已是 Member，括号纯属多余。曾导致 `await super.close()`
+        // 打印成 `await (super.close)()`，二轮把 await 当标识符调用
+        //（await 后随 `(`）→ `await(super.close)()`，幂等差分抓获。
+        if matches!(self.data(inner), NodeData::Raw { text } if text.starts_with("super")) {
             return false;
         }
         matches!(

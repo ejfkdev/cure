@@ -242,7 +242,22 @@ impl<'a> Parser<'a> {
             self.parse_export(deco_raw);
             return;
         }
-        if self.is_kw("declare") || self.is_kw("namespace") || self.is_kw("interface") || self.is_kw("module") {
+        // TS 上下文关键字只有在声明形态下才按原文整条捕获：
+        // `module.exports = …` / `namespace.foo()` / `interface = 1` 都是
+        // 普通标识符表达式（曾把 CommonJS 入口 `module.exports = fn()`
+        // 截成 `module.exports =` 残句 + 匿名函数声明；pngjs 等真实库
+        // 编译差分抓获）。
+        let kw_decl_shape = (self.is_kw("module") || self.is_kw("namespace"))
+            && (self.tk_at(1).kind == TokKind::Ident
+                || self.tk_at(1).kind == TokKind::Str)
+            || (self.is_kw("interface") && self.tk_at(1).kind == TokKind::Ident)
+            || (self.is_kw("declare")
+                && matches!(
+                    self.tk_at(1).text.as_str(),
+                    "var" | "let" | "const" | "function" | "class" | "module" | "namespace"
+                        | "interface" | "type" | "abstract" | "enum" | "global"
+                ));
+        if kw_decl_shape {
             let start = self.pos;
             self.skip_balanced_to_stmt_boundary();
             let raw = self.raw_between(start, self.pos);
@@ -949,7 +964,15 @@ impl<'a> Parser<'a> {
                     }
                     self.ast.raw(&self.raw_between(s, self.pos))
                 }
-                "enum" | "interface" | "namespace" | "module" => {
+                "enum" => {
+                    let s = self.pos;
+                    self.skip_balanced_to_stmt_boundary();
+                    self.ast.raw(&self.raw_between(s, self.pos))
+                }
+                "interface" | "namespace" | "module"
+                    if self.tk_at(1).kind == TokKind::Ident
+                        || self.tk_at(1).kind == TokKind::Str =>
+                {
                     let s = self.pos;
                     self.skip_balanced_to_stmt_boundary();
                     self.ast.raw(&self.raw_between(s, self.pos))
@@ -1356,7 +1379,7 @@ impl<'a> Parser<'a> {
                     .toks
                     .get(head_start + 1)
                     .is_some_and(|t| matches!(t.text.as_str(), "in" | "of"));
-            let decl = if self.toks[head_start].kind == TokKind::Ident
+            let mut decl = if self.toks[head_start].kind == TokKind::Ident
                 && !let_is_binding
                 && matches!(self.toks[head_start].text.as_str(), "var" | "let" | "const" | "using")
             {
@@ -1389,13 +1412,14 @@ impl<'a> Parser<'a> {
                     };
                     (nm, ty)
                 } else {
-                    // 解构 for-of——整条原文（**从 `for` 关键字起**——
-                    // 曾从 head_start 起丢了 `for (` 前缀，打印出
-                    // `const [k] of …))` 残句——真实语料 roundtrip 抓获）
-                    self.pos = for_pos;
-                    let s = self.pos;
-                    self.skip_balanced_to_stmt_boundary();
-                    return self.ast.raw(&self.raw_between(s, self.pos));
+                    // 解构 for-of/for-in：绑定原文整体进 name（含
+                    // `let/const/var` 与模式），decl=None 让打印器原样
+                    // 输出 head。**不**整条原文捕获 body——单语句体里的
+                    // if/else 链会被语句边界扫描截断，`else` 残句化
+                    //（真实库 oxfmt 编译差分抓获：for (... ) if (...) …;
+                    // else if ... 的 else 被拆成独立语句）。
+                    decl = None;
+                    (bind_raw.trim().to_string(), None)
                 }
             } else {
                 (bind_raw.trim().to_string(), None)
@@ -1675,6 +1699,9 @@ impl<'a> Parser<'a> {
         let e = self.parse_expr();
         // 解构赋值语句：Assign(target 是 ObjLit/ArrayLit)
         if let Some(stmt) = self.wrap_destruct_assign(e, start) {
+            // 语句自身的 `;` 必须在此消费——否则下一轮解析把它当
+            // Empty 语句，且每轮再解析都多出一个 `;`（无界增长）
+            self.consume_semi();
             return stmt;
         }
         // 裸字符串表达式语句 = 指令序言（"use strict" 等）：**原文**保留。
@@ -1837,7 +1864,11 @@ impl<'a> Parser<'a> {
         }
         let close = self.match_paren(p)?;
         let mut q = close + 1;
-        if q < self.toks.len() && self.toks[q].kind == TokKind::Punct && self.toks[q].text == ":" {
+        if q < self.toks.len()
+            && self.toks[q].kind == TokKind::Punct
+            && self.toks[q].text == ":"
+            && self.params_plausible(p, close)
+        {
             // 返回类型前瞻。**语句边界终止**：`;`/`,`/`}`/裸 `{` 出现在
             // 顶层即中止——`cond ? (a ? b : c) : else` 的三元 else 冒号
             // 曾被当类型起点扫到**后续语句**的 `=>`，跨语句吞成假箭头
@@ -1877,6 +1908,69 @@ impl<'a> Parser<'a> {
         self.pos = q + 1;
         let body = self.parse_arrow_body();
         Some(self.ast.lambda(&params_inner, body, true, is_async, false))
+    }
+
+    /// 括号组是否可能是**参数列表**（TS 返回类型注解前瞻的守卫）：
+    /// `(v=()=>e.value,$=hr(e))` 这类逗号表达式/后续三元里的括号
+    /// 不能被误读成 `(…): T =>` 的箭头参数（真实库 minified 代码
+    /// 的 `c ? (a=()=>x,b=f()) : …` 曾被吞成一层箭头）。
+    fn params_plausible(&self, open: usize, close: usize) -> bool {
+        #[derive(Clone, Copy, PartialEq)]
+        enum St {
+            SegStart,
+            InIdent,
+            InTail,
+        }
+        let mut st = St::SegStart;
+        let mut depth = 0i32;
+        let mut i = open + 1;
+        while i < close {
+            let t = &self.toks[i];
+            if t.kind == TokKind::Punct {
+                match t.text.as_str() {
+                    "(" | "[" | "{" => {
+                        depth += 1;
+                        i += 1;
+                        continue;
+                    }
+                    ")" | "]" | "}" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            st = St::InIdent;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if depth == 0 {
+                let ident_like = matches!(
+                    t.kind,
+                    TokKind::Ident | TokKind::Num | TokKind::Str | TokKind::Regex
+                );
+                if t.kind == TokKind::Punct {
+                    match t.text.as_str() {
+                        "," => st = St::SegStart,
+                        "..." if st == St::SegStart => st = St::InIdent,
+                        ":" | "=" | "?" if st == St::InIdent => st = St::InTail,
+                        _ => {
+                            if st != St::InTail {
+                                return false;
+                            }
+                        }
+                    }
+                } else if ident_like {
+                    if st == St::SegStart {
+                        st = St::InIdent;
+                    } else if st != St::InTail {
+                        return false;
+                    }
+                }
+            }
+            i += 1;
+        }
+        true
     }
 
     fn match_paren(&self, i: usize) -> Option<usize> {

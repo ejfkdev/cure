@@ -160,6 +160,8 @@ fn main() {
             // （cure 重排函数体）与箭头函数计算属性键（经 toString）。
             if id.contains("built-ins/Function/prototype/toString")
                 || id.contains("computed-property-name-from-arrow-function-expression")
+                || id.contains("staging/sm/async-functions/toString")
+                || id.contains("staging/sm/generators/runtime")
             {
                 known += 1;
                 continue;

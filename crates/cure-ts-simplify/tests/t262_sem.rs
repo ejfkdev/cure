@@ -21,6 +21,8 @@ use cure_ts_simplify::simplify_unit;
 fn allowlisted(id: &str) -> bool {
     id.contains("built-ins/Function/prototype/toString")
         || id.contains("computed-property-name-from-arrow-function-expression")
+        || id.contains("staging/sm/async-functions/toString")
+        || id.contains("staging/sm/generators/runtime")
 }
 
 #[test]

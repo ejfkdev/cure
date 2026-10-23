@@ -110,9 +110,10 @@ cure [选项] <文件.java>... | <目录> | -
 | 2. 差分测试 | 原版与简化版各自 `javac` 编译、`java` 运行，**stdout/退出码/异常签名必须一致**（12 组：溢出、NaN、除零异常、StringBuilder、迭代器、装箱、短路副作用…） | Java 全链路语义保持 |
 | 3. 语料库 | 3,999 个入库真实文件（12 套自动发现）+ 5,596 文件外部 mega 语料 + 37 万文件 OpenJDK 源码语料 | 鲁棒性（不 panic）、自洽性（输出可重新干净解析）、幂等性（第二轮 0 改写） |
 | 4. 反编译 APK | 5 个真实 Android APK 经 [ddc](https://github.com/ejfkdev/ddc) 反编译共 144,592 文件，cure 完整 + `--dead-code` 双模式 | 同上三不变量 + javac 差分：ddc 原输出可编译的包在 cure 后必须仍可编译 |
-| 5. ECMAScript 规范符合性 | [Test262](https://github.com/tc39/test262) 四层：(a) 同步用例原版与 cure 版各在全新 `node` vm 上下文执行，比较异常状态 + stdout（34,006 个可执行用例）；(b) **async 用例**执行并排空 `$DONE`/微任务/定时器（5,423 个执行）；(c) **module 用例**按 ESM 链接（相对 fixture 文件系统加载）并求值（358 个执行）；(d) **全部 49,266 个文件做编译差分**（含 async/module/负向）——合法 script/module 源码在 cure 后必须仍可编译 | ECMAScript 语义：f64/ToInt32 域、±2^53、TDZ、Annex B 提升、eval 作用域、解构、生成器/`yield` 文法、稀疏数组、async/await 时序、ESM 链接/活绑定；外加导入属性/顶层 await 语法 |
+| 5. ECMAScript 规范符合性 | [Test262](https://github.com/tc39/test262) 四层：(a) 同步用例原版与 cure 版各在全新 `node` vm 上下文执行，比较异常状态 + stdout（34,004 个可执行用例）；(b) **async 用例**执行并排空 `$DONE`/微任务/定时器（5,423 个执行）；(c) **module 用例**按 ESM 链接（相对 fixture 文件系统加载）并求值（358 个执行）；(d) **全部 49,266 个文件做编译差分**（含 async/module/负向）——合法 script/module 源码在 cure 后必须仍可编译 | ECMAScript 语义：f64/ToInt32 域、±2^53、TDZ、Annex B 提升、eval 作用域、解构、生成器/`yield` 文法、稀疏数组、async/await 时序、ESM 链接/活绑定；外加导入属性/顶层 await 语法 |
+| 6. 真实 JS 语料 | 全局 npm 安装中的 4,358 个 `.js/.mjs/.cjs`（约 568 MB：undici、pnpm、yarn、vite-plus、Lark CLI、bytenode…）：合法文件在 cure 后必须仍可编译；第二轮 cure 输出必须逐字节一致 | 真实包语法（压缩 bundle、顶层 await、导入属性）与模块常量传播下的幂等性 |
 
-`cargo test` 共 432 个测试。Test262 语义差分 **33,962/34,006（99.87%）
+`cargo test` 共 432 个测试。Test262 语义差分 **33,960/34,004（99.87%）
 执行结果逐字节一致**；仅 44 个用例被排除——它们比较
 `Function.prototype.toString` 的**源码文本**（cure 会重排函数体格式），
 或用箭头函数作计算属性名（键依赖同一文本）。async 层 **5,423/5,423

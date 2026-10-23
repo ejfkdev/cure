@@ -627,10 +627,14 @@ impl<'a> Lexer<'a> {
             // 泛型（不可能是除法左操作数）→ 拒绝正则；其余标点开
             // 表达式 → 正则
             Prev::Punct => !matches!(self.prev_text.as_str(), "++" | "--" | "<"),
-            // `)` 后多数是表达式结尾（除 if/for 头——罕见正则位置，
-            // 保守按除法；坏除法由 parser 容错恢复兜底）
-            Prev::Ident | Prev::Num | Prev::Str | Prev::Regex | Prev::CloseParen
-            | Prev::CloseBracket => false,
+            // `)` 后：控制语句头（if/for/while/with）结束 → 正则可起
+            // 新表达式（`for (x of y) /re/.test(x)`——真实库 minified
+            // 形态）；其余调用/分组结尾按除法。
+            Prev::CloseParen => matches!(
+                self.last_close_paren_pre.as_str(),
+                "if" | "for" | "while" | "with"
+            ),
+            Prev::Ident | Prev::Num | Prev::Str | Prev::Regex | Prev::CloseBracket => false,
         }
     }
 

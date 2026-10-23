@@ -5,6 +5,48 @@
 
 ## [Unreleased]
 
+### 验证（npm 真实语料编译差分 + 幂等——2026-10-23 第七批）
+
+- **真实 npm 语料**：全局安装 `/opt/homebrew/lib/node_modules` 下
+  4,358 个 `.js/.mjs/.cjs`（约 568 MB，含 undici、pnpm、yarn、
+  vite-plus、Lark CLI、bytenode 等）。目录模式全量运行后做两项校验：
+  合法文件编译差分 **4,174 ok / 0 broken**（184 个原版自身不可编译
+  或环境跳过）；对 cure 输出再跑一次 cure，`diff -rq` **0 差异**
+  （早期为 80 → 59 → 5 → 0）。
+- 修复（真实语料驱动——解析器/打印器）：
+  - 控制语句头 `)` 后可起正则：`for (x of y) /re/.test(x)` 曾被
+    当除法；调用/分组结尾仍按除法（`last_close_paren_pre`）。
+  - TS 上下文关键字按声明形态判定：`module.exports = fn()`、
+    `namespace.foo()`、`interface = 1` 不再被整条截成声明残句
+    （pngjs 编译差分抓获）。
+  - 解构 for-of/for-in 头只保留绑定原文、不整条捕获 body——单语句
+    体里的 `if/else if` 链不再被语句边界扫描截断（oxfmt 的 `else`
+    残句化）。
+  - `DestructStmt` 消费自身分号：曾每轮解析多出一个 Empty `;`
+    （`for (…) { [a[i],a[j]] = …; ; }` 无界增长）。
+  - 箭头返回类型前瞻增加参数形态状态机：`c ? (a=()=>x,b=f()) : …`
+    不再被误读成 `(…): T =>` 箭头。
+  - 原文段拼接 `push_raw`：末行含 `//` 时补换行——参数尾注释曾吞掉
+    后续 `) => {`（vitest `diff.js`）。
+- 修复（真实语料驱动——常量/幂等）：
+  - 模块多声明 Group 的常量接纳与死项清理按组内逐声明进行；
+    `var p=…,a=p+…` 首轮即传播，且组外引用不再误删组内声明。
+  - eval 污染扫描只沿**当前根可达**节点——arena 中已脱离树的
+    Group 孩子不再把整个模块标成不透明（首轮 0 改写、二轮才优化）。
+  - Group 中仅 `var`/`using` 声明保持不透明；`let`/`const` 的声明
+    初始化式可首轮折叠（`const TICK_MS = (1000 >> 1) - 1` 曾二轮才
+    变 499）。
+  - 整值 `Double`（≤ ±2^53、fract=0）进入 ToInt32 折叠域：
+    `1e3 >> 1` 与 `1000 >> 1` 首轮同折为 500。
+  - `super.x` / `super[x]` / `super(…)` 原文作调用/成员基座时不再
+    加括号——`await super.close()` 曾打印成 `await (super.close)()`，
+    二轮 await 被当标识符调用变成 `await(super.close)()`。
+- 回归：Test262 四层复跑——同步 **33,960/34,004（99.87%）**、
+  44 个 `Function.prototype.toString` 源文本限制（新增 staging
+  async/generator toString 用例入 allowlist）、async **5,423/5,423**、
+  module **358/358**、编译 **49,165/49,165 合法文件 0 破坏**；
+  `cargo test --workspace` **432 通过**。
+
 ### 验证（TS/JS module 语义差分——2026-10-23 第六批）
 
 - **Test262 module 语义差分**（`examples/t262_module_sem` +
