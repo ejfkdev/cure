@@ -5,6 +5,33 @@
 
 ## [Unreleased]
 
+### 修复（Test262 官方一致性测试集驱动的解析器加固——2026-10-23）
+- **OOM 级 bug（曾致系统崩溃）**：标识符转义扫描的两个字符白名单
+  （转义分支无 ZWJ/ZWNJ、字节分支有）不一致——`\u200C` 在转义分支
+  break 且零字节消费，入口守卫却接受 `\`+`u` → 空 ident token 无限
+  累积（100GB）。修复白名单对齐 + **零进展保险丝**（tokenize 层：
+  非 Eof token 必须消费 ≥1 字节，违反即按整 UTF-8 字符跳过并记错
+  ——任何未来词法 bug 都只丢一个字节，不再可能 OOM）。
+- **行首 yield/await 误判**：sloppy 标识符守卫曾检查关键词自身的
+  newline_before——生成器里 `yield` 换行开头（最常见形态）被当
+  标识符，操作数全部错位。改为纯前瞻形态判定（= . [ ( , ) ; EOF）。
+- 语法缺口（Test262 正句法干净解析率 86.8% → **92.2%**，49,266
+  文件零 panic）：
+  - 标识符/成员名 `\uXXXX`/`\u{...}` 转义解码（含 ℘ 等
+    Other_ID_Start 字符的宽容接受策略）
+  - Unicode 空白（NBSP/U+2028/U+FEFF）的 trivia 处理
+  - `async function*` 表达式、`new.target`、嵌套 `new new X()`
+  - 对象字面量/类成员的生成器方法（`*m()`）、计算键方法
+    （`[Symbol.iterator]()`）、数字/字符串键方法、计算键访问器
+    （`get [name]() {}` / `static get [Symbol.species]() {}`）
+  - 标签语句不再要求语句形态门（`yield: 1` 等 sloppy 标签）
+  - `for (using x of …)` / for 头 using 声明
+  - `var x \n = 1` 的 ASI 续行（`=` 不受限产生式）
+  - 稀疏数组 elision（`[, ,42,,]`）
+  - 对象解构模式带默认值（`({x = v} = o)`）→ 整段不透明原文
+- Test262 接入为常驻测试（tests/t262.rs：抽样 4000 文件零 panic +
+  解析率 ≥85% 基线 + 保险丝单元验证；语料缺失自动跳过）。
+
 ### 新增
 - **TypeScript/JavaScript 后端**（v0.2.0 的主体）：`cure-ts-ast` /
   `cure-ts-parser` / `cure-ts-print` / `cure-ts-simplify` 四 crate 全链路。

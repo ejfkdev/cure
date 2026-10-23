@@ -190,7 +190,18 @@ impl<'a> Parser<'a> {
         if e <= s {
             return String::new();
         }
-        self.src[s.min(self.src.len())..e.min(self.src.len())].to_string()
+        let src = self.src;
+        let mut s = s.min(src.len());
+        let mut e = e.min(src.len());
+        // 字符边界对齐（防御：偏移来自异常路径时可能落在多字节
+        // 字符中间——from_utf8_lossy 兜底而不是 panic）
+        while s < e && !src.is_char_boundary(s) {
+            s += 1;
+        }
+        while e > s && !src.is_char_boundary(e) {
+            e -= 1;
+        }
+        src[s..e].to_string()
     }
 
     // ---- 模块层 ----
@@ -492,13 +503,18 @@ impl<'a> Parser<'a> {
         }
         loop {
             let t = self.tk().clone();
+            // 修饰符循环：后随**任意键形态**（Ident/计算键 `[`/数字/字符串
+            //——`static get [Symbol.species]() {}` 的 get 后随 `[`）
             if t.kind == TokKind::Ident
                 && matches!(
                     t.text.as_str(),
                     "static" | "public" | "private" | "protected" | "readonly" | "abstract"
                         | "override" | "declare" | "async" | "get" | "set" | "const" | "accessor"
                 )
-                && self.tk_at(1).kind == TokKind::Ident
+                && (self.tk_at(1).kind == TokKind::Ident
+                    || self.tk_at(1).kind == TokKind::Num
+                    || self.tk_at(1).kind == TokKind::Str
+                    || self.is_punct_at(1, "["))
                 && !self.tk_at(1).newline_before
             {
                 self.advance();
@@ -519,6 +535,19 @@ impl<'a> Parser<'a> {
                 n.push_str(&self.advance().text);
             }
             n
+        } else if name_tok.kind == TokKind::Num || name_tok.kind == TokKind::Str {
+            // 数字/字符串键（`0() {}` / `"s"() {}`——方法或字段）
+            self.advance().text
+        } else if name_tok.kind == TokKind::Punct && name_tok.text == "[" {
+            // 计算键 [expr]：解析本体；名字进 sig_raw 原文（占位空串）
+            self.advance();
+            let _ = self.parse_assign_expr();
+            if self.is_punct("]") {
+                self.advance();
+            } else {
+                self.err_here("expected ]");
+            }
+            String::new()
         } else {
             let s = self.pos;
             self.skip_balanced_to_stmt_boundary();
@@ -911,7 +940,9 @@ impl<'a> Parser<'a> {
                     }
                     ty_raw = Some(self.raw_between(ts, self.pos));
                 }
-                let init = if self.is_punct("=") && !self.tk().newline_before {
+                // `=` 不受限产生式：`var x \n = 1` 按续行解析（JS 的
+                // ASI 只在下一 token 无法续行时插入——`=` 只能续行）
+                let init = if self.is_punct("=") {
                     self.advance();
                     Some(self.parse_assign_expr())
                 } else {
@@ -1103,7 +1134,7 @@ impl<'a> Parser<'a> {
             let is_of = of_at.is_some();
             let bind_raw = self.raw_between(head_start, kw_at);
             let decl = if self.toks[head_start].kind == TokKind::Ident
-                && matches!(self.toks[head_start].text.as_str(), "var" | "let" | "const")
+                && matches!(self.toks[head_start].text.as_str(), "var" | "let" | "const" | "using")
             {
                 Some(match self.toks[head_start].text.as_str() {
                     "var" => VarKind::Var,
@@ -1156,6 +1187,7 @@ impl<'a> Parser<'a> {
         if !self.is_punct(";") {
             if self.is_kw("var")
                 || self.is_kw("const")
+                || self.is_kw("using")
                 || (self.is_kw("let") && self.let_is_decl())
             {
                 let d = self.parse_var_decl_stmt();
@@ -1386,20 +1418,14 @@ impl<'a> Parser<'a> {
 
     fn parse_expr_or_decl_stmt(&mut self) -> TsId {
         let t = self.tk().clone();
-        // 标签语句：ident `:` 后随语句形态
-        if t.kind == TokKind::Ident && self.is_punct_at(1, ":") {
-            let next = self.tk_at(2);
-            let stmt_like = match next.kind {
-                TokKind::Ident => true,
-                TokKind::Punct => matches!(next.text.as_str(), "{" | "("),
-                _ => false,
-            };
-            if stmt_like && !self.tk_at(1).newline_before {
-                let name = self.advance().text;
-                self.advance(); // :
-                let stmt = self.parse_stmt();
-                return self.ast.label(&name, stmt);
-            }
+        // 标签语句：语句位的 `ident :` 恒为标签（对象字面量不能起始
+        // 语句；三元不可能在 ident 后立刻出现冒号——语句位无前驱
+        // 操作数。test262：yield: 1 / await: 2 等 sloppy 标签）
+        if t.kind == TokKind::Ident && self.is_punct_at(1, ":") && !self.tk_at(1).newline_before {
+            let name = self.advance().text;
+            self.advance(); // :
+            let stmt = self.parse_stmt();
+            return self.ast.label(&name, stmt);
         }
         let start = self.pos;
         let e = self.parse_expr();
@@ -1450,6 +1476,25 @@ impl<'a> Parser<'a> {
             return a;
         }
         if self.is_kw("yield") {
+            // sloppy 位的 yield 标识符用法：yield = x / yield.x /
+            // yield[x] / yield(x) / yield, / yield)——按 VarRef（
+            // 生成器语境外 yield 是普通名；test262 non-strict 家族）
+            // 守卫**只看前瞻 token 形态**（= . [ ( , ) ; EOF）——
+            // 绝不检查 yield 自身的 newline_before：生成器里 yield
+            // 换行开头是最常见形态（test262 annexB 抓获：曾把行首
+            // yield 误判为标识符，后续操作数全部错位）
+            if self.is_punct("=")
+                || self.is_punct(".")
+                || self.is_punct("[")
+                || self.is_punct("(")
+                || self.is_punct(",")
+                || self.is_punct(")")
+                || self.is_punct(";")
+                || self.at_eof()
+            {
+                let name = self.advance().text;
+                return self.ast.var(&name);
+            }
             // yield 表达式：原文捕获（生成器恢复 v1 不简化）
             let s = self.pos;
             self.advance();
@@ -1667,9 +1712,19 @@ impl<'a> Parser<'a> {
         self.parse_postfix()
     }
 
-    /// `await` 是否是普通标识符（作为值引用——`await(x)` 调用形/实参）。
+    /// `await` 是否是普通标识符（sloppy 非异步语境：`await(x)` 调用/
+    /// `await.x` 成员/`await = x` 赋值/`await, await)` 参数位——
+    /// test262 非 async 文件大量使用 await 作名）。
     fn await_is_ident(&self) -> bool {
-        self.is_punct_at(1, "(") || self.tk_at(1).newline_before
+        // 只看前瞻形态（换行接操作数 `await \n x` 是合法 await——
+        // 不可当标识符判据）
+        self.is_punct_at(1, "(")
+            || self.is_punct_at(1, ".")
+            || self.is_punct_at(1, "=")
+            || self.is_punct_at(1, "[")
+            || self.is_punct_at(1, ",")
+            || self.is_punct_at(1, ";")
+            || self.is_punct_at(1, ")")
     }
 
     fn parse_postfix(&mut self) -> TsId {
@@ -1762,7 +1817,18 @@ impl<'a> Parser<'a> {
     fn parse_primary_with_new(&mut self) -> TsId {
         if self.is_kw("new") {
             self.advance();
-            let mut e = self.parse_primary();
+            // new.target 元属性
+            if self.is_punct(".") && self.tk_at(1).text == "target" {
+                self.advance();
+                self.advance();
+                return self.ast.raw("new.target");
+            }
+            // 嵌套 new（new new X()()）：操作数以 new 开头递归
+            let mut e = if self.is_kw("new") {
+                self.parse_primary_with_new()
+            } else {
+                self.parse_primary()
+            };
             loop {
                 if self.is_punct(".") {
                     self.advance();
@@ -1954,6 +2020,7 @@ impl<'a> Parser<'a> {
             TokKind::Ident => match t.text.as_str() {
                 "function" => self.parse_function_expr(false),
                 "async" if self.tk_at(1).text == "function" && !self.tk_at(1).newline_before => {
+                    self.advance(); // async（parse_function_expr 消费 function）
                     self.parse_function_expr(true)
                 }
                 "class" if self.tk_at(1).kind == TokKind::Ident || self.tk_at(1).kind == TokKind::Punct => {
@@ -2026,6 +2093,13 @@ impl<'a> Parser<'a> {
                     self.advance();
                     let mut elems = Vec::new();
                     while !self.is_punct("]") && !self.at_eof() {
+                        // 稀疏数组 elision（`[, ,42,,]`——空洞位占位；
+                        // 打印原样输出空槽保持长度语义）
+                        if self.is_punct(",") {
+                            elems.push(self.ast.raw(""));
+                            self.advance();
+                            continue;
+                        }
                         if self.is_punct("...") {
                             self.advance();
                             let e = self.parse_assign_expr();
@@ -2109,6 +2183,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_obj_lit(&mut self) -> TsId {
+        let open = self.pos;
         self.advance(); // {
         let mut props: Vec<String> = Vec::new();
         let mut values: Vec<TsId> = Vec::new();
@@ -2122,6 +2197,14 @@ impl<'a> Parser<'a> {
                 let (p, v) = self.parse_obj_prop();
                 props.push(p);
                 values.push(v);
+            }
+            // 解构模式信号：键后是 `=`（默认值 `{x = v}`——对象字面量
+            // 语法无此形态；声明/赋值目标的模式）→ 整段 `{…}` 原文
+            //（绑定名不可见 → 不透明，语义保真）
+            if self.is_punct("=") {
+                self.pos = open;
+                self.skip_braces();
+                return self.ast.raw(&self.raw_between(open, self.pos));
             }
             if self.is_punct(",") {
                 self.advance();
@@ -2139,22 +2222,60 @@ impl<'a> Parser<'a> {
 
     fn parse_obj_prop(&mut self) -> (String, TsId) {
         let t = self.tk().clone();
-        // 访问器/异步方法：get x() / set x(v) / async m()——整体原文
-        if t.kind == TokKind::Ident
+        // 生成器方法前缀 *（{*f() {} / * [k] () {}）
+        let mut gen_prefix = String::new();
+        if t.kind == TokKind::Punct && t.text == "*" {
+            gen_prefix = "*".to_string();
+            self.advance();
+        }
+        // 访问器/异步方法：get x() / set [k]() / async 0()——整体原文
+        //（前缀与键组合形态过多，v1 原文保真）。前瞻：键（Ident/`[expr]`/
+        // Num/Str）之后的 `(`——计算键需跳到配对 `]` 后检查
+        if gen_prefix.is_empty()
+            && t.kind == TokKind::Ident
             && matches!(t.text.as_str(), "get" | "set" | "async")
-            && self.tk_at(1).kind == TokKind::Ident
-            && self.is_punct_at(2, "(")
+            && !self.tk_at(1).newline_before
+            && self.accessor_ahead()
         {
             let s = self.pos;
-            // 扫过方法体（平衡花括号）
             self.skip_obj_method();
             let raw = self.raw_between(s, self.pos);
             let raw = raw.trim_end().trim_end_matches(';').to_string();
             return (raw, self.ast.raw(""));
         }
-        // 方法简写 name(params) { body }
-        if t.kind == TokKind::Ident && self.is_punct_at(1, "(") && !self.tk_at(1).newline_before {
-            let name = self.advance().text;
+        // 键（ident / str / num / 计算键）
+        let key = match self.tk().clone() {
+            Token { kind: TokKind::Ident, text, .. } => {
+                self.advance();
+                text
+            }
+            Token { kind: TokKind::Str | TokKind::Num, text, .. } => {
+                self.advance();
+                text
+            }
+            Token { kind: TokKind::Punct, text, .. } if text == "[" => {
+                // 计算键 [expr]：raw 不含两端括号（含进去打印层再包
+                // 一层——往返每轮多一层 `[`）
+                let s = self.pos;
+                self.advance();
+                let _ = self.parse_assign_expr();
+                if self.is_punct("]") {
+                    self.advance();
+                } else {
+                    self.err_here("expected ]");
+                }
+                format!("[{}]", self.raw_between(s + 1, self.pos - 1))
+            }
+            _ => {
+                self.err_here("expected property key");
+                if !self.at_eof() {
+                    self.advance();
+                }
+                String::new()
+            }
+        };
+        // 方法（任意键形 + `(`）：name(params) { body }
+        if self.is_punct("(") && !self.tk().newline_before {
             let ps = self.pos;
             self.skip_parens();
             let params_full = self.raw_between(ps, self.pos);
@@ -2169,66 +2290,82 @@ impl<'a> Parser<'a> {
                 self.err_here("expected { in object method");
                 self.ast.block(vec![])
             };
-            let lam = self.ast.lambda(&inner, body, false, false, false);
-            return (format!("{name}{params_full}"), lam);
+            let lam = self.ast.lambda(&inner, body, false, false, !gen_prefix.is_empty());
+            return (format!("{gen_prefix}{key}{params_full}"), lam);
         }
-        // 键
-        let key = match t.kind {
-            TokKind::Ident => {
-                self.advance();
-                t.text.clone()
-            }
-            TokKind::Str | TokKind::Num => {
-                self.advance();
-                t.text.clone()
-            }
-            TokKind::Punct if t.text == "[" => {
-                // 计算键 [expr]：raw 区间**不含**两端括号（含进去会让
-                // 打印层 format 再包一层——每轮往返多一层 `[`；真实
-                // 语料三轮振荡累积抓获）
-                let s = self.pos;
-                self.advance();
-                let _ = self.parse_assign_expr();
-                if self.is_punct("]") {
-                    self.advance();
-                } else {
-                    self.err_here("expected ]");
-                }
-                format!("[{}]", self.raw_between(s + 1, self.pos - 1))
-            }
-            _ => {
-                self.err_here("expected property key");
-                self.advance();
-                String::new()
-            }
-        };
         if !self.is_punct(":") {
-            // 简写 { x }
-            if t.kind == TokKind::Ident {
+            // 简写 { x }（仅 ident 键；gen 前缀后无方法是语法错——
+            // 容错按原文残段处理）
+            if t.kind == TokKind::Ident && gen_prefix.is_empty() {
                 return (key.clone(), self.ast.var(&t.text));
             }
-            return (key, self.ast.raw(""));
+            if gen_prefix.is_empty() {
+                return (key, self.ast.raw(""));
+            }
+            return (format!("{gen_prefix}{key}"), self.ast.raw(""));
         }
         self.advance(); // :
         let v = self.parse_assign_expr();
-        (key, v)
+        (format!("{gen_prefix}{key}"), v)
     }
 
-    /// 扫过对象方法（`name(…) { … }`）到平衡体尾。
+    /// 扫过对象方法（`[kw] key(…) { … }`）到平衡体尾——键支持
+    /// Ident/计算键 `[expr]`/Num/Str 全形态。
     fn skip_obj_method(&mut self) {
-        // 跳键
         self.advance(); // get/set/async
-        if self.tk().kind == TokKind::Ident {
+        if self.is_punct("[") {
+            self.skip_brackets();
+        } else if matches!(self.tk().kind, TokKind::Ident | TokKind::Num | TokKind::Str) {
+            self.advance();
+        }
+        if self.is_punct("*") {
             self.advance();
         }
         self.skip_parens();
         if self.is_punct("{") {
             self.skip_braces();
         }
-        // 尾分号可选
         if self.is_punct(";") {
             self.advance();
         }
+    }
+
+    /// 访问器前瞻：get/set/async + 键形态 + `(`。
+    fn accessor_ahead(&self) -> bool {
+        if matches!(
+            self.tk_at(1).kind,
+            TokKind::Ident | TokKind::Num | TokKind::Str
+        ) {
+            return self.is_punct_at(2, "(");
+        }
+        if self.is_punct_at(1, "[") {
+            // 计算键：找配对 `]` 后的 `(`
+            let mut depth = 0i32;
+            let mut i = self.pos + 1;
+            while i < self.toks.len() {
+                let t = &self.toks[i];
+                if t.kind == TokKind::Eof {
+                    return false;
+                }
+                if t.kind == TokKind::Punct {
+                    match t.text.as_str() {
+                        "[" => depth += 1,
+                        "]" => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return self
+                                    .toks
+                                    .get(i + 1)
+                                    .is_some_and(|n| n.kind == TokKind::Punct && n.text == "(");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                i += 1;
+            }
+        }
+        false
     }
 
     /// 类表达式边界扫描。

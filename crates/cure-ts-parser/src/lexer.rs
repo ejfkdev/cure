@@ -117,15 +117,28 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// 全量词法（容错）。
+    /// 全量词法（容错）。**零进展防御**：非 Eof token 必须消费 ≥1 字节
+    /// ——违反即跳过该字节并记错（异常转义/未来词法 bug 的保险丝；
+    /// test262 曾因空 ident 零消费进入无限 token 累积 → 系统级 OOM）。
     pub fn tokenize(mut self) -> (Vec<Token>, Vec<LexError>) {
         let mut toks = Vec::new();
         loop {
+            let before = self.pos;
             let t = self.next_token();
             let is_eof = t.kind == TokKind::Eof;
             toks.push(t);
             if is_eof {
                 break;
+            }
+            if self.pos == before {
+                self.errors.push(LexError {
+                    line: self.line,
+                    col: self.pos - self.line_start + 1,
+                    message: format!("zero-progress token at byte {before} skipped"),
+                });
+                // 按整 UTF-8 字符跳（单字节会落在多字节字符中间——
+                // 后续 token 起点非字符边界，raw 切片 panic）
+                self.pos += utf8_len(self.peek()).max(1);
             }
         }
         (toks, self.errors)
@@ -171,6 +184,20 @@ impl<'a> Lexer<'a> {
             match self.peek() {
                 b' ' | b'\t' | b'\r' | 0x0b | 0x0c => {
                     self.pos += 1;
+                }
+                c2 if c2 >= 0x80 => {
+                    // Unicode 空白（NBSP/U+2028/U+FEFF 等）：解码判定
+                    let l = utf8_len(c2);
+                    let end = (self.pos + l).min(self.src.len());
+                    let ch = String::from_utf8_lossy(&self.src[self.pos..end])
+                        .chars()
+                        .next()
+                        .unwrap_or('\u{fffd}');
+                    if ch.is_whitespace() || ch == '\u{feff}' {
+                        self.pos = end;
+                    } else {
+                        return newline;
+                    }
                 }
                 b'\n' => {
                     newline = true;
@@ -341,13 +368,59 @@ impl<'a> Lexer<'a> {
                 kind = TokKind::Num;
                 text = n;
             }
-            _ if is_ident_start(c) => {
-                let mut n = self.pos;
-                while n < self.src.len() && is_ident_part(self.src[n]) {
-                    n += 1;
+            _ if is_ident_start(c) || (c == b'\\' && self.peek2() == b'u') => {
+                // 标识符可含 unicode 转义（\uXXXX / \u{...}——test262
+                // 大量使用）：解码进名字（打印输出解码形态——语义恒等，
+                // 幂等成立）。高字节按 UTF-8 解码字符判定（NBSP 等非
+                // 标识字符终止——test262 whitespace 家族）。
+                let mut word = String::new();
+                while self.pos < self.src.len() {
+                    let c = self.peek();
+                    if c == b'\\' && self.peek2() == b'u' {
+                        match decode_unicode_escape(self.src, self.pos + 1) {
+                            Some((ch, len)) => {
+                                // 白名单与高字节分支**严格一致**（含 ZWJ/
+                                // ZWNJ 续接符——`‌` 曾因两分支白名单
+                                // 不一致被本分支 break 且零消费——空 ident
+                                // token 无限累积 → 100GB OOM，test262
+                                // unicode-property-names 抓获）
+                                if !(ch.is_alphanumeric()
+                                    || ch == '_'
+                                    || ch == '$'
+                                    || ch == '\u{200c}'
+                                    || ch == '\u{200d}')
+                                {
+                                    break;
+                                }
+                                word.push(ch);
+                                self.pos += len + 1;
+                            }
+                            None => break,
+                        }
+                    } else if c < 0x80 && is_ident_part(c) {
+                        word.push(c as char);
+                        self.pos += 1;
+                    } else if c >= 0x80 {
+                        // 高字节字符：**宽容接受**为标识符（Unicode ID 表
+                        // 无法零依赖内置——test262 的 ℘/℮ 等 Other_ID_Start
+                        // 字符远多于误判代价；唯一终止条件是空白。
+                        // 真正的 Unicode 标点误并入标识符最多损失一个
+                        // 错误报告——原文保真不受影响）
+                        let l = utf8_len(c);
+                        let end = (self.pos + l).min(self.src.len());
+                        let ch_str = String::from_utf8_lossy(&self.src[self.pos..end]).to_string();
+                        let ch = ch_str.chars().next().unwrap_or('\u{fffd}');
+                        if ch.is_whitespace() {
+                            break;
+                        }
+                        word.push_str(&ch_str);
+                        self.pos = end;
+                    } else {
+                        break;
+                    }
                 }
-                let word = String::from_utf8_lossy(&self.src[self.pos..n]).to_string();
-                self.pos = n;
+                let word = word;
+                self.pos = self.pos;
                 kind = TokKind::Ident;
                 text = word.clone();
                 self.set_prev(
@@ -635,6 +708,36 @@ impl<'a> Lexer<'a> {
 
 pub fn is_ident_start(c: u8) -> bool {
     c == b'_' || c == b'$' || c.is_ascii_alphabetic() || c >= 0x80
+}
+
+/// 解码标识符转义（`\uXXXX` / `\u{...}`）：返回解码字符与消耗长度。
+/// 无效转义返回 None（调用方按原文兜底）。
+fn decode_unicode_escape(src: &[u8], pos: usize) -> Option<(char, usize)> {
+    // pos 指向 'u'
+    if src.get(pos) != Some(&b'u') {
+        return None;
+    }
+    if src.get(pos + 1) == Some(&b'{') {
+        let mut end = pos + 2;
+        while end < src.len() && src[end] != b'}' {
+            end += 1;
+        }
+        if end >= src.len() {
+            return None;
+        }
+        let hex = std::str::from_utf8(&src[pos + 2..end]).ok()?;
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        let c = char::from_u32(v)?;
+        Some((c, end - pos + 1))
+    } else {
+        if pos + 4 >= src.len() {
+            return None;
+        }
+        let hex = std::str::from_utf8(&src[pos + 1..pos + 5]).ok()?;
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        let c = char::from_u32(v)?;
+        Some((c, 5))
+    }
 }
 
 pub fn is_ident_part(c: u8) -> bool {
