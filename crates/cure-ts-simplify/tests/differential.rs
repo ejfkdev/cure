@@ -851,3 +851,224 @@ fn assign_to_compound_is_binding_aware() {
     assert!(printed.contains("a += "), "{printed}");
     assert!(printed.contains("o.x = o.x + 1"), "member target must stay: {printed}");
 }
+
+// ---------------------------------------------------------------------------
+// 随机小程序差分（确定性 PRNG）：原版/cure 版 node 输出比较 + 二次幂等
+// ---------------------------------------------------------------------------
+
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed.max(1))
+    }
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+fn gen_expr(rng: &mut Rng, vars: &[String], funcs: &[String], depth: usize) -> String {
+    let leaf = depth == 0 || rng.below(3) == 0;
+    if leaf {
+        if !vars.is_empty() && rng.below(4) != 0 {
+            return vars[rng.below(vars.len())].clone();
+        }
+        return match rng.below(7) {
+            0 => "0".into(),
+            1 => "1".into(),
+            2 => "2".into(),
+            3 => "-1".into(),
+            4 => format!("{}", rng.below(20) as i64 - 10),
+            5 => "true".into(),
+            6 => "false".into(),
+            _ => format!("'{}'", ["", "a", "0", "x y"][rng.below(4)]),
+        };
+    }
+    match rng.below(8) {
+        0 => {
+            let op = ["+", "-", "*", "%", "&", "|", "^", "<<", ">>", ">>>"][rng.below(10)];
+            format!(
+                "({} {} {})",
+                gen_expr(rng, vars, funcs, depth - 1),
+                op,
+                gen_expr(rng, vars, funcs, depth - 1)
+            )
+        }
+        1 => {
+            let op = ["===", "!==", "<", ">", "<=", ">="][rng.below(6)];
+            format!(
+                "({} {} {})",
+                gen_expr(rng, vars, funcs, depth - 1),
+                op,
+                gen_expr(rng, vars, funcs, depth - 1)
+            )
+        }
+        2 => {
+            let op = ["&&", "||", "??"][rng.below(3)];
+            format!(
+                "({} {} {})",
+                gen_expr(rng, vars, funcs, depth - 1),
+                op,
+                gen_expr(rng, vars, funcs, depth - 1)
+            )
+        }
+        3 => {
+            let op = ["!", "~", "-", "+", "typeof ", "void "][rng.below(6)];
+            format!("({op}{})", gen_expr(rng, vars, funcs, depth - 1))
+        }
+        4 => format!(
+            "({} ? {} : {})",
+            gen_expr(rng, vars, funcs, depth - 1),
+            gen_expr(rng, vars, funcs, depth - 1),
+            gen_expr(rng, vars, funcs, depth - 1)
+        ),
+        5 if !funcs.is_empty() => format!(
+            "{}({}, {})",
+            funcs[rng.below(funcs.len())],
+            gen_expr(rng, vars, funcs, depth - 1),
+            gen_expr(rng, vars, funcs, depth - 1)
+        ),
+        6 => format!(
+            "`{}${{{}}}`",
+            ["p", "", "x"][rng.below(3)],
+            gen_expr(rng, vars, funcs, depth - 1)
+        ),
+        _ => format!(
+            "(({}, {}))",
+            gen_expr(rng, vars, funcs, depth - 1),
+            gen_expr(rng, vars, funcs, depth - 1)
+        ),
+    }
+}
+
+fn gen_block(
+    rng: &mut Rng,
+    vars: &mut Vec<String>,
+    assignable: &mut Vec<String>,
+    funcs: &mut Vec<String>,
+    out: &mut String,
+    n: usize,
+    indent: &str,
+) {
+    for _ in 0..n {
+        match rng.below(6) {
+            0 | 1 => {
+                let name = format!("v{}", vars.len() + assignable.len());
+                let expr = gen_expr(rng, vars, funcs, 3);
+                let kind = ["var", "let", "const"][rng.below(3)];
+                out.push_str(&format!("{indent}{kind} {name} = {expr};\n"));
+                if kind != "const" {
+                    assignable.push(name.clone());
+                }
+                vars.push(name);
+            }
+            2 if !assignable.is_empty() => {
+                let name = assignable[rng.below(assignable.len())].clone();
+                let expr = gen_expr(rng, vars, funcs, 3);
+                let op = ["=", "+=", "-=", "^=", "*="][rng.below(5)];
+                out.push_str(&format!("{indent}{name} {op} {expr};\n"));
+            }
+            3 => {
+                let expr = gen_expr(rng, vars, funcs, 2);
+                let a = gen_expr(rng, vars, funcs, 2);
+                let b = gen_expr(rng, vars, funcs, 2);
+                out.push_str(&format!("{indent}if ({expr}) {{\n"));
+                let mut inner = vars.clone();
+                let mut inner_as = assignable.clone();
+                gen_block(rng, &mut inner, &mut inner_as, funcs, out, 2, &format!("{indent}  "));
+                out.push_str(&format!("{indent}}} else {{\n"));
+                let mut inner2 = vars.clone();
+                let mut inner2_as = assignable.clone();
+                gen_block(rng, &mut inner2, &mut inner2_as, funcs, out, 2, &format!("{indent}  "));
+                out.push_str(&format!("{indent}}}\n"));
+                // 保留 else 分支里对既有变量的赋值可见性（新声明不外泄）
+                let _ = (a, b);
+            }
+            4 => {
+                let bound = 1 + rng.below(3);
+                let body = gen_expr(rng, vars, funcs, 2);
+                let target = if assignable.is_empty() {
+                    "v".to_string()
+                } else {
+                    assignable[rng.below(assignable.len())].clone()
+                };
+                if assignable.is_empty() {
+                    out.push_str(&format!("{indent}for (let i = 0; i < {bound}; i++) {{ void {body}; }}\n"));
+                } else {
+                    out.push_str(&format!(
+                        "{indent}for (let i = 0; i < {bound}; i++) {{ {target} = {body}; }}\n"
+                    ));
+                }
+            }
+            5 => {
+                let fname = format!("f{}", funcs.len());
+                let p0 = "a";
+                let p1 = "b";
+                let body = gen_expr(rng, vars, funcs, 2);
+                out.push_str(&format!(
+                    "{indent}function {fname}({p0}, {p1}) {{ return {body}; }}\n"
+                ));
+                funcs.push(fname);
+            }
+            _ => {
+                // 内层同名遮蔽
+                if let Some(name) = vars.first().cloned() {
+                    let expr = gen_expr(rng, vars, funcs, 2);
+                    out.push_str(&format!("{indent}{{\n{indent}  let {name} = {expr};\n"));
+                    let mut inner = vars.clone();
+                    let mut inner_as = assignable.clone();
+                    inner_as.retain(|v| v != &name);
+                    gen_block(rng, &mut inner, &mut inner_as, funcs, out, 1, &format!("{indent}  "));
+                    out.push_str(&format!("{indent}}}\n"));
+                }
+            }
+        }
+    }
+}
+
+fn gen_program(seed: u64) -> String {
+    let mut rng = Rng::new(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    let mut vars = Vec::new();
+    let mut assignable = Vec::new();
+    let mut funcs = Vec::new();
+    let mut out = String::new();
+    gen_block(&mut rng, &mut vars, &mut assignable, &mut funcs, &mut out, 6, "");
+    let args = if vars.is_empty() { "'empty'".to_string() } else { vars.join(", ") };
+    out.push_str(&format!("console.log({args});\n"));
+    out
+}
+
+#[test]
+fn randomized_program_differential() {
+    if node_bin().is_none() {
+        eprintln!("skip randomized differential: node not found");
+        return;
+    }
+    let cases: u64 = std::env::var("CURE_FUZZ_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(80);
+    for seed in 1..=cases {
+        let src = gen_program(seed);
+        eprintln!("--- random case {seed} ---\n{src}");
+        differential(&format!("rand_{seed}"), &src);
+        // 二次 cure 幂等（同一输入下输出必须逐字节一致）
+        let mut out = parse(&src);
+        assert!(out.errors.is_empty(), "case {seed} parse: {:?}\n{src}", out.errors);
+        let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
+        let once = print_module(&out.ast, &out.unit);
+        let mut out2 = parse(&once);
+        assert!(out2.errors.is_empty(), "case {seed} reparse: {:?}\n{once}", out2.errors);
+        let _ = simplify_unit(&mut out2.ast, &mut out2.unit, &Config::default());
+        let twice = print_module(&out2.ast, &out2.unit);
+        assert_eq!(once, twice, "case {seed} not idempotent:\n{src}\n--- once ---\n{once}\n--- twice ---\n{twice}");
+    }
+}

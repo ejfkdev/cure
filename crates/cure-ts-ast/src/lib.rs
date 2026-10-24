@@ -2157,7 +2157,18 @@ impl Lang for TsAst {
         match self.data(id) {
             NodeData::Literal(JsLit::Bool(_)) => true,
             NodeData::Binary { op } => {
-                op.is_comparison() || matches!(op, BinOp::And | BinOp::Or | BinOp::Nullish)
+                if op.is_comparison() {
+                    true
+                } else if matches!(op, BinOp::And | BinOp::Or | BinOp::Nullish) {
+                    // `-1 || true` 返回 -1（truthy 非布尔左操作数）——只有
+                    // **两侧都语法级布尔**时结果才是布尔。此前把任意
+                    // And/Or 当布尔，`x || true` 被误折成 true（随机差分
+                    // 135 抓获）。
+                    let ch = self.children(id);
+                    ch.len() == 2 && self.is_bool(ch[0]) && self.is_bool(ch[1])
+                } else {
+                    false
+                }
             }
             NodeData::Unary { op: UnOp::Not } => true,
             NodeData::Paren => self.is_bool(self.children(id)[0]),
@@ -2586,6 +2597,10 @@ impl Lang for TsAst {
             // 简化后本根的语句事实可能从未构建——缺事实时规则退回保守
             // 扫描，λ 捕获守卫漏判（class 字段存在时 `let self = this`
             // 被内联进内层函数；Test262 private-field-access 族抓获）。
+            // 先重建绑定/var_trap：事件与语句事实的 is_opaque 依赖它
+            //（顺序反了会缓存“非不透明”事件，导致二次运行才简化——
+            // 随机差分 case 511 抓获）。
+            self.rebuild_local_marks(root);
             for sr in cure_tree::stmt_roots(self, root) {
                 let idx = sr.0 as usize;
                 if self.stmt_facts.get(idx).map_or(true, |f| f.is_none()) {
@@ -2600,12 +2615,13 @@ impl Lang for TsAst {
                     }
                 }
             }
-            self.rebuild_local_marks(root);
             self.prepared_root = Some(root);
             return;
         }
         self.prepared_root = Some(root);
         self.events.mark_clean();
+        // 同上：先算绑定不透明性，再建事件/事实。
+        self.rebuild_local_marks(root);
         for sr in cure_tree::stmt_roots(self, root) {
             let idx = sr.0 as usize;
             if self.events.slot(idx).is_none() {
@@ -2628,7 +2644,6 @@ impl Lang for TsAst {
             }
         }
         self.refresh_effects(root, n_nodes);
-        self.rebuild_local_marks(root);
     }
 
     fn cost_weight(&self, kind: NodeKind) -> u64 {

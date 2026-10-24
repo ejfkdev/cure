@@ -56,16 +56,6 @@ fn parse_inner(src: &str, module_goal: Option<bool>) -> ParseOutcome {
         src
     };
     let (toks, lex_errs) = Lexer::new(body).tokenize();
-    if std::env::var("CURE_STATS_MEM").is_ok() {
-        let heap: usize = toks.iter().map(|t| t.text.capacity()).sum();
-        eprintln!(
-            "[mem] src={} tokens={} token_size={} text_heap={}",
-            body.len(),
-            toks.len(),
-            std::mem::size_of::<Token>(),
-            heap
-        );
-    }
     let module_goal = module_goal.unwrap_or_else(|| detect_module_goal(&toks));
     let mut p = Parser {
         src: body,
@@ -97,14 +87,6 @@ fn parse_inner(src: &str, module_goal: Option<bool>) -> ParseOutcome {
             col: 1,
             message: "nesting too deep; preserved verbatim".into(),
         });
-    }
-    if std::env::var("CURE_STATS_MEM").is_ok() {
-        eprintln!(
-            "[mem] nodes={} node_size={} node_bytes={}",
-            p.ast.node_count(),
-            std::mem::size_of::<cure_ts_ast::Node>(),
-            p.ast.node_count() * std::mem::size_of::<cure_ts_ast::Node>()
-        );
     }
     ParseOutcome {
         ast: p.ast,
