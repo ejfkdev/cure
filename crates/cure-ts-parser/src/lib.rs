@@ -56,6 +56,16 @@ fn parse_inner(src: &str, module_goal: Option<bool>) -> ParseOutcome {
         src
     };
     let (toks, lex_errs) = Lexer::new(body).tokenize();
+    if std::env::var("CURE_STATS_MEM").is_ok() {
+        let heap: usize = toks.iter().map(|t| t.text.capacity()).sum();
+        eprintln!(
+            "[mem] src={} tokens={} token_size={} text_heap={}",
+            body.len(),
+            toks.len(),
+            std::mem::size_of::<Token>(),
+            heap
+        );
+    }
     let module_goal = module_goal.unwrap_or_else(|| detect_module_goal(&toks));
     let mut p = Parser {
         src: body,
@@ -87,6 +97,14 @@ fn parse_inner(src: &str, module_goal: Option<bool>) -> ParseOutcome {
             col: 1,
             message: "nesting too deep; preserved verbatim".into(),
         });
+    }
+    if std::env::var("CURE_STATS_MEM").is_ok() {
+        eprintln!(
+            "[mem] nodes={} node_size={} node_bytes={}",
+            p.ast.node_count(),
+            std::mem::size_of::<cure_ts_ast::Node>(),
+            p.ast.node_count() * std::mem::size_of::<cure_ts_ast::Node>()
+        );
     }
     ParseOutcome {
         ast: p.ast,
@@ -250,8 +268,8 @@ impl<'a> Parser<'a> {
     fn err_here(&mut self, msg: &str) {
         let t = self.tk().clone();
         self.errors.push(ParseError {
-            line: t.line,
-            col: t.col,
+            line: t.line as usize,
+            col: t.col as usize,
             message: msg.to_string(),
         });
     }
@@ -261,9 +279,9 @@ impl<'a> Parser<'a> {
         if b <= a || a >= self.toks.len() {
             return String::new();
         }
-        let s = self.toks[a].start;
+        let s = self.toks[a].start as usize;
         let e = if b <= self.toks.len() {
-            self.toks[b - 1].end
+            self.toks[b - 1].end as usize
         } else {
             self.src.len()
         };
@@ -2163,8 +2181,8 @@ impl<'a> Parser<'a> {
                 if std::env::var("CURE_DBG_COND").is_ok() {
                     eprintln!(
                         "[cond] L{} C{} then={:?} next={:?}",
-                        self.tk().line,
-                        self.tk().col,
+                        self.tk().line as usize,
+                        self.tk().col as usize,
                         cure_engine::kind::NodeKind::from(self.ast.kind(then)),
                         self.tk().text
                     );
@@ -2776,7 +2794,8 @@ impl<'a> Parser<'a> {
         }
         // `function (` vs `function(`：Function.prototype.toString 与
         // 计算属性键依赖原文，保留空档（Test262 cpn-class 家族抓获）。
-        let space = self.pos > 0 && self.tk().start > self.toks[self.pos - 1].end;
+        let space = self.pos > 0
+            && self.tk().start as usize > self.toks[self.pos - 1].end as usize;
         let ps = self.pos;
         self.skip_parens();
         let full = self.raw_between(ps, self.pos);

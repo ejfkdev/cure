@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+### 性能（增量 effect 缓存 + 紧凑 Token——2026-10-24 第十二批）
+
+- **增量 effect 缓存**：旧实现每个 pass 对整个 arena 跑
+  `rebuild_effects`（4 轮 × 全部节点），13.6 MB 的 `pnpm.mjs`
+  9085 个 pass 下耗时 31.8 s。现在 effect 只在首次/换根时后序计算
+  可达节点，编辑沿祖先链标脏，prepare 只重算脏子树。同一文件
+  **31.8 s → 4.75 s（约 6.7×）**，指令数 275B → 75B；格式-only
+  仍为 0.41 s。
+- **Token 紧凑布局**：`line/col/start/end` 从 `usize` 改为 `u32`，
+  Token 64→48 字节。2.09M token 的大文件减少约 33 MB 结构占用；
+  格式-only 峰值 RSS 327→294 MB，完整流程 506→476 MB。
+- 真实 npm 语料 4,358 文件：约 10.5 s（wall），输出与编辑数不变，
+  **0 broken / 0 二次差异**；Test262 六层全绿（同步 0 失配、async
+  5,423、module 358、编译 49,165 valid / 0 破坏、往返/幂等各
+  49,159）；`cargo test --workspace` **448 通过**。
+
 ### 健壮性（深嵌套栈护栏 + Raw 条目换行——2026-10-24 第十一批）
 
 - **递归深度护栏**：parser 对语句/表达式/一元链统一计数，超过

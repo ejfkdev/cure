@@ -54,7 +54,10 @@ the same thing.
   ("virtual execution") of literal-only JDK calls.
 - **Scales to real codebases** — the full OpenJDK source corpus
   (371,674 files, 4.7 GB) processes in ~15 s on an 18-core laptop, with
-  0 parse failures and 0 panics.
+  0 parse failures and 0 panics. On the JS/TS side, a 13 MB minified
+  bundle runs in ~5 s (was ~32 s before incremental effect caches), and
+  4,358 npm files process in ~10.5 s; token positions are `u32`, keeping
+  each token at 48 bytes.
 - **Cross-platform I/O backends** — Linux builds can use batched
   `io_uring` (3,483-file syscall trace: read calls 6,977 → 10, syscall time
   −53%); macOS/Windows use a tuned thread pool. The default build stays

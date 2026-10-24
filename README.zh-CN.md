@@ -43,7 +43,9 @@ class B {                                     class B {
   还原、语句级 StringBuilder 链还原、XOR 噪声剥除、纯字面量 JDK 调用
   的部分求值（"虚拟执行"）。
 - **真实代码库规模** —— OpenJDK 全源码语料（371,674 文件 / 4.7 GB）
-  在 18 核笔记本上约 15 秒处理完，0 解析失败、0 panic。
+  在 18 核笔记本上约 15 秒处理完，0 解析失败、0 panic。TS/JS 侧：
+  13 MB 压缩 bundle 约 5 秒（增量 effect 缓存前约 32 秒），4,358 个
+  npm 文件约 10.5 秒；Token 位置字段改为 u32，每个 token 48 字节。
 - **跨平台 I/O 后端** —— Linux 可启用批量 `io_uring`（3,483 文件
   syscall 追踪：read 调用 6,977 → 10，syscall 时长 −53%）；macOS /
   Windows 用调优线程池。默认构建零运行时依赖。

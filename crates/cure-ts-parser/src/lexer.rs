@@ -41,13 +41,14 @@ pub struct Token {
     pub kind: TokKind,
     /// 原文（Num/Str/Regex 含定界符与全部原文；Ident/Punct 为自身）。
     pub text: String,
-    pub line: usize,
-    pub col: usize,
+    // 位置用 u32：2M token 的文件里每字段 8→4 字节，Token 64→48 字节。
+    pub line: u32,
+    pub col: u32,
     /// token 前是否有换行（ASI 判定）。
     pub newline_before: bool,
     /// 源码字节偏移（原文区间捕获：Raw/JSX/模式/签名）。
-    pub start: usize,
-    pub end: usize,
+    pub start: u32,
+    pub end: u32,
 }
 
 /// 词法错误。
@@ -304,11 +305,11 @@ impl<'a> Lexer<'a> {
             return Token {
                 kind: TokKind::Eof,
                 text: String::new(),
-                line,
-                col,
+                line: line as u32,
+                col: col as u32,
                 newline_before: newline,
-                start: byte_start,
-                end: byte_start,
+                start: byte_start as u32,
+                end: byte_start as u32,
             };
         }
         let c = self.peek();
@@ -326,11 +327,11 @@ impl<'a> Lexer<'a> {
             return Token {
                 kind: TokKind::TemplateQuasi { is_end, cont: false },
                 text: q,
-                line,
-                col,
+                line: line as u32,
+                col: col as u32,
                 newline_before: newline,
-                start: byte_start,
-                end,
+                start: byte_start as u32,
+                end: end as u32,
             };
         }
         // 插值内深度 0 的 `}`：终结插值，扫下一 quasi（cont=true——
@@ -348,11 +349,11 @@ impl<'a> Lexer<'a> {
             return Token {
                 kind: TokKind::TemplateQuasi { is_end, cont: true },
                 text: q,
-                line,
-                col,
+                line: line as u32,
+                col: col as u32,
                 newline_before: newline,
-                start: byte_start,
-                end,
+                start: byte_start as u32,
+                end: end as u32,
             };
         }
         // 插值内的 `{`/`}`：深度维护
@@ -419,11 +420,11 @@ impl<'a> Lexer<'a> {
                     return Token {
                         kind: TokKind::Regex,
                         text: r,
-                        line,
-                        col,
+                        line: line as u32,
+                        col: col as u32,
                         newline_before: newline,
-                        start: byte_start,
-                        end,
+                        start: byte_start as u32,
+                        end: end as u32,
                     };
                 }
                 self.bump();
@@ -555,11 +556,11 @@ impl<'a> Lexer<'a> {
         Token {
             kind,
             text,
-            line,
-            col,
+            line: line as u32,
+            col: col as u32,
             newline_before: newline,
-            start: byte_start,
-            end: self.pos,
+            start: byte_start as u32,
+            end: self.pos as u32,
         }
     }
 
@@ -575,11 +576,11 @@ impl<'a> Lexer<'a> {
         Token {
             kind,
             text: text.to_string(),
-            line,
-            col,
+            line: line as u32,
+            col: col as u32,
             newline_before: newline,
-            start,
-            end: self.pos,
+            start: start as u32,
+            end: self.pos as u32,
         }
     }
 

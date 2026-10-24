@@ -381,8 +381,14 @@ pub struct TsAst {
     /// 可内联的模块级单 return 函数：名字 → (参数名表, 返回表达式)。
     /// 常量解密 helper（字符串数组访问器）的调用点展开材料。
     pub inline_funcs: HashMap<String, (Vec<String>, TsId)>,
-    /// prepare() 重建：TsId → 聚合效果（稠密槽）。
+    /// prepare() 重建：TsId → 聚合效果（稠密槽）。增量维护：编辑只把
+    /// 受影响祖先标脏，prepare 仅重算脏子树。
     effect_cache: Vec<Option<Effect>>,
+    /// 脏 effect 节点（去重标记 + 列表）。
+    effect_dirty: Vec<TsId>,
+    effect_dirty_mark: Vec<bool>,
+    /// effect_cache 上次完整覆盖的根（换根时补算可达节点）。
+    effects_root: Option<TsId>,
     /// prepare() 重建：VarRef → 是否解析到**局部绑定**（作用域栈解析）。
     /// JS 无声明类型 → var_types 退化为局部性布尔（is_local_var 的依据）。
     local_marks: Vec<bool>,
@@ -1878,8 +1884,13 @@ impl Lang for TsAst {
     }
 
     fn invalidate_effect(&mut self, id: TsId) {
-        if let Some(slot) = self.effect_cache.get_mut(id.0 as usize) {
+        let i = id.0 as usize;
+        if let Some(slot) = self.effect_cache.get_mut(i) {
             *slot = None;
+        }
+        if i < self.effect_dirty_mark.len() && !self.effect_dirty_mark[i] {
+            self.effect_dirty_mark[i] = true;
+            self.effect_dirty.push(id);
         }
         self.events.invalidate(id.0 as usize);
         if let Some(slot) = self.stmt_facts.get_mut(id.0 as usize) {
@@ -2562,8 +2573,7 @@ impl Lang for TsAst {
                 }
             }
         }
-        let effects = cure_tree::rebuild_effects(self, n_nodes);
-        self.effect_cache = effects;
+        self.refresh_effects(root, n_nodes);
         self.rebuild_local_marks(root);
     }
 
@@ -2955,4 +2965,86 @@ fn lit_equiv(a: &JsLit, b: &JsLit) -> bool {
         (JsLit::Null, JsLit::Null) => true,
         _ => false,
     }
+}
+
+impl TsAst {
+    /// 增量 effect 缓存：首次/换根补算可达节点；之后只重算 invalidate
+    /// 标脏的子树。旧实现每 pass 全量 `rebuild_effects`（4×全部节点），
+    /// 13MB 单文件 9k pass 时是主要 CPU 来源。
+    fn refresh_effects(&mut self, root: TsId, n: usize) {
+        if self.effect_cache.len() < n {
+            self.effect_cache.resize(n, None);
+        }
+        if self.effect_dirty_mark.len() < n {
+            self.effect_dirty_mark.resize(n, false);
+        }
+        if self.effects_root != Some(root) {
+            // 可达节点后序计算；已缓存子树直接跳过（跨根共享/离开的
+            // 节点不失效）。
+            let mut stack = vec![(root, false)];
+            while let Some((id, exiting)) = stack.pop() {
+                let idx = id.0 as usize;
+                if idx >= n {
+                    continue;
+                }
+                if exiting {
+                    if self.effect_cache[idx].is_none() {
+                        let mut e = <TsAst as Lang>::own_effect(self, id);
+                        for &c in self.nodes[idx].children.as_slice() {
+                            e = e.worst(
+                                self.effect_cache
+                                    .get(c.0 as usize)
+                                    .and_then(|x| *x)
+                                    .unwrap_or(Effect::Unknown),
+                            );
+                        }
+                        self.effect_cache[idx] = Some(e);
+                    }
+                } else if self.effect_cache[idx].is_none() {
+                    stack.push((id, true));
+                    for &c in self.nodes[idx].children.as_slice() {
+                        stack.push((c, false));
+                    }
+                }
+            }
+            self.effects_root = Some(root);
+        }
+        let dirty = std::mem::take(&mut self.effect_dirty);
+        for id in dirty {
+            let idx = id.0 as usize;
+            if idx < self.effect_dirty_mark.len() {
+                self.effect_dirty_mark[idx] = false;
+            }
+            if idx >= n || self.effect_cache[idx].is_some() {
+                continue;
+            }
+            let mut stack = vec![(id, false)];
+            while let Some((x, exiting)) = stack.pop() {
+                let xi = x.0 as usize;
+                if xi >= n {
+                    continue;
+                }
+                if exiting {
+                    if self.effect_cache[xi].is_none() {
+                        let mut e = <TsAst as Lang>::own_effect(self, x);
+                        for &c in self.nodes[xi].children.as_slice() {
+                            e = e.worst(
+                                self.effect_cache
+                                    .get(c.0 as usize)
+                                    .and_then(|v| *v)
+                                    .unwrap_or(Effect::Unknown),
+                            );
+                        }
+                        self.effect_cache[xi] = Some(e);
+                    }
+                } else if self.effect_cache[xi].is_none() {
+                    stack.push((x, true));
+                    for &c in self.nodes[xi].children.as_slice() {
+                        stack.push((c, false));
+                    }
+                }
+            }
+        }
+    }
+
 }
