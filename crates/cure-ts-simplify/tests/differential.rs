@@ -1072,3 +1072,29 @@ fn randomized_program_differential() {
         assert_eq!(once, twice, "case {seed} not idempotent:\n{src}\n--- once ---\n{once}\n--- twice ---\n{twice}");
     }
 }
+
+#[test]
+fn diff_ternary_bool_op_requires_boolean_condition() {
+    // c ? true : b ≡ c || b 仅当 c 是布尔；数值 1 时前者 true、后者 1。
+    differential(
+        "ternary_bool_numeric_cond",
+        r#"
+let v0 = (true & true);
+let v2 = ((v0 ? (false ? 1 : true) : (true < v0)) || v0);
+console.log(v0, v2);
+"#,
+    );
+}
+
+#[test]
+fn diff_double_neg_only_for_numbers() {
+    // -(-true) = 1，不是 true；-(-("1")) = -1，不是 "1"。
+    differential(
+        "double_neg_non_number",
+        r#"
+let v0 = (-(-((false, true))));
+let v1 = (-(-("1")));
+console.log(v0, v1);
+"#,
+    );
+}

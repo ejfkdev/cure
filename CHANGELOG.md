@@ -5,6 +5,21 @@
 
 ## [Unreleased]
 
+### 正确性（随机差分扩展——2026-10-24 第十五批）
+
+- 随机差分扩到 **5,000 例**，又抓到两个类型域错误：
+  - `ternary_bool_op`：`c ? true : b ≡ c || b` 仅当 `c` 是语法级布尔；
+    数值条件 `1 ? true : false` 得 `true`，而 `1 || false` 得 `1`。
+    增加 `is_bool(c)` 守卫（case 2074）。
+  - `double_neg_fold`：`-(-x) ≡ x` 仅对精确整数成立；布尔/字符串/`null`
+    会被 ToNumber（`-(-true)` = 1），浮点 `-0` 也会变号。增加
+    `is_exact_int(x)` 守卫（case 3157）。
+- 新增两个差分回归用例（数值条件三元、非数值双重取负）。
+- 回归：同步 33,963/34,007（44 allowlist，0 失配）、async 5,423、
+  module 358、编译 49,165 valid / 0 破坏、往返/幂等各 49,159；
+  npm 4,358 文件 **0 broken / 0 二次差异**；`cargo test --workspace`
+  **458 通过**。
+
 ### 正确性（随机差分 + is_bool + prepare 顺序——2026-10-24 第十四批）
 
 - **随机程序差分**（`randomized_program_differential`）：确定性 PRNG

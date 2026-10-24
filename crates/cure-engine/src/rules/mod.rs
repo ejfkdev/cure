@@ -2284,6 +2284,11 @@ impl<L: Lang> Rule<L> for DoubleNegFold {
         let inner = *lang.children(id).first()?;
         if lang.un_op(inner) == Some(UnOp::Neg) {
             let x = *lang.children(inner).first()?;
+            // `-(-x)` 仅对精确整数恒等：布尔/字符串/null 会被 ToNumber
+            //（`-(-true)` = 1 而不是 true）；浮点 -0 也会改变符号。
+            if !lang.is_exact_int(x) {
+                return None;
+            }
             return Some(Edit::Replace {
                 target: id,
                 with: x,
@@ -3240,6 +3245,11 @@ impl<L: Lang> Rule<L> for TernaryBoolOp {
         }
         let ch = lang.children(id);
         let (c, a, b) = (*ch.first()?, *ch.get(1)?, *ch.get(2)?);
+        // c 必须是语法级布尔：`1 ? true : false` 得 true，而 `1 || false`
+        // 得 1（truthy 非布尔条件改变结果类型）。随机差分 case 2074 抓获。
+        if !lang.is_bool(c) {
+            return None;
+        }
         let lb = |n: L::Id| matches!(lang.literal(n), Some(LitRef::Bool(v)) if v);
         let is_false = |n: L::Id| matches!(lang.literal(n), Some(LitRef::Bool(v)) if !v);
         let with = if is_false(b) && lang.is_bool(a) {
