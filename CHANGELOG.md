@@ -5,6 +5,32 @@
 
 ## [Unreleased]
 
+### 架构（TS/JS 绑定/作用域 resolver——2026-10-24 第九批）
+
+- **每文件绑定 resolver**（`crates/cure-ts-ast/src/resolve.rs`）：
+  建作用域树，`var` 绑定到最近函数作用域、`let/const/using` 到当前块，
+  覆盖块/for/for-of/catch/参数/函数声明/具名函数表达式；引用解析到
+  `Binding` 身份，对外提供 `bindings()` / `binding_of()` /
+  `binding_id()` / `BindingKind`。
+- 替换旧的名字集合遍历：`local_marks`、`captured_names`、
+  `mutated_names`、`var_trap` 现在都由绑定事实推导；`is_local_var`
+  使用**绑定级捕获**（lambda 自己的参数不再被同名全局捕获牵连）。
+- 修复/加固：
+  - 顶层 `let/const` 声明必须不透明：class/函数体是模块合成根之外的
+    顶层项，其中的写对声明级规则不可见（`let x=0; class C { m(){++x;} }`
+    曾被 local_propagation 折成 `0`）。resolver 把所有模块级声明标
+    opaque，不再只覆盖 `var`。
+  - 具名函数表达式名字是**不可变绑定**（sloppy 赋值静默忽略、strict
+    抛错）：新增 `BindingKind::FunctionExprName`，禁止当普通局部变量
+    做写删/传播；`ts_trailing_assign_return` 同时要求赋值目标与返回
+    引用解析到同一绑定（同名遮蔽不再误判）。
+  - 写计数按绑定：`mutated_names` 不再把未解析全局的同名写算到局部
+    绑定上（减少误保守），raw 解构模式仍按词保守登记。
+- 回归：同步语义 **33,962/34,006（99.87%）**、44 个 toString allowlist、
+  async **5,423/5,423**、module **358/358**、编译 **49,165 valid / 0
+  破坏**、打印往返/幂等 **49,159/49,159**；npm 4,358 文件 **0 broken /
+  0 二次差异**；`cargo test --workspace` **446 通过**。
+
 ### 验证（Test262 打印往返 + 简化幂等——2026-10-24 第八批）
 
 - **打印往返结构差分**（`examples/t262_roundtrip` +

@@ -1419,6 +1419,12 @@ impl Rule<TsAst> for TsTrailingAssignReturn {
         if lang.var_name(ret_ch[0]) != Some(name.as_str()) {
             return None;
         }
+        // 同名不同绑定（块内遮蔽）不是同一个存储位置。
+        if lang.binding_id(target).is_some()
+            && lang.binding_id(target) != lang.binding_id(ret_ch[0])
+        {
+            return None;
+        }
         if lang.effect(value) > Effect::MayRead {
             return None;
         }

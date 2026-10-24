@@ -59,6 +59,39 @@ pub enum VarKind {
     Using,
 }
 
+/// 绑定种类（resolver 事实层）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingKind {
+    Var,
+    Let,
+    Const,
+    Using,
+    Param,
+    CatchParam,
+    Function,
+    /// 具名函数表达式的内部名字：不可变绑定（sloppy 赋值静默忽略，
+    /// strict 抛错）——不能当普通局部变量做写删/传播。
+    FunctionExprName,
+}
+
+/// 一个词法绑定（resolver 产出）。`decl` 指向声明节点；参数/模式绑定的
+/// `decl` 指向函数/循环节点。`module_level` 表示绑定在脚本/模块顶层
+/// （跨根不可见，规则不得当局部变量传播）。
+#[derive(Clone, Debug)]
+pub struct Binding {
+    pub name: String,
+    pub kind: BindingKind,
+    pub decl: Option<TsId>,
+    /// 解析到该绑定的 VarRef 数（含读写）。
+    pub ref_count: u32,
+    /// 写次数（赋值目标/++--/裸 for-in）。
+    pub write_count: u32,
+    /// 被嵌套函数按引用捕获（延迟读）。
+    pub captured: bool,
+    /// 顶层绑定。
+    pub module_level: bool,
+}
+
 /// 数值字面量的解析值。
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum NumVal {
@@ -85,6 +118,8 @@ pub enum JsLit {
 /// 符号（intern 名字 id）——与 Java 后端同构（高重复率名字的零分配 clone）。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Sym(pub u32);
+
+mod resolve;
 
 // Custom(u16) 判别值注册表（本语言专属、引擎规则不触碰的构造）。
 // u16 值语言侧自定；引擎只做相等性比较。
@@ -361,6 +396,10 @@ pub struct TsAst {
     var_trap: Vec<bool>,
     /// 合成 Group 的直接 VarDecl 孩子（见 is_opaque 注释）。
     group_decls: Vec<bool>,
+    /// resolver 产出：全部绑定事实（每次 prepare 重建）。
+    bindings: Vec<Binding>,
+    /// 节点 → 解析到的绑定（VarRef 与声明节点；未解析/非名字节点 None）。
+    binding_of: Vec<Option<u32>>,
     /// 根内被**改写**的名字（赋值目标/++--/裸 for-in 绑定）：局部传播
     /// 评估「参数值在声明与使用之间是否稳定」。
     mutated_names: std::collections::HashSet<String>,
@@ -1088,6 +1127,28 @@ impl TsAst {
         self.local_marks.get(id.0 as usize).copied().unwrap_or(false)
     }
 
+    /// resolver 产出的全部绑定（按 BindingId 索引）。
+    pub fn bindings(&self) -> &[Binding] {
+        &self.bindings
+    }
+
+    /// BindingId → 绑定事实。
+    pub fn binding(&self, bid: u32) -> Option<&Binding> {
+        self.bindings.get(bid as usize)
+    }
+
+    /// 节点解析到的绑定（VarRef/声明节点）。未解析或非名字节点 → None。
+    pub fn binding_of(&self, id: TsId) -> Option<&Binding> {
+        self.binding_of
+            .get(id.0 as usize)
+            .and_then(|b| b.and_then(|bid| self.binding(bid)))
+    }
+
+    /// 节点解析到的 BindingId。
+    pub fn binding_id(&self, id: TsId) -> Option<u32> {
+        self.binding_of.get(id.0 as usize).copied().flatten()
+    }
+
     // ---- 语句事实收集（与 Java 版同构）----
 
     fn collect_stmt_facts(&self, root: TsId) -> Box<[StmtFact]> {
@@ -1313,284 +1374,7 @@ impl TsAst {
 
     pub(crate) fn rebuild_local_marks(&mut self, root: TsId) {
         self.rebuild_eval_taint(root);
-        self.mutated_names.clear();
-        self.local_marks.clear();
-        self.local_marks.resize(self.nodes.len(), false);
-
-        // ---- 第 1 遍：父表 + 作用域栈局部性 ----
-        let mut parents: Vec<(TsId, usize)> = vec![(root, usize::MAX); self.nodes.len()];
-        enum Frame {
-            Enter(TsId),
-            Bind(String),
-            PopScope,
-            Exit,
-            ExitLambda,
-        }
-        let mut base: HashSet<String> = HashSet::new();
-        for n in &self.param_scope {
-            base.insert(n.clone());
-        }
-        // 模块合成根：直接 VarDecl 孩子不透明（引擎锚定拒绝——
-        // 跨根安全性由 const 表规则接管）
-        let module_root = matches!(self.nodes[root.0 as usize].data, NodeData::ModuleBlock);
-        // 模块级直接声明（含 Group 内一层）：**不绑定**——跨根读不可见，
-        // 绑定会让 is_local_var 为真、引擎传播/写杀规则跨根误判
-        //（execCount 被 lambda 内写、assert 读——曾被当局部常量传播
-        // Test262 Symbol.match/coerce-global 抓获）
-        let mut module_decls: HashSet<TsId> = HashSet::new();
-        if module_root {
-            for &c in self.nodes[root.0 as usize].children.as_slice() {
-                match &self.nodes[c.0 as usize].data {
-                    NodeData::VarDecl { .. } => {
-                        module_decls.insert(c);
-                    }
-                    NodeData::Group => {
-                        for &g in self.nodes[c.0 as usize].children.as_slice() {
-                            if matches!(self.nodes[g.0 as usize].data, NodeData::VarDecl { .. }) {
-                                module_decls.insert(g);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let mut scopes: Vec<HashSet<String>> = vec![base];
-        let mut stack = vec![Frame::Enter(root)];
-        let mut lambda_depth = 0i32;
-        let mut captured: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut mutated: std::collections::HashSet<String> = std::collections::HashSet::new();
-        while let Some(f) = stack.pop() {
-            match f {
-                Frame::Enter(id) => {
-                    let node = &self.nodes[id.0 as usize];
-                    enum Action {
-                        None,
-                        Bind(Vec<String>),
-                    }
-                    let action = match &node.data {
-                        // ModuleBlock 不推作用域：模块级名字不绑定
-                        //（跨根读不可见——保守非局部）
-                        NodeData::Block | NodeData::For { .. } | NodeData::Try => {
-                            let mut a = Action::None;
-                            // For 头部的 let 声明进新层（for (let i…））
-                            if let NodeData::For { inits, .. } = &node.data {
-                                // 逐个 init 若是 let VarDecl 则 bind 进新层
-                                let mut names = Vec::new();
-                                for &c in node.children.as_slice().iter().take(*inits as usize) {
-                                    if let NodeData::VarDecl { name, kind: VarKind::Let, .. } =
-                                        &self.nodes[c.0 as usize].data
-                                    {
-                                        names.push(name.clone());
-                                    }
-                                }
-                                if !names.is_empty() {
-                                    a = Action::Bind(names);
-                                }
-                            }
-                            a
-                        }
-                        NodeData::VarDecl { name, .. } => {
-                            if !module_decls.contains(&id) {
-                                scopes.last_mut().unwrap().insert(name.clone());
-                            }
-                            Action::None
-                        }
-                        NodeData::VarRef { name } => {
-                            if scopes.iter().rev().any(|s| s.contains(self.sn(*name))) {
-                                self.local_marks[id.0 as usize] = true;
-                                // λ 体内解析到外层绑定 = 按引用捕获——
-                                // 延迟读对写杀/传播不可见 → 名字整体保守化
-                                if lambda_depth > 0 {
-                                    captured.insert(self.sn(*name).to_string());
-                                }
-                            }
-                            Action::None
-                        }
-                        NodeData::Catch { param_raw } => match param_raw
-                            .as_deref()
-                            .and_then(simple_binding_name)
-                        {
-                            Some(n) => Action::Bind(vec![n]),
-                            None => Action::None,
-                        },
-                        NodeData::ForEach { name, decl, .. } => {
-                            if decl.is_some() {
-                                Action::Bind(vec![name.clone()])
-                            } else {
-                                // 裸名 for (x in o)：x 是既有绑定的读+条件写
-                                // ——非声明，不 bind；其读语义由区域事件的
-                                // Write/Shadow 记录保守覆盖
-                                mutated.insert(name.clone());
-                                Action::None
-                            }
-                        }
-                        NodeData::Assign { .. } => {
-                            let mut cur = node.children.as_slice()[0];
-                            while matches!(self.nodes[cur.0 as usize].data, NodeData::Paren) {
-                                let Some(&c) =
-                                    self.nodes[cur.0 as usize].children.as_slice().first()
-                                else {
-                                    break;
-                                };
-                                cur = c;
-                            }
-                            if let NodeData::VarRef { name } =
-                                &self.nodes[cur.0 as usize].data
-                            {
-                                mutated.insert(self.sn(*name).to_string());
-                            }
-                            Action::None
-                        }
-                        // 解构目标（赋值形态）的写对 AST 不可见——按
-                        // 可能变异保守处理（模式词全记）
-                        NodeData::Destruct { pattern_raw } => {
-                            for w in pattern_raw
-                                .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
-                            {
-                                if !w.is_empty() {
-                                    mutated.insert(w.to_string());
-                                }
-                            }
-                            Action::None
-                        }
-                        NodeData::DestructStmt { pattern, .. } => {
-                            for w in pattern
-                                .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
-                            {
-                                if !w.is_empty() {
-                                    mutated.insert(w.to_string());
-                                }
-                            }
-                            Action::None
-                        }
-                        NodeData::Unary { op } if op.is_incdec() => {
-                            let mut cur = node.children.as_slice()[0];
-                            while matches!(self.nodes[cur.0 as usize].data, NodeData::Paren) {
-                                let Some(&c) =
-                                    self.nodes[cur.0 as usize].children.as_slice().first()
-                                else {
-                                    break;
-                                };
-                                cur = c;
-                            }
-                            if let NodeData::VarRef { name } =
-                                &self.nodes[cur.0 as usize].data
-                            {
-                                mutated.insert(self.sn(*name).to_string());
-                            }
-                            Action::None
-                        }
-                        NodeData::Lambda { params_raw, name, .. } => {
-                            let mut names = match simple_params(params_raw) {
-                                Some(names) => names,
-                                None => vec![], // 模式参数——空 bind（推层不种名）
-                            };
-                            // NFE 名字在函数体内是绑定（`function f(){ f }`）
-                            if !name.is_empty() {
-                                names.push(name.clone());
-                            }
-                            Action::Bind(names)
-                        }
-                        NodeData::FuncStmt { params_raw, .. } => match simple_params(params_raw) {
-                            Some(names) => Action::Bind(names),
-                            None => Action::Bind(vec![]),
-                        },
-                        _ => Action::None,
-                    };
-                    // λ 边界：进入时 depth+1，Exit 时 -1
-                    let is_lambda_node =
-                        matches!(node.data, NodeData::Lambda { .. } | NodeData::FuncStmt { .. });
-                    if is_lambda_node {
-                        lambda_depth += 1;
-                        stack.push(Frame::ExitLambda);
-                    } else {
-                        stack.push(Frame::Exit);
-                    }
-                    let binds = match action {
-                        Action::Bind(names) => {
-                            scopes.push(HashSet::new());
-                            stack.push(Frame::PopScope);
-                            names
-                        }
-                        Action::None => vec![],
-                    };
-                    // 父表：记录每个孩子在父内的下标
-                    let ch = node.children.as_slice();
-                    for (i, &c) in ch.iter().enumerate().rev() {
-                        parents[c.0 as usize] = (id, i);
-                        stack.push(Frame::Enter(c));
-                    }
-                    for n in binds.into_iter().rev() {
-                        stack.push(Frame::Bind(n));
-                    }
-                }
-                Frame::Bind(name) => {
-                    scopes.last_mut().unwrap().insert(name);
-                }
-                Frame::PopScope => {
-                    scopes.pop();
-                }
-                Frame::ExitLambda => {
-                    lambda_depth -= 1;
-                }
-                Frame::Exit => {}
-            }
-        }
-        self.captured_names = captured;
-        self.mutated_names = mutated;
-
-        // ---- 第 2 遍：var 提升陷阱 ----
-        // 每个名字（VarDecl-let/const/var、VarRef、简单 ForEach/Catch/
-        // FuncStmt 名）的全部出现节点；var 声明的可见性判定见上。
-        self.var_trap.clear();
-        self.var_trap.resize(self.nodes.len(), false);
-        if module_root {
-            for &c in self.nodes[root.0 as usize].children.as_slice() {
-                if matches!(self.nodes[c.0 as usize].data, NodeData::VarDecl { .. }) {
-                    self.var_trap[c.0 as usize] = true;
-                }
-            }
-        }
-        // 名字 → 出现节点列表（var_name 持有者；键克隆避免借用冲突）
-        let mut occ: HashMap<String, Vec<TsId>> = HashMap::new();
-        let mut walk = vec![root];
-        while let Some(id) = walk.pop() {
-            if let Some(nm) = self.var_name(id) {
-                if self.names.var_key(id.0 as usize).is_some() {
-                    occ.entry(nm.to_string()).or_default().push(id);
-                }
-            }
-            for &c in self.nodes[id.0 as usize].children.as_slice() {
-                walk.push(c);
-            }
-        }
-        for (i, node) in self.nodes.iter().enumerate() {
-            if let NodeData::VarDecl { name, kind: VarKind::Var, .. } = &node.data {
-                let decl = TsId(i as u32);
-                // 声明所在块（最近 Block/Group 祖先）与块内下标
-                let Some((block, dpos)) = ancestor_block_pos(&self.nodes, &parents, decl) else {
-                    self.var_trap[i] = true; // 无块容器（防御）
-                    continue;
-                };
-                let name = name.as_str();
-                let mut trap = false;
-                if let Some(list) = occ.get(name) {
-                    for &o in list {
-                        if o == decl {
-                            continue;
-                        }
-                        if !inside_later_sibling(&parents, o, block, dpos) {
-                            trap = true;
-                            break;
-                        }
-                    }
-                }
-                if trap {
-                    self.var_trap[i] = true;
-                }
-            }
-        }
+        crate::resolve::rebuild(self, root);
     }
 }
 
@@ -2329,6 +2113,14 @@ impl Lang for TsAst {
         // 代码）→ false（保守）。
         if !matches!(self.data(id), NodeData::VarRef { .. }) {
             return false;
+        }
+        // 绑定级捕获判定：同名但不同绑定不再互相牵连（旧实现按名字
+        // 全局集合，λ 自己的参数也会被误标捕获）。
+        if let Some(b) = self.binding_of(id) {
+            if b.kind == BindingKind::FunctionExprName {
+                return false;
+            }
+            return !b.module_level && !b.captured;
         }
         if let NodeData::VarRef { name } = self.data(id) {
             if self.captured_names.contains(self.sn(*name)) {
