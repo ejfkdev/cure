@@ -1523,6 +1523,7 @@ pub fn default_ts_rules() -> Vec<Box<dyn Rule<TsAst>>> {
     rules.push(Box::new(TsTruthyFold));
     rules.push(Box::new(TsMemberUnquote));
     rules.push(Box::new(TsInlineFunc));
+    rules.push(Box::new(crate::rules::TsAssignToCompound));
     // 移植规则包（字面量求值 / try 清理 / else 展平 / 尾赋值返回 /
     // 纯调用删除）
     rules.extend(ported_rules());

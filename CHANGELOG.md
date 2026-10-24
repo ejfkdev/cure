@@ -5,6 +5,24 @@
 
 ## [Unreleased]
 
+### 语法/规则（泛型函数/箭头 + 复合赋值——2026-10-24 第十三批）
+
+- **TS 泛型函数/箭头**：函数声明/嵌套函数/函数表达式支持
+  `<T extends …>`（含 `const` 类型参数），箭头支持
+  `<T,>(x: T) => …` / `async <T>(x: T) => …`。`Lambda` 新增
+  `generics_raw` 字段并原样打印；类声明 `class C<T>` 不再多打空格。
+- **`ts_assign_to_compound`**：`a = a + b` → `a += b`（仅算术/位运算/
+  移位/幂，目标与 RHS 左操作数须解析到同一绑定）。两种形态的求值序、
+  GetValue/PutValue 和类型胁迫完全一致；成员目标 `o.x = o.x + 1`
+  明确拒绝。
+- 新增 `tests/modern_syntax.rs`（5 组：资源管理、导入属性/phase
+  imports、装饰器/accessor/私有/static 块、TS 泛型与 `satisfies`、
+  RegExp v/可选链）与 2 个 differential 用例（复合赋值语义、绑定感知）。
+- 回归：Test262 六层全绿（同步 33,962/34,006、44 allowlist、async
+  5,423、module 358、编译 49,165 valid / 0 破坏、往返/幂等各
+  49,159）；npm 4,358 文件 **0 broken / 0 二次差异**（编辑数
+  52,098 → 52,294）；`cargo test --workspace` **455 通过**。
+
 ### 性能（增量 effect 缓存 + 紧凑 Token——2026-10-24 第十二批）
 
 - **增量 effect 缓存**：旧实现每个 pass 对整个 arena 跑

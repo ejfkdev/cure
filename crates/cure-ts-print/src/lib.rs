@@ -189,7 +189,10 @@ impl<'a> Printer<'a> {
             self.out.push_str(&c.name);
         }
         if !head.is_empty() {
-            self.out.push(' ');
+            // `class C<T>`：类型参数紧贴类名，`extends` 才需要空格。
+            if !head.starts_with('<') {
+                self.out.push(' ');
+            }
             self.push_raw(head);
         }
         self.out.push_str(" {");
@@ -892,11 +895,23 @@ impl<'a> Printer<'a> {
                 }
                 self.out.push('}');
             }
-            NodeData::Lambda { params_raw, name, space, arrow, is_async, is_generator } => {
+            NodeData::Lambda {
+                params_raw,
+                name,
+                generics_raw,
+                space,
+                arrow,
+                is_async,
+                is_generator,
+            } => {
                 if *is_async {
                     self.out.push_str("async ");
                 }
                 if *arrow {
+                    if !generics_raw.trim().is_empty() {
+                        let g = generics_raw.trim().to_string();
+                        self.push_raw(&g);
+                    }
                     let ps = params_raw.trim();
                     if is_plain_ident(ps) {
                         self.out.push_str(ps);
@@ -920,6 +935,13 @@ impl<'a> Printer<'a> {
                     if !name.is_empty() {
                         self.out.push(' ');
                         self.out.push_str(name);
+                    }
+                    if !generics_raw.trim().is_empty() {
+                        if name.is_empty() {
+                            self.out.push(' ');
+                        }
+                        let g = generics_raw.trim().to_string();
+                        self.push_raw(&g);
                     }
                     if *space {
                         self.out.push(' ');

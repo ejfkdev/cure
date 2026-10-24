@@ -48,6 +48,12 @@ the same thing.
   `javac`/`java` runs, and whole-corpus re-parse/idempotency checks (details
   below). These layers caught real bugs during development; they are not
   decorative.
+- **Modern TS/JS syntax** — decorators (class/member), `accessor`, private
+  fields/methods, static blocks, `using`/`await using`, import
+  attributes/`defer`/`source`, top-level await, generic functions/arrows
+  (including `const` type parameters), `satisfies`/`as const`, `#x in o`,
+  RegExp `v` flags and optional chains. Unsupported constructs stay verbatim
+  instead of aborting.
 - **64+ simplification rules** (language-agnostic engine rules + Java/TS packs),
   including control-flow flattening recovery, statement-level
   `StringBuilder` chain recovery, XOR-noise removal, and partial evaluation
@@ -130,7 +136,7 @@ otherwise the locale is auto-detected. Full option reference: `cure --help`.
 | 5. ECMAScript conformance | [Test262](https://github.com/tc39/test262), six layers: (a) sync original vs cured in fresh `node` vm contexts, exception status + stdout compared (34,006 executable cases); (b) **async** cases executed with `$DONE`/microtask/timer draining (5,423 executed); (c) **module** cases linked and evaluated as ESM with a filesystem fixture loader (358 executed); (d) **compile-only on all 49,266 files** including async/module/negative; (e) **print round-trip**: parse → print (no simplify) → parse, ASTs structurally equal ignoring `Paren`/literal spelling/`Group` expansion (49,159 checked); (f) **simplify idempotency**: cure twice over the same corpus, byte-identical output (49,159 checked) | ECMAScript semantics: f64/ToInt32 domains, ±2^53, TDZ, Annex B hoisting, eval scoping, destructuring, generator/`yield` grammar, sparse arrays, async/await ordering, ESM linking/live bindings; printer/paren/decorator drift; fixed-point convergence |
 | 6. Real-world JS | 4,358 `.js/.mjs/.cjs` files (~568 MB) from a global npm install (undici, pnpm, yarn, vite-plus, Lark CLI, bytenode, …): every valid file must still compile after cure; a second cure pass must produce byte-identical output | real-package syntax (minified bundles, top-level await, import attributes), idempotency under module-level constant propagation |
 
-`cargo test` runs 448 tests. The Test262 semantic differential reaches
+`cargo test` runs 455 tests. The Test262 semantic differential reaches
 **33,962/34,006 (99.87%) identical runs**; the only 44 excluded cases compare
 `Function.prototype.toString` **source text** (cure reformats function
 bodies) or use arrow functions as computed-property keys, which relies on

@@ -569,6 +569,13 @@ impl<'a> Parser<'a> {
         } else {
             String::new()
         };
+        // TS 类型参数：function f<T extends U>(…) / function <T>(…)
+        let mut generics = String::new();
+        if self.is_punct("<") {
+            let gs = self.pos;
+            self.skip_angle_balanced();
+            generics = self.raw_between(gs, self.pos).trim().to_string();
+        }
         if !self.is_punct("(") {
             self.pos = start;
             return None;
@@ -611,6 +618,12 @@ impl<'a> Parser<'a> {
         if !name.is_empty() {
             sig.push(' ');
             sig.push_str(&name);
+        }
+        if !generics.is_empty() {
+            if name.is_empty() {
+                sig.push(' ');
+            }
+            sig.push_str(&generics);
         }
         sig.push_str(&params_full);
         sig.push_str(&ret_raw);
@@ -1188,6 +1201,12 @@ impl<'a> Parser<'a> {
         } else {
             String::new()
         };
+        let mut generics = String::new();
+        if self.is_punct("<") {
+            let gs = self.pos;
+            self.skip_angle_balanced();
+            generics = self.raw_between(gs, self.pos).trim().to_string();
+        }
         if !self.is_punct("(") {
             self.pos = start;
             return None;
@@ -1225,6 +1244,12 @@ impl<'a> Parser<'a> {
         if !name.is_empty() {
             sig.push(' ');
             sig.push_str(&name);
+        }
+        if !generics.is_empty() {
+            if name.is_empty() {
+                sig.push(' ');
+            }
+            sig.push_str(&generics);
         }
         sig.push_str(&params_full);
         sig.push_str(&ret_raw);
@@ -2004,15 +2029,32 @@ impl<'a> Parser<'a> {
         let mut is_async = false;
         if self.toks[p].kind == TokKind::Ident && self.toks[p].text == "async" {
             let n = self.toks.get(p + 1)?;
-            if (n.kind == TokKind::Ident || (n.kind == TokKind::Punct && n.text == "("))
+            if (n.kind == TokKind::Ident
+                || (n.kind == TokKind::Punct && matches!(n.text.as_str(), "(" | "<")))
                 && !n.newline_before
             {
                 is_async = true;
                 p += 1;
             }
         }
+        // TS 泛型箭头：<T,>(x: T) => … / <T extends U>(x) => …
+        // 类型参数必须后随括号参数表；`<` 在表达式起始不是合法 JS。
+        let mut generics = String::new();
+        if self.toks[p].kind == TokKind::Punct && self.toks[p].text == "<" {
+            let close = self.match_angle(p)?;
+            let params_at = close + 1;
+            let ok = self
+                .toks
+                .get(params_at)
+                .is_some_and(|t| t.kind == TokKind::Punct && t.text == "(");
+            if !ok {
+                return None;
+            }
+            generics = self.raw_between(p, params_at).trim().to_string();
+            p = params_at;
+        }
         // ident =>
-        if self.toks[p].kind == TokKind::Ident {
+        if self.toks[p].kind == TokKind::Ident && generics.is_empty() {
             let n = self.toks.get(p + 1)?;
             if n.kind == TokKind::Punct && n.text == "=>" {
                 let param = self.toks[p].text.clone();
@@ -2023,6 +2065,9 @@ impl<'a> Parser<'a> {
             return None;
         }
         // ( … ) [: ret] =>
+        if self.toks[p].kind == TokKind::Ident {
+            return None;
+        }
         if !(self.toks[p].kind == TokKind::Punct && self.toks[p].text == "(") {
             return None;
         }
@@ -2071,7 +2116,14 @@ impl<'a> Parser<'a> {
             .to_string();
         self.pos = q + 1;
         let body = self.enter_async(is_async, |p| p.parse_arrow_body());
-        Some(self.ast.lambda(&params_inner, body, true, is_async, false))
+        if generics.is_empty() {
+            Some(self.ast.lambda(&params_inner, body, true, is_async, false))
+        } else {
+            Some(
+                self.ast
+                    .lambda_generic(&generics, &params_inner, body, true, is_async, false),
+            )
+        }
     }
 
     /// 括号组是否可能是**参数列表**（TS 返回类型注解前瞻的守卫）：
@@ -2151,6 +2203,44 @@ impl<'a> Parser<'a> {
                     ")" => {
                         depth -= 1;
                         if depth == 0 {
+                            return Some(j);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            j += 1;
+        }
+        None
+    }
+
+    /// `<…>` 泛型参数的配对结束下标（支持嵌套与 `>>`/`>>>`）。
+    fn match_angle(&self, i: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut j = i;
+        while j < self.toks.len() {
+            let t = &self.toks[j];
+            if t.kind == TokKind::Eof {
+                return None;
+            }
+            if t.kind == TokKind::Punct {
+                match t.text.as_str() {
+                    "<" => depth += 1,
+                    ">" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(j);
+                        }
+                    }
+                    ">>" => {
+                        depth -= 2;
+                        if depth <= 0 {
+                            return Some(j);
+                        }
+                    }
+                    ">>>" => {
+                        depth -= 3;
+                        if depth <= 0 {
                             return Some(j);
                         }
                     }
@@ -2788,6 +2878,12 @@ impl<'a> Parser<'a> {
         } else {
             String::new()
         };
+        let mut generics = String::new();
+        if self.is_punct("<") {
+            let gs = self.pos;
+            self.skip_angle_balanced();
+            generics = self.raw_between(gs, self.pos).trim().to_string();
+        }
         if !self.is_punct("(") {
             self.err_here("expected ( after function");
             return self.ast.raw("function");
@@ -2810,7 +2906,20 @@ impl<'a> Parser<'a> {
             self.err_here("expected { in function expression");
             self.ast.block(vec![])
         };
-        self.ast.lambda_named(&inner, body, false, is_async, is_gen, &name, space)
+        if generics.is_empty() {
+            self.ast.lambda_named(&inner, body, false, is_async, is_gen, &name, space)
+        } else {
+            self.ast.lambda_named_generic(
+                &generics,
+                &inner,
+                body,
+                false,
+                is_async,
+                is_gen,
+                &name,
+                space,
+            )
+        }
     }
 
     fn parse_obj_lit(&mut self) -> TsId {

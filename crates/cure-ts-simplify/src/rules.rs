@@ -1562,3 +1562,74 @@ pub fn ported_rules() -> Vec<Box<dyn Rule<TsAst>>> {
         Box::new(TsDeadPureCall),
     ]
 }
+/// `a = a op b` → `a op= b`（同一绑定的简单变量）。
+///
+/// 语义等价性：两种形态都先求值目标引用、再 GetValue(a)、求值 b、
+/// 应用 op、PutValue；对标识符绑定没有 getter/setter 差异。仅限
+/// 算术/位运算/移位/幂——逻辑与比较没有对应的 `op=` 或短路语义不同。
+pub struct TsAssignToCompound;
+
+impl Rule<TsAst> for TsAssignToCompound {
+    fn name(&self) -> &'static str {
+        "ts_assign_to_compound"
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Assign]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
+        let RewriteCtx { lang, .. } = ctx;
+        if !matches!(lang.data(id), NodeData::Assign { op: None }) {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        if ch.len() != 2 {
+            return None;
+        }
+        let (target, value) = (ch[0], ch[1]);
+        let target = unwrap_ts_paren(lang, target);
+        if lang.kind(target) != NodeKind::VarRef {
+            return None;
+        }
+        if lang.kind(value) != NodeKind::Binary {
+            return None;
+        }
+        let op = lang.bin_op(value)?;
+        if !matches!(
+            op,
+            cure_engine::kind::BinOp::Add
+                | cure_engine::kind::BinOp::Sub
+                | cure_engine::kind::BinOp::Mul
+                | cure_engine::kind::BinOp::Div
+                | cure_engine::kind::BinOp::Rem
+                | cure_engine::kind::BinOp::Pow
+                | cure_engine::kind::BinOp::BitAnd
+                | cure_engine::kind::BinOp::BitOr
+                | cure_engine::kind::BinOp::BitXor
+                | cure_engine::kind::BinOp::Shl
+                | cure_engine::kind::BinOp::Shr
+                | cure_engine::kind::BinOp::UShr
+        ) {
+            return None;
+        }
+        let vc = lang.children(value).to_vec();
+        if vc.len() != 2 {
+            return None;
+        }
+        let lhs = unwrap_ts_paren(lang, vc[0]);
+        if lang.kind(lhs) != NodeKind::VarRef || !lang.same_binding(target, lhs) {
+            return None;
+        }
+        Some(Edit::Replace {
+            target: id,
+            with: lang.assign_op(op, target, vc[1]),
+        })
+    }
+}
+
+fn unwrap_ts_paren(ast: &TsAst, mut id: TsId) -> TsId {
+    while matches!(ast.data(id), NodeData::Paren) {
+        let Some(&c) = ast.children(id).first() else { break };
+        id = c;
+    }
+    id
+}

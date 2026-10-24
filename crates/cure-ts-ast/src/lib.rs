@@ -216,7 +216,7 @@ pub enum NodeData {
     This,
     /// 函数表达式 / 箭头函数。children: `[body]`（Block 或表达式）。
     /// params_raw 保真（含 TS 类型注解/模式参数原文）。
-    Lambda { params_raw: String, name: String, space: bool, arrow: bool, is_async: bool, is_generator: bool },
+    Lambda { params_raw: String, name: String, generics_raw: String, space: bool, arrow: bool, is_async: bool, is_generator: bool },
     /// 模板字面量：quasis 长度 = 孩子数+1（tagged 时孩子 0 是 tag）。
     Template { quasis: Vec<String>, tag: bool },
     /// `...expr`。children: `[expr]`
@@ -773,16 +773,63 @@ impl TsAst {
         name: &str,
         space: bool,
     ) -> TsId {
+        self.lambda_named_generic(
+            "",
+            params_raw,
+            body,
+            arrow,
+            is_async,
+            is_generator,
+            name,
+            space,
+        )
+    }
+
+    /// 带 TS 类型参数（`<T extends …>`）的函数/箭头表达式。
+    #[allow(clippy::too_many_arguments)]
+    pub fn lambda_named_generic(
+        &mut self,
+        generics_raw: &str,
+        params_raw: &str,
+        body: TsId,
+        arrow: bool,
+        is_async: bool,
+        is_generator: bool,
+        name: &str,
+        space: bool,
+    ) -> TsId {
         self.push(
             NodeData::Lambda {
                 params_raw: params_raw.into(),
                 name: name.into(),
+                generics_raw: generics_raw.into(),
                 space,
                 arrow,
                 is_async,
                 is_generator,
             },
             vec![body],
+        )
+    }
+
+    pub fn lambda_generic(
+        &mut self,
+        generics_raw: &str,
+        params_raw: &str,
+        body: TsId,
+        arrow: bool,
+        is_async: bool,
+        is_generator: bool,
+    ) -> TsId {
+        self.lambda_named_generic(
+            generics_raw,
+            params_raw,
+            body,
+            arrow,
+            is_async,
+            is_generator,
+            "",
+            false,
         )
     }
     /// 模板字面量。quasis.len() 必须 == children.len() + 1（无 tag）。
@@ -974,6 +1021,7 @@ impl TsAst {
                 NodeData::Lambda {
                     params_raw: px,
                     name: nx,
+                    generics_raw: gex,
                     space: sx,
                     arrow: ax,
                     is_async: asyncx,
@@ -982,14 +1030,20 @@ impl TsAst {
                 NodeData::Lambda {
                     params_raw: py,
                     name: ny,
+                    generics_raw: gey,
                     space: sy,
                     arrow: ay,
                     is_async: asyncy,
                     is_generator: gy,
                 },
             ) => {
-                nx == ny && sx == sy && ax == ay && asyncx == asyncy && gx == gy
+                nx == ny
+                    && sx == sy
+                    && ax == ay
+                    && asyncx == asyncy
+                    && gx == gy
                     && norm_code(px) == norm_code(py)
+                    && norm_code(gex) == norm_code(gey)
             }
             (
                 NodeData::Template { quasis: qx, tag: tx },
@@ -2260,9 +2314,9 @@ impl Lang for TsAst {
              NodeData::For { inits: i2, has_cond: c2, steps: s2 }) => {
                 i1 == i2 && c1 == c2 && s1 == s2
             }
-            (NodeData::Lambda { params_raw: p1, name: n1, space: s1, arrow: a1, is_async: y1, is_generator: g1 },
-             NodeData::Lambda { params_raw: p2, name: n2, space: s2, arrow: a2, is_async: y2, is_generator: g2 }) => {
-                p1 == p2 && n1 == n2 && s1 == s2 && a1 == a2 && y1 == y2 && g1 == g2
+            (NodeData::Lambda { params_raw: p1, name: n1, generics_raw: e1, space: s1, arrow: a1, is_async: y1, is_generator: g1 },
+             NodeData::Lambda { params_raw: p2, name: n2, generics_raw: e2, space: s2, arrow: a2, is_async: y2, is_generator: g2 }) => {
+                p1 == p2 && n1 == n2 && e1 == e2 && s1 == s2 && a1 == a2 && y1 == y2 && g1 == g2
             }
             (NodeData::FuncStmt { sig_raw: s1, name: n1, params_raw: p1 },
              NodeData::FuncStmt { sig_raw: s2, name: n2, params_raw: p2 }) => {

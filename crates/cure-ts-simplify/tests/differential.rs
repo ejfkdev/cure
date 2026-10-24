@@ -823,3 +823,31 @@ fn deep_nesting_falls_back_to_verbatim_source() {
     let _ = simplify_unit(&mut out2.ast, &mut out2.unit, &Config::default());
     assert_eq!(print_module(&out2.ast, &out2.unit), printed);
 }
+
+#[test]
+fn diff_assign_to_compound() {
+    differential(
+        "assign_to_compound",
+        r#"
+let a = 1;
+let b = 2;
+a = a + b;
+let s = "x";
+s = s + "y";
+let c = 5;
+function bump() { c = 10; return 2; }
+c = c + bump();
+console.log(a, s, c);
+"#,
+    );
+}
+
+#[test]
+fn assign_to_compound_is_binding_aware() {
+    let src = "let a = 1, b = 2; a = a + b;\nconst o = { x: 1 }; o.x = o.x + 1;\n";
+    let mut out = parse(src);
+    let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
+    let printed = print_module(&out.ast, &out.unit);
+    assert!(printed.contains("a += "), "{printed}");
+    assert!(printed.contains("o.x = o.x + 1"), "member target must stay: {printed}");
+}
