@@ -540,7 +540,7 @@ impl<L: Lang> Rule<L> for SelfAssign {
         if lang.kind(t) != NodeKind::VarRef || lang.kind(v) != NodeKind::VarRef {
             return None;
         }
-        if lang.var_name(t) != lang.var_name(v) || !lang.is_local_var(t) {
+        if !lang.same_binding(t, v) || !lang.is_local_var(t) {
             return None;
         }
         // 删除目标必须是**语句**：`x = x;` 的 AST 形态是 ExprStmt[Assign]
@@ -748,7 +748,7 @@ impl<L: Lang> Rule<L> for AssignBackFold {
                 return None;
             }
             let (target, rhs) = (ach[0], ach[1]);
-            if lang.kind(target) != NodeKind::VarRef || lang.var_key(target) != Some(name_key) {
+            if lang.kind(target) != NodeKind::VarRef || !lang.same_binding(id, target) {
                 return None;
             }
             // (op, K)：复合形态（RHS 即字面量操作数）/ 展开形态
@@ -764,8 +764,8 @@ impl<L: Lang> Rule<L> for AssignBackFold {
                     if rc.len() != 2 || lang.kind(rc[0]) != NodeKind::VarRef {
                         return None;
                     }
-                    // 左操作数必须是 x 自身（名字键等值）；右操作数字面量
-                    if lang.var_key(rc[0]) != Some(name_key) {
+                    // 左操作数必须是 x 自身（同一绑定）；右操作数字面量
+                    if !lang.same_binding(id, rc[0]) {
                         return None;
                     }
                     (op, lang.literal(rc[1]).and_then(|x| x.as_int())?)
@@ -1092,7 +1092,7 @@ impl<L: Lang> Rule<L> for LocalPropagation {
                 let pch = lang.children(p);
                 if pch.len() == 2
                     && lang.kind(pch[0]) == NodeKind::VarRef
-                    && lang.var_key(pch[0]) == Some(name_key)
+                    && lang.same_binding(pch[0], use_id)
                     && pch[1] == use_id
                 {
                     return None;
@@ -1841,7 +1841,7 @@ impl<L: Lang> Rule<L> for ArithZero {
         if op == BinOp::Sub
             && lang.kind(l) == NodeKind::VarRef
             && lang.kind(r) == NodeKind::VarRef
-            && lang.var_name(l) == lang.var_name(r)
+            && lang.same_binding(l, r)
             && lang.is_local_var(l)
             && lang.is_exact_int(l)
         {
@@ -1897,8 +1897,12 @@ impl<L: Lang> Rule<L> for InverseAssignPair {
             // 窗口左端不是赋值语句 → 滑到下一窗口（不能整check放弃）
             let Some(a1) = norm_assign(lang, s1) else { continue };
             let Some(a2) = norm_assign(lang, s2) else { continue };
-            // 同一局部变量（名字键等值）
-            if a1.key != a2.key || !a1.local || !a2.local {
+            // 同一局部变量（同一绑定；名字键仅作快速预筛）
+            if a1.key != a2.key
+                || !lang.same_binding(a1.target, a2.target)
+                || !a1.local
+                || !a2.local
+            {
                 continue;
             }
             // 精确整型（模 2^w 群恒等性成立；浮点舍入破坏交换律）
@@ -1930,8 +1934,9 @@ impl<L: Lang> Rule<L> for InverseAssignPair {
 /// 归一化一条赋值语句 → `(变量键, 算符, 常量)`。
 /// 接受复合形态（`x op= K`，RHS 即字面量）与展开形态（`x = x op K`，
 /// RHS = Binary{op, VarRef(x), K}）。
-struct NormAssign<K> {
-    key: K,
+struct NormAssign<L: Lang> {
+    key: L::NameKey,
+    target: L::Id,
     op: BinOp,
     k: i64,
     local: bool,
@@ -1939,7 +1944,7 @@ struct NormAssign<K> {
     exact_int: bool,
 }
 
-fn norm_assign<L: Lang>(lang: &L, stmt: L::Id) -> Option<NormAssign<L::NameKey>> {
+fn norm_assign<L: Lang>(lang: &L, stmt: L::Id) -> Option<NormAssign<L>> {
     // 语句形态：ExprStmt{Assign} 或裸 Assign
     let a = match lang.kind(stmt) {
         NodeKind::ExprStmt => {
@@ -1971,7 +1976,7 @@ fn norm_assign<L: Lang>(lang: &L, stmt: L::Id) -> Option<NormAssign<L::NameKey>>
         // 复合形态：`x op= K`——RHS 就是操作数
         Some(op) => {
             let k = lang.literal(rhs).and_then(|x| x.as_int())?;
-            Some(NormAssign { key, op, k, local, exact_int })
+            Some(NormAssign { key, target, op, k, local, exact_int })
         }
         // 展开形态：`x = x op K`——RHS = Binary{op, VarRef(x), K}
         None => {
@@ -1983,12 +1988,12 @@ fn norm_assign<L: Lang>(lang: &L, stmt: L::Id) -> Option<NormAssign<L::NameKey>>
             if rc.len() != 2 {
                 return None;
             }
-            // 左操作数必须是 x 自身（名字键等值）
-            if lang.kind(rc[0]) != NodeKind::VarRef || lang.var_key(rc[0]) != Some(key) {
+            // 左操作数必须是 x 自身（同一绑定）
+            if lang.kind(rc[0]) != NodeKind::VarRef || !lang.same_binding(target, rc[0]) {
                 return None;
             }
             let k = lang.literal(rc[1]).and_then(|x| x.as_int())?;
-            Some(NormAssign { key, op, k, local, exact_int })
+            Some(NormAssign { key, target, op, k, local, exact_int })
         }
     }
 }
@@ -2161,25 +2166,23 @@ impl<L: Lang> Rule<L> for DeadStore {
         }
 
         // 变量一致性 + 局部性
-        let name = if decl_form {
-            if lang.var_name(id) != lang.var_name(target) {
+        if decl_form {
+            if !lang.same_binding(id, target) {
                 return None;
             }
-            lang.var_name(id).map(|s| s.to_string())
         } else {
             let a = first_assign?;
             let t = *lang.children(a).first()?;
-            if lang.kind(t) != NodeKind::VarRef {
+            if lang.kind(t) != NodeKind::VarRef
+                || !lang.same_binding(t, target)
+                || !lang.is_local_var(t)
+            {
                 return None;
             }
-            if lang.var_name(t) != lang.var_name(target) || !lang.is_local_var(t) {
-                return None;
-            }
-            lang.var_name(t).map(|s| s.to_string())
-        }?;
+        }
         // b 中不得引用 x（x = b 依赖旧值时不可删第一条）
         if subtree_contains(&*lang, value, |n| {
-            lang.kind(n) == NodeKind::VarRef && lang.var_name(n) == Some(name.as_str())
+            lang.kind(n) == NodeKind::VarRef && lang.same_binding(n, target)
         }) {
             return None;
         }
@@ -2417,7 +2420,7 @@ impl<L: Lang> Rule<L> for BitIdentity {
         if op == BinOp::BitXor
             && lang.kind(l) == NodeKind::VarRef
             && lang.kind(r) == NodeKind::VarRef
-            && lang.var_name(l) == lang.var_name(r)
+            && lang.same_binding(l, r)
             && lang.is_local_var(l)
             && lang.is_exact_int(l)
         {
@@ -2713,7 +2716,7 @@ impl<L: Lang> Rule<L> for IfAssignTernary {
         };
         let (t1, va) = single_assign(ch[1])?;
         let (t2, vb) = single_assign(ch[2])?;
-        if lang.var_name(t1) != lang.var_name(t2) || lang.var_name(t1).is_none() {
+        if !lang.same_binding(t1, t2) || lang.var_name(t1).is_none() {
             return None;
         }
         let t = lang.build_ternary(c, va, vb);

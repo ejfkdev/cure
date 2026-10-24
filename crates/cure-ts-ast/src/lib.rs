@@ -1901,6 +1901,16 @@ impl Lang for TsAst {
         self.names.var_key(id.0 as usize)
     }
 
+    fn same_binding(&self, a: TsId, b: TsId) -> bool {
+        match (self.binding_id(a), self.binding_id(b)) {
+            (Some(x), Some(y)) => x == y,
+            // 未解析（模式绑定/手工 AST/未 prepare）退回名字键——与旧
+            // 行为一致；一侧有一侧无说明不是同一个可解析绑定。
+            (None, None) => self.var_key(a).is_some() && self.var_key(a) == self.var_key(b),
+            _ => false,
+        }
+    }
+
     fn stmt_var_ref_count(&self, stmt: TsId, key: u32) -> Option<u32> {
         let slot = self.stmt_facts.get(stmt.0 as usize)?.as_deref()?;
         Some(

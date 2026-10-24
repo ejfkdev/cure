@@ -143,3 +143,13 @@ fn top_level_decl_is_opaque_when_outside_root_writes_exist() {
     }
     assert!(Lang::is_opaque(&out.ast, decl.expect("x decl")));
 }
+
+#[test]
+fn same_binding_rejects_shadowed_same_name() {
+    let (out, root) = prepare("let x = 1; { let x = 2; x; } x;");
+    let rs = refs(&out, root, "x");
+    let inner = rs.iter().find(|&&r| out.ast.is_local_var(r)).copied().unwrap();
+    let outer = rs.iter().find(|&&r| !out.ast.is_local_var(r)).copied().unwrap();
+    assert!(!Lang::same_binding(&out.ast, inner, outer));
+    assert!(Lang::same_binding(&out.ast, inner, inner));
+}

@@ -5,6 +5,25 @@
 
 ## [Unreleased]
 
+### 规则（绑定身份接入引擎别名判定——2026-10-24 第十批）
+
+- 新增 `Lang::same_binding`：默认按名字键（Java 语义不变）；TS/JS 后端
+  覆盖为 `BindingId` 等值——两侧都未解析时回落名字键，一侧解析一侧
+  未解析则拒绝（保守）。
+- 引擎规则改用绑定身份判定“同一存储位置”：`self_assign`、
+  `assign_back_fold`（声明↔赋值目标 / `x=x op K` 的 RHS 左操作数）、
+  `dead_store`（声明/前赋值/后赋值目标，以及 b 中是否引用旧值）、
+  `local_propagation` 的纯自赋值守卫、`x - x → 0` / `x ^ x → 0`、
+  `inverse_assign_pair`（NormAssign 新增 target）、
+  `if_assign_ternary`。名字键仅保留为快速预筛与扫描窗口（保守命中）。
+- 效果：同名遮蔽不再被当成同一变量；`var`/`let` 提升、catch/块内
+  遮蔽、具名函数表达式等场景的别名折叠有绑定级依据。npm 语料的
+  编辑数与输出不变（52,098 次编辑），Test262 打印往返/幂等仍
+  49,159/49,159。
+- 回归：同步 **33,962/34,006**、async **5,423**、module **358**、
+  编译 **49,165 valid / 0 破坏**、npm **0 broken / 0 二次差异**、
+  `cargo test --workspace` **447 通过**。
+
 ### 架构（TS/JS 绑定/作用域 resolver——2026-10-24 第九批）
 
 - **每文件绑定 resolver**（`crates/cure-ts-ast/src/resolve.rs`）：

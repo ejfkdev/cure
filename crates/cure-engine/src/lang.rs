@@ -97,6 +97,16 @@ pub trait Lang {
     fn var_key(&self, _id: Self::Id) -> Option<Self::NameKey> {
         None
     }
+
+    /// 两个节点是否指向**同一个存储位置**。默认按名字键（Java 的
+    /// 作用域信息由前端 facts 提供）；有绑定解析的后端（TS/JS）应覆盖
+    /// 为 BindingId 等值，避免同名遮蔽被当成同一变量。
+    fn same_binding(&self, a: Self::Id, b: Self::Id) -> bool {
+        match (self.var_key(a), self.var_key(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
+    }
     /// Syntactic VarRef count for `key` inside this statement subtree.
     /// `None` = no fresh index (unbuilt/stale) — callers fall back to a
     /// recursive walk. Indexed languages return `Some(0)` for a statement
