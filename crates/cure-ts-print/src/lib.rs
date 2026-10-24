@@ -134,7 +134,8 @@ impl<'a> Printer<'a> {
                 self.out.push(' ');
                 match body {
                     Some(b) => self.print_block_like(*b),
-                    None => self.out.push_str(";\n"),
+                    // print_module 统一补条目换行——这里再加会多空行。
+                    None => self.out.push(';'),
                 }
             }
             TopItem::Class(c) => self.print_class(c),
@@ -160,7 +161,6 @@ impl<'a> Printer<'a> {
                 if !r.ends_with(';') && !r.ends_with('}') && !r.ends_with('{') {
                     self.out.push(';');
                 }
-                self.out.push('\n');
             }
         }
     }

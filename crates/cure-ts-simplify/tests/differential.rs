@@ -806,3 +806,20 @@ fn module_top_level_await_keeps_operator() {
     let _ = simplify_unit(&mut out2.ast, &mut out2.unit, &Config::default());
     assert_eq!(once, print_module(&out2.ast, &out2.unit));
 }
+
+#[test]
+fn deep_nesting_falls_back_to_verbatim_source() {
+    let src = format!(
+        "var x = {}1{};\n",
+        "(".repeat(2000),
+        ")".repeat(2000)
+    );
+    let mut out = parse(&src);
+    assert!(!out.errors.is_empty(), "depth guard should mark fallback");
+    let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
+    let printed = print_module(&out.ast, &out.unit);
+    assert_eq!(printed, src, "deep input must be preserved verbatim");
+    let mut out2 = parse(&printed);
+    let _ = simplify_unit(&mut out2.ast, &mut out2.unit, &Config::default());
+    assert_eq!(print_module(&out2.ast, &out2.unit), printed);
+}

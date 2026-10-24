@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+### 健壮性（深嵌套栈护栏 + Raw 条目换行——2026-10-24 第十一批）
+
+- **递归深度护栏**：parser 对语句/表达式/一元链统一计数，超过
+  `MAX_NEST`（512）即停止深入并把**整文件**作为 `TopItem::Raw` 原文
+  保真返回（清空部分 AST 的语义输出，保留一条诊断）。此前 20k 层括号
+  会让进程栈溢出 abort；现在退出码 0、输出与输入逐字节一致，二次
+  cure 稳定。
+- **Raw 顶层条目换行**：Import/ExportRaw/Raw 与无体函数声明不再各自
+  追加 `\n`（`print_module` 已统一补条目换行）。此前 raw 条目后多出
+  空行，深嵌套 raw 文件首轮输出多一个换行、二轮才收敛。
+- 新增回归 `deep_nesting_falls_back_to_verbatim_source`（2000 层括号：
+  原文保真 + 二次幂等）。
+- 回归：六层 Test262 全绿（同步 0 失配、async 5,423、module 358、
+  编译 49,165 valid / 0 破坏、往返/幂等 49,159）、npm 4,358 文件
+  **0 broken / 0 二次差异**；`cargo test --workspace` **448 通过**。
+
 ### 规则（绑定身份接入引擎别名判定——2026-10-24 第十批）
 
 - 新增 `Lang::same_binding`：默认按名字键（Java 语义不变）；TS/JS 后端

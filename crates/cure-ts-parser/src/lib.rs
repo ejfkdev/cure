@@ -65,6 +65,8 @@ fn parse_inner(src: &str, module_goal: Option<bool>) -> ParseOutcome {
         unit: ModuleUnit { shebang, items: Vec::new() },
         errors: Vec::new(),
         async_ctx: module_goal,
+        depth: 0,
+        too_deep: false,
     };
     for e in lex_errs {
         p.errors.push(ParseError {
@@ -74,6 +76,18 @@ fn parse_inner(src: &str, module_goal: Option<bool>) -> ParseOutcome {
         });
     }
     p.parse_module();
+    if p.too_deep {
+        // 部分 AST 已不可信：整文件原文保真（含注释/格式），
+        // 后续 simplify 对 TopItem::Raw 不做任何改写。
+        p.unit.items.clear();
+        p.unit.items.push(TopItem::Raw(body.to_string()));
+        p.errors.clear();
+        p.errors.push(ParseError {
+            line: 1,
+            col: 1,
+            message: "nesting too deep; preserved verbatim".into(),
+        });
+    }
     ParseOutcome {
         ast: p.ast,
         unit: p.unit,
@@ -92,7 +106,14 @@ struct Parser<'a> {
     /// module 顶层为 true；普通函数边界重置为 false（箭头不继承外层
     /// async——`() => await x` 在 async 函数里也是语法错误）。
     async_ctx: bool,
+    /// 递归嵌套深度（语句/表达式/一元链）。超过 `MAX_NEST` 时不再深入，
+    /// 整个文件走原文保真（避免恶意/生成代码的栈溢出）。
+    depth: usize,
+    too_deep: bool,
 }
+
+/// 递归上限。正常源码远低于此；超出者整文件 Raw 保真。
+const MAX_NEST: usize = 512;
 
 /// 顶层 `import`/`export` → module 目标。只扫花括号/圆/方括号深度 0；
 /// `import(`/`import.meta` 是表达式，不算声明。
@@ -977,6 +998,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stmt(&mut self) -> TsId {
+        if self.depth >= MAX_NEST {
+            self.too_deep = true;
+            let s = self.pos;
+            self.skip_balanced_to_stmt_boundary();
+            return self.ast.raw(&self.raw_between(s, self.pos));
+        }
+        self.depth += 1;
+        let out = self.parse_stmt_inner();
+        self.depth -= 1;
+        out
+    }
+
+    fn parse_stmt_inner(&mut self) -> TsId {
         let t = self.tk().clone();
         match t.kind {
             TokKind::Punct => match t.text.as_str() {
@@ -1851,6 +1885,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_assign_expr(&mut self) -> TsId {
+        if self.depth >= MAX_NEST {
+            self.too_deep = true;
+            let s = self.pos;
+            self.skip_balanced_to_stmt_boundary();
+            return self.ast.raw(&self.raw_between(s, self.pos));
+        }
+        self.depth += 1;
+        let out = self.parse_assign_expr_inner();
+        self.depth -= 1;
+        out
+    }
+
+    fn parse_assign_expr_inner(&mut self) -> TsId {
         if let Some(a) = self.try_parse_arrow() {
             return a;
         }
@@ -2160,6 +2207,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> TsId {
+        if self.depth >= MAX_NEST {
+            self.too_deep = true;
+            let s = self.pos;
+            self.skip_balanced_to_stmt_boundary();
+            return self.ast.raw(&self.raw_between(s, self.pos));
+        }
+        self.depth += 1;
+        let out = self.parse_unary_inner();
+        self.depth -= 1;
+        out
+    }
+
+    fn parse_unary_inner(&mut self) -> TsId {
         let t = self.tk().clone();
         if t.kind == TokKind::Punct {
             let op = match t.text.as_str() {
