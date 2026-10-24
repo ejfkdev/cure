@@ -139,8 +139,20 @@ impl<'a> Printer<'a> {
             }
             TopItem::Class(c) => self.print_class(c),
             TopItem::ExportStmt(stmt) => {
-                self.out.push_str("export ");
-                self.print_stmt_at(*stmt);
+                // `export var a=1,b=2;` 的 Group 必须逐声明保留 export——
+                // 只给第一条加前缀会让后续名字变成非导出（模块语义改变）。
+                let kids: Vec<TsId> = if matches!(self.ast.data(*stmt), NodeData::Group) {
+                    self.ast.children(*stmt).to_vec()
+                } else {
+                    vec![*stmt]
+                };
+                for (i, k) in kids.into_iter().enumerate() {
+                    if i > 0 {
+                        self.out.push('\n');
+                    }
+                    self.out.push_str("export ");
+                    self.print_stmt_at(k);
+                }
             }
             TopItem::Import(raw) | TopItem::ExportRaw(raw) | TopItem::Raw(raw) => {
                 let r = raw.trim_end();

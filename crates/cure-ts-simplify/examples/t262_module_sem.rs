@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use cure_engine::Config;
-use cure_ts_parser::parse;
+use cure_ts_parser::parse_module;
 use cure_ts_print::print_module;
 use cure_ts_simplify::simplify_unit;
 
@@ -61,7 +61,7 @@ fn main() {
                 }
             }
         }
-        let mut out = parse(&c.src);
+        let mut out = parse_module(&c.src);
         let clean = out.errors.is_empty();
         let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
         let cured = print_module(&out.ast, &out.unit);

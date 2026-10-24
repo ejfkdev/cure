@@ -825,6 +825,264 @@ impl TsAst {
         self.names.name(sym.0)
     }
 
+    /// 结构等价（忽略 `Paren` 包装、字面量拼写与原文段空白）：
+    /// 用于「解析 → 打印 → 再解析」的往返校验。**不用于语义判定**——
+    /// 化简会改变结构，这里只回答“打印器有没有改变程序形态”。
+    pub fn equiv(&self, a: TsId, other: &TsAst, b: TsId) -> bool {
+        let mut stack = vec![(a, b)];
+        while let Some((mut x, mut y)) = stack.pop() {
+            x = self.unparen(x);
+            y = other.unparen(y);
+            // 语句容器：Group（多声明符合成）与 Block 在打印后形态不同
+            // （`if (x) var a=1,b=2;` → 加花括号的两条语句），按展平后的
+            // 语句序列比较。Block 只有全部为 VarDecl 时才可能与 Group
+            // 等价——这里不额外检查：Group 本身只承载 var 声明。
+            if is_stmt_container(self.data(x)) && is_stmt_container(other.data(y)) {
+                let ca = self.flat_stmt_children(x);
+                let cb = other.flat_stmt_children(y);
+                if ca.len() != cb.len() {
+                    return false;
+                }
+                for (u, v) in ca.into_iter().zip(cb) {
+                    stack.push((u, v));
+                }
+                continue;
+            }
+            if !self.data_equiv(x, other, y) {
+                if std::env::var("CURE_EQUIV_DEBUG").is_ok() {
+                    eprintln!("[equiv] {:?} != {:?}", self.data(x), other.data(y));
+                }
+                return false;
+            }
+            let ca = self.children(x);
+            let cb = other.children(y);
+            if ca.len() != cb.len() {
+                return false;
+            }
+            for (u, v) in ca.iter().zip(cb.iter()) {
+                stack.push((*u, *v));
+            }
+        }
+        true
+    }
+
+    /// 语句容器的直接孩子序列；Group 递归展开（无花括号分组）。
+    fn flat_stmt_children(&self, id: TsId) -> Vec<TsId> {
+        let mut out = Vec::new();
+        for &c in self.children(id) {
+            if matches!(self.data(c), NodeData::Group) {
+                out.extend(self.flat_stmt_children(c));
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn unparen(&self, mut id: TsId) -> TsId {
+        loop {
+            if !matches!(self.data(id), NodeData::Paren) {
+                return id;
+            }
+            let Some(&c) = self.children(id).first() else { return id };
+            id = c;
+        }
+    }
+
+    fn data_equiv(&self, a: TsId, other: &TsAst, b: TsId) -> bool {
+        match (self.data(a), other.data(b)) {
+            (NodeData::Literal(x), NodeData::Literal(y)) => lit_equiv(x, y),
+            (NodeData::VarRef { name: x }, NodeData::VarRef { name: y }) => {
+                self.sn(*x) == other.sn(*y)
+            }
+            (
+                NodeData::Member { name: x, optional: ox },
+                NodeData::Member { name: y, optional: oy },
+            ) => ox == oy && self.sn(*x) == other.sn(*y),
+            (
+                NodeData::VarDecl { name: x, kind: kx, ty_raw: tx },
+                NodeData::VarDecl { name: y, kind: ky, ty_raw: ty },
+            ) => x == y && kx == ky && norm_opt(tx) == norm_opt(ty),
+            (
+                NodeData::ForEach { name: x, of: ox, decl: dx, ty_raw: tx, await_: ax },
+                NodeData::ForEach { name: y, of: oy, decl: dy, ty_raw: ty, await_: ay },
+            ) => x == y && ox == oy && dx == dy && ax == ay && norm_opt(tx) == norm_opt(ty),
+            (NodeData::Catch { param_raw: x }, NodeData::Catch { param_raw: y }) => {
+                norm_opt(x) == norm_opt(y)
+            }
+            (NodeData::Break { label: x }, NodeData::Break { label: y })
+            | (NodeData::Continue { label: x }, NodeData::Continue { label: y }) => x == y,
+            (NodeData::Raw { text: x }, NodeData::Raw { text: y }) => {
+                norm_code(x) == norm_code(y)
+            }
+            // `(yield)` / `yield;`：无操作数 yield 在解析器里有时走 Raw
+            // （换行/无操作数形态）、有时走 VarRef（分号形态）。两者
+            // 打印文本相同，生成器语境外的 token 流也相同——作为同一
+            // 源形态比较（仅限 yield，避免泛化掩盖真实漂移）。
+            (NodeData::Raw { text }, NodeData::VarRef { name }) => {
+                text.trim() == "yield" && other.sn(*name) == "yield"
+            }
+            (NodeData::VarRef { name }, NodeData::Raw { text }) => {
+                text.trim() == "yield" && self.sn(*name) == "yield"
+            }
+            (
+                NodeData::Lambda {
+                    params_raw: px,
+                    name: nx,
+                    space: sx,
+                    arrow: ax,
+                    is_async: asyncx,
+                    is_generator: gx,
+                },
+                NodeData::Lambda {
+                    params_raw: py,
+                    name: ny,
+                    space: sy,
+                    arrow: ay,
+                    is_async: asyncy,
+                    is_generator: gy,
+                },
+            ) => {
+                nx == ny && sx == sy && ax == ay && asyncx == asyncy && gx == gy
+                    && norm_code(px) == norm_code(py)
+            }
+            (
+                NodeData::Template { quasis: qx, tag: tx },
+                NodeData::Template { quasis: qy, tag: ty },
+            ) => tx == ty && qx.len() == qy.len()
+                && qx.iter().zip(qy).all(|(a, b)| norm_code(a) == norm_code(b)),
+            (NodeData::Destruct { pattern_raw: x }, NodeData::Destruct { pattern_raw: y }) => {
+                norm_code(x) == norm_code(y)
+            }
+            (NodeData::ObjLit { props: x }, NodeData::ObjLit { props: y }) => {
+                x.len() == y.len()
+                    && x.iter().zip(y).all(|(a, b)| norm_code(a) == norm_code(b))
+            }
+            (NodeData::TsAs { ty_raw: x }, NodeData::TsAs { ty_raw: y })
+            | (NodeData::TsSatisfies { ty_raw: x }, NodeData::TsSatisfies { ty_raw: y }) => {
+                norm_code(x) == norm_code(y)
+            }
+            (
+                NodeData::FuncStmt { sig_raw: sx, name: nx, params_raw: px },
+                NodeData::FuncStmt { sig_raw: sy, name: ny, params_raw: py },
+            ) => nx == ny && norm_code(sx) == norm_code(sy) && norm_code(px) == norm_code(py),
+            (NodeData::ClassExpr { raw: x }, NodeData::ClassExpr { raw: y }) => {
+                norm_code(x) == norm_code(y)
+            }
+            (
+                NodeData::DestructStmt { kw: kx, pattern: px },
+                NodeData::DestructStmt { kw: ky, pattern: py },
+            ) => kx == ky && norm_code(px) == norm_code(py),
+            _ => self.data(a) == other.data(b),
+        }
+    }
+
+    /// 模块单元等价：语句/函数/类逐项比较；import/export 原文按归一化
+    /// 文本比较。顶层语句顺序必须一致（打印器不得重排）。
+    pub fn unit_equiv(&self, ua: &ModuleUnit, other: &TsAst, ub: &ModuleUnit) -> bool {
+        if ua.shebang != ub.shebang {
+            return false;
+        }
+        let mut fa = Vec::new();
+        self.flat_items(&ua.items, &mut fa);
+        let mut fb = Vec::new();
+        other.flat_items(&ub.items, &mut fb);
+        if fa.len() != fb.len() {
+            return false;
+        }
+        fa.iter().zip(&fb).all(|(a, b)| match (a, b) {
+            (FlatTop::Stmt { export: ea, id: x }, FlatTop::Stmt { export: eb, id: y }) => {
+                ea == eb && self.equiv(*x, other, *y)
+            }
+            (FlatTop::Item(x), FlatTop::Item(y)) => self.item_equiv(x, other, y),
+            _ => false,
+        })
+    }
+
+    /// 顶层项展平：`export var a=1,b=2`（ExportStmt(Group)）与打印后的
+    /// 多条 `export var …` 对齐。
+    fn flat_items<'a>(&self, items: &'a [TopItem], out: &mut Vec<FlatTop<'a>>) {
+        for it in items {
+            match it {
+                TopItem::Stmt(s) => self.push_flat_item(*s, false, out),
+                TopItem::ExportStmt(s) => self.push_flat_item(*s, true, out),
+                _ => out.push(FlatTop::Item(it)),
+            }
+        }
+    }
+
+    fn push_flat_item<'a>(&self, id: TsId, export: bool, out: &mut Vec<FlatTop<'a>>) {
+        if matches!(self.data(id), NodeData::Group) {
+            for &c in self.children(id) {
+                self.push_flat_item(c, export, out);
+            }
+        } else {
+            out.push(FlatTop::Stmt { export, id });
+        }
+    }
+
+    fn item_equiv(&self, a: &TopItem, other: &TsAst, b: &TopItem) -> bool {
+        match (a, b) {
+            (TopItem::Stmt(x), TopItem::Stmt(y))
+            | (TopItem::ExportStmt(x), TopItem::ExportStmt(y)) => self.equiv(*x, other, *y),
+            (
+                TopItem::Func { sig_raw: sx, name: nx, body: bx },
+                TopItem::Func { sig_raw: sy, name: ny, body: by },
+            ) => {
+                nx == ny
+                    && norm_code(sx) == norm_code(sy)
+                    && match (bx, by) {
+                        (None, None) => true,
+                        (Some(x), Some(y)) => self.equiv(*x, other, *y),
+                        _ => false,
+                    }
+            }
+            (TopItem::Class(x), TopItem::Class(y)) => self.class_equiv(x, other, y),
+            (TopItem::Import(x), TopItem::Import(y))
+            | (TopItem::ExportRaw(x), TopItem::ExportRaw(y))
+            | (TopItem::Raw(x), TopItem::Raw(y)) => norm_code(x) == norm_code(y),
+            _ => false,
+        }
+    }
+
+    fn class_equiv(&self, a: &ClassDecl, other: &TsAst, b: &ClassDecl) -> bool {
+        if norm_code(&a.prefix) != norm_code(&b.prefix)
+            || norm_code(&a.head_raw) != norm_code(&b.head_raw)
+            || a.kind_kw != b.kind_kw
+            || a.name != b.name
+            || a.members.len() != b.members.len()
+        {
+            return false;
+        }
+        a.members.iter().zip(&b.members).all(|(x, y)| match (x, y) {
+            (ClassMember::Method { sig_raw: sx, body: bx }, ClassMember::Method { sig_raw: sy, body: by }) => {
+                norm_code(sx) == norm_code(sy)
+                    && match (bx, by) {
+                        (None, None) => true,
+                        (Some(x), Some(y)) => self.equiv(*x, other, *y),
+                        _ => false,
+                    }
+            }
+            (
+                ClassMember::Field { sig_raw: sx, name: nx, init: ix },
+                ClassMember::Field { sig_raw: sy, name: ny, init: iy },
+            ) => {
+                nx == ny
+                    && norm_code(sx) == norm_code(sy)
+                    && match (ix, iy) {
+                        (None, None) => true,
+                        (Some(x), Some(y)) => self.equiv(*x, other, *y),
+                        _ => false,
+                    }
+            }
+            (ClassMember::StaticBlock { body: x }, ClassMember::StaticBlock { body: y }) => {
+                self.equiv(*x, other, *y)
+            }
+            (ClassMember::Raw(x), ClassMember::Raw(y)) => norm_code(x) == norm_code(y),
+            _ => false,
+        })
+    }
+
     /// 作用域解析后的 VarRef 局部性（prepare 之后有效）。
     pub fn is_local_ref(&self, id: TsId) -> bool {
         self.local_marks.get(id.0 as usize).copied().unwrap_or(false)
@@ -1535,6 +1793,19 @@ impl Lang for TsAst {
             if let (LitRef::Int(v), LitRef::Str(b)) = (ll, rr) {
                 if js_int_representable(v) {
                     return Some(self.build_str(&format!("{v}{b}")));
+                }
+            }
+            // 整值/有限 Double 的字符串化：`1.0 + ''` 的 JS 结果是
+            // `"1"`（首轮 Double 未折、二轮打印成 Int 才折——幂等差分
+            // 抓获）。format_js_number 与打印器同一 ECMA Number→String。
+            if let (LitRef::Str(a), LitRef::Double(v)) = (ll, rr) {
+                if v.is_finite() {
+                    return Some(self.build_str(&format!("{a}{}", format_js_number(v))));
+                }
+            }
+            if let (LitRef::Double(v), LitRef::Str(b)) = (ll, rr) {
+                if v.is_finite() {
+                    return Some(self.build_str(&format!("{}{b}", format_js_number(v))));
                 }
             }
         }
@@ -2792,5 +3063,94 @@ mod tests {
         let o = a.lit(JsLit::Int(1));
         let folded = <TsAst as Lang>::fold_lit_bin(&mut a, BinOp::Add, f, o);
         assert!(matches!(a.literal(folded.unwrap()), Some(LitRef::Int(4294967296))));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 结构等价的归一化辅助（打印往返校验；不参与语义判定）
+// ---------------------------------------------------------------------------
+
+/// 打印器会把 Group 展开成多条同缩进语句（必要时包 Block）。
+fn is_stmt_container(d: &NodeData) -> bool {
+    matches!(d, NodeData::Block | NodeData::Group | NodeData::ModuleBlock)
+}
+
+/// 顶层项展平后的视图（Group/多声明符与打印后的多条语句对齐）。
+enum FlatTop<'a> {
+    Item(&'a TopItem),
+    Stmt { export: bool, id: TsId },
+}
+
+/// 原文/签名归一化：去掉首尾空白与尾部 `;`，仅保留标识符之间的空白
+///（标点周围的空白不影响 token 流）。字符串内的空白可能被折叠——这只
+/// 用于等价校验，宁可漏报不误报。
+fn norm_code(s: &str) -> String {
+    let t = s.trim().trim_end_matches(';');
+    let mut out = String::with_capacity(t.len());
+    let mut pending_space = false;
+    let mut prev_ident = false;
+    for c in t.chars() {
+        if c.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        let is_ident =
+            c.is_alphanumeric() || c == '_' || c == '$' || c == '#' || c == '\\';
+        if pending_space && prev_ident && is_ident {
+            out.push(' ');
+        }
+        out.push(c);
+        prev_ident = is_ident;
+        pending_space = false;
+    }
+    out
+}
+
+fn norm_opt(s: &Option<String>) -> Option<String> {
+    s.as_deref().map(norm_code)
+}
+
+/// 数值字面量按值比较：`1e3`/`0x3e8`/`1000` 等价；非整 Double 走位比较。
+fn num_parts(l: &JsLit) -> Option<(f64, Option<i64>)> {
+    let (v, as_i) = match l {
+        JsLit::Int(v) => (*v as f64, Some(*v)),
+        JsLit::Double(v) => {
+            let exact = v.is_finite()
+                && v.fract() == 0.0
+                && v.abs() <= (1u64 << 53) as f64;
+            (*v, if exact { Some(*v as i64) } else { None })
+        }
+        JsLit::NumRaw { val, .. } => match val {
+            NumVal::Int(v) => (*v as f64, Some(*v)),
+            NumVal::Double(v) => {
+                let exact = v.is_finite()
+                    && v.fract() == 0.0
+                    && v.abs() <= (1u64 << 53) as f64;
+                (*v, if exact { Some(*v as i64) } else { None })
+            }
+        },
+        _ => return None,
+    };
+    Some((v, as_i))
+}
+
+fn lit_equiv(a: &JsLit, b: &JsLit) -> bool {
+    if let (Some((fa, ia)), Some((fb, ib))) = (num_parts(a), num_parts(b)) {
+        return match (ia, ib) {
+            (Some(x), Some(y)) => x == y,
+            _ => fa.to_bits() == fb.to_bits(),
+        };
+    }
+    match (a, b) {
+        (JsLit::Bool(x), JsLit::Bool(y)) => x == y,
+        (JsLit::Str(x), JsLit::Str(y)) => x == y,
+        (JsLit::Regex(x), JsLit::Regex(y)) => x == y,
+        (JsLit::BigInt(x), JsLit::BigInt(y)) => {
+            let nx: String = x.chars().filter(|c| *c != '_').collect();
+            let ny: String = y.chars().filter(|c| *c != '_').collect();
+            nx == ny
+        }
+        (JsLit::Null, JsLit::Null) => true,
+        _ => false,
     }
 }

@@ -212,38 +212,57 @@ fn remove_dead_module_items(ast: &mut TsAst, unit: &mut ModuleUnit) -> usize {
             TopItem::Stmt(s) => {
                 if let NodeData::Group = ast.data(*s) {
                     let kids = ast.children(*s).to_vec();
-                    let mut keep: Vec<TsId> = Vec::new();
-                    let mut changed = false;
-                    for (k, &kid) in kids.iter().enumerate() {
-                        let dead = if let NodeData::VarDecl { name, .. } = ast.data(kid) {
-                            if ast.const_fields.contains_key(name) {
-                                // 其它兄弟的引用
-                                let mut sibling_hit = false;
-                                for (j, &o) in kids.iter().enumerate() {
-                                    if j == k {
-                                        continue;
-                                    }
-                                    let mut refs = HashSet::new();
-                                    let mut raws = Vec::new();
-                                    collect_refs_and_raws(ast, o, &mut refs, &mut raws);
-                                    if refs.contains(name) {
-                                        sibling_hit = true;
-                                        break;
-                                    }
+                    // 组内常量的存活是**图可达**问题：`var wi=1024,Ti=64*wi*wi;`
+                    // 中 Ti 可能因传播而死，wi 的唯一引用来自这个将死的
+                    // 兄弟——只按“任一兄弟引用”判定会保留 wi，二轮才删
+                    // （npm 语料幂等差分抓获）。先算候选，再对“被活兄弟
+                    // 引用”做不动点。
+                    let cand: Vec<Option<String>> = kids
+                        .iter()
+                        .map(|&kid| {
+                            if let NodeData::VarDecl { name, .. } = ast.data(kid) {
+                                if ast.const_fields.contains_key(name)
+                                    && !all_words(Some(i)).contains(name)
+                                {
+                                    return Some(name.clone());
                                 }
-                                !sibling_hit && !all_words(Some(i)).contains(name)
-                            } else {
-                                false
                             }
-                        } else {
-                            false
-                        };
-                        if dead {
-                            changed = true;
-                        } else {
-                            keep.push(kid);
+                            None
+                        })
+                        .collect();
+                    let mut live: Vec<bool> = cand.iter().map(|c| c.is_none()).collect();
+                    loop {
+                        let mut changed = false;
+                        for k in 0..kids.len() {
+                            if live[k] {
+                                continue;
+                            }
+                            let name = cand[k].as_ref().unwrap();
+                            for (j, &o) in kids.iter().enumerate() {
+                                if j == k || !live[j] {
+                                    continue;
+                                }
+                                let mut refs = HashSet::new();
+                                let mut raws = Vec::new();
+                                collect_refs_and_raws(ast, o, &mut refs, &mut raws);
+                                if refs.contains(name) || raws.contains(name) {
+                                    live[k] = true;
+                                    changed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !changed {
+                            break;
                         }
                     }
+                    let keep: Vec<TsId> = kids
+                        .iter()
+                        .enumerate()
+                        .filter(|(k, _)| live[*k])
+                        .map(|(_, &kid)| kid)
+                        .collect();
+                    let changed = keep.len() != kids.len();
                     if changed {
                         let new_group = if keep.is_empty() {
                             None
@@ -695,7 +714,12 @@ pub fn collect_unit_consts(ast: &mut TsAst, unit: &ModuleUnit) {
                 });
                 if candidate {
                     let init = init.unwrap();
-                    let scalar_ok = is_scalar_lit(ast, init);
+                    // 标量不只“已折叠的字面量”：Binary/Paren 常量在
+                    // const_init_ok 下已保证操作数全为标量、效果≤MayRead，
+                    // 结果必为原始值（string/number/bool）——可在**首轮**
+                    // 就参与传播。否则长常量链每轮只前进一层，第六轮后
+                    // 仍未收敛（真实 Test262 RegExp 语料二轮漂移抓获）。
+                    let scalar_ok = is_scalar_const(ast, init);
                     ast.const_fields.insert(name.clone(), init);
                     if scalar_ok {
                         ast.const_scalars.insert(name.clone());
@@ -832,6 +856,21 @@ fn body_has_inline_hazard(ast: &TsAst, expr: TsId, fname: &str) -> bool {
     false
 }
 
+/// 常量初始化式是否产生**原始值**（可安全多副本传播）。
+/// `const_init_ok` 已保证 Binary/Paren 的操作数全为标量、效果 ≤ MayRead；
+/// Paren 只看内部——数组/对象即使被括号包住也不是标量（同一性）。
+fn is_scalar_const(ast: &TsAst, id: TsId) -> bool {
+    match ast.kind(id) {
+        NodeKind::Literal => is_scalar_lit(ast, id),
+        NodeKind::Binary => true,
+        NodeKind::Paren => ast
+            .children(id)
+            .first()
+            .is_some_and(|&c| is_scalar_const(ast, c)),
+        _ => false,
+    }
+}
+
 /// 标量字面量（正则除外——对象语义）。
 fn is_scalar_lit(ast: &TsAst, n: TsId) -> bool {
     matches!(ast.data(n), NodeData::Literal(l) if !matches!(l, JsLit::Regex(_)))
@@ -884,6 +923,12 @@ fn const_init_ok(
                 }
             }
             ok
+        }
+        // 括号只是语法层：语义按内部表达式判定（`("a" + B)` 与
+        // `"a" + B` 同值）。
+        NodeKind::Paren => {
+            let Some(&inner) = ast.children(init).first() else { return false };
+            const_init_ok(ast, inner, accepted, scalar_set)
         }
         NodeKind::Binary => {
             // 表达式效果 ≤ MayRead 且自由变量全在先序接纳集**且为标量**

@@ -728,3 +728,81 @@ console.log(run());
         3,
     );
 }
+
+#[test]
+fn diff_paren_array_identity() {
+    // 括号包裹的数组常量不是标量：传播会复制数组同一性
+    // （`([1,2]).push(3)` 不会改变原常量 A）。
+    differential(
+        "paren_array_identity",
+        r#"
+const A = ([1, 2]);
+A.push(3);
+console.log(A.length, A.join(","));
+const B = ({ v: 1 });
+B.v = 2;
+console.log(B.v);
+"#,
+    );
+}
+
+#[test]
+fn diff_await_identifier_in_nested_scope() {
+    // 非 async 函数里 `await(...)` 是名为 await 的普通函数调用。
+    differential(
+        "await_identifier",
+        r#"
+var await = function (x) { return x + 1; };
+function f() { return await(null); }
+function g() { function h() { return await(1); } return h(); }
+console.log(f(), g());
+"#,
+    );
+}
+
+#[test]
+fn export_group_keeps_all_exports() {
+    let src = "export var a = 1, b = 2;\n";
+    let mut out = cure_ts_parser::parse_module(src);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
+    let printed = print_module(&out.ast, &out.unit);
+    assert!(
+        printed.contains("export var a") && printed.contains("export var b"),
+        "multi-declarator export lost binding export:\n{printed}"
+    );
+}
+
+#[test]
+fn decorators_are_preserved() {
+    for src in [
+        "class C { @dec m() {} }\n",
+        "class C { @ns.$ static m() {} }\n",
+        "@dec class C { m() {} }\n",
+    ] {
+        let mut out = parse(src);
+        assert!(out.errors.is_empty(), "{src}: {:?}", out.errors);
+        let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
+        let once = print_module(&out.ast, &out.unit);
+        assert!(once.contains("@dec") || once.contains("@ns.$"), "{src}:\n{once}");
+        let mut out2 = parse(&once);
+        assert!(out2.errors.is_empty(), "{once}: {:?}", out2.errors);
+        let _ = simplify_unit(&mut out2.ast, &mut out2.unit, &Config::default());
+        let twice = print_module(&out2.ast, &out2.unit);
+        assert_eq!(once, twice, "decorator output not idempotent:\n{once}\n---\n{twice}");
+    }
+}
+
+#[test]
+fn module_top_level_await_keeps_operator() {
+    let src = "await (g());\n";
+    let mut out = cure_ts_parser::parse_module(src);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
+    let once = print_module(&out.ast, &out.unit);
+    assert!(once.contains("await g()") || once.contains("await (g())"), "{once}");
+    let mut out2 = cure_ts_parser::parse_module(&once);
+    assert!(out2.errors.is_empty(), "{once}: {:?}", out2.errors);
+    let _ = simplify_unit(&mut out2.ast, &mut out2.unit, &Config::default());
+    assert_eq!(once, print_module(&out2.ast, &out2.unit));
+}

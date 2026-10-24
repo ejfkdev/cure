@@ -5,6 +5,55 @@
 
 ## [Unreleased]
 
+### 验证（Test262 打印往返 + 简化幂等——2026-10-24 第八批）
+
+- **打印往返结构差分**（`examples/t262_roundtrip` +
+  `tests/t262_roundtrip.rs`）：每个 Test262 文件解析 → 打印（不简化）
+  → 再解析，按原文件的 script/module 目标比较 AST 结构等价（忽略
+  `Paren`、字面量拼写、Group/多声明符展开）。**49,159/49,159 一致，
+  0 漂移**；负向用例跳过（无效输入不属于打印契约）。
+- **简化幂等差分**（`examples/t262_idem` + `tests/t262_idem.rs`）：
+  cure 输出再跑一遍 cure，文本必须逐字节一致。**49,159/49,159 稳定，
+  0 漂移**。
+- 两层都用 `T262_OFFSET/T262_LIMIT` 分块、支持 `T262_DUMP` 落盘失败
+  样本；`equiv_check` 调试工具（`CURE_EQUIV_DEBUG=1` 打印首个差异
+  节点）。新增 `parse_module`/`parse_script` 与顶层 `import`/`export`
+  自动判定；CLI 对 `.mjs/.mts` 强制 module、`.cjs/.cts` 强制 script。
+- 抓出并修复：
+  - **多声明符导出丢导出**：`export var a=1,b=2;` 曾打印成
+    `export var a=1;
+var b=2;`——`b` 变成非导出（模块语义改变）。
+    `ExportStmt(Group)` 现在逐声明加 `export`。
+  - **装饰器解析**：`skip_decorator` 把成员名一起吞掉，`@dec m() {}`
+    整个成员塌成 `Raw("{}")`，类级 `@dec class C` 的装饰器也被丢弃。
+    现在装饰器成员整条原文保真（规则不进入装饰器语义），类级装饰器
+    正确进入 `ClassDecl.prefix`。
+  - **await 语境**：`await (x)` 在非 async 函数里是名为 await 的函数
+    调用（Test262 `private-field-rhs-await-absent`、嵌套 function/
+    generator 用例）；此前按 Await 一元解析导致 SyntaxError。新增
+    `async_ctx`——async 函数/async 方法/async 箭头/module 顶层为真，
+    普通函数与箭头边界重置；`await`,`=`,`yield` 等标识符形态保持。
+    同时给 parser 增加 module goal，避免顶层 await 的 script/module
+    误读。
+  - **长常量链首轮不收敛**：`var B="0"+A; var C="1"+B; …` 每轮只前进
+    一层，六轮上限后仍有残留（二次 cure 才清完）。`const_init_ok` 已
+    保证 Binary/Paren 常量的操作数全为标量、效果 ≤ MayRead，现在它们
+    首轮直接进入 scalar 集合；`1.0 + ''` 等整值 Double 字符串化也在
+    首轮折叠。
+  - **Group 死声明存活**：`var wi=1024,Ti=64*wi*wi;` 中 Ti 传播后，
+    wi 的唯一引用来自将死的兄弟——只按“任一兄弟引用”判定会保留 wi，
+    二轮才删（npm 真实语料幂等差）。改为组内“被活兄弟引用”的不动点
+    可达分析，首轮即删。
+  - **括号数组/对象常量同一性**：首轮 scalar 判定递归到 Paren 内部，
+    只有 Binary/Paren(标量) 才视为原始值；`const A=([1,2]); A.push(3)`
+    不再把数组传播成互不影响的新副本（回归用例
+    `diff_paren_array_identity`）。
+- 回归：同步语义 **33,956/34,000（99.87%）**、44 个 toString 源文本
+  限制、async **5,423/5,423**、module **358/358**、编译
+  **49,165/49,165 合法文件 0 破坏**、打印往返/幂等 **49,159/49,159**；
+  npm 4,358 文件编译 **0 broken**、两轮 **0 差异**；
+  `cargo test --workspace` **439 通过**。
+
 ### 验证（npm 真实语料编译差分 + 幂等——2026-10-23 第七批）
 
 - **真实 npm 语料**：全局安装 `/opt/homebrew/lib/node_modules` 下

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use cure_engine::Config;
-use cure_ts_parser::parse;
+use cure_ts_parser::parse_module;
 use cure_ts_print::print_module;
 use cure_ts_simplify::simplify_unit;
 
@@ -78,7 +78,7 @@ fn t262_module_semantic_sample() {
                 }
             }
         }
-        let mut out = parse(&c.src);
+        let mut out = parse_module(&c.src);
         let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
         let cured = print_module(&out.ast, &out.unit);
         let id = c.path.strip_prefix(&root).unwrap_or(&c.path).to_string_lossy().to_string();

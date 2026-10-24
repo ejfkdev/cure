@@ -21,7 +21,7 @@ use cure_engine::Config;
 use cure_java_parser::parse;
 use cure_java_print::print_unit;
 use cure_java_simplify::simplify_unit;
-use cure_ts_parser::parse as ts_parse;
+use cure_ts_parser::{parse as ts_parse, parse_module as ts_parse_module, parse_script as ts_parse_script};
 use cure_ts_print::print_module as ts_print;
 use cure_ts_simplify::simplify_unit as ts_simplify_unit;
 
@@ -842,7 +842,17 @@ fn process_source_ts(
     out_path: Option<PathBuf>,
     display: &str,
 ) -> Result<FileResult, String> {
-    let mut outcome = ts_parse(src);
+    // 扩展名强制 script/module 目标（`.mjs`/`.mts` = ESM，顶层 await
+    // 是运算符；`.cjs`/`.cts` = CommonJS；其余按顶层 import/export
+    // 自动判定）。
+    let disp = display.to_ascii_lowercase();
+    let mut outcome = if disp.ends_with(".mjs") || disp.ends_with(".mts") {
+        ts_parse_module(src)
+    } else if disp.ends_with(".cjs") || disp.ends_with(".cts") {
+        ts_parse_script(src)
+    } else {
+        ts_parse(src)
+    };
     let had_errors = !outcome.errors.is_empty();
     let need_lines = opts.stats || opts.report;
     let lines_before = if need_lines { src.lines().count() } else { 0 };

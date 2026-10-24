@@ -26,8 +26,23 @@ pub struct ParseOutcome {
     pub errors: Vec<ParseError>,
 }
 
-/// 解析源文件（容错）。
+/// 解析源文件（容错）。自动判定 script/module：顶层 `import`/`export`
+/// 视为 module（顶层 await 可用）；否则按 script（`await` 可作标识符）。
 pub fn parse(src: &str) -> ParseOutcome {
+    parse_inner(src, None)
+}
+
+/// 按 module 目标解析（ESM：顶层 await 是运算符）。
+pub fn parse_module(src: &str) -> ParseOutcome {
+    parse_inner(src, Some(true))
+}
+
+/// 按 script 目标解析（顶层 await 按标识符/普通名）。
+pub fn parse_script(src: &str) -> ParseOutcome {
+    parse_inner(src, Some(false))
+}
+
+fn parse_inner(src: &str, module_goal: Option<bool>) -> ParseOutcome {
     let mut shebang = String::new();
     let body = if let Some(rest) = src.strip_prefix("#!") {
         if let Some(nl) = rest.find('\n') {
@@ -41,6 +56,7 @@ pub fn parse(src: &str) -> ParseOutcome {
         src
     };
     let (toks, lex_errs) = Lexer::new(body).tokenize();
+    let module_goal = module_goal.unwrap_or_else(|| detect_module_goal(&toks));
     let mut p = Parser {
         src: body,
         toks,
@@ -48,6 +64,7 @@ pub fn parse(src: &str) -> ParseOutcome {
         ast: TsAst::new(),
         unit: ModuleUnit { shebang, items: Vec::new() },
         errors: Vec::new(),
+        async_ctx: module_goal,
     };
     for e in lex_errs {
         p.errors.push(ParseError {
@@ -71,6 +88,48 @@ struct Parser<'a> {
     ast: TsAst,
     unit: ModuleUnit,
     errors: Vec<ParseError>,
+    /// 当前函数体/[Await] 语境：async 函数/async 方法/async 箭头/
+    /// module 顶层为 true；普通函数边界重置为 false（箭头不继承外层
+    /// async——`() => await x` 在 async 函数里也是语法错误）。
+    async_ctx: bool,
+}
+
+/// 顶层 `import`/`export` → module 目标。只扫花括号/圆/方括号深度 0；
+/// `import(`/`import.meta` 是表达式，不算声明。
+fn detect_module_goal(toks: &[Token]) -> bool {
+    let mut depth = 0i32;
+    for (i, t) in toks.iter().enumerate() {
+        if t.kind == TokKind::Punct {
+            match t.text.as_str() {
+                "{" | "(" | "[" => depth += 1,
+                "}" | ")" | "]" => depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        if depth != 0 || t.kind != TokKind::Ident {
+            continue;
+        }
+        if t.text == "export" {
+            return true;
+        }
+        if t.text == "import" {
+            let next = toks.get(i + 1);
+            let prev_dot = i > 0 && toks[i - 1].kind == TokKind::Punct && toks[i - 1].text == ".";
+            if prev_dot {
+                continue;
+            }
+            if let Some(n) = next {
+                if n.kind == TokKind::Ident || n.kind == TokKind::Str {
+                    return true;
+                }
+                if n.kind == TokKind::Punct && matches!(n.text.as_str(), "{" | "*") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// 二元运算符表：`(优先级, BinOp)`。`??` 与 `||` 同层（混合需括号——
@@ -282,12 +341,12 @@ impl<'a> Parser<'a> {
             self.unit.items.push(TopItem::Raw(raw));
             return;
         }
-        if let Some(f) = self.try_parse_function_decl(deco_raw, false) {
+        if let Some(f) = self.try_parse_function_decl(deco_raw.clone(), false) {
             self.unit.items.push(f);
             return;
         }
         if self.is_kw("class") || (self.is_kw("abstract") && self.tk_at(1).text == "class") {
-            if let Some(c) = self.try_parse_class_decl(String::new()) {
+            if let Some(c) = self.try_parse_class_decl(deco_raw) {
                 self.unit.items.push(TopItem::Class(c));
                 return;
             }
@@ -487,7 +546,7 @@ impl<'a> Parser<'a> {
             ret_raw = self.raw_between(rs, self.pos);
         }
         let body = if self.is_punct("{") {
-            Some(self.parse_block())
+            Some(self.enter_async(is_async, |p| p.parse_block()))
         } else {
             // declare/abstract 无体形态——原文回退
             if self.is_punct(";") {
@@ -622,16 +681,19 @@ impl<'a> Parser<'a> {
         // static 块
         if self.is_kw("static") && self.is_punct_at(1, "{") && !self.tk_at(1).newline_before {
             self.advance();
-            let body = self.parse_block();
+            let body = self.enter_async(false, |p| p.parse_block());
             return Some(ClassMember::StaticBlock { body });
         }
         if self.is_punct("{") {
-            let body = self.parse_block();
+            let body = self.enter_async(false, |p| p.parse_block());
             return Some(ClassMember::StaticBlock { body });
         }
+        let mut had_deco = false;
         while self.is_punct("@") {
+            had_deco = true;
             self.skip_decorator();
         }
+        let mut method_async = false;
         loop {
             let t = self.tk().clone();
             // 修饰符循环：后随**任意键形态**（Ident/计算键 `[`/数字/字符串
@@ -654,6 +716,9 @@ impl<'a> Parser<'a> {
                     || self.is_punct_at(1, "*"))
                 && !self.tk_at(1).newline_before
             {
+                if t.text == "async" {
+                    method_async = true;
+                }
                 self.advance();
             } else {
                 break;
@@ -686,7 +751,7 @@ impl<'a> Parser<'a> {
             }
             String::new()
         } else {
-            let s = self.pos;
+            let s = if had_deco { start } else { self.pos };
             self.skip_balanced_to_stmt_boundary();
             return Some(ClassMember::Raw(self.raw_between(s, self.pos)));
         };
@@ -706,11 +771,17 @@ impl<'a> Parser<'a> {
             // 幂等差分抓获：constructor 曾打印体两遍）
             let sig_end = self.pos;
             let body = if self.is_punct("{") {
-                Some(self.parse_block())
+                Some(self.enter_async(method_async, |p| p.parse_block()))
             } else {
                 self.consume_semi();
                 None
             };
+            if had_deco {
+                // 装饰器成员整体原文保真：装饰器表达式（调用/成员链/
+                // 括号）与成员体的边界比普通成员脆弱，且规则不触碰
+                // 装饰器语义——整条 Raw 最安全。
+                return Some(ClassMember::Raw(self.raw_between(start, self.pos)));
+            }
             let sig_raw = self.raw_between(start, sig_end);
             return Some(ClassMember::Method { sig_raw, body });
         }
@@ -727,7 +798,7 @@ impl<'a> Parser<'a> {
         let init = if self.is_punct("=") && !self.tk().newline_before {
             eq_pos = self.pos;
             self.advance();
-            Some(self.parse_assign_expr())
+            Some(self.enter_async(false, |p| p.parse_assign_expr()))
         } else {
             None
         };
@@ -737,6 +808,9 @@ impl<'a> Parser<'a> {
         // sig 截成 `x = () => { var t`、打印时体重复）。
         let sig_end = if init.is_some() { eq_pos } else { self.pos };
         self.consume_semi();
+        if had_deco {
+            return Some(ClassMember::Raw(self.raw_between(start, self.pos)));
+        }
         let sig_raw = self.raw_between(start, sig_end);
         Some(ClassMember::Field { sig_raw, name, init })
     }
@@ -769,11 +843,36 @@ impl<'a> Parser<'a> {
 
     fn skip_decorator(&mut self) {
         self.advance(); // @
-        while self.tk().kind == TokKind::Ident || self.is_punct(".") {
-            self.advance();
-        }
+        // `@(expr)` 括号装饰器：整体跳过
         if self.is_punct("(") {
             self.skip_parens();
+            return;
+        }
+        // 装饰器成员表达式：IdentifierReference (`.` IdentifierName)*
+        // 后接可选调用链。**不能**把裸 Ident 一直吞下去——`@dec m()`
+        // 的 `m` 是下一个成员名（旧实现吞掉 m 和 ()，只留 `{}` 当
+        // Raw，装饰器与方法一起丢失）。
+        if self.tk().kind == TokKind::Ident {
+            self.advance();
+        }
+        loop {
+            if self.is_punct(".") {
+                self.advance();
+                if self.tk().kind == TokKind::Ident {
+                    self.advance();
+                } else if self.is_punct("#") {
+                    self.advance();
+                    if self.tk().kind == TokKind::Ident {
+                        self.advance();
+                    }
+                } else {
+                    break;
+                }
+            } else if self.is_punct("(") {
+                self.skip_parens();
+            } else {
+                break;
+            }
         }
     }
 
@@ -1058,7 +1157,7 @@ impl<'a> Parser<'a> {
             ret_raw = self.raw_between(rs, self.pos);
         }
         let body = if self.is_punct("{") {
-            self.parse_block()
+            self.enter_async(is_async, |p| p.parse_block())
         } else {
             self.pos = start;
             return None;
@@ -1853,7 +1952,7 @@ impl<'a> Parser<'a> {
             if n.kind == TokKind::Punct && n.text == "=>" {
                 let param = self.toks[p].text.clone();
                 self.pos = p + 2;
-                let body = self.parse_arrow_body();
+                let body = self.enter_async(is_async, |p| p.parse_arrow_body());
                 return Some(self.ast.lambda(&param, body, true, is_async, false));
             }
             return None;
@@ -1906,7 +2005,7 @@ impl<'a> Parser<'a> {
             .unwrap_or(&params_full)
             .to_string();
         self.pos = q + 1;
-        let body = self.parse_arrow_body();
+        let body = self.enter_async(is_async, |p| p.parse_arrow_body());
         Some(self.ast.lambda(&params_inner, body, true, is_async, false))
     }
 
@@ -2104,10 +2203,27 @@ impl<'a> Parser<'a> {
         self.parse_postfix()
     }
 
+    /// 在指定 [Await] 语境里执行闭包，退出时恢复（函数边界重置）。
+    fn enter_async<T>(&mut self, is_async: bool, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = self.async_ctx;
+        self.async_ctx = is_async;
+        let out = f(self);
+        self.async_ctx = saved;
+        out
+    }
+
     /// `await` 是否是普通标识符（sloppy 非异步语境：`await(x)` 调用/
     /// `await.x` 成员/`await = x` 赋值/`await, await)` 参数位——
     /// test262 非 async 文件大量使用 await 作名）。
     fn await_is_ident(&self) -> bool {
+        // async 语境（async 函数体/async 方法/async 箭头/module 顶层）
+        // 里 `await` 是运算符，即使后随 `(`——`await (x)` 是 Await 的
+        // 括号操作数；非 async 语境里 `await (x)` 是名为 await 的函数
+        // 调用（`function await(){}; await(null)`，Test262
+        // private-field-rhs-await-absent 抓获）。
+        if self.async_ctx {
+            return false;
+        }
         // 只看前瞻形态（换行接操作数 `await \n x` 是合法 await——
         // 不可当标识符判据）
         self.is_punct_at(1, "(")
@@ -2610,7 +2726,7 @@ impl<'a> Parser<'a> {
             .unwrap_or(&full)
             .to_string();
         let body = if self.is_punct("{") {
-            self.parse_block()
+            self.enter_async(is_async, |p| p.parse_block())
         } else {
             self.err_here("expected { in function expression");
             self.ast.block(vec![])
@@ -2726,7 +2842,8 @@ impl<'a> Parser<'a> {
                 .unwrap_or(&params_full)
                 .to_string();
             let body = if self.is_punct("{") {
-                self.parse_block()
+                let is_async = gen_prefix.starts_with("async");
+                self.enter_async(is_async, |p| p.parse_block())
             } else {
                 self.err_here("expected { in object method");
                 self.ast.block(vec![])

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use cure_engine::Config;
-use cure_ts_parser::parse;
+use cure_ts_parser::{parse, parse_module};
 use cure_ts_print::print_module;
 use cure_ts_simplify::simplify_unit;
 
@@ -51,7 +51,7 @@ fn main() {
             .nth(1)
             .and_then(|s| s.split(']').next())
             .is_some_and(|f| f.contains("module"));
-        let mut out = parse(&src);
+        let mut out = if module { parse_module(&src) } else { parse(&src) };
         let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
         let cured = print_module(&out.ast, &out.unit);
         let id = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().to_string();
