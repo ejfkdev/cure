@@ -160,7 +160,7 @@ otherwise the locale is auto-detected. Full option reference: `cure --help`.
 | 7. Randomized JS differential | Deterministic PRNG generates valid programs mixing declarations, shadowing, `var` hoisting, closures, loops, ternaries, short circuits and templates; original vs cured run under `node` (stdout + exit code) and a second cure must be byte-identical (`CURE_FUZZ_CASES` scales the sample) | rule-combination semantics and first/second-pass convergence; 5,000 cases used during development |
 | 6. Real-world JS/TS | 4,358 `.js/.mjs/.cjs` files (~568 MB) plus 1,334 `.ts/.tsx/.mts/.cts` files from a global npm install (undici, zod, minisearch, pnpm, yarn, vite-plus, Lark CLI, bytenode, …): every valid file must still compile after cure; a second cure pass must produce byte-identical output. Both corpora run at **0 parser diagnostics** and **0 second-pass differences** in default and preserve modes, and every cured file parses cleanly with Oxc (`oxfmt`, 0 syntax errors) | real-package syntax (minified bundles, top-level await, import attributes), complex type syntax, idempotency under module-level constant propagation |
 
-`cargo test` runs 471 tests. The Test262 semantic differential reaches
+`cargo test` runs 474 tests. The Test262 semantic differential reaches
 **33,963/34,007 (99.87%) identical runs** in default mode; the only 44
 excluded cases compare `Function.prototype.toString` **source text** (cure
 reformats function bodies) or use arrow functions as computed-property keys,

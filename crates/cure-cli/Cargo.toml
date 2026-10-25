@@ -34,10 +34,10 @@ io-uring = ["dep:io-uring"]
 io-uring = { version = "0.7", optional = true }
 
 [dependencies]
-cure-ts-ast = { path = "../cure-ts-ast", version = "0.1.10" }
-cure-ts-parser = { path = "../cure-ts-parser", version = "0.1.10" }
-cure-ts-print = { path = "../cure-ts-print", version = "0.1.10" }
-cure-ts-simplify = { path = "../cure-ts-simplify", version = "0.1.10" }
+cure-ts-ast = { path = "../cure-ts-ast", version = "0.1.11" }
+cure-ts-parser = { path = "../cure-ts-parser", version = "0.1.11" }
+cure-ts-print = { path = "../cure-ts-print", version = "0.1.11" }
+cure-ts-simplify = { path = "../cure-ts-simplify", version = "0.1.11" }
 cure-java-parser = { workspace = true }
 cure-java-simplify = { workspace = true }
 cure-java-print = { workspace = true }

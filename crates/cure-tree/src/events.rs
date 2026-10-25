@@ -115,32 +115,47 @@ fn collect_events_into<L: Lang>(
         return true;
     }
     match lang.kind(node) {
-        // 赋值：目标是简单变量 → 对其名字写入；事件节点记 target。
-        // 只递归 RHS（target 的读不算事件——写即事件）。
+        // 赋值：简单变量目标 → 写；复合赋值还要读目标。
+        // **成员/索引目标**（`a[i] = v`）的基座与键是读——漏掉会让
+        // `i = 0; a[i] = 1; i = 2;` 把前一条 i 存储当死写删除
+        // （jscd 寄存器风格抓获）。
         NodeKind::Assign => {
             let ch = lang.children(node);
+            let mut opaque = false;
             if let Some(&t) = ch.first() {
                 if lang.kind(t) == NodeKind::VarRef {
+                    if lang.assign_op(node).is_some() {
+                        if let Some(k) = lang.var_key(t) {
+                            out.push(RegionEvent { kind: EventKind::Use, node: t, key: k });
+                        }
+                    }
                     if let Some(k) = lang.var_key(t) {
                         out.push(RegionEvent { kind: EventKind::Write, node: t, key: k });
                     }
+                } else {
+                    opaque |= collect_events_into(lang, t, out);
                 }
             }
-            match ch.get(1) {
-                Some(&v) => collect_events_into(lang, v, out),
-                None => false,
+            if let Some(&v) = ch.get(1) {
+                opaque |= collect_events_into(lang, v, out);
             }
+            opaque
         }
-        // 自增/自减：对目标写入（目标自身不再产生读事件）
+        // 自增/自减：目标既读又写；成员/索引目标递归（基座/键是读）。
         NodeKind::Unary if lang.un_op(node).is_some_and(|o| o.is_incdec()) => {
             if let Some(&t) = lang.children(node).first() {
                 if lang.kind(t) == NodeKind::VarRef {
                     if let Some(k) = lang.var_key(t) {
+                        out.push(RegionEvent { kind: EventKind::Use, node: t, key: k });
                         out.push(RegionEvent { kind: EventKind::Write, node: t, key: k });
                     }
+                    false
+                } else {
+                    collect_events_into(lang, t, out)
                 }
+            } else {
+                false
             }
-            false
         }
         // 声明：写 + 遮蔽（事件节点 = 声明节点自身），全孩子递归
         NodeKind::VarDecl | NodeKind::ForEach => {

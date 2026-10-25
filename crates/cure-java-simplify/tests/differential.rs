@@ -1990,3 +1990,25 @@ class T2 {
     assert!(!out.contains("v7"), "v7 索引残留:\n{out}");
     assert!(!out.contains("addSuppressed"), "抑制异常样板残留:\n{out}");
 }
+
+#[test]
+fn store_kill_reads_index_target() {
+    // 引擎事件/击杀扫描的通用修复：成员/索引赋值目标的基座/键是读。
+    differential(
+        "store_kill_index_target",
+        r#"public class store_kill_index_target {
+    static String f() {
+        int[] a = new int[3];
+        int i = 0;
+        a[i] = 1;
+        i = 2;
+        a[i] = 3;
+        return a[0] + "," + a[2];
+    }
+    public static void main(String[] args) {
+        System.out.println(f());
+    }
+}
+"#,
+    );
+}

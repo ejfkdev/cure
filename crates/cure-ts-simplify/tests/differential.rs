@@ -1151,3 +1151,43 @@ if (X ? (v = 1) : rt(1) ? t ? v = h ? () => h(1, 2) : 0 : v = 3 : v = ai, v) {
 "#,
     );
 }
+
+#[test]
+fn diff_store_kill_reads_index_target() {
+    // `a[i] = v` 的目标是索引：i 是读。曾因只扫 RHS，把 `i = 0`
+    // 当成被后续 `i = 2` 支配的死写删除（jscd 寄存器产物抓获）。
+    differential(
+        "store_kill_index_target",
+        r#"function f() {
+  let a = [], i;
+  i = 0;
+  a[i] = 1;
+  i = 2;
+  a[i] = 3;
+  return a[0] + ',' + a[2];
+}
+console.log(f());
+"#,
+    );
+}
+
+#[test]
+fn diff_dead_store_opaque_yield_rhs() {
+    // `r2 = yield r2` 的 RHS 是原文区域，AST 看不到对 r2 的读；
+    // dead_store 曾据此删掉前一条 `r2 = r1 * 2`。
+    differential(
+        "dead_store_yield_rhs",
+        r#"function* g() {
+  let r1 = 0, r2;
+  while (r1 < 2) {
+    r2 = r1 * 2;
+    r2 = yield r2;
+    r1 = ++r1;
+  }
+}
+const out = [];
+for (const v of g()) out.push(v);
+console.log(out.join(','));
+"#,
+    );
+}

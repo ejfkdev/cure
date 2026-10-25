@@ -1418,6 +1418,13 @@ fn scan_region<L: Lang>(lang: &L, node: L::Id, w: &mut Watch<L>) {
                             }
                         }
                     }
+                    // 复合赋值读旧值（简单赋值是纯写）
+                    if lang.assign_op(node).is_some() {
+                        scan_region(lang, t, w);
+                    }
+                } else {
+                    // 成员/索引目标：基座/键是读
+                    scan_region(lang, t, w);
                 }
             }
             if let Some(&v) = ch.get(1) {
@@ -1435,6 +1442,10 @@ fn scan_region<L: Lang>(lang: &L, node: L::Id, w: &mut Watch<L>) {
                             }
                         }
                     }
+                    // ++/-- 也读旧值
+                    scan_region(lang, t, w);
+                } else {
+                    scan_region(lang, t, w);
                 }
             }
         }
@@ -2186,10 +2197,14 @@ impl<L: Lang> Rule<L> for DeadStore {
                 return None;
             }
         }
-        // b 中不得引用 x（x = b 依赖旧值时不可删第一条）
-        if subtree_contains(&*lang, value, |n| {
-            lang.kind(n) == NodeKind::VarRef && lang.same_binding(n, target)
-        }) {
+        // b 中不得引用 x（x = b 依赖旧值时不可删第一条）。
+        // 含 Raw/原文区域时 AST 看不见其中的读（`r2 = yield r2`）——
+        // 保守拒绝，否则会删掉前一条仍被读取的存储。
+        if lang.stmt_has_opaque_region(value)
+            || subtree_contains(&*lang, value, |n| {
+                lang.kind(n) == NodeKind::VarRef && lang.same_binding(n, target)
+            })
+        {
             return None;
         }
         // a 的求值被丢弃：effect ≤ MayRead
@@ -3333,14 +3348,26 @@ pub fn scan_kill_event<L: Lang>(
                     return e;
                 }
             }
-            if lang.assign_op(node).is_none() {
-                if let Some(&t) = ch.first() {
-                    if lang.kind(t) == NodeKind::VarRef && lang.var_name(t) == Some(name) {
-                        if dominating {
-                            return StmtKill::DomWrite(node);
-                        }
-                        return StmtKill::None; // 条件写：不击杀，也不算读
+            let Some(&target) = ch.first() else {
+                return StmtKill::None;
+            };
+            if lang.kind(target) == NodeKind::VarRef {
+                if lang.assign_op(node).is_some() {
+                    // 复合赋值 `x += 1` 读旧值
+                    if lang.var_name(target) == Some(name) {
+                        return StmtKill::Read;
                     }
+                } else if lang.var_name(target) == Some(name) {
+                    if dominating {
+                        return StmtKill::DomWrite(node);
+                    }
+                    return StmtKill::None; // 条件写：不击杀，也不算读
+                }
+            } else {
+                // 成员/索引目标：基座与键是读（`a[i] = v` 读 a、i）
+                let e = scan_kill_event(lang, target, name, false);
+                if matches!(e, StmtKill::Read | StmtKill::Shadow) {
+                    return e;
                 }
             }
             StmtKill::None
@@ -3479,6 +3506,15 @@ pub fn collect_stmt_kill_events<L: Lang>(lang: &L, root: L::Id) -> Vec<(L::NameK
                     stack.push(Act::AfterAssign(node, dominating));
                     if let Some(&val) = ch.get(1) {
                         stack.push(Act::Enter(val, dominating));
+                    }
+                    // 目标是 VarRef：简单赋值是纯写（不产生 Use），
+                    // 复合赋值要读旧值；成员/索引目标整体按读扫描。
+                    if let Some(&target) = ch.first() {
+                        if lang.kind(target) != NodeKind::VarRef
+                            || lang.assign_op(node).is_some()
+                        {
+                            stack.push(Act::Enter(target, false));
+                        }
                     }
                 }
                 NodeKind::If | NodeKind::While | NodeKind::Ternary => {

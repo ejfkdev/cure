@@ -141,7 +141,7 @@ cure [选项] <文件.java>... | <目录> | -
 | 7. 随机 JS 差分 | 确定性 PRNG 生成合法程序（声明/遮蔽/`var` 提升/闭包/循环/三元/短路/模板混合）；原版与 cure 版在 `node` 下比较 stdout + 退出码，并要求二次 cure 逐字节一致（`CURE_FUZZ_CASES` 控制样本数） | 规则组合语义与首轮/二轮收敛；开发中跑过 5,000 例 |
 | 6. 真实 JS/TS 语料 | 全局 npm 安装中的 4,358 个 `.js/.mjs/.cjs`（约 568 MB）与 1,334 个 `.ts/.tsx/.mts/.cts`（undici、zod、minisearch、pnpm、yarn、vite-plus、Lark CLI、bytenode…）：合法文件在 cure 后必须仍可编译；第二轮 cure 输出必须逐字节一致。两种语料均 **0 解析诊断 / 0 二轮差异**（默认与保真模式），cure 产物经 Oxc（`oxfmt`）解析 **0 语法错误** | 真实包语法（压缩 bundle、顶层 await、导入属性）、复杂类型语法与模块常量传播下的幂等性 |
 
-`cargo test` 共 471 个测试。默认模式下 Test262 语义差分
+`cargo test` 共 474 个测试。默认模式下 Test262 语义差分
 **33,963/34,007（99.87%）执行结果逐字节一致**；仅 44 个用例被排除——它们比较
 `Function.prototype.toString` 的**源码文本**（cure 会重排函数体格式），
 或用箭头函数作计算属性名（键依赖同一文本）。使用

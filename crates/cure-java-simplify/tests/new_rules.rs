@@ -1622,13 +1622,19 @@ fn catch_clauses_visible_to_escaping() {
 
 #[test]
 fn dead_store_sees_assign_target_index_reads() {
-    // arr[j]='q' 的 j 是读（赋值目标下标位）——事件模型盲区，句法补扫
-    //（曾删 var j → 不可编译）
+    // arr[j]='q' 的 j 是读（赋值目标下标位）。事件模型曾漏掉目标子树，
+    // 把 `j = 0` 当死写删除→不可编译。现在目标读可见，j 可安全地
+    // 传播成常量 1（比仅保活更彻底）；两种形态都说明读没有被误删。
     let out = run_src(
         "class A{static char[] a;static{char[] arr=\"abc\".toCharArray();int j=0;lbl:{arr[j]='x';j++;String t=System.console()==null?null:null;arr[j]='q';}a=arr;}}",
     );
-    assert!(out.contains("var j = 1;") || out.contains("int j"), "{out}");
-    assert!(out.contains("arr[j] = 'q';"), "{out}");
+    assert!(
+        out.contains("arr[1] = 'q';")
+            || (out.contains("j") && out.contains("arr[j] = 'q';")),
+        "{out}"
+    );
+    // 前一条写入不能被删（数组内容仍是 x,q,c 语义）
+    assert!(out.contains("'x'"), "{out}");
 }
 
 #[test]

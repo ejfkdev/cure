@@ -5,6 +5,24 @@
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-10-25
+
+### 修复（读分析健全性——2026-10-25 第十八批）
+
+- **赋值目标读**：成员/索引目标的基座与键是读（`a[i] = v` 读 `a`、`i`），
+  复合赋值与 `++`/`--` 读旧值。修复两条扫描路径
+  （`scan_kill_event` / `collect_stmt_kill_events`）、cure-tree 区域事件
+  索引与 `Watch` 递归路径。此前 `i = 0; a[i] = 1; i = 2;` 会把前一条
+  `i` 存储当成被支配的死写删除（jscd 寄存器风格高频命中）。
+- **DeadStore 原文 RHS**：相邻 `x = a; x = b` 折叠前检查 `b` 是否含
+  Raw/原文区域；`x = yield x` 这类 AST 不可见的读保守拒绝，避免删掉
+  仍被读取的前一条存储。
+- **jscd 集成**：cure 0.1.11 默认规则（无需 `--disable store_kill
+  --disable dead_store`）在 jscd 0.2.2 的 call_once / string_regex /
+  closure fixture 上与 jscd 原输出语义一致；测试覆盖索引写入目标与
+  `yield` 生成器。
+- 新增 JS/Java 差分回归；`cargo test --workspace` **474 通过**。
+
 ## [0.1.10] - 2026-10-25
 
 ### 兼容（复杂 TypeScript 类型语法——2026-10-25 第十七批）

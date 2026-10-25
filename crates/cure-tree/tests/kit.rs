@@ -250,12 +250,13 @@ fn toy_events_match_semantics() {
     assert_eq!(ev.len(), 1);
     assert!(matches!(ev[0].kind, cure_engine::kind::EventKind::Write));
 
-    // y++：Write(y)
+    // y++：Use(y) + Write(y)——自增读旧值，事件模型必须可见
     let y_key = t.names.intern("y");
     let ev = t.region_events(roots[2]).unwrap();
-    assert_eq!(ev.len(), 1);
+    assert_eq!(ev.len(), 2);
     assert_eq!(ev[0].key, y_key);
-    assert!(matches!(ev[0].kind, cure_engine::kind::EventKind::Write));
+    assert!(matches!(ev[0].kind, cure_engine::kind::EventKind::Use));
+    assert!(matches!(ev[1].kind, cure_engine::kind::EventKind::Write));
 
     // for (s : …)：Write(s) + Shadow(s)
     let ev = t.region_events(roots[3]).unwrap();
