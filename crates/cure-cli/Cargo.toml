@@ -1,13 +1,13 @@
 [package]
 name = "cure-cli"
-description = "CLI for cure: fault-tolerant Java and TypeScript/JavaScript simplifier/formatter (source in, source out)"
+description = "CLI for cure: fault-tolerant Java, TypeScript/JavaScript and Python simplifier/formatter (source in, source out)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
-keywords = ["java", "typescript", "javascript", "deobfuscation", "formatter"]
+keywords = ["java", "typescript", "javascript", "python", "deobfuscation"]
 categories = ["command-line-utilities", "development-tools"]
 
 # cargo-binstall: fetch the prebuilt release binary instead of compiling.
@@ -34,10 +34,14 @@ io-uring = ["dep:io-uring"]
 io-uring = { version = "0.7", optional = true }
 
 [dependencies]
-cure-ts-ast = { path = "../cure-ts-ast", version = "0.1.11" }
-cure-ts-parser = { path = "../cure-ts-parser", version = "0.1.11" }
-cure-ts-print = { path = "../cure-ts-print", version = "0.1.11" }
-cure-ts-simplify = { path = "../cure-ts-simplify", version = "0.1.11" }
+cure-ts-ast = { path = "../cure-ts-ast", version = "0.2.0" }
+cure-ts-parser = { path = "../cure-ts-parser", version = "0.2.0" }
+cure-ts-print = { path = "../cure-ts-print", version = "0.2.0" }
+cure-ts-simplify = { path = "../cure-ts-simplify", version = "0.2.0" }
+cure-python-ast = { path = "../cure-python-ast", version = "0.2.0" }
+cure-python-parser = { path = "../cure-python-parser", version = "0.2.0" }
+cure-python-print = { path = "../cure-python-print", version = "0.2.0" }
+cure-python-simplify = { path = "../cure-python-simplify", version = "0.2.0" }
 cure-java-parser = { workspace = true }
 cure-java-simplify = { workspace = true }
 cure-java-print = { workspace = true }

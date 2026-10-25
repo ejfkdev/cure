@@ -1,0 +1,13 @@
+[package]
+name = "cure-python-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Fault-tolerant Python parser (indentation, implicit joins, 3.15 syntax) for cure"
+repository.workspace = true
+keywords = ["python", "parser", "ast", "deobfuscator"]
+categories = ["development-tools"]
+
+[dependencies]
+cure-python-ast = { path = "../cure-python-ast", version = "0.2.0" }

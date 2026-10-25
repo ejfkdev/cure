@@ -10,3 +10,7 @@
 # 本地实验
 *.tmp
 crates/cure-java-simplify/tests/corpus_data-cure-out/
+
+# Python 本地实验/驱动
+__pycache__/
+*.pyc

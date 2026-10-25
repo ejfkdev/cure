@@ -11,11 +11,15 @@ members = [
     "crates/cure-ts-parser",
     "crates/cure-ts-print",
     "crates/cure-ts-simplify",
+    "crates/cure-python-ast",
+    "crates/cure-python-parser",
+    "crates/cure-python-print",
+    "crates/cure-python-simplify",
     "crates/cure-cli",
 ]
 
 [workspace.package]
-version = "0.1.11"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ejfkdev/cure"
@@ -24,12 +28,16 @@ rust-version = "1.74"
 
 
 [workspace.dependencies]
-cure-engine = { path = "crates/cure-engine", version = "0.1.11" }
-cure-tree = { path = "crates/cure-tree", version = "0.1.11" }
-cure-java-ast = { path = "crates/cure-java-ast", version = "0.1.11" }
-cure-java-parser = { path = "crates/cure-java-parser", version = "0.1.11" }
-cure-java-print = { path = "crates/cure-java-print", version = "0.1.11" }
-cure-java-simplify = { path = "crates/cure-java-simplify", version = "0.1.11" }
+cure-engine = { path = "crates/cure-engine", version = "0.2.0" }
+cure-tree = { path = "crates/cure-tree", version = "0.2.0" }
+cure-java-ast = { path = "crates/cure-java-ast", version = "0.2.0" }
+cure-java-parser = { path = "crates/cure-java-parser", version = "0.2.0" }
+cure-java-print = { path = "crates/cure-java-print", version = "0.2.0" }
+cure-java-simplify = { path = "crates/cure-java-simplify", version = "0.2.0" }
+cure-python-ast = { path = "crates/cure-python-ast", version = "0.2.0" }
+cure-python-parser = { path = "crates/cure-python-parser", version = "0.2.0" }
+cure-python-print = { path = "crates/cure-python-print", version = "0.2.0" }
+cure-python-simplify = { path = "crates/cure-python-simplify", version = "0.2.0" }
 
 [profile.release]
 lto = "fat"

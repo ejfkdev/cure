@@ -8,11 +8,10 @@
 [cure](https://github.com/ejfkdev/cure) simplification engine: a
 fault-tolerant, semantic-preserving code simplifier/formatter that turns
 decompiled code back into something a human would have written. The CLI is
-language-agnostic (**Java and TypeScript/JavaScript are the backends
-implemented today**) — a new
-language registers in `LANG_BACKENDS` (extensions + pipeline function) and
-inherits traversal, parallelism, `--check`/`--diff`/`--stats`, and the
-cross-platform batched I/O for free.
+language-agnostic (**Java, TypeScript/JavaScript and Python are the backends
+implemented today**) — a new language registers in `LANG_BACKENDS`
+(extensions + pipeline function) and inherits traversal, parallelism,
+`--check`/`--diff`/`--stats`, and the cross-platform batched I/O for free.
 
 ```bash
 cargo install cure-cli
@@ -29,6 +28,10 @@ echo 'class A{int m(){int a=foo();int b=a;return b;}}' | cure -
 echo 'const x = 1 + 2; console.log(x);' | cure --lang ts -
 # const x = 3;
 # console.log(3);
+
+printf 'x = 1 + 2\nprint(x)\n' | cure --lang py -
+# x = 3
+# print(3)
 ```
 
 Highlights:
@@ -36,6 +39,10 @@ Highlights:
 - **Fault-tolerant** — parse errors never abort a run; broken regions are
   preserved verbatim while everything around them is simplified
   (`--strict` turns them into an error exit for CI).
+- **Python 3.15** — `.py`/`.pyi` back end: indentation-aware fault-tolerant
+  parser (PEP 701 f-strings, t-strings, `match`, walrus, `except*`, PEP 695
+  type parameters, `lazy import`), Python-semantics constant folding and
+  generator/scope-preserving dead-branch removal.
 - **Directory mode** — recursive, parallel (dynamic work queue, threads =
   CPU cores × 1.5), mirrors the tree into `<dir>-cure-out/`; the 371,674-file OpenJDK
   corpus (4.70 GB) in ~15 s / ~430 MiB peak RSS on an 18-core laptop

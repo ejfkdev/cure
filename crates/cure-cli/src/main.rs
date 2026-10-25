@@ -2,9 +2,9 @@
 //!
 //! `cure` —— 容错式代码简化 / 格式化命令行工具。CLI 与引擎均语言无关，
 //! **当前实现的语言后端：Java、TypeScript/JavaScript**（ts/tsx/mts/cts/
-//! js/jsx/mjs/cjs）——新语言在 [`LANG_BACKENDS`] 登记一条（后缀 + 管线
-//! 函数）即获得目录遍历 / 并行 / `--check` / `--diff` /
-//! `--stats` / 跨平台批量 I/O 的全部基础设施。
+//! js/jsx/mjs/cjs）与 **Python**（py/pyi）——新语言在 [`LANG_BACKENDS`]
+//! 登记一条（后缀 + 管线函数）即获得目录遍历 / 并行 / `--check` /
+//! `--diff` / `--stats` / 跨平台批量 I/O 的全部基础设施。
 //!
 //! - 输入：源码文件、目录（递归）、stdin
 //! - 单文件默认输出 stdout；目录默认输出到同级 `<目录名>-cure-out/`
@@ -21,6 +21,9 @@ use cure_engine::Config;
 use cure_java_parser::parse;
 use cure_java_print::print_unit;
 use cure_java_simplify::simplify_unit;
+use cure_python_parser::parse as py_parse;
+use cure_python_print::print_module as py_print;
+use cure_python_simplify::simplify_module as py_simplify;
 use cure_ts_parser::{parse_with_options, ParseOptions};
 use cure_ts_print::print_module as ts_print;
 use cure_ts_simplify::simplify_unit as ts_simplify_unit;
@@ -51,6 +54,11 @@ const LANG_BACKENDS: &[LangBackend] = &[
         exts: &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
         process: process_source_ts,
     },
+    LangBackend {
+        name: "python",
+        exts: &["py", "pyi"],
+        process: process_source_py,
+    },
 ];
 
 /// 后缀 → 后端（O(后端数)，无哈希）。
@@ -64,6 +72,7 @@ fn backend_for_lang(name: &str) -> Option<&'static LangBackend> {
         "java" => Some(&LANG_BACKENDS[0]),
         "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs"
         | "typescript" | "javascript" => Some(&LANG_BACKENDS[1]),
+        "py" | "python" | "python3" | "pyi" => Some(&LANG_BACKENDS[2]),
         _ => None,
     }
 }
@@ -289,7 +298,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 let v = args.get(i).ok_or("missing value for --lang")?;
                 if backend_for_lang(v).is_none() {
                     return Err(format!(
-                        "未知语言 `{v}`（可选：java、ts/js/typescript/javascript、tsx/jsx/mjs/cjs）"
+                        "未知语言 `{v}`（可选：java、ts/js/typescript/javascript、py/python）"
                     ));
                 }
                 opts.lang = Some(v.to_ascii_lowercase());
@@ -565,19 +574,22 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         } else {
             Some(default_out_root(dir)?)
         };
-        let effective_exts: Vec<String> = if opts.exts.is_empty() {
-            supported_exts().into_iter().map(|s| s.to_string()).collect()
-        } else {
+        let effective_exts: Vec<String> = if !opts.exts.is_empty() {
             opts.exts.clone()
+        } else if let Some(lang) = &opts.lang {
+            // 显式 --lang：目录模式只收集该后端的后缀，避免把混合目录
+            // 里的 .js 当 Python（或反之）解析。
+            backend_for_lang(lang)
+                .map(|b| b.exts.iter().map(|s| s.to_string()).collect())
+                .unwrap_or_else(|| supported_exts().into_iter().map(|s| s.to_string()).collect())
+        } else {
+            supported_exts().into_iter().map(|s| s.to_string()).collect()
         };
         let skip = out_root
             .as_ref()
             .and_then(|o| o.canonicalize().ok())
             .unwrap_or_else(|| PathBuf::from("\u{0}nonexistent"));
-        let display_root = out_root
-            .clone()
-            .map(|o| dir.parent().map(|p| p.join(o.file_name().unwrap_or_default())).unwrap_or(o))
-            .unwrap_or_else(|| dir.clone().join("."));
+        let display_root = out_root.clone().unwrap_or_else(|| dir.clone());
         let (mut sources, mut others) = walk_files_parallel(dir, &skip, &effective_exts);
         sources.sort();
         others.sort();
@@ -1001,7 +1013,7 @@ fn process_source_ts(
         }
     }
 
-    result.changed = result.edits > 0 || printed != src;
+    result.changed = printed != src;
 
     if opts.diff && result.changed {
         result.diff_text = unified_diff(src, &printed, display);
@@ -1011,6 +1023,117 @@ fn process_source_ts(
         return Ok(result);
     }
 
+    match out_path {
+        Some(p) => fs::write(&p, printed).map_err(|e| format!("写入 {} 失败: {e}", p.display()))?,
+        None => {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(printed.as_bytes())
+                .map_err(|e| format!("写出失败: {e}"))?;
+            if !printed.ends_with('\n') {
+                let _ = stdout.write_all(b"\n");
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Python 管线（parse → 门控简化 → 打印）。
+fn process_source_py(
+    src: &str,
+    opts: &Options,
+    out_path: Option<PathBuf>,
+    display: &str,
+) -> Result<FileResult, String> {
+    let mut outcome = py_parse(src);
+    let had_errors = !outcome.errors.is_empty();
+    let need_lines = opts.stats || opts.report;
+    let lines_before = if need_lines { src.lines().count() } else { 0 };
+    let (nodes_b, dec_b, depth_b) = if need_lines {
+        cure_python_ast::unit_metrics(&outcome.ast, outcome.module)
+    } else {
+        (0, 0, 0)
+    };
+
+    let mut result = FileResult {
+        errored: had_errors,
+        lines_before,
+        nodes_before: nodes_b,
+        decisions_before: dec_b,
+        depth_before: depth_b,
+        display: display.to_string(),
+        ..Default::default()
+    };
+
+    if !opts.format_only {
+        let mut cfg = Config::default();
+        for r in &opts.disabled {
+            cfg.disabled_rules.insert(r.clone());
+        }
+        cfg.remove_dead_methods = opts.dead_code;
+        let report = py_simplify(&mut outcome.ast, outcome.module, &cfg);
+        if need_lines {
+            let (n, d, dep) = cure_python_ast::unit_metrics(&outcome.ast, outcome.module);
+            result.nodes_after = n;
+            result.decisions_after = d;
+            result.depth_after = dep;
+        }
+        result.edits = report.edits;
+        result.by_rule = report.by_rule.iter().map(|(k, v)| (*k, *v)).collect();
+        if opts.report {
+            eprintln!(
+                "cure: {display}: {} 次改写 / {} 轮",
+                report.edits, report.iterations
+            );
+            if need_lines {
+                eprintln!(
+                    "  结构：节点 {}→{} / 判定点 {}→{} / 嵌套 {}→{}",
+                    nodes_b,
+                    result.nodes_after,
+                    dec_b,
+                    result.decisions_after,
+                    depth_b,
+                    result.depth_after
+                );
+            }
+            if !report.by_rule.is_empty() {
+                let detail: Vec<String> = report
+                    .by_rule
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect();
+                eprintln!("  逐规则：{}", detail.join(", "));
+            }
+        }
+    }
+    let printed = py_print(&outcome.ast, outcome.module);
+    if need_lines {
+        result.lines_after = printed.lines().count();
+        if result.nodes_before > 0 && result.nodes_after == 0 {
+            result.nodes_after = result.nodes_before;
+            result.decisions_after = result.decisions_before;
+            result.depth_after = result.depth_before;
+        }
+    }
+    if had_errors {
+        eprintln!(
+            "cure: {display}: {} 处语法问题已跳过（保留原文）:",
+            outcome.errors.len()
+        );
+        for e in outcome.errors.iter().take(5) {
+            eprintln!("  {display}:{}:{}: {}", e.line, e.col, e.message);
+        }
+        if outcome.errors.len() > 5 {
+            eprintln!("  … 其余 {} 处省略", outcome.errors.len() - 5);
+        }
+    }
+    result.changed = printed != src;
+    if opts.diff && result.changed {
+        result.diff_text = unified_diff(src, &printed, display);
+    }
+    if opts.check {
+        return Ok(result);
+    }
     match out_path {
         Some(p) => fs::write(&p, printed).map_err(|e| format!("写入 {} 失败: {e}", p.display()))?,
         None => {
@@ -1116,7 +1239,7 @@ fn process_source(
         }
     }
 
-    result.changed = result.edits > 0 || printed != src;
+    result.changed = printed != src;
 
     if opts.diff && result.changed {
         result.diff_text = unified_diff(src, &printed, display);
@@ -1493,8 +1616,64 @@ mod tests {
         assert_eq!(backend_for_lang("ts").unwrap().name, "typescript/javascript");
         assert_eq!(backend_for_lang("js").unwrap().name, "typescript/javascript");
         assert_eq!(backend_for_lang("java").unwrap().name, "java");
+        assert_eq!(backend_for_lang("python").unwrap().name, "python");
+        assert_eq!(backend_for_lang("py").unwrap().name, "python");
         assert!(backend_for_lang("bogus").is_none());
         let opts = parse_args(&["--lang".into(), "ts".into(), "-".into()]).unwrap();
         assert_eq!(opts.lang.as_deref(), Some("ts"));
+    }
+
+    #[test]
+    fn lang_filter_limits_dir_extensions() {
+        let root = tmp("pydir");
+        write(&root.join("a.py"), "x = 1 + 2\nprint(x)\n");
+        write(&root.join("b.js"), "const x = 1 + 2; console.log(x);\n");
+        let code = run(&["--lang".into(), "py".into(), root.display().to_string()]).unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+        let out = root.parent().unwrap().join(format!(
+            "{}-cure-out",
+            root.file_name().unwrap().to_str().unwrap()
+        ));
+        assert!(out.join("a.py").exists(), "python file missing");
+        assert!(
+            !out.join("b.js").exists(),
+            "javascript leaked into --lang py run"
+        );
+        let a = fs::read_to_string(out.join("a.py")).unwrap();
+        assert!(a.contains("x = 3"), "{a}");
+        assert!(!a.contains("1 + 2"), "{a}");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn check_reports_converged_python_as_clean() {
+        let root = tmp("pycheck");
+        let plain = root.join("plain.py");
+        write(&plain, "x = -1\nprint(x)\n");
+        let code = run(&[
+            "--lang".into(),
+            "py".into(),
+            "--check".into(),
+            plain.display().to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "converged file reported rewritable"
+        );
+
+        let fold = root.join("fold.py");
+        write(&fold, "x = 1 + 2\nprint(x)\n");
+        let code = run(&[
+            "--lang".into(),
+            "py".into(),
+            "--check".into(),
+            fold.display().to_string(),
+        ])
+        .unwrap();
+        assert_eq!(code, ExitCode::from(2), "rewritable file not reported");
+        let _ = fs::remove_dir_all(&root);
     }
 }

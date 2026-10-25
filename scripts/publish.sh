@@ -7,8 +7,8 @@
 #
 # 行为:
 #   1. 校验 tag 版本与 workspace 版本一致（在 tag ref 上发布时）
-#   2. 按 workspace 依赖拓扑依序发布：engine → java-ast → java-parser →
-#      java-print → java-simplify → cli
+#   2. 按 workspace 依赖拓扑依序发布：engine/tree → ts-* / python-* /
+#      java-* → cli
 #   3. 单 crate 失败自动重试（crates.io 索引传播延迟，最多 5 次/间隔 15s）
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -35,6 +35,7 @@ fi
 # 的 dev-dependency 在 parser 发布后才可见。曾漏掉全部 cure-ts-* 导致
 # CLI 发布时找不到上游 crate）：
 # engine → tree → ts-ast → ts-parser → ts-print → ts-simplify
+#        → python-ast → python-parser → python-print → python-simplify
 #        → java-ast → java-print → java-parser → java-simplify → cli
 CRATES=(
   cure-engine
@@ -43,6 +44,10 @@ CRATES=(
   cure-ts-parser
   cure-ts-print
   cure-ts-simplify
+  cure-python-ast
+  cure-python-parser
+  cure-python-print
+  cure-python-simplify
   cure-java-ast
   cure-java-print
   cure-java-parser

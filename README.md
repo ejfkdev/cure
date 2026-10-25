@@ -9,13 +9,17 @@
 
 **cure** is a fault-tolerant, semantic-preserving code simplifier and
 formatter that turns decompiled code back into something a human would have
-written. The engine and CLI are language-agnostic — **Java and
-TypeScript/JavaScript** (`ts`/`tsx`/`mts`/`cts`/`js`/`jsx`/`mjs`/`cjs`) are
-the backends implemented today; the pipeline below shows the Java experience
-(the TS/JS backend ships the same engine with ECMAScript semantics: f64 /
-ToInt32 folding domains, ±2^53 exactness, per-file binding/scope resolution
-for `var` hoisting and closure-capture guards, optional-chain and
-destructuring opacity, ECMA number formatting).
+written. The engine and CLI are language-agnostic — **Java**,
+**TypeScript/JavaScript** (`ts`/`tsx`/`mts`/`cts`/`js`/`jsx`/`mjs`/`cjs`) and
+**Python** (`py`/`pyi`) are the backends implemented today; the pipeline
+below shows the Java experience. The TS/JS backend ships the same engine with
+ECMAScript semantics (f64 / ToInt32 folding domains, ±2^53 exactness,
+per-file binding/scope resolution for `var` hoisting and closure-capture
+guards, optional-chain and destructuring opacity, ECMA number formatting).
+The Python backend targets CPython 3.15 syntax — indentation and implicit
+joins, PEP 701 f-strings and t-strings, `match`/`case`, walrus, `except*`,
+PEP 695 type parameters, `lazy import` — with Python truthiness,
+floor-division/power semantics and generator/scope preservation.
 
 ```java
 // decompiled input                          // after cure
@@ -66,8 +70,15 @@ the same thing.
   (including `const` type parameters), `satisfies`/`as const`, `#x in o`,
   RegExp `v` flags and optional chains. Unsupported constructs stay verbatim
   instead of aborting.
-- **64+ simplification rules** (language-agnostic engine rules + Java/TS packs),
-  including control-flow flattening recovery, statement-level
+- **Python 3.15 backend** — `.py`/`.pyi` parse → simplify → print with a
+  fault-tolerant indentation-aware parser. Constant folding follows Python
+  semantics (exact integer arithmetic inside the i64 domain, floor division
+  and modulo, `and`/`or` returning an operand, truthiness of
+  `None`/`False`/`0`/`""`); dead branches are never dropped when they
+  contain `yield`, `global` or `nonlocal`, so generators keep their PEP 479
+  marking and scoping stays intact.
+- **64+ simplification rules** (language-agnostic engine rules + Java, TS and
+  Python packs), including control-flow flattening recovery, statement-level
   `StringBuilder` chain recovery, XOR-noise removal, and partial evaluation
   ("virtual execution") of literal-only JDK calls.
 - **Scales to real codebases** — the full OpenJDK source corpus
@@ -120,8 +131,14 @@ echo 'const x = 1 + 2; console.log(x);' | cure --lang ts -
 # console.log(3);
 ```
 
+```bash
+printf 'x = 1 + 2\nprint(x)\n' | cure --lang py -
+# x = 3
+# print(3)
+```
+
 ```text
-cure [选项] <文件.java>... | <目录> | -
+cure [选项] <文件>... | <目录> | -
 ```
 
 | Option | Meaning |
@@ -132,6 +149,7 @@ cure [选项] <文件.java>... | <目录> | -
 | `-j, --threads <N>` | worker threads (default: CPU cores × 1.5) |
 | `--format-only` | format only, no simplification |
 | `--ext <list>` | restrict to given extensions (comma/space separated) |
+| `--lang <name>` | force a backend: `java`, `ts`/`js` (TS/JS) or `python`/`py`; by default inferred from the file extension |
 | `--copy-other` | directory mode: copy non-source files verbatim |
 | `--diff` | print unified diffs of every rewritten file |
 | `--stats` / `--report` | aggregate / per-file rewrite statistics |
@@ -157,10 +175,11 @@ otherwise the locale is auto-detected. Full option reference: `cure --help`.
 | 3. Corpora | 3,999 vendored real-world files in 12 auto-discovered suites + 5,596-file external mega-corpus + the 371k-file OpenJDK source corpus | robustness (no panics), self-consistency (output re-parses cleanly), idempotency (second pass = 0 rewrites) |
 | 4. Decompiled apps | 144,592 files from 5 real-world Android APKs run through [ddc](https://github.com/ejfkdev/ddc), then cure (full + `--dead-code`) | same invariants + javac differential: every package whose ddc output compiles must still compile after cure |
 | 5. ECMAScript conformance | [Test262](https://github.com/tc39/test262), six layers: (a) sync original vs cured in fresh `node` vm contexts, exception status + stdout compared (34,007 executable cases); (b) **async** cases executed with `$DONE`/microtask/timer draining (5,423 executed); (c) **module** cases linked and evaluated as ESM with a filesystem fixture loader (358 executed); (d) **compile-only on all 53,910 files** including async/module/negative; (e) **print round-trip**: parse → print (no simplify) → parse, ASTs structurally equal ignoring `Paren`/literal spelling/`Group` expansion (49,159 checked); (f) **simplify idempotency**: cure twice over the same corpus, byte-identical output (49,159 checked) | ECMAScript semantics: f64/ToInt32 domains, ±2^53, TDZ, Annex B hoisting, eval scoping, destructuring, generator/`yield` grammar, sparse arrays, async/await ordering, ESM linking/live bindings; printer/paren/decorator drift; fixed-point convergence |
-| 7. Randomized JS differential | Deterministic PRNG generates valid programs mixing declarations, shadowing, `var` hoisting, closures, loops, ternaries, short circuits and templates; original vs cured run under `node` (stdout + exit code) and a second cure must be byte-identical (`CURE_FUZZ_CASES` scales the sample) | rule-combination semantics and first/second-pass convergence; 5,000 cases used during development |
 | 6. Real-world JS/TS | 4,358 `.js/.mjs/.cjs` files (~568 MB) plus 1,334 `.ts/.tsx/.mts/.cts` files from a global npm install (undici, zod, minisearch, pnpm, yarn, vite-plus, Lark CLI, bytenode, …): every valid file must still compile after cure; a second cure pass must produce byte-identical output. Both corpora run at **0 parser diagnostics** and **0 second-pass differences** in default and preserve modes, and every cured file parses cleanly with Oxc (`oxfmt`, 0 syntax errors) | real-package syntax (minified bundles, top-level await, import attributes), complex type syntax, idempotency under module-level constant propagation |
+| 7. Randomized JS differential | Deterministic PRNG generates valid programs mixing declarations, shadowing, `var` hoisting, closures, loops, ternaries, short circuits and templates; original vs cured run under `node` (stdout + exit code) and a second cure must be byte-identical (`CURE_FUZZ_CASES` scales the sample) | rule-combination semantics and first/second-pass convergence; 5,000 cases used during development |
+| 8. Python 3.15 stdlib | 2,459 `.py`/`.pyi` files under CPython 3.15's stdlib (2,456 UTF-8 sources): parse → print compared with CPython `ast.dump`; a second cure must be byte-identical; every simplified file is compiled by CPython; 12 curated programs also run side-by-side | **0** parser diagnostics; **2,453/2,456** round-trips AST-identical (3 fixtures are intentionally invalid); **2,456/2,456** idempotent, 0 drift; **2,447/2,447** compilable outputs (9 originals were already uncompilable, 0 broken); curated stdout/exit codes match |
 
-`cargo test` runs 474 tests. The Test262 semantic differential reaches
+`cargo test` runs 484 tests. The Test262 semantic differential reaches
 **33,963/34,007 (99.87%) identical runs** in default mode; the only 44
 excluded cases compare `Function.prototype.toString` **source text** (cure
 reformats function bodies) or use arrow functions as computed-property keys,
@@ -177,6 +196,18 @@ t262_sem|t262_async|t262_module|t262_compile|t262_roundtrip|t262_idem`); they sk
 `/tmp/test262` or `node` is unavailable (`T262_ROOT` / `T262_SAMPLE` override). Layers 1–2 caught three real semantic/parse bugs
 during development (`x && true` mis-fold, `((Cast) x).method()` postfix loss,
 `new` treated as a type name).
+
+The Python differential covers the CPython 3.15 standard library: 2,459
+`.py`/`.pyi` files (2,456 UTF-8 sources), **0 parser diagnostics**,
+**2,453/2,456** parse → print round-trips AST-identical under CPython's own
+`ast.dump` (the other 3 are intentionally invalid fixtures), **2,456/2,456**
+simplify-idempotent with 0 drift, and **2,447/2,447** simplified files
+accepted by `compile()` (9 originals were already uncompilable; cure broke
+none). A directory run rewrites 2,363 files with 2,176 observable edits, and
+a second run performs **0 edits** on byte-identical output. Twelve curated
+programs (constants, control flow, short-circuit side effects, generators,
+classes/exceptions, comprehensions/walrus, 3.15 syntax, async, match) run
+side-by-side under CPython with identical stdout and exit codes.
 
 ### Adversarial case studies
 
@@ -232,6 +263,13 @@ when evaluation succeeds, never on the exception path),
 fernflower leftover, ≥23 sites in a 66-file corpus),
 new_string_char_array_fold (`new String(CHAR_ARRAY)`), empty_finally_strip, try_unwrap_no_catch, static_array_index_fold (literal array indexing), const_method_inline (single-return helper inlining — string decrypters), trailing_continue (label-aware tail continue removal).
 
+**Python (4):** `py_const_fold` (Python integer / floor-division / modulo /
+power domains, truthiness, `and`/`or` operand-return semantics),
+`py_const_if` (`if`/`while`/`IfExp` on literal conditions, guarded so
+`yield`/`global`/`nonlocal` are never dropped), `py_unreachable` (statements
+after `return`/`raise`/`break`/`continue`, same guards) and
+`py_pass_cleanup` (no-op `pass` removal while keeping a body non-empty).
+
 ## Performance
 
 Release build, 18-core Apple Silicon laptop, warm page cache, default
@@ -241,6 +279,7 @@ threads (cores × 1.5):
 |---|---|---|---|
 | Single file (stdin → stdout) | 1 | <10 ms | ~2 MiB |
 | Vendored test corpora | 3,999 | 0.6 s | ~110 MiB |
+| CPython 3.15 stdlib, output tree written | 2,456 | 0.3 s | ~150 MiB |
 | OpenJDK full source corpus, `--check` | 371,674 / 4.70 GB | 14.8 s | ~430 MiB |
 | OpenJDK full source corpus, output tree written | 371,674 / 4.70 GB | 27.5 s | ~430 MiB |
 
@@ -271,24 +310,32 @@ cure-java-parser   fault-tolerant Java lexer/parser (byte-borrowed tokens,
                    zero-copy source)
 cure-java-print    canonical Java printer/formatter
 cure-java-simplify Java rule pack + facade over cure-engine
+cure-python-ast    Python NodeData + PyId arena
+cure-python-parser fault-tolerant indentation-aware parser (CPython 3.15)
+cure-python-print  canonical 4-space Python printer
+cure-python-simplify Python constant/control-flow rules over cure-engine
 cure-cli           the `cure` binary: parallel pipeline, cross-platform
                    batch I/O (io_uring / thread pool), directory mode
 ```
 
 The `Lang` trait is the language boundary. Numeric/string folding semantics
 live behind language hooks (`fold_lit_bin` / `fold_lit_cmp` / `fold_lit_neg` /
-`reassoc_delta`) — the engine hardcodes no language's arithmetic. A second
+`reassoc_delta`) — the engine hardcodes no language's arithmetic. Each
 language frontend provides its own AST + parser + printer + rule pack on top
-of `cure-engine` + `cure-tree` (see the ~100-line toy language in
-`cure-tree/tests/kit.rs`).
+of `cure-engine` + `cure-tree`; the TS/JS and Python backends are two such
+frontends (see also the ~100-line toy language in `cure-tree/tests/kit.rs`).
 
 ## Status & roadmap
 
 - ✅ Java backend at production robustness: 371k-file corpus, 0 failures
-- ✅ 12 vendored corpora, three-layer verification, 332 tests
+- ✅ TS/JS backend: Test262 six layers, 0 parser diagnostics on npm corpora
+- ✅ Python 3.15 backend: CPython stdlib 2,456 sources, 0 diagnostics,
+  AST-identical round-trips, idempotent and compilable output
+- ✅ 12 vendored Java corpora, three-layer verification, 484 tests
 - 🔜 Restoration rules V2 (reflective `addSuppressed` shapes, nested
   two-resource try-with-resources)
-- 🔜 A second language to validate the `Lang` trait boundary
+- 🔜 Python rule-pack expansion (local propagation, docstring/whitespace
+  normalization, decompiler-shape restoration)
 
 ## License
 

@@ -15,11 +15,11 @@ pub(crate) fn print_help() {
 pub(crate) fn print_version() {
     match CliLang::detect() {
         CliLang::Zh => println!(
-            "cure {}（容错式代码简化/格式化器；后端：java、typescript/javascript）\n{REPO_URL}",
+            "cure {}（容错式代码简化/格式化器；后端：java、typescript/javascript、python）\n{REPO_URL}",
             env!("CARGO_PKG_VERSION")
         ),
         CliLang::En => println!(
-            "cure {} — fault-tolerant code simplifier/formatter (backends: java, typescript/javascript)\n{REPO_URL}",
+            "cure {} — fault-tolerant code simplifier/formatter (backends: java, typescript/javascript, python)\n{REPO_URL}",
             env!("CARGO_PKG_VERSION")
         ),
     }
@@ -29,7 +29,7 @@ fn print_help_en() {
     let v = env!("CARGO_PKG_VERSION");
     println!("cure {v} — fault-tolerant, semantic-preserving code simplifier/formatter");
     println!("Decompiled code in, human-written-looking code out.");
-    println!("Supported languages: java, typescript/javascript (ts/tsx/mts/cts/js/jsx/mjs/cjs).");
+    println!("Supported languages: java, typescript/javascript (ts/tsx/mts/cts/js/jsx/mjs/cjs), python (py/pyi).");
     println!("{REPO_URL}  (MIT license)");
     println!();
     println!("Usage:");
@@ -40,7 +40,9 @@ fn print_help_en() {
     println!("  cure help [COMMAND]                this help, or one command's");
     println!("  cure version | -h | -V");
     println!();
-    println!("Languages: java, typescript/javascript (this release). The CLI and engine are");
+    println!(
+        "Languages: java, typescript/javascript, python (this release). The CLI and engine are"
+    );
     println!("new backends register in LANG_BACKENDS and get the whole pipeline");
     println!("(traversal, parallelism, --check/--diff/--stats, batched I/O).");
     println!();
@@ -58,7 +60,9 @@ fn print_help_en() {
     println!("      --check              dry run: exit 2 if rewritable; write nothing");
     println!("  -j, --threads <N>        worker threads (default: CPU cores × 1.5)");
     println!("      --format-only        format only, no simplification");
-    println!("  -l, --lang <name>        force java | ts/js/typescript/javascript");
+    println!(
+        "  -l, --lang <name>        force java | ts/js/typescript/javascript | py/python/python3"
+    );
     println!("      --ext <list>         only given extensions (comma/space separated)");
     println!("      --copy-other         dir mode: copy non-source files verbatim");
     println!("      --diff               print unified diffs of rewritten files");
@@ -104,7 +108,7 @@ fn print_help_zh() {
     let v = env!("CARGO_PKG_VERSION");
     println!("cure {v} — 容错式、语义保持的代码简化 / 格式化器");
     println!("反编译代码进，像人手写的代码出。");
-    println!("已支持语言：java、typescript/javascript（ts/tsx/mts/cts/js/jsx/mjs/cjs）。");
+    println!("已支持语言：java、typescript/javascript（ts/tsx/mts/cts/js/jsx/mjs/cjs）、python（py/pyi）。");
     println!("{REPO_URL}  (MIT 许可证)");
     println!();
     println!("用法:");
@@ -115,7 +119,7 @@ fn print_help_zh() {
     println!("  cure help [子命令]                本帮助，或某子命令的帮助");
     println!("  cure version | -h | -V");
     println!();
-    println!("语言后端: java、typescript/javascript（本版）。CLI 与引擎均语言无关——");
+    println!("语言后端: java、typescript/javascript、python（本版）。CLI 与引擎均语言无关——");
     println!("LANG_BACKENDS 登记一条即获得全部基础设施（目录遍历/并行/");
     println!("--check/--diff/--stats/批量 I/O）。");
     println!();
@@ -132,7 +136,9 @@ fn print_help_zh() {
     println!("      --check              干跑：有可优化改写 → 退出码 2，不写出");
     println!("  -j, --threads <N>        并行工作线程数（默认=CPU 核心数 × 1.5）");
     println!("      --format-only        仅格式化，不做简化");
-    println!("  -l, --lang <语言>      强制 java | ts/js/typescript/javascript");
+    println!(
+        "  -l, --lang <语言>      强制 java | ts/js/typescript/javascript | py/python/python3"
+    );
     println!("      --ext <后缀列表>     只处理指定后缀（逗号或空格分隔）");
     println!("      --copy-other         目录模式：不受处理的文件原样拷入输出树");
     println!("      --diff               打印被改写文件的统一 diff");
@@ -203,6 +209,12 @@ fn print_rules_en() {
     for n in &opt_in {
         println!("  {n}");
     }
+    let py = cure_python_simplify::default_rules();
+    println!();
+    println!("Python (default, {}):", py.len());
+    for n in py {
+        println!("  {n}");
+    }
     println!();
     println!("Example:  cure --disable cff_recover --disable xor_noise src/");
 }
@@ -219,6 +231,12 @@ fn print_rules_zh() {
     println!();
     println!("选配（{} 条；--dead-code 启用 unreachable_after_terminal）：", opt_in.len());
     for n in &opt_in {
+        println!("  {n}");
+    }
+    let py = cure_python_simplify::default_rules();
+    println!();
+    println!("Python（默认启用，{} 条）：", py.len());
+    for n in py {
         println!("  {n}");
     }
     println!();

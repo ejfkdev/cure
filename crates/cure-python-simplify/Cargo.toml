@@ -1,0 +1,18 @@
+[package]
+name = "cure-python-simplify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Python constant folding and control-flow simplification for cure"
+repository.workspace = true
+keywords = ["python", "simplifier", "deobfuscator"]
+categories = ["development-tools"]
+
+[dependencies]
+cure-engine = { path = "../cure-engine", version = "0.2.0" }
+cure-python-ast = { path = "../cure-python-ast", version = "0.2.0" }
+
+[dev-dependencies]
+cure-python-parser = { path = "../cure-python-parser", version = "0.2.0" }
+cure-python-print = { path = "../cure-python-print", version = "0.2.0" }

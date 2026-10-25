@@ -1,0 +1,13 @@
+[package]
+name = "cure-python-print"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Python source printer/formatter for cure"
+repository.workspace = true
+keywords = ["python", "formatter", "printer", "deobfuscator"]
+categories = ["development-tools"]
+
+[dependencies]
+cure-python-ast = { path = "../cure-python-ast", version = "0.2.0" }
