@@ -17,6 +17,10 @@ pub struct Config {
     /// opt-in：反射（getDeclaredMethod）无法静态排除；名字匹配不分重载，
     /// 只会更保守地保留。默认 false。
     pub remove_dead_methods: bool,
+    /// 函数/class/对象字面量源码保真（TS/JS）：打印时原样输出这些构造
+    /// 的源码文本（含 CRLF），内部不参与简化；被保真区引用的绑定不传播、
+    /// 不删除。用于 `Function.prototype.toString` 兼容；Java 后端忽略。
+    pub preserve_function_source: bool,
 }
 
 impl Default for Config {
@@ -25,6 +29,7 @@ impl Default for Config {
             max_edits: 100_000,
             disabled_rules: HashSet::new(),
             remove_dead_methods: false,
+            preserve_function_source: false,
         }
     }
 }

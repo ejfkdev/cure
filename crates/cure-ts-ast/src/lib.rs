@@ -25,6 +25,7 @@
 //! arena 不变量：children 永远先于父节点入 arena（index 递增）。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use cure_engine::analysis::{subtree_metrics, TreeMetrics};
 use cure_engine::lang::{ReassocOutcome, StmtKill};
@@ -305,7 +306,16 @@ pub enum TopItem {
     /// 普通语句（含 import/export 语句的值级部分？否——import/export 走原文）。
     Stmt(TsId),
     /// 顶层函数声明（export/default 修饰并入 sig_raw）。
-    Func { sig_raw: String, name: String, body: Option<TsId> },
+    Func {
+        sig_raw: String,
+        name: String,
+        body: Option<TsId>,
+        /// `function`/`async` 之前的修饰前缀（`export default ` 等）。
+        prefix: String,
+        /// 完整声明源码区间（`function`/`async function` 起，至 `}`）；
+        /// preserve_function_source 打印用。
+        raw_span: Option<(u32, u32)>,
+    },
     /// 类/接口/枚举/命名空间声明。
     Class(ClassDecl),
     /// import 语句原文（不建模——与外部模块的绑定关系不可分析）。
@@ -332,6 +342,8 @@ pub struct ClassDecl {
     pub kind_kw: String,
     pub name: String,
     pub members: Vec<ClassMember>,
+    /// 完整 class 源码区间（`class` 起，至 `}`）。
+    pub raw_span: Option<(u32, u32)>,
 }
 
 /// 类成员。
@@ -423,6 +435,12 @@ pub struct TsAst {
     captured_names: std::collections::HashSet<String>,
     /// 名字 intern 表 + 节点名字键（NameKey = u32）。
     names: NameTable,
+    /// 原始源码（不含 shebang；span 相对于它）。
+    source: Option<Arc<str>>,
+    /// 函数/对象字面量节点 → 源码字节区间（preserve_function_source）。
+    source_spans: HashMap<TsId, (u32, u32)>,
+    /// 打印时函数/class/对象字面量原文输出。
+    preserve_source: bool,
     /// 区域事件索引（B3 惰性重建）。
     events: EventStore<TsId, u32>,
     stmt_facts: Vec<Option<Box<[StmtFact]>>>,
@@ -502,6 +520,65 @@ impl TsAst {
             NodeData::DestructStmt { .. } => NodeKind::Custom(custom::DESTRUCT_STMT),
             NodeData::Seq => NodeKind::Custom(custom::SEQ),
         }
+    }
+
+    /// 记录原始源码（span 基准）。
+    pub fn set_source(&mut self, src: &str) {
+        self.source = Some(Arc::from(src));
+    }
+
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    /// 记录函数/对象字面量节点的源码区间。
+    pub fn set_source_span(&mut self, id: TsId, start: usize, end: usize) {
+        if end > start {
+            self.source_spans.insert(id, (start as u32, end as u32));
+        }
+    }
+
+    pub fn source_span(&self, id: TsId) -> Option<(usize, usize)> {
+        self.source_spans.get(&id).map(|&(a, b)| (a as usize, b as usize))
+    }
+
+    pub fn set_preserve_source(&mut self, on: bool) {
+        if self.preserve_source == on {
+            return;
+        }
+        self.preserve_source = on;
+        // 绑定不透明标记依赖该开关（resolver 在 prepare 时读取）——
+        // 切换后强制下一个根重建标记与语句事实。
+        self.prepared_root = None;
+        for slot in &mut self.stmt_facts {
+            *slot = None;
+        }
+        for slot in &mut self.stmt_kills {
+            *slot = None;
+        }
+        for slot in &mut self.stmt_opq {
+            *slot = None;
+        }
+    }
+
+    pub fn preserve_source(&self) -> bool {
+        self.preserve_source
+    }
+
+    /// span 原文（preserve 模式打印用）。**逐字节保留**行终止符：
+    /// `Function.prototype.toString` 必须原样返回 CRLF/CR 序列
+    ///（Test262 line-terminator-normalisation-* 明确禁止归一化）。
+    pub fn source_text_range(&self, start: usize, end: usize) -> Option<String> {
+        let s = self.source.as_deref()?;
+        if start >= end || end > s.len() {
+            return None;
+        }
+        s.get(start..end).map(|t| t.to_string())
+    }
+
+    pub fn node_source_text(&self, id: TsId) -> Option<String> {
+        let (a, b) = self.source_span(id)?;
+        self.source_text_range(a, b)
     }
 
     pub fn node_count(&self) -> usize {
@@ -1125,8 +1202,8 @@ impl TsAst {
             (TopItem::Stmt(x), TopItem::Stmt(y))
             | (TopItem::ExportStmt(x), TopItem::ExportStmt(y)) => self.equiv(*x, other, *y),
             (
-                TopItem::Func { sig_raw: sx, name: nx, body: bx },
-                TopItem::Func { sig_raw: sy, name: ny, body: by },
+                TopItem::Func { sig_raw: sx, name: nx, body: bx, .. },
+                TopItem::Func { sig_raw: sy, name: ny, body: by, .. },
             ) => {
                 nx == ny
                     && norm_code(sx) == norm_code(sy)

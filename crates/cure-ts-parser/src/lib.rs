@@ -29,20 +29,36 @@ pub struct ParseOutcome {
 /// 解析源文件（容错）。自动判定 script/module：顶层 `import`/`export`
 /// 视为 module（顶层 await 可用）；否则按 script（`await` 可作标识符）。
 pub fn parse(src: &str) -> ParseOutcome {
-    parse_inner(src, None)
+    parse_inner(src, None, false)
 }
 
 /// 按 module 目标解析（ESM：顶层 await 是运算符）。
 pub fn parse_module(src: &str) -> ParseOutcome {
-    parse_inner(src, Some(true))
+    parse_inner(src, Some(true), false)
 }
 
 /// 按 script 目标解析（顶层 await 按标识符/普通名）。
 pub fn parse_script(src: &str) -> ParseOutcome {
-    parse_inner(src, Some(false))
+    parse_inner(src, Some(false), false)
 }
 
-fn parse_inner(src: &str, module_goal: Option<bool>) -> ParseOutcome {
+/// 解析并记录函数/类/对象字面量的源码区间（供
+/// `preserve_function_source` 原样打印）。默认解析不承担这份内存。
+pub fn parse_with_source(src: &str) -> ParseOutcome {
+    parse_inner(src, None, true)
+}
+
+/// [`parse_with_source`] 的 module 目标版本。
+pub fn parse_module_with_source(src: &str) -> ParseOutcome {
+    parse_inner(src, Some(true), true)
+}
+
+/// [`parse_with_source`] 的 script 目标版本。
+pub fn parse_script_with_source(src: &str) -> ParseOutcome {
+    parse_inner(src, Some(false), true)
+}
+
+fn parse_inner(src: &str, module_goal: Option<bool>, capture_source: bool) -> ParseOutcome {
     let mut shebang = String::new();
     let body = if let Some(rest) = src.strip_prefix("#!") {
         if let Some(nl) = rest.find('\n') {
@@ -67,7 +83,11 @@ fn parse_inner(src: &str, module_goal: Option<bool>) -> ParseOutcome {
         async_ctx: module_goal,
         depth: 0,
         too_deep: false,
+        capture_source,
     };
+    if capture_source {
+        p.ast.set_source(body);
+    }
     for e in lex_errs {
         p.errors.push(ParseError {
             line: e.line,
@@ -110,6 +130,8 @@ struct Parser<'a> {
     /// 整个文件走原文保真（避免恶意/生成代码的栈溢出）。
     depth: usize,
     too_deep: bool,
+    /// 记录节点源码区间（preserve_function_source）。
+    capture_source: bool,
 }
 
 /// 递归上限。正常源码远低于此；超出者整文件 Raw 保真。
@@ -540,6 +562,7 @@ impl<'a> Parser<'a> {
             self.pos = start;
             return None;
         }
+        let fn_start = if is_async { start } else { self.pos };
         self.advance();
         let mut is_generator = false;
         if self.is_punct("*") {
@@ -583,12 +606,16 @@ impl<'a> Parser<'a> {
             None
         };
         let mut sig = String::new();
+        let mut decl_prefix = String::new();
         if !prefix_raw.is_empty() {
             sig.push_str(&prefix_raw);
             sig.push(' ');
+            decl_prefix.push_str(&prefix_raw);
+            decl_prefix.push(' ');
         }
         if exported {
             sig.push_str("export ");
+            decl_prefix.push_str("export ");
         }
         if is_async {
             sig.push_str("async ");
@@ -609,7 +636,12 @@ impl<'a> Parser<'a> {
         }
         sig.push_str(&params_full);
         sig.push_str(&ret_raw);
-        Some(TopItem::Func { sig_raw: sig, name, body })
+        let raw_span = if body.is_some() {
+            self.span_u32(fn_start)
+        } else {
+            None
+        };
+        Some(TopItem::Func { sig_raw: sig, name, body, prefix: decl_prefix, raw_span })
     }
 
     fn try_parse_class_decl(&mut self, deco_raw: String) -> Option<ClassDecl> {
@@ -620,13 +652,15 @@ impl<'a> Parser<'a> {
             prefix.push(' ');
         }
         let mut head = String::new();
-        let mut kind_kw = String::new();
+        let kind_kw: String;
+        let class_start: usize;
         if self.is_kw("abstract") && self.tk_at(1).text == "class" {
             prefix.push_str("abstract ");
             self.advance();
         }
         if self.is_kw("class") {
             kind_kw = "class".into();
+            class_start = self.pos;
             self.advance();
         } else {
             self.pos = start;
@@ -707,7 +741,8 @@ impl<'a> Parser<'a> {
         if self.is_punct("}") {
             self.advance();
         }
-        Some(ClassDecl { prefix, head_raw: head, kind_kw, name, members })
+        let raw_span = self.span_u32(class_start);
+        Some(ClassDecl { prefix, head_raw: head, kind_kw, name, members, raw_span })
     }
 
     fn parse_class_member(&mut self) -> Option<ClassMember> {
@@ -1160,6 +1195,26 @@ impl<'a> Parser<'a> {
         self.is_kw("async") && self.tk_at(1).text == "function" && !self.tk_at(1).newline_before
     }
 
+    /// 当前节点从 `start_tok` 到最近消费 token 的源码字节区间。
+    fn span_u32(&self, start_tok: usize) -> Option<(u32, u32)> {
+        if !self.capture_source {
+            return None;
+        }
+        let s = self.toks.get(start_tok)?.start;
+        let e = if self.pos > start_tok {
+            self.toks.get(self.pos - 1)?.end
+        } else {
+            s
+        };
+        Some((s, e))
+    }
+
+    fn set_span_here(&mut self, id: TsId, start_tok: usize) {
+        if let Some((s, e)) = self.span_u32(start_tok) {
+            self.ast.set_source_span(id, s as usize, e as usize);
+        }
+    }
+
     /// 嵌套函数声明语句 → FuncStmt（Custom——引擎不触碰，体进 arena）。
     fn try_parse_function_stmt(&mut self) -> Option<TsId> {
         let start = self.pos;
@@ -1172,6 +1227,7 @@ impl<'a> Parser<'a> {
             self.pos = start;
             return None;
         }
+        let fn_start = if is_async { start } else { self.pos };
         self.advance();
         let mut is_generator = false;
         if self.is_punct("*") {
@@ -1235,7 +1291,9 @@ impl<'a> Parser<'a> {
         }
         sig.push_str(&params_full);
         sig.push_str(&ret_raw);
-        Some(self.ast.func_stmt(&sig, &name, &params_inner, body))
+        let id = self.ast.func_stmt(&sig, &name, &params_inner, body);
+        self.set_span_here(id, fn_start);
+        Some(id)
     }
 
     /// 嵌套类声明语句：扫 `class … { … }` 平衡。
@@ -2007,6 +2065,7 @@ impl<'a> Parser<'a> {
     }
 
     fn try_parse_arrow(&mut self) -> Option<TsId> {
+        let src_start = self.pos;
         let mut p = self.pos;
         let mut is_async = false;
         if self.toks[p].kind == TokKind::Ident && self.toks[p].text == "async" {
@@ -2042,7 +2101,9 @@ impl<'a> Parser<'a> {
                 let param = self.toks[p].text.clone();
                 self.pos = p + 2;
                 let body = self.enter_async(is_async, |p| p.parse_arrow_body());
-                return Some(self.ast.lambda(&param, body, true, is_async, false));
+                let id = self.ast.lambda(&param, body, true, is_async, false);
+                self.set_span_here(id, src_start);
+                return Some(id);
             }
             return None;
         }
@@ -2098,14 +2159,14 @@ impl<'a> Parser<'a> {
             .to_string();
         self.pos = q + 1;
         let body = self.enter_async(is_async, |p| p.parse_arrow_body());
-        if generics.is_empty() {
-            Some(self.ast.lambda(&params_inner, body, true, is_async, false))
+        let id = if generics.is_empty() {
+            self.ast.lambda(&params_inner, body, true, is_async, false)
         } else {
-            Some(
-                self.ast
-                    .lambda_generic(&generics, &params_inner, body, true, is_async, false),
-            )
-        }
+            self.ast
+                .lambda_generic(&generics, &params_inner, body, true, is_async, false)
+        };
+        self.set_span_here(id, src_start);
+        Some(id)
     }
 
     /// 括号组是否可能是**参数列表**（TS 返回类型注解前瞻的守卫）：
@@ -2692,10 +2753,14 @@ impl<'a> Parser<'a> {
             }
             TokKind::TemplateQuasi { .. } => self.parse_template_after(None),
             TokKind::Ident => match t.text.as_str() {
-                "function" => self.parse_function_expr(false),
+                "function" => {
+                    let st = self.pos;
+                    self.parse_function_expr(false, st)
+                }
                 "async" if self.tk_at(1).text == "function" && !self.tk_at(1).newline_before => {
+                    let st = self.pos;
                     self.advance(); // async（parse_function_expr 消费 function）
-                    self.parse_function_expr(true)
+                    self.parse_function_expr(true, st)
                 }
                 "class" if self.tk_at(1).kind == TokKind::Ident || self.tk_at(1).kind == TokKind::Punct => {
                     // 类表达式（class / class Name …）
@@ -2734,7 +2799,6 @@ impl<'a> Parser<'a> {
                     self.ast.this()
                 }
                 "super" => {
-                    let s = self.pos;
                     self.advance();
                     let mut raw = String::from("super");
                     if self.is_punct(".") {
@@ -2848,7 +2912,7 @@ impl<'a> Parser<'a> {
         t.kind == TokKind::Ident && t.text == w
     }
 
-    fn parse_function_expr(&mut self, is_async: bool) -> TsId {
+    fn parse_function_expr(&mut self, is_async: bool, src_start: usize) -> TsId {
         self.advance(); // function（async 已在外层 advance）
         let mut is_gen = false;
         if self.is_punct("*") {
@@ -2888,7 +2952,7 @@ impl<'a> Parser<'a> {
             self.err_here("expected { in function expression");
             self.ast.block(vec![])
         };
-        if generics.is_empty() {
+        let id = if generics.is_empty() {
             self.ast.lambda_named(&inner, body, false, is_async, is_gen, &name, space)
         } else {
             self.ast.lambda_named_generic(
@@ -2901,7 +2965,9 @@ impl<'a> Parser<'a> {
                 &name,
                 space,
             )
-        }
+        };
+        self.set_span_here(id, src_start);
+        id
     }
 
     fn parse_obj_lit(&mut self) -> TsId {
@@ -2939,7 +3005,9 @@ impl<'a> Parser<'a> {
         } else {
             self.err_here("expected }");
         }
-        self.ast.obj_lit(props, values)
+        let id = self.ast.obj_lit(props, values);
+        self.set_span_here(id, open);
+        id
     }
 
     fn parse_obj_prop(&mut self) -> (String, TsId) {

@@ -21,7 +21,13 @@ use cure_engine::Config;
 use cure_java_parser::parse;
 use cure_java_print::print_unit;
 use cure_java_simplify::simplify_unit;
-use cure_ts_parser::{parse as ts_parse, parse_module as ts_parse_module, parse_script as ts_parse_script};
+use cure_ts_parser::{
+    parse as ts_parse, parse_module as ts_parse_module,
+    parse_module_with_source as ts_parse_module_with_source,
+    parse_script as ts_parse_script,
+    parse_script_with_source as ts_parse_script_with_source,
+    parse_with_source as ts_parse_with_source,
+};
 use cure_ts_print::print_module as ts_print;
 use cure_ts_simplify::simplify_unit as ts_simplify_unit;
 
@@ -200,6 +206,8 @@ struct Options {
     strict: bool,
     /// 显式语言后端（`--lang java|ts|js`）；未指定时按文件后缀/默认后端。
     lang: Option<String>,
+    /// 函数/类/对象字面量源码保真（`Function.prototype.toString` 兼容）。
+    preserve_function_source: bool,
     stdin: bool,
     /// 工作线程数（0/None = 自动；见 worker_threads()）
     threads: usize,
@@ -244,6 +252,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         jdk_home: None,
         strict: false,
         lang: None,
+        preserve_function_source: false,
         stdin: false,
         threads: 0,
     };
@@ -270,6 +279,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--report" => opts.report = true,
             "--strict" => opts.strict = true,
             "--dead-code" => opts.dead_code = true,
+            "--preserve-function-source" => opts.preserve_function_source = true,
             "--jdk-home" => {
                 i += 1;
                 let v = args.get(i).ok_or("missing value for --jdk-home")?;
@@ -894,13 +904,27 @@ fn process_source_ts(
     // 是运算符；`.cjs`/`.cts` = CommonJS；其余按顶层 import/export
     // 自动判定）。
     let disp = display.to_ascii_lowercase();
+    let capture = opts.preserve_function_source;
     let mut outcome = if disp.ends_with(".mjs") || disp.ends_with(".mts") {
-        ts_parse_module(src)
+        if capture {
+            ts_parse_module_with_source(src)
+        } else {
+            ts_parse_module(src)
+        }
     } else if disp.ends_with(".cjs") || disp.ends_with(".cts") {
-        ts_parse_script(src)
+        if capture {
+            ts_parse_script_with_source(src)
+        } else {
+            ts_parse_script(src)
+        }
+    } else if capture {
+        ts_parse_with_source(src)
     } else {
         ts_parse(src)
     };
+    if opts.preserve_function_source {
+        outcome.ast.set_preserve_source(true);
+    }
     let had_errors = !outcome.errors.is_empty();
     let need_lines = opts.stats || opts.report;
     let lines_before = if need_lines { src.lines().count() } else { 0 };
@@ -926,6 +950,7 @@ fn process_source_ts(
             cfg.disabled_rules.insert(r.clone());
         }
         cfg.remove_dead_methods = opts.dead_code;
+        cfg.preserve_function_source = opts.preserve_function_source;
         let report = ts_simplify_unit(&mut outcome.ast, &mut outcome.unit, &cfg);
         if need_lines {
             let after_metrics = cure_ts_ast::unit_metrics(&outcome.ast, &outcome.unit);

@@ -615,7 +615,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// 正则启发式。
-    fn regex_allowed(&self, newline: bool) -> bool {
+    fn regex_allowed(&self, _newline: bool) -> bool {
         match self.prev {
             Prev::Start | Prev::Keyword | Prev::Template => true,
             // `}` 后按**除法**处理：函数表达式体/对象字面量后的 `/`

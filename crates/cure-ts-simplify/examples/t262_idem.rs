@@ -7,7 +7,9 @@
 use std::path::{Path, PathBuf};
 
 use cure_engine::Config;
-use cure_ts_parser::{parse, parse_module};
+use cure_ts_parser::{
+    parse, parse_module, parse_module_with_source, parse_with_source,
+};
 use cure_ts_print::print_module;
 use cure_ts_simplify::simplify_unit;
 
@@ -42,6 +44,7 @@ fn main() {
         files.truncate(limit);
     }
 
+    let preserve = std::env::var_os("T262_PRESERVE").is_some();
     let dump = std::env::var("T262_DUMP").ok().map(PathBuf::from);
     let (mut ok, mut diff, mut bad_reparse, mut skipped) = (0usize, 0usize, 0usize, 0usize);
     let mut examples: Vec<(String, &'static str)> = Vec::new();
@@ -52,15 +55,35 @@ fn main() {
             continue;
         }
         let module = is_module(&src);
-        let mut out1 = if module { parse_module(&src) } else { parse(&src) };
+        let parse_mode = |text: &str| {
+            if module {
+                if preserve {
+                    parse_module_with_source(text)
+                } else {
+                    parse_module(text)
+                }
+            } else if preserve {
+                parse_with_source(text)
+            } else {
+                parse(text)
+            }
+        };
+        let mut cfg = Config::default();
+        if preserve {
+            cfg.preserve_function_source = true;
+        }
+        let mut out1 = parse_mode(&src);
         if !out1.errors.is_empty() {
             skipped += 1;
             continue;
         }
-        let _ = simplify_unit(&mut out1.ast, &mut out1.unit, &Config::default());
+        if preserve {
+            out1.ast.set_preserve_source(true);
+        }
+        let _ = simplify_unit(&mut out1.ast, &mut out1.unit, &cfg);
         let once = print_module(&out1.ast, &out1.unit);
 
-        let mut out2 = if module { parse_module(&once) } else { parse(&once) };
+        let mut out2 = parse_mode(&once);
         let id = path
             .strip_prefix(&root)
             .unwrap_or(path)
@@ -74,7 +97,10 @@ fn main() {
             dump_failure(dump.as_deref(), &id, &once, "");
             continue;
         }
-        let _ = simplify_unit(&mut out2.ast, &mut out2.unit, &Config::default());
+        if preserve {
+            out2.ast.set_preserve_source(true);
+        }
+        let _ = simplify_unit(&mut out2.ast, &mut out2.unit, &cfg);
         let twice = print_module(&out2.ast, &out2.unit);
         if once != twice {
             diff += 1;

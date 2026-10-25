@@ -10,7 +10,9 @@
 
 use std::path::{Path, PathBuf};
 
-use cure_ts_parser::{parse, parse_module};
+use cure_ts_parser::{
+    parse, parse_module, parse_module_with_source, parse_with_source,
+};
 use cure_ts_print::print_module;
 
 fn main() {
@@ -44,6 +46,7 @@ fn main() {
         files.truncate(limit);
     }
 
+    let preserve = std::env::var_os("T262_PRESERVE").is_some();
     let dump = std::env::var("T262_DUMP").ok().map(PathBuf::from);
     let (mut ok, mut ast_diff, mut bad_print, mut skipped) = (0usize, 0usize, 0usize, 0usize);
     let mut examples: Vec<(String, &'static str)> = Vec::new();
@@ -54,7 +57,20 @@ fn main() {
             continue;
         }
         let module = is_module(&src);
-        let out1 = if module { parse_module(&src) } else { parse(&src) };
+        let mut out1 = if module {
+            if preserve {
+                parse_module_with_source(&src)
+            } else {
+                parse_module(&src)
+            }
+        } else if preserve {
+            parse_with_source(&src)
+        } else {
+            parse(&src)
+        };
+        if preserve {
+            out1.ast.set_preserve_source(true);
+        }
         if !out1.errors.is_empty() {
             skipped += 1;
             continue;

@@ -328,6 +328,54 @@ pub(crate) fn rebuild(ast: &mut TsAst, root: TsId) {
             _ => {}
         }
     }
+    // ---- 源码保真区（preserve_function_source）----
+    // 函数/对象字面量将逐字节原样打印；任何内部改写都会被打印层丢弃，
+    // 但**基于内部引用的外部改写**（把绑定值传播进字段/删除声明）不会
+    // 被丢弃——打印原文后会变成悬挂引用。这里把保真区内的节点及其
+    // 引用的绑定声明全部标为不透明，规则既不进入也不据此删除。
+    let preserved = if ast.preserve_source() {
+        let mut in_zone = vec![false; n];
+        // 从根向下传播：命中保真根后其整棵子树都在保真区。
+        let mut zone_root = vec![false; n];
+        for &id in &st.visited {
+            let d = &ast.nodes[id.0 as usize].data;
+            if matches!(
+                d,
+                NodeData::Lambda { .. } | NodeData::ObjLit { .. } | NodeData::FuncStmt { .. }
+            ) {
+                zone_root[id.0 as usize] = true;
+            }
+        }
+        // 迭代式父->子传播（visited 顺序不保证父先于子）
+        let mut order: Vec<TsId> = Vec::new();
+        let mut seen = vec![false; n];
+        let mut q = vec![root];
+        while let Some(x) = q.pop() {
+            if seen[x.0 as usize] {
+                continue;
+            }
+            seen[x.0 as usize] = true;
+            order.push(x);
+            for c in ast.nodes[x.0 as usize].children.as_slice() {
+                q.push(*c);
+            }
+        }
+        for &x in &order {
+            if zone_root[x.0 as usize] {
+                in_zone[x.0 as usize] = true;
+            }
+            if in_zone[x.0 as usize] {
+                for c in ast.nodes[x.0 as usize].children.as_slice() {
+                    in_zone[c.0 as usize] = true;
+                }
+            }
+        }
+        in_zone
+    } else {
+        Vec::new()
+    };
+    let preserved_zone = !preserved.is_empty();
+
     // ---- var 提升陷阱（按绑定引用，而不是全名出现）----
     let mut var_trap = vec![false; n];
     for &id in &st.visited {
@@ -338,6 +386,16 @@ pub(crate) fn rebuild(ast: &mut TsAst, root: TsId) {
             var_trap[id.0 as usize] = true;
             continue;
         };
+        // 绑定在保真区内被引用 → 声明不得被传播/删除（打印原文会
+        // 重新引入该引用）。
+        if preserved_zone
+            && refs[bid as usize]
+                .iter()
+                .any(|&r| preserved.get(r.0 as usize).copied().unwrap_or(false))
+        {
+            var_trap[id.0 as usize] = true;
+            continue;
+        }
         // 顶层声明（含 let/const）在模块合成根里看不见别的顶层项
         //（class/函数体/另一个根）里的读写——声明级规则必须拒绝触碰。
         // 旧实现用 module root var_trap 覆盖；resolver 统一按绑定判定。
@@ -362,6 +420,15 @@ pub(crate) fn rebuild(ast: &mut TsAst, root: TsId) {
         var_trap[id.0 as usize] = trap;
     }
 
+    if preserved_zone {
+        // 保真区内部节点也不接受规则改写（打印层反正会丢弃内部改写，
+        // 但避免基于改写结果的跨节点提案）。
+        for (i, &z) in preserved.iter().enumerate() {
+            if z {
+                var_trap[i] = true;
+            }
+        }
+    }
     ast.bindings = st.bindings;
     ast.binding_of = binding_of;
     ast.local_marks = local;

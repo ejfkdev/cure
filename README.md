@@ -48,6 +48,11 @@ the same thing.
   `javac`/`java` runs, and whole-corpus re-parse/idempotency checks (details
   below). These layers caught real bugs during development; they are not
   decorative.
+- **Opt-in source fidelity** — `--preserve-function-source` prints every
+  function, class and object literal byte-for-byte (comments, whitespace and
+  CRLF included), so `Function.prototype.toString()` matches the original.
+  Bindings referenced from preserved regions are frozen; the rest of the
+  module is still simplified.
 - **Modern TS/JS syntax** — decorators (class/member), `accessor`, private
   fields/methods, static blocks, `using`/`await using`, import
   attributes/`defer`/`source`, top-level await, generic functions/arrows
@@ -125,6 +130,7 @@ cure [选项] <文件.java>... | <目录> | -
 | `--stats` / `--report` | aggregate / per-file rewrite statistics |
 | `--disable <rule>` | disable a named rule (repeatable) |
 | `--dead-code` | opt-in: drop private methods referenced nowhere in the unit |
+| `--preserve-function-source` | TS/JS: print functions/classes/object literals byte-for-byte (`Function.prototype.toString`); preserved regions are not simplified |
 | `--strict` | exit 1 on any parse error |
 
 Directory mode recurses, processes files in parallel (dynamic work queue,
@@ -143,15 +149,17 @@ otherwise the locale is auto-detected. Full option reference: `cure --help`.
 | 2. Differential testing | Original and simplified versions each compiled by `javac` and run; stdout / exit code / exception signature must match byte-for-byte (12 families: overflow, NaN, division by zero, StringBuilder, iterators, boxing, short-circuit side effects, …) | full Java-language semantics |
 | 3. Corpora | 3,999 vendored real-world files in 12 auto-discovered suites + 5,596-file external mega-corpus + the 371k-file OpenJDK source corpus | robustness (no panics), self-consistency (output re-parses cleanly), idempotency (second pass = 0 rewrites) |
 | 4. Decompiled apps | 144,592 files from 5 real-world Android APKs run through [ddc](https://github.com/ejfkdev/ddc), then cure (full + `--dead-code`) | same invariants + javac differential: every package whose ddc output compiles must still compile after cure |
-| 5. ECMAScript conformance | [Test262](https://github.com/tc39/test262), six layers: (a) sync original vs cured in fresh `node` vm contexts, exception status + stdout compared (34,007 executable cases); (b) **async** cases executed with `$DONE`/microtask/timer draining (5,423 executed); (c) **module** cases linked and evaluated as ESM with a filesystem fixture loader (358 executed); (d) **compile-only on all 49,266 files** including async/module/negative; (e) **print round-trip**: parse → print (no simplify) → parse, ASTs structurally equal ignoring `Paren`/literal spelling/`Group` expansion (49,159 checked); (f) **simplify idempotency**: cure twice over the same corpus, byte-identical output (49,159 checked) | ECMAScript semantics: f64/ToInt32 domains, ±2^53, TDZ, Annex B hoisting, eval scoping, destructuring, generator/`yield` grammar, sparse arrays, async/await ordering, ESM linking/live bindings; printer/paren/decorator drift; fixed-point convergence |
+| 5. ECMAScript conformance | [Test262](https://github.com/tc39/test262), six layers: (a) sync original vs cured in fresh `node` vm contexts, exception status + stdout compared (34,007 executable cases); (b) **async** cases executed with `$DONE`/microtask/timer draining (5,423 executed); (c) **module** cases linked and evaluated as ESM with a filesystem fixture loader (358 executed); (d) **compile-only on all 53,910 files** including async/module/negative; (e) **print round-trip**: parse → print (no simplify) → parse, ASTs structurally equal ignoring `Paren`/literal spelling/`Group` expansion (49,159 checked); (f) **simplify idempotency**: cure twice over the same corpus, byte-identical output (49,159 checked) | ECMAScript semantics: f64/ToInt32 domains, ±2^53, TDZ, Annex B hoisting, eval scoping, destructuring, generator/`yield` grammar, sparse arrays, async/await ordering, ESM linking/live bindings; printer/paren/decorator drift; fixed-point convergence |
 | 7. Randomized JS differential | Deterministic PRNG generates valid programs mixing declarations, shadowing, `var` hoisting, closures, loops, ternaries, short circuits and templates; original vs cured run under `node` (stdout + exit code) and a second cure must be byte-identical (`CURE_FUZZ_CASES` scales the sample) | rule-combination semantics and first/second-pass convergence; 5,000 cases used during development |
 | 6. Real-world JS | 4,358 `.js/.mjs/.cjs` files (~568 MB) from a global npm install (undici, pnpm, yarn, vite-plus, Lark CLI, bytenode, …): every valid file must still compile after cure; a second cure pass must produce byte-identical output | real-package syntax (minified bundles, top-level await, import attributes), idempotency under module-level constant propagation |
 
-`cargo test` runs 458 tests. The Test262 semantic differential reaches
-**33,963/34,007 (99.87%) identical runs**; the only 44 excluded cases compare
-`Function.prototype.toString` **source text** (cure reformats function
-bodies) or use arrow functions as computed-property keys, which relies on
-that same text. The async layer executes **5,423/5,423 cases identically
+`cargo test` runs 463 tests. The Test262 semantic differential reaches
+**33,963/34,007 (99.87%) identical runs** in default mode; the only 44
+excluded cases compare `Function.prototype.toString` **source text** (cure
+reformats function bodies) or use arrow functions as computed-property keys,
+which relies on that same text. With `--preserve-function-source` the same
+layer passes **34,007/34,007 (100%)** — function/class/object-literal source
+is emitted byte-for-byte, so the excluded cases now compare equal too. The async layer executes **5,423/5,423 cases identically
 (0 mismatch)**, the module layer **358/358 (0 mismatch)**, and the compile
 layer keeps **49,165/49,165 valid files compiling after cure** (0 broken;
 modules via `vm.SourceTextModule`); the print round-trip and simplify

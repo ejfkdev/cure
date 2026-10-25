@@ -128,7 +128,16 @@ impl<'a> Printer<'a> {
     fn print_top_item(&mut self, item: &TopItem) {
         match item {
             TopItem::Stmt(s) => self.print_stmt(*s),
-            TopItem::Func { sig_raw, body, .. } => {
+            TopItem::Func { sig_raw, body, prefix, raw_span, .. } => {
+                if self.ast.preserve_source() {
+                    if let Some((a, b)) = raw_span {
+                        if let Some(t) = self.ast.source_text_range(*a as usize, *b as usize) {
+                            self.out.push_str(prefix);
+                            self.push_raw(&t);
+                            return;
+                        }
+                    }
+                }
                 let sig = sig_raw.trim_end().to_string();
                 self.push_raw(&sig);
                 self.out.push(' ');
@@ -182,6 +191,14 @@ impl<'a> Printer<'a> {
         if !prefix.is_empty() {
             self.out.push_str(prefix);
             self.out.push(' ');
+        }
+        if self.ast.preserve_source() {
+            if let Some((a, b)) = c.raw_span {
+                if let Some(t) = self.ast.source_text_range(a as usize, b as usize) {
+                    self.push_raw(&t);
+                    return;
+                }
+            }
         }
         self.out.push_str(&c.kind_kw);
         if !c.name.is_empty() {
@@ -313,6 +330,12 @@ impl<'a> Printer<'a> {
                 self.out.push(';');
             }
             NodeData::FuncStmt { sig_raw, .. } => {
+                if self.ast.preserve_source() {
+                    if let Some(t) = self.ast.node_source_text(s) {
+                        self.push_raw(&t);
+                        return;
+                    }
+                }
                 let sig = sig_raw.trim_end().to_string();
                 self.push_raw(&sig);
                 self.out.push(' ');
@@ -713,6 +736,19 @@ impl<'a> Printer<'a> {
     }
 
     fn print_expr_inner(&mut self, e: TsId, my_prec: Prec) {
+        // 源码保真模式：函数/对象字面量整段原样输出——内部节点即使被
+        // 简化改写过也不影响 `Function.prototype.toString`。
+        if self.ast.preserve_source()
+            && matches!(
+                self.ast.data(e),
+                NodeData::Lambda { .. } | NodeData::ObjLit { .. }
+            )
+        {
+            if let Some(t) = self.ast.node_source_text(e) {
+                self.push_raw(&t);
+                return;
+            }
+        }
         match self.ast.data(e) {
             NodeData::Literal(l) => self.print_lit(l),
             NodeData::VarRef { name } => {

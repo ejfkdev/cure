@@ -1098,3 +1098,23 @@ console.log(v0, v1);
 "#,
     );
 }
+
+#[test]
+fn diff_empty_then_branch_swap() {
+    // 回归：`if (c) {} else {B}` → `if (!c) {B}` 在代价模型上可能
+    // 恰好持平（空 Block 1 + cond 1 vs Unary 3），曾触发引擎 debug
+    // `non-simplifying edit` 断言。
+    differential(
+        "if_empty_then",
+        r#"function f(x) {
+  var r = "";
+  if (x) {
+  } else {
+    r = "b";
+  }
+  return r;
+}
+console.log(f(true), f(false));
+"#,
+    );
+}

@@ -5,7 +5,31 @@
 
 ## [Unreleased]
 
-## [0.1.10] - 2026-10-24
+## [0.1.10] - 2026-10-25
+
+### 新增（函数源码保真模式——2026-10-25 第十六批）
+
+- **`--preserve-function-source`**（库侧 `Config::preserve_function_source`
+  + `TsAst::set_preserve_source` + `cure_ts_parser::parse_with_source`）：
+  TS/JS 的函数/类/对象字面量按源字节原样打印——注释、空白、CRLF 全部
+  保留，`Function.prototype.toString()` 与原文逐字节一致。保真区内部
+  不做简化；**从保真区引用的绑定被冻结**（不传播、不删除），模块其余
+  顶层代码仍正常简化。默认关闭。
+- 打印层：`Lambda`/`ObjLit`/`FuncStmt`/函数声明/类声明在保真模式下走
+  源码区间输出；区间按 token 字节偏移记录，CR 序列不归一化（Test262
+  `line-terminator-normalisation-*` 要求原样返回）。
+- 解析器：新增 `parse_with_source` / `parse_module_with_source` /
+  `parse_script_with_source`，仅在这些入口记录源码与区间，默认解析
+  零额外内存。
+- 修复 `if_else_empty`：`if (c) {} else {B}` → `if (!c) {B}` 的代价
+  可能恰好持平（空 Block + 条件 vs 一元 `!`），debug 断言曾
+  `panic: non-simplifying edit`；该规则标记为 structural 结构改写。
+- 新增 `tests/preserve_source.rs`（4 组：toString 逐字节、对象简写
+  绑定不被传播删除、CRLF 保留、默认模式仍重排）+ 三个 Test262 驱动
+  的 `T262_PRESERVE=1` 模式。
+- 回归：**保真模式同步语义差分 34,007/34,007（100%，0 失配、0 豁免）**；
+  默认模式保持 33,963/34,007（44 个 toString 用例为已知重排差异，0 失配）；
+  `cargo test --workspace` **463 通过**。
 
 ### 正确性（随机差分扩展——2026-10-24 第十五批）
 

@@ -116,7 +116,7 @@ pub fn simplify_unit(ast: &mut TsAst, unit: &mut ModuleUnit, cfg: &Config) -> Re
         ) || matches!(it, TopItem::Func { sig_raw, .. } if sig_raw.contains("export"))
             || matches!(it, TopItem::Class(c) if c.head_raw.contains("export"))
     });
-    if module_detected || cfg.remove_dead_methods {
+    if (module_detected || cfg.remove_dead_methods) && !cfg.preserve_function_source {
         total.edits += remove_dead_module_items(ast, unit);
     }
     total
@@ -1092,6 +1092,10 @@ fn simplify_top_item(ast: &mut TsAst, item: &mut TopItem, cfg: &Config, total: &
             simplify_stmt_root(ast, s, cfg, total);
         }
         TopItem::Func { sig_raw, body, .. } => {
+            // 源码保真：函数体逐字节原样打印，简化结果会被丢弃。
+            if cfg.preserve_function_source {
+                return;
+            }
             // 形参默认值内的直接 eval 会把 var 注入函数作用域——整个
             // 函数跳过简化（静态作用域分析失效）。
             if !cure_ts_ast::raw_has_direct_eval(sig_raw) {
@@ -1118,6 +1122,11 @@ fn simplify_class(ast: &mut TsAst, c: &mut ClassDecl, cfg: &Config, total: &mut 
 }
 
 fn simplify_class_member(ast: &mut TsAst, m: &mut ClassMember, cfg: &Config, total: &mut Report) {
+    // 源码保真：整个 class 原样打印，成员简化无意义且会制造
+    // 「简化事实 vs 原文打印」不一致。
+    if cfg.preserve_function_source {
+        return;
+    }
     match m {
         ClassMember::Method { sig_raw, body } => {
             if cure_ts_ast::raw_has_direct_eval(sig_raw) {

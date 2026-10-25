@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use cure_engine::Config;
-use cure_ts_parser::parse_module;
+use cure_ts_parser::{parse_module, parse_module_with_source};
 use cure_ts_print::print_module;
 use cure_ts_simplify::simplify_unit;
 
@@ -17,6 +17,7 @@ fn main() {
     let sample: usize = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(0);
     let offset: usize = std::env::var("T262_OFFSET").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let limit: usize = std::env::var("T262_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let preserve = std::env::var_os("T262_PRESERVE").is_some();
     let sta = std::fs::read_to_string(root.join("harness/sta.js")).unwrap();
     let assert = std::fs::read_to_string(root.join("harness/assert.js")).unwrap();
     let mut files = Vec::new();
@@ -61,9 +62,18 @@ fn main() {
                 }
             }
         }
-        let mut out = parse_module(&c.src);
+        let mut out = if preserve {
+            parse_module_with_source(&c.src)
+        } else {
+            parse_module(&c.src)
+        };
         let clean = out.errors.is_empty();
-        let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
+        let mut cfg = Config::default();
+        if preserve {
+            cfg.preserve_function_source = true;
+            out.ast.set_preserve_source(true);
+        }
+        let _ = simplify_unit(&mut out.ast, &mut out.unit, &cfg);
         let cured = print_module(&out.ast, &out.unit);
         let mk = |body: &str| format!("{prelude}{body}");
         let id = c.path.strip_prefix(&root).unwrap_or(&c.path).to_string_lossy().to_string();

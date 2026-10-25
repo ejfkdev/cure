@@ -309,6 +309,12 @@ impl<L: Lang> Rule<L> for IfElseEmpty {
     fn kinds(&self) -> &'static [NodeKind] {
         &[NodeKind::If]
     }
+    fn structural(&self) -> bool {
+        // `if (c) {} else {B}` → `if (!c) {B}` 在代价模型上可能恰好
+        // 持平（空 Block 1 + cond 1 vs Unary 3）——这是可读性结构
+        // 改写，允许零代价应用（否则 debug 断言 panic）。
+        true
+    }
     fn check(&self, ctx: RewriteCtx<'_, L>, id: L::Id) -> Option<Edit<L>> {
         let RewriteCtx { lang, walk } = ctx;
         if lang.kind(id) != NodeKind::If {

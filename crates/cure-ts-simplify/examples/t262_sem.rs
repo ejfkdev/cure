@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use cure_engine::Config;
-use cure_ts_parser::parse;
+use cure_ts_parser::{parse, parse_with_source};
 use cure_ts_print::print_module;
 use cure_ts_simplify::simplify_unit;
 
@@ -27,6 +27,7 @@ fn main() {
     let sta = std::fs::read_to_string(harness.join("sta.js")).unwrap();
     let assert = std::fs::read_to_string(harness.join("assert.js")).unwrap();
 
+    let preserve = std::env::var_os("T262_PRESERVE").is_some();
     let mut files: Vec<PathBuf> = Vec::new();
     walk(&root.join("test"), &mut files);
     files.sort();
@@ -86,9 +87,18 @@ fn main() {
         }
         eligible_seen += 1;
 
-        let mut out = parse(&src);
+        let mut out = if preserve {
+            parse_with_source(&src)
+        } else {
+            parse(&src)
+        };
         let clean_parse = out.errors.is_empty();
-        let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
+        let mut cfg = Config::default();
+        if preserve {
+            cfg.preserve_function_source = true;
+            out.ast.set_preserve_source(true);
+        }
+        let _ = simplify_unit(&mut out.ast, &mut out.unit, &cfg);
         let cured_src = print_module(&out.ast, &out.unit);
 
         let mk = |body: &str| {
@@ -158,10 +168,12 @@ fn main() {
         if st_c != "ok" || out_o != out_c {
             // 已知不可保持面：Function.prototype.toString 源码文本
             // （cure 重排函数体）与箭头函数计算属性键（经 toString）。
-            if id.contains("built-ins/Function/prototype/toString")
-                || id.contains("computed-property-name-from-arrow-function-expression")
-                || id.contains("staging/sm/async-functions/toString")
-                || id.contains("staging/sm/generators/runtime")
+            // 保真模式下这些用例必须真正一致，不再计入豁免。
+            if !preserve
+                && (id.contains("built-ins/Function/prototype/toString")
+                    || id.contains("computed-property-name-from-arrow-function-expression")
+                    || id.contains("staging/sm/async-functions/toString")
+                    || id.contains("staging/sm/generators/runtime"))
             {
                 known += 1;
                 continue;

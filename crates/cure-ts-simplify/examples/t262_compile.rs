@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use cure_engine::Config;
-use cure_ts_parser::{parse, parse_module};
+use cure_ts_parser::{
+    parse, parse_module, parse_module_with_source, parse_with_source,
+};
 use cure_ts_print::print_module;
 use cure_ts_simplify::simplify_unit;
 
@@ -18,6 +20,7 @@ fn main() {
     let sample: usize = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(0);
     let offset: usize = std::env::var("T262_OFFSET").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let limit: usize = std::env::var("T262_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let preserve = std::env::var_os("T262_PRESERVE").is_some();
     let mut files = Vec::new();
     walk(&root.join("test"), &mut files);
     files.sort();
@@ -51,8 +54,23 @@ fn main() {
             .nth(1)
             .and_then(|s| s.split(']').next())
             .is_some_and(|f| f.contains("module"));
-        let mut out = if module { parse_module(&src) } else { parse(&src) };
-        let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
+        let mut out = if module {
+            if preserve {
+                parse_module_with_source(&src)
+            } else {
+                parse_module(&src)
+            }
+        } else if preserve {
+            parse_with_source(&src)
+        } else {
+            parse(&src)
+        };
+        let mut cfg = Config::default();
+        if preserve {
+            cfg.preserve_function_source = true;
+            out.ast.set_preserve_source(true);
+        }
+        let _ = simplify_unit(&mut out.ast, &mut out.unit, &cfg);
         let cured = print_module(&out.ast, &out.unit);
         let id = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().to_string();
         tests.push(T { id, orig: src, cured, module });
