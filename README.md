@@ -187,7 +187,7 @@ otherwise the locale is auto-detected. Full option reference: `cure --help`.
 | 7. Randomized JS differential | Deterministic PRNG generates valid programs mixing declarations, shadowing, `var` hoisting, closures, loops, ternaries, short circuits and templates; original vs cured run under `node` (stdout + exit code) and a second cure must be byte-identical (`CURE_FUZZ_CASES` scales the sample) | rule-combination semantics and first/second-pass convergence; 5,000 cases used during development |
 | 8. Python (2.7 + 3.13–3.15) | CPython 2.7 stdlib (1,609 UTF-8 sources), a 4,135-file Python 2 package corpus (Django 1.11, Twisted 20.3, pip 20.3, setuptools 44, requests, six, PyYAML), CPython 3.13/3.14/3.15 stdlibs (2,188 / 2,288 / 2,456 sources), 18,128 Python 3.14 site-packages files plus 1,083 / 422 files from the 3.13 / 3.15 sites: parse → print compared with that interpreter's `ast.dump`; a second cure must be byte-identical; every simplified file compiled by the same interpreter; curated programs executed | **0** parser diagnostics in all corpora; **32,289** AST-identical round-trips (5,736 Python 2 + 26,553 Python 3; 20 intentionally invalid/foreign fixtures excluded), **35,548/35,548** idempotent with 0 drift, **32,274** compile checks with **0 regressions** (35 originals were already uncompilable); curated stdout/exit codes match |
 
-`cargo test` runs 504 tests. The Test262 semantic differential reaches
+`cargo test` runs 519 tests. The Test262 semantic differential reaches
 **33,963/34,007 (99.87%) identical runs** in default mode; the only 44
 excluded cases compare `Function.prototype.toString` **source text** (cure
 reformats function bodies) or use arrow functions as computed-property keys,
@@ -217,7 +217,10 @@ site-packages tree add 26,553 AST-identical round-trips with 0 diagnostics,
 0 idempotency drift and 0 compile regressions; the 3.6 and 3.8 stdlibs are
 also clean (1,578 and 1,661 files). Across all corpora that is **32,289 AST
 comparisons, 35,548 idempotent files and 32,274 compilations, with 0
-regressions**. Curated Python 2 and 3 programs (print/exec/raise forms,
+regressions**; the simplifier performs **133,243 rewrites** (5,501 Python 2
+stdlib, 4,864 Python 2 packages, 7,700 Python 3.15 stdlib, 97,951 Python
+3.14 site-packages), while docstrings and version-visible types stay intact.
+Curated Python 2 and 3 programs (print/exec/raise forms,
 backticks, `<>`, long/int types, tuple parameters, decorators with
 triple-quoted arguments) execute side-by-side with identical stdout and exit
 codes. Non-UTF-8 source files (PEP 263 encodings other than UTF-8) are
@@ -278,12 +281,20 @@ when evaluation succeeds, never on the exception path),
 fernflower leftover, ≥23 sites in a 66-file corpus),
 new_string_char_array_fold (`new String(CHAR_ARRAY)`), empty_finally_strip, try_unwrap_no_catch, static_array_index_fold (literal array indexing), const_method_inline (single-return helper inlining — string decrypters), trailing_continue (label-aware tail continue removal).
 
-**Python (4):** `py_const_fold` (Python integer / floor-division / modulo /
-power domains, truthiness, `and`/`or` operand-return semantics),
-`py_const_if` (`if`/`while`/`IfExp` on literal conditions, guarded so
-`yield`/`global`/`nonlocal` are never dropped), `py_unreachable` (statements
-after `return`/`raise`/`break`/`continue`, same guards) and
-`py_pass_cleanup` (no-op `pass` removal while keeping a body non-empty).
+**Python (12):** `py_const_fold` (integer/boolean/string literals, string
+`+`/`*`, comparisons, truthiness, `and`/`or` operand-return semantics;
+long/float/exotic literals are never folded), `py_call_fold` (literal `str`
+methods — upper/lower/swapcase/capitalize/strip/replace/startswith/endswith/
+join — plus shadow-safe `len`/`ord`/`chr`/`str`/`int`/`abs`/`bool`/`min`/
+`max`), `py_subscript_fold` (literal string/list/tuple index and slice),
+`py_const_if`, `py_if_ternary` (single-assignment or single-return branches →
+conditional expression), `py_nested_if` (`if a: if b:` → `if a and b:`),
+`py_else_after_terminal` (drop `else` when the `if` body always terminates),
+`py_dead_store` (adjacent pure-literal overwrite), `py_dead_expr` (bare
+numeric/`None`/`...` expressions), `py_return_none` (`return None` →
+`return`), `py_unreachable` and `py_pass_cleanup`. Docstrings, Python 2
+int/long types, shadowed `True`/`False`/builtins (including `exec` and
+`import *`) and version-ambiguous forms are guarded.
 
 ## Performance
 
@@ -294,10 +305,10 @@ threads (cores × 1.5):
 |---|---|---|---|
 | Single file (stdin → stdout) | 1 | <10 ms | ~2 MiB |
 | Vendored test corpora | 3,999 | 0.6 s | ~110 MiB |
-| CPython 2.7 stdlib, output tree written | 1,609 | 0.23 s | ~90 MiB |
-| Python 2 package corpus, output tree written | 4,135 | 0.54 s | ~90 MiB |
+| CPython 2.7 stdlib, output tree written | 1,609 | 0.16 s | ~90 MiB |
+| Python 2 package corpus, output tree written | 4,135 | 0.40 s | ~90 MiB |
 | CPython 3.15 stdlib, output tree written | 2,456 | 0.3 s | ~150 MiB |
-| Python 3.14 site-packages, output tree written | 18,128 | 2.3 s | ~320 MiB |
+| Python 3.14 site-packages, output tree written | 18,128 | 1.8 s | ~370 MiB |
 | OpenJDK full source corpus, `--check` | 371,674 / 4.70 GB | 14.8 s | ~430 MiB |
 | OpenJDK full source corpus, output tree written | 371,674 / 4.70 GB | 27.5 s | ~430 MiB |
 
@@ -349,7 +360,7 @@ frontends (see also the ~100-line toy language in `cure-tree/tests/kit.rs`).
 - ✅ TS/JS backend: Test262 six layers, 0 parser diagnostics on npm corpora
 - ✅ Python 2.7 + 3.x backend: 35,548 stdlib/site-package files, 0
   diagnostics, 0 idempotency drift, 0 compile regressions
-- ✅ 12 vendored Java corpora, three-layer verification, 504 tests
+- ✅ 12 vendored Java corpora, three-layer verification, 519 tests
 - 🔜 Restoration rules V2 (reflective `addSuppressed` shapes, nested
   two-resource try-with-resources)
 - 🔜 Python rule-pack expansion (local propagation, docstring/whitespace

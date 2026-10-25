@@ -125,8 +125,12 @@ v = 1L and 2L
 fn py2_shadowed_true_false_are_not_folded() {
     let src = "True = 0\nFalse = 1\nif True:\n    x = 1\nelse:\n    x = 2\n";
     let out = cured(src);
-    assert!(out.contains("if True:"), "被遮蔽的 True 被折成常量：\n{out}");
-    assert!(out.contains("x = 1") && out.contains("x = 2"), "{out}");
+    // 分支可以合并成条件表达式，但 True 不能被当成常量折叠。
+    assert!(
+        out.contains("1 if True else 2"),
+        "被遮蔽的 True 被折成常量：\n{out}"
+    );
+    assert!(!out.contains("x = 1\n"), "{out}");
     assert_idempotent(src);
 
     // 形参/for 目标/lambda 参数同样是绑定。

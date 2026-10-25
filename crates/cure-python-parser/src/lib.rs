@@ -1851,6 +1851,14 @@ fn reindent_decorator(
 /// Python 2 的 True/False 可以被赋值；检测到绑定后就不要再把它们
 /// 当字面量折叠（Python 3 里这种绑定本身是语法错误，按名字处理也无害）。
 fn bool_literals_are_shadowed(toks: &[Token]) -> bool {
+    // Python 2 的 exec 可以在运行时改写 globals 里的 True/False；保守地
+    // 关闭该模块的布尔常量折叠。
+    if toks
+        .iter()
+        .any(|t| t.kind == TokKind::Name && t.text == "exec")
+    {
+        return true;
+    }
     for (i, t) in toks.iter().enumerate() {
         if t.kind != TokKind::Name || !matches!(t.text.as_str(), "True" | "False") {
             continue;
