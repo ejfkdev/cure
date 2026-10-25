@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "Python constant folding and control-flow simplification for cure"
 repository.workspace = true
+readme = "README.md"
 keywords = ["python", "simplifier", "deobfuscator"]
 categories = ["development-tools"]
 

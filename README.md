@@ -74,7 +74,7 @@ the same thing.
   (including `const` type parameters), `satisfies`/`as const`, `#x in o`,
   RegExp `v` flags and optional chains. Unsupported constructs stay verbatim
   instead of aborting.
-- **Python backend (2.7 + 3.15)** — `.py`/`.pyi` parse → simplify → print
+- **Python backend (2.7 + 3.x)** — `.py`/`.pyi` parse → simplify → print
   with a fault-tolerant, indentation-aware parser for both grammars. Python 2
   statements and literals (`print`, `exec`, `raise E, V`, backticks, `<>`,
   `1L`, `0777`, `ur"..."`, tuple parameters, `except E, e`, unparenthesized
@@ -85,8 +85,9 @@ the same thing.
   int/long types and `True`/`False` rebinding are preserved, and
   version-dependent forms stay byte-preserved when ambiguous. Dead branches
   containing `yield`/`global`/`nonlocal` are never dropped.
-- **64+ simplification rules** (language-agnostic engine rules + Java, TS and
-  Python packs), including control-flow flattening recovery, statement-level
+- **92 simplification rules** (66 Java defaults + 1 Java opt-in + 25
+  Python; 33 of the Java defaults are language-agnostic engine rules),
+  including control-flow flattening recovery, statement-level
   `StringBuilder` chain recovery, XOR-noise removal, and partial evaluation
   ("virtual execution") of literal-only JDK calls.
 - **Scales to real codebases** — the full OpenJDK source corpus
@@ -250,7 +251,7 @@ byte-identical output and preserved side-effect call sequences:
 
 ## Rule catalog
 
-**Engine (language-agnostic, 34):** `paren_removal`, `const_condition`,
+**Engine (language-agnostic, 33):** `paren_removal`, `const_condition`,
 `boolean_return`, `if_to_ternary`, `if_assign_ternary`, `if_else_empty`,
 `bool_compare`, `double_not`, `bool_not_fold`, `bool_short_circuit`,
 `not_compare`, `ternary_fold`, `ternary_bool`, `ternary_bool_op`,
@@ -261,11 +262,11 @@ concat constant merging `("a"+x)+"b"+"c" → "a"+x+"bc"`), `local_propagation`,
 `decl_assign_merge`, `assign_propagation` (copy-assignment inlining with
 block-scope declaration anchoring), `store_kill` (distant dead stores /
 register pre-declarations killed on the dominating path only),
-`multi_use_copy`, `trailing_return`, `trailing_continue` (label-aware),
-`inverse_assign_pair` (`x+=K;x-=K` register-noise pairs), `dead_store`, `store_kill`,
+`multi_use_copy`, `trailing_return`,
+`inverse_assign_pair` (`x+=K;x-=K` register-noise pairs), `dead_store`,
 `assign_back_fold` (`x=e; x=x+K` register accumulator folded into the decl), `dead_decl`, double_neg_fold (fold `-(-lit)`), block_flatten (unnecessary nested blocks collapse), opt-in `unreachable_after_terminal`.
 
-**Java-specific (23):** `cast_simplify`, `self_compare`,
+**Java-specific (33):** `cast_simplify`, `self_compare`,
 `string_builder_fold`, `box_unbox_chain`, `iterator_to_for_each`,
 `while_iterator_to_for_each`, `new_string_fold`, `loop_head_break` (incl.
 do-while shapes), `concat_value_of_drop`, `string_builder_statements`
@@ -280,7 +281,7 @@ when evaluation succeeds, never on the exception path),
 `twr_recover` + `string_switch_recover` (decompiler-shape restoration),
 `try_unwrap_rethrow` (`catch (E e) { throw e; }` unwrapping — the most frequent
 fernflower leftover, ≥23 sites in a 66-file corpus),
-new_string_char_array_fold (`new String(CHAR_ARRAY)`), empty_finally_strip, try_unwrap_no_catch, static_array_index_fold (literal array indexing), const_method_inline (single-return helper inlining — string decrypters), trailing_continue (label-aware tail continue removal).
+new_string_char_array_fold (`new String(CHAR_ARRAY)`), empty_finally_strip, try_unwrap_no_catch, static_array_index_fold (literal array indexing), const_method_inline (single-return helper inlining — string decrypters), trailing_continue (label-aware tail continue removal), static_exec, url_decode_fold, trailing_assign_return, dead_pure_call, ctor_delegation_hoist, trailing_else_flatten, trailing_if_continue, const_field_propagate, noop_private_call.
 
 **Python (25):** `py_const_fold` (integer/boolean/string literals, string
 `+`/`*`, comparisons, truthiness, `and`/`or` operand-return semantics;
@@ -319,10 +320,10 @@ threads (cores × 1.5):
 |---|---|---|---|
 | Single file (stdin → stdout) | 1 | <10 ms | ~2 MiB |
 | Vendored test corpora | 3,999 | 0.6 s | ~110 MiB |
-| CPython 2.7 stdlib, output tree written | 1,609 | 0.16 s | ~90 MiB |
-| Python 2 package corpus, output tree written | 4,135 | 0.40 s | ~90 MiB |
-| CPython 3.15 stdlib, output tree written | 2,456 | 0.3 s | ~150 MiB |
-| Python 3.14 site-packages, output tree written | 18,128 | 1.8 s | ~370 MiB |
+| CPython 2.7 stdlib, output tree written | 1,609 | 0.18 s | ~85 MiB |
+| Python 2 package corpus, output tree written | 4,135 | 0.38 s | ~75 MiB |
+| CPython 3.15 stdlib, output tree written | 2,456 | 0.35 s | ~150 MiB |
+| Python 3.14 site-packages, output tree written | 18,128 | 1.6 s | ~285 MiB |
 | OpenJDK full source corpus, `--check` | 371,674 / 4.70 GB | 14.8 s | ~430 MiB |
 | OpenJDK full source corpus, output tree written | 371,674 / 4.70 GB | 27.5 s | ~430 MiB |
 

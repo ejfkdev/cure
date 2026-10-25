@@ -261,11 +261,13 @@ fn rules_subcommand_lists_catalog() {
             .args(args)
             .assert()
             .success()
-            .stdout(predicate::str::contains("simplification rules"))
+            .stdout(predicate::str::contains("92 simplification rules (67 Java + 25 Python)"))
             .stdout(predicate::str::contains("const_fold_bin"))
             .stdout(predicate::str::contains("cff_recover"))
-            // 默认/选配分组与 --disable 提示
-            .stdout(predicate::str::contains("Enabled by default"))
+            // 默认/选配分组、Python 目录与 --disable 提示
+            .stdout(predicate::str::contains("Java enabled by default"))
+            .stdout(predicate::str::contains("Java opt-in"))
+            .stdout(predicate::str::contains("Python (default, 25)"))
             .stdout(predicate::str::contains("--disable"));
     }
 }

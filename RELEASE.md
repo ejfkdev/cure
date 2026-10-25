@@ -1,6 +1,6 @@
 # Release checklist
 
-`cure` ships six raw binaries from a tag (`vX.Y.Z`) and publishes 11 crates
+`cure` ships six raw binaries from a tag (`vX.Y.Z`) and publishes 15 crates
 to crates.io in dependency order.
 
 1. **Bump the version everywhere**: `scripts/bump-version.sh X.Y.Z`
@@ -11,21 +11,26 @@ to crates.io in dependency order.
    `## [X.Y.Z] - YYYY-MM-DD` and refresh the compare links.
 3. **Verify locally**:
    - `cargo test --workspace --release`
-   - `cargo publish --dry-run -p cure-engine` (the only crate with no
-     `cure-*` dependency; later crates can only be dry-run after their
-     upstream version is on crates.io)
+   - `cargo publish --dry-run -p cure-engine` and `-p cure-tree` (the two
+     crates with no `cure-*` dependency; later crates can only be dry-run
+     after their upstream version is on crates.io)
    - Optional full corpora: the Test262 six-layer examples and the npm
      corpus checks documented in README.
 4. **Commit** the version bump and docs.
 5. **Tag and push**:
    ```bash
-   git tag -a vX.Y.Z -m "cure X.Y.Z"
+   git tag -a vX.Y.Z -F - <<'EOF'
+   cure X.Y.Z
+
+   <release highlights and verification numbers>
+   EOF
    git push origin main
    git push origin vX.Y.Z
    ```
-   The tag body becomes the GitHub Release description. The release
-   workflow builds all six targets, stages raw `cure-vX.Y.Z-<target>`
-   assets, and runs `scripts/publish.sh` for crates.io.
+   The tag subject and body become the GitHub Release description. The
+   release workflow builds all six targets, stages raw
+   `cure-vX.Y.Z-<target>` assets, and runs `scripts/publish.sh` for
+   crates.io (15 crates, idempotent on re-runs).
 6. **Preconditions**: repository secret `CARGO_REGISTRY_TOKEN` must be valid
    (crates.io token with `publish-new` + `publish-update`); CI must be green
    on the tagged commit.

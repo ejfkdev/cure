@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "Fault-tolerant TypeScript/JavaScript parser (lexer + ASI + modern syntax) for cure"
 repository.workspace = true
+readme = "README.md"
 keywords = ["typescript", "javascript", "parser", "deobfuscator"]
 categories = ["development-tools", "parser-implementations"]
 

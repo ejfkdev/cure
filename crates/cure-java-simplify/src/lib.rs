@@ -6307,8 +6307,9 @@ pub fn default_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
 /// 全量规则（含 DCE 类选配项：不可达语句删除等）。
 pub fn all_java_rules() -> Vec<Box<dyn Rule<JavaAst>>> {
     let mut rules = default_java_rules();
-    let mut engine_all = cure_engine::rules::all_rules();
-    rules.append(&mut engine_all);
+    // 只补 default_java_rules 尚未包含的引擎选配规则；追加整个
+    // all_rules() 会把 33 条引擎默认规则重复一遍。
+    rules.push(Box::new(cure_engine::rules::UnreachableAfterTerminal));
     rules
 }
 

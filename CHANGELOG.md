@@ -5,9 +5,9 @@
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-10-25
+## [0.2.0] - 2026-10-26
 
-### 新增（Python 2.7 + 3.15 后端）
+### 新增（Python 2.7 + 3.x 后端）
 
 - **新语言后端**：新增 `cure-python-ast` / `cure-python-parser` /
   `cure-python-print` / `cure-python-simplify` 四个 crate 并接入 CLI；
@@ -73,7 +73,13 @@
 - `--check` 与统计中的「改写」改为按**输出文本**判定：此前按规则编辑
   次数计算，已收敛文件可能因打印不可见的 AST 归一被误报为可改写；
 - 目录模式的输出路径提示改为实际写入根（此前显示成输入目录的兄弟路径）；
-- `cure rules`、`--help` 与 README（中英）增加 Python 后端与规则说明。
+- `cure rules` 标题汇总 Java + Python 规则数，并明确 Java / Python
+  分组；`--lang` 帮助补上 `pyi`，示例增加 Python 用法；
+- README（中英）规则清单补齐 33 条 Java 专属规则并修正引擎规则数，
+  同步性能/测试数字；RELEASE.md 更新为 15 个 crate；
+- TS/Python 子 crate 增加 crates.io README 与 keywords/categories；
+  `.gitattributes` 将 Java 测试语料标记为 vendored，GitHub 语言统计
+  聚焦 Rust 代码。
 
 ### 验证
 
@@ -709,6 +715,8 @@ var b=2;`——`b` 变成非导出（模块语义改变）。
 - 跨平台批量 I/O：Linux `io_uring` feature（read syscall 6,977 → 10，
   syscall 时长 −53%）；macOS/Windows 线程池；默认构建零运行时依赖
 
-[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ejfkdev/cure/releases/tag/v0.2.0
+[0.1.11]: https://github.com/ejfkdev/cure/releases/tag/v0.1.11
 [0.1.10]: https://github.com/ejfkdev/cure/releases/tag/v0.1.10
 [0.1.0]: https://github.com/ejfkdev/cure/releases/tag/v0.1.0

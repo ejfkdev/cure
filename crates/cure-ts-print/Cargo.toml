@@ -5,7 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
 description = "Code printer for cure's TypeScript/JavaScript backend"
+keywords = ["typescript", "javascript", "formatter", "deobfuscator"]
+categories = ["development-tools"]
 
 [dependencies]
 cure-engine = { path = "../cure-engine", version = "0.2.0" }

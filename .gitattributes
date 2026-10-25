@@ -1,0 +1,9 @@
+# Vendored third-party test corpora: keep GitHub language statistics focused
+# on cure's own code (the Java corpus alone is ~4,000 files).
+crates/cure-java-simplify/tests/corpus_data/** linguist-vendored
+
+# Binary fixtures
+*.jar binary
+*.zip binary
+*.jcod binary
+*.class binary

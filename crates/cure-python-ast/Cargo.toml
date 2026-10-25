@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "Python AST (arena + PyId) for the cure simplifier engine"
 repository.workspace = true
+readme = "README.md"
 keywords = ["python", "ast", "deobfuscator", "simplifier"]
 categories = ["development-tools"]
 

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "Python source printer/formatter for cure"
 repository.workspace = true
+readme = "README.md"
 keywords = ["python", "formatter", "printer", "deobfuscator"]
 categories = ["development-tools"]
 

@@ -40,11 +40,10 @@ fn print_help_en() {
     println!("  cure help [COMMAND]                this help, or one command's");
     println!("  cure version | -h | -V");
     println!();
-    println!(
-        "Languages: java, typescript/javascript, python 2.7/3.x (this release). The CLI and engine are"
-    );
-    println!("new backends register in LANG_BACKENDS and get the whole pipeline");
-    println!("(traversal, parallelism, --check/--diff/--stats, batched I/O).");
+    println!("Languages: java, typescript/javascript, python 2.7/3.x (this release).");
+    println!("The CLI and engine are language-agnostic: a new backend registers in");
+    println!("LANG_BACKENDS and gets the whole pipeline (traversal, parallelism,");
+    println!("--check/--diff/--stats, batched I/O).");
     println!();
     println!("Language: CURE_LANG=zh|en forces; otherwise auto-detected from the");
     println!("locale environment (on Windows: the system UI language).");
@@ -60,9 +59,7 @@ fn print_help_en() {
     println!("      --check              dry run: exit 2 if rewritable; write nothing");
     println!("  -j, --threads <N>        worker threads (default: CPU cores × 1.5)");
     println!("      --format-only        format only, no simplification");
-    println!(
-        "  -l, --lang <name>        force java | ts/js/typescript/javascript | py/python/python3"
-    );
+    println!("  -l, --lang <name>        force java | ts/js/typescript/javascript | py/python/python3/pyi");
     println!("      --ext <list>         only given extensions (comma/space separated)");
     println!("      --copy-other         dir mode: copy non-source files verbatim");
     println!("      --diff               print unified diffs of rewritten files");
@@ -86,6 +83,10 @@ fn print_help_en() {
     println!("  # one file to stdout");
     println!("  echo 'class A{{int m(){{int a=foo();int b=a;return b;}}}}' | cure -");
     println!("  cure Input.java");
+    println!();
+    println!("  # Python 2.7 / 3.x (.py/.pyi auto-detected; -l py forces it)");
+    println!("  cure Script.py");
+    println!("  cure src/ -l py");
     println!();
     println!("  # a directory — mirror into src-cure-out/, hierarchy preserved");
     println!("  cure src/");
@@ -119,9 +120,9 @@ fn print_help_zh() {
     println!("  cure help [子命令]                本帮助，或某子命令的帮助");
     println!("  cure version | -h | -V");
     println!();
-    println!("语言后端: java、typescript/javascript、python 2.7/3.x（本版）。CLI 与引擎均语言无关——");
-    println!("LANG_BACKENDS 登记一条即获得全部基础设施（目录遍历/并行/");
-    println!("--check/--diff/--stats/批量 I/O）。");
+    println!("语言后端: java、typescript/javascript、python 2.7/3.x（本版）。");
+    println!("CLI 与引擎均语言无关：在 LANG_BACKENDS 登记一条即获得全部基础设施");
+    println!("（目录遍历/并行/--check/--diff/--stats/批量 I/O）。");
     println!();
     println!("语言: CURE_LANG=zh|en 强制指定；否则按 locale 环境自动检测");
     println!("（Windows：系统 UI 语言）。");
@@ -137,7 +138,7 @@ fn print_help_zh() {
     println!("  -j, --threads <N>        并行工作线程数（默认=CPU 核心数 × 1.5）");
     println!("      --format-only        仅格式化，不做简化");
     println!(
-        "  -l, --lang <语言>      强制 java | ts/js/typescript/javascript | py/python/python3"
+        "  -l, --lang <语言>      强制 java | ts/js/typescript/javascript | py/python/python3/pyi"
     );
     println!("      --ext <后缀列表>     只处理指定后缀（逗号或空格分隔）");
     println!("      --copy-other         目录模式：不受处理的文件原样拷入输出树");
@@ -161,6 +162,10 @@ fn print_help_zh() {
     println!("  # 单文件到 stdout");
     println!("  echo 'class A{{int m(){{int a=foo();int b=a;return b;}}}}' | cure -");
     println!("  cure Input.java");
+    println!();
+    println!("  # Python 2.7 / 3.x（.py/.pyi 自动识别；-l py 强制指定）");
+    println!("  cure Script.py");
+    println!("  cure src/ -l py");
     println!();
     println!("  # 目录——镜像到 src-cure-out/，保持层级结构");
     println!("  cure src/");
@@ -197,19 +202,28 @@ fn rule_catalog() -> (Vec<&'static str>, Vec<&'static str>) {
 
 fn print_rules_en() {
     let (defaults, opt_in) = rule_catalog();
-    println!("cure rules — {} simplification rules", defaults.len() + opt_in.len());
+    let py = cure_python_simplify::default_rules();
+    let java = defaults.len() + opt_in.len();
+    println!(
+        "cure rules — {} simplification rules ({} Java + {} Python)",
+        java + py.len(),
+        java,
+        py.len()
+    );
     println!("Names are what --disable takes.");
     println!();
-    println!("Enabled by default ({}):", defaults.len());
+    println!("Java enabled by default ({}):", defaults.len());
     for n in &defaults {
         println!("  {n}");
     }
     println!();
-    println!("Opt-in ({}; --dead-code enables unreachable_after_terminal):", opt_in.len());
+    println!(
+        "Java opt-in ({}; available through the library API):",
+        opt_in.len()
+    );
     for n in &opt_in {
         println!("  {n}");
     }
-    let py = cure_python_simplify::default_rules();
     println!();
     println!("Python (default, {}):", py.len());
     for n in py {
@@ -221,19 +235,28 @@ fn print_rules_en() {
 
 fn print_rules_zh() {
     let (defaults, opt_in) = rule_catalog();
-    println!("cure rules — 共 {} 条简化规则", defaults.len() + opt_in.len());
+    let py = cure_python_simplify::default_rules();
+    let java = defaults.len() + opt_in.len();
+    println!(
+        "cure rules — 共 {} 条简化规则（Java {} + Python {}）",
+        java + py.len(),
+        java,
+        py.len()
+    );
     println!("名字即 --disable 的取值。");
     println!();
-    println!("默认启用（{} 条）：", defaults.len());
+    println!("Java 默认启用（{} 条）：", defaults.len());
     for n in &defaults {
         println!("  {n}");
     }
     println!();
-    println!("选配（{} 条；--dead-code 启用 unreachable_after_terminal）：", opt_in.len());
+    println!(
+        "Java 选配（{} 条；通过库 API 启用）：",
+        opt_in.len()
+    );
     for n in &opt_in {
         println!("  {n}");
     }
-    let py = cure_python_simplify::default_rules();
     println!();
     println!("Python（默认启用，{} 条）：", py.len());
     for n in py {

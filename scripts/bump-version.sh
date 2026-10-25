@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 统一更新 workspace 与所有 cure-* crate 依赖版本，并刷新 Cargo.lock。
-# 用法: scripts/bump-version.sh 0.1.11
+# 用法: scripts/bump-version.sh X.Y.Z
 set -euo pipefail
 cd "$(dirname "$0")/.."
 NEW="${1:?usage: scripts/bump-version.sh X.Y.Z}"

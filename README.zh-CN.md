@@ -61,7 +61,7 @@ class B {                                     class B {
   static 块、`using`/`await using`、导入属性/`defer`/`source`、顶层
   await、泛型函数/箭头（含 `const` 类型参数）、`satisfies`/`as const`、
   `#x in o`、RegExp `v` 标志与可选链；未建模结构原文保真，不中断。
-- **Python 后端（2.7 + 3.15）** —— `.py`/`.pyi` 全流程解析 → 简化 → 打印，
+- **Python 后端（2.7 + 3.x，至 3.15）** —— `.py`/`.pyi` 全流程解析 → 简化 → 打印，
   容错缩进解析器同时接受两套语法：Python 2 的 print/exec/raise 语句、反引号、
   `<>`、`1L`、`0777`、`ur"..."`、元组形参、`except E, e`、无括号推导式元组，
   与 PEP 701、t-string、match、海象、except*、PEP 695、lazy import 共存。
@@ -69,9 +69,9 @@ class B {                                     class B {
   返回操作数、真值）；Python 2 int/long 类型与 True/False 重绑定保持健全，
   版本相关写法在歧义时逐字节保留；含 `yield`/`global`/`nonlocal` 的死分支
   一律不删。
-- **64+ 条简化规则**（引擎通用 + Java/TS/Python 规则包），含控制流扁平化
-  还原、语句级 StringBuilder 链还原、XOR 噪声剥除、纯字面量 JDK 调用
-  的部分求值（"虚拟执行"）。
+- **92 条简化规则**（66 条 Java 默认 + 1 条 Java 选配 + 25 条 Python；
+  其中 33 条为引擎通用规则），含控制流扁平化还原、语句级 StringBuilder
+  链还原、XOR 噪声剥除、纯字面量 JDK 调用的部分求值（"虚拟执行"）。
 - **真实代码库规模** —— OpenJDK 全源码语料（371,674 文件 / 4.7 GB）
   在 18 核笔记本上约 15 秒处理完，0 解析失败、0 panic。TS/JS 侧：
   13 MB 压缩 bundle 约 5 秒（增量 effect 缓存前约 32 秒），4,358 个
@@ -217,7 +217,7 @@ UTF-8 源码；其他 PEP 263 编码文件会跳过（上面的 Python 2 标准�
 
 ## 规则清单
 
-**引擎通用（34）**：`paren_removal`、`const_condition`、`boolean_return`、
+**引擎通用（33）**：`paren_removal`、`const_condition`、`boolean_return`、
 `if_to_ternary`、`if_assign_ternary`、`if_else_empty`、`bool_compare`、
 `double_not`、`bool_not_fold`、`bool_short_circuit`、`not_compare`、
 `ternary_fold`、`ternary_bool`、`ternary_bool_op`、`const_fold_bin`
@@ -227,11 +227,11 @@ UTF-8 源码；其他 PEP 263 编码文件会跳过（上面的 Python 2 标准�
 `("a"+x)+"b"+"c" → "a"+x+"bc"`）、`local_propagation`、
 `decl_assign_merge`、`assign_propagation`（拷贝赋值内联，块内声明锚点
 防逃逸）、`store_kill`（支配路径击杀远距死存储/寄存器预声明）、
-`multi_use_copy`、`trailing_return`、`trailing_continue`（标签感知）、
+`multi_use_copy`、`trailing_return`、
 `inverse_assign_pair`（`x+=K;x-=K` 寄存器噪声对抵消）、`assign_back_fold`（`x=e; x=x+K`
-寄存器累加折回声明）、`dead_decl`（零使用死声明删除）、`dead_store`、`store_kill`、double_neg_fold（`-(-lit)` 折叠）、block_flatten（无谓嵌套块塌平）、选配 `unreachable_after_terminal`。
+寄存器累加折回声明）、`dead_decl`（零使用死声明删除）、`dead_store`、double_neg_fold（`-(-lit)` 折叠）、block_flatten（无谓嵌套块塌平）、选配 `unreachable_after_terminal`。
 
-**Java 专属（23）**：`cast_simplify`、`self_compare`、
+**Java 专属（33）**：`cast_simplify`、`self_compare`、
 `string_builder_fold`、`box_unbox_chain`、`iterator_to_for_each`、
 `while_iterator_to_for_each`、`new_string_fold`、`loop_head_break`
 （含 do-while 形态）、`concat_value_of_drop`、
@@ -244,7 +244,7 @@ UTF-8 源码；其他 PEP 263 编码文件会跳过（上面的 Python 2 标准�
 `base64_new_string_fold`、`cff_recover`（控制流扁平化还原）、
 `twr_recover` + `string_switch_recover`（反编译形态还原）、
 `try_unwrap_rethrow`（`catch (E e) { throw e; }` 纯重抛剥除——fernflower
-最高频残迹，66 文件语料 ≥23 处）、new_string_char_array_fold（`new String(CHAR_ARRAY)`）、empty_finally_strip、try_unwrap_no_catch、static_array_index_fold（字面量数组下标）、const_method_inline（单 return helper 内联——解密器）、trailing_continue（标签感知尾 continue 删除）、
+最高频残迹，66 文件语料 ≥23 处）、new_string_char_array_fold（`new String(CHAR_ARRAY)`）、empty_finally_strip、try_unwrap_no_catch、static_array_index_fold（字面量数组下标）、const_method_inline（单 return helper 内联——解密器）、trailing_continue（标签感知尾 continue 删除）、static_exec、url_decode_fold、trailing_assign_return、dead_pure_call、ctor_delegation_hoist、trailing_else_flatten、trailing_if_continue、const_field_propagate、noop_private_call。
 
 **Python 专属（25）**：`py_const_fold`（整数/布尔/字符串字面量、字符串
 `+`/`*`、比较、真值、`and`/`or` 返回操作数；long/浮点/复杂字面量不折）、
@@ -278,10 +278,10 @@ release 构建、18 核 Apple Silicon 笔记本、页缓存热、默认线程数
 |---|---|---|---|
 | 单文件（stdin → stdout） | 1 | <10 ms | ~2 MiB |
 | 入库测试语料 | 3,999 | 0.6 s | ~110 MiB |
-| CPython 2.7 标准库，写出输出树 | 1,609 | 0.16 s | ~90 MiB |
-| Python 2 包语料，写出输出树 | 4,135 | 0.40 s | ~90 MiB |
-| CPython 3.15 标准库，写出输出树 | 2,456 | 0.3 s | ~150 MiB |
-| Python 3.14 site-packages，写出输出树 | 18,128 | 1.8 s | ~370 MiB |
+| CPython 2.7 标准库，写出输出树 | 1,609 | 0.18 s | ~85 MiB |
+| Python 2 包语料，写出输出树 | 4,135 | 0.38 s | ~75 MiB |
+| CPython 3.15 标准库，写出输出树 | 2,456 | 0.35 s | ~150 MiB |
+| Python 3.14 site-packages，写出输出树 | 18,128 | 1.6 s | ~285 MiB |
 | OpenJDK 全源码语料，`--check` | 371,674 / 4.70 GB | 14.8 s | ~430 MiB |
 | OpenJDK 全源码语料，写出输出树 | 371,674 / 4.70 GB | 27.5 s | ~430 MiB |
 

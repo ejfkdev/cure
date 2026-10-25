@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "TypeScript/JavaScript AST (arena + TsId) for the cure simplifier engine"
 repository.workspace = true
+readme = "README.md"
 keywords = ["typescript", "javascript", "ast", "deobfuscator", "simplifier"]
 categories = ["development-tools"]
 
