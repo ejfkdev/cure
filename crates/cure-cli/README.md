@@ -8,7 +8,8 @@
 [cure](https://github.com/ejfkdev/cure) simplification engine: a
 fault-tolerant, semantic-preserving code simplifier/formatter that turns
 decompiled code back into something a human would have written. The CLI is
-language-agnostic (**Java is the backend implemented today**) — a new
+language-agnostic (**Java and TypeScript/JavaScript are the backends
+implemented today**) — a new
 language registers in `LANG_BACKENDS` (extensions + pipeline function) and
 inherits traversal, parallelism, `--check`/`--diff`/`--stats`, and the
 cross-platform batched I/O for free.
@@ -24,6 +25,10 @@ echo 'class A{int m(){int a=foo();int b=a;return b;}}' | cure -
 #         return foo();
 #     }
 # }
+
+echo 'const x = 1 + 2; console.log(x);' | cure --lang ts -
+# const x = 3;
+# console.log(3);
 ```
 
 Highlights:

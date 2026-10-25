@@ -58,6 +58,7 @@ fn print_help_en() {
     println!("      --check              dry run: exit 2 if rewritable; write nothing");
     println!("  -j, --threads <N>        worker threads (default: CPU cores × 1.5)");
     println!("      --format-only        format only, no simplification");
+    println!("  -l, --lang <name>        force java | ts/js/typescript/javascript");
     println!("      --ext <list>         only given extensions (comma/space separated)");
     println!("      --copy-other         dir mode: copy non-source files verbatim");
     println!("      --diff               print unified diffs of rewritten files");
@@ -127,6 +128,7 @@ fn print_help_zh() {
     println!("      --check              干跑：有可优化改写 → 退出码 2，不写出");
     println!("  -j, --threads <N>        并行工作线程数（默认=CPU 核心数 × 1.5）");
     println!("      --format-only        仅格式化，不做简化");
+    println!("  -l, --lang <语言>      强制 java | ts/js/typescript/javascript");
     println!("      --ext <后缀列表>     只处理指定后缀（逗号或空格分隔）");
     println!("      --copy-other         目录模式：不受处理的文件原样拷入输出树");
     println!("      --diff               打印被改写文件的统一 diff");

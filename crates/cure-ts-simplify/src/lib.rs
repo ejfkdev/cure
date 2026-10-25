@@ -201,7 +201,6 @@ fn remove_dead_module_items(ast: &mut TsAst, unit: &mut ModuleUnit) -> usize {
         }
         out
     };
-    let mut removed = 0usize;
     let mut drop_indices: Vec<usize> = Vec::new();
     // Group 项（`var a=…,b=…`）：逐声明判定，保留存活声明重建 Group。
     // 组内引用必须**排除候选自身**、保留其它兄弟（`var p=…,e=f(p)`：
@@ -292,7 +291,7 @@ fn remove_dead_module_items(ast: &mut TsAst, unit: &mut ModuleUnit) -> usize {
             _ => {}
         }
     }
-    removed = 0;
+    let mut removed = 0usize;
     // 先应用到 Group（不改项数），再删除整项（逆序保下标）
     for (i, new_item) in group_rebuild {
         match new_item {

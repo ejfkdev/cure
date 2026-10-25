@@ -62,8 +62,12 @@ class B {                                     class B {
 # 从 crates.io
 cargo install cure-cli
 
-# 或从 GitHub Releases 下载预编译二进制
-curl -L https://github.com/ejfkdev/cure/releases/latest/download/cure-<target>.tar.gz | tar xz
+# 或经 cargo-binstall 安装预编译二进制
+cargo binstall cure-cli
+
+# 或从 GitHub Releases 直接下载裸二进制（无压缩包）：
+# 资产命名为 cure-vX.Y.Z-<target>
+# https://github.com/ejfkdev/cure/releases
 
 # 或从源码
 git clone https://github.com/ejfkdev/cure
@@ -81,6 +85,12 @@ class A {
         return foo();
     }
 }
+```
+
+```bash
+echo 'const x = 1 + 2; console.log(x);' | cure --lang ts -
+# const x = 3;
+# console.log(3);
 ```
 
 ```text

@@ -10,8 +10,6 @@ keywords = ["typescript", "javascript", "parser", "deobfuscator"]
 categories = ["development-tools", "parser-implementations"]
 
 [dependencies]
-cure-engine = { path = "../cure-engine", version = "0.1.9" }
-cure-ts-ast = { path = "../cure-ts-ast", version = "0.1.9" }
+cure-engine = { path = "../cure-engine", version = "0.1.10" }
+cure-ts-ast = { path = "../cure-ts-ast", version = "0.1.10" }
 
-[dev-dependencies]
-cure-ts-print = { path = "../cure-ts-print", version = "0.1.9" }

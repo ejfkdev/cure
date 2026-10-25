@@ -20,10 +20,8 @@
 //!   非 locale 版本一致；locale 变体不在折叠域）
 //! - `x + y` 的字符串胁迫不在本层（引擎 fold_lit_bin 已按 JS 域处理）
 
-use std::collections::HashMap;
-
 use cure_engine::kind::{LitRef, NodeKind};
-use cure_engine::{Config, Edit, Effect, Lang, Report, RewriteCtx, Rule};
+use cure_engine::{Edit, Effect, Lang, RewriteCtx, Rule};
 use cure_ts_ast::{format_js_number, JsLit, NodeData, TsAst, TsId};
 
 // ---------------------------------------------------------------------------
@@ -858,18 +856,13 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(clean.len() * 3 / 4);
     let mut buf = 0u32;
     let mut bits = 0u32;
-    let mut pad = 0usize;
     for (i, &c) in clean.iter().enumerate() {
         if c == b'=' {
-            pad += 1;
             // '=' 之后只允许 '='
             if clean[i..].iter().any(|&b| b != b'=') {
                 return None;
             }
             break;
-        }
-        if pad > 0 {
-            return None;
         }
         let v = lut[c as usize];
         if v == 255 {

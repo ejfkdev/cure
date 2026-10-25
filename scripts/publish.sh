@@ -31,12 +31,18 @@ if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
 fi
 
 # --- 依赖拓扑序（被依赖者在前）---
-# 正确拓扑序（parser 依赖 print——首次发布时 print 排在 parser 之后
-# 曾使 parser 找不到上游 crate 而失败，实测抓获）：
-# engine → tree → java-ast → java-print → java-parser → simplify → cli
+# 正确拓扑序（Java parser 依赖 print；TS parser 只依赖 ts-ast，ts-print
+# 的 dev-dependency 在 parser 发布后才可见。曾漏掉全部 cure-ts-* 导致
+# CLI 发布时找不到上游 crate）：
+# engine → tree → ts-ast → ts-parser → ts-print → ts-simplify
+#        → java-ast → java-print → java-parser → java-simplify → cli
 CRATES=(
   cure-engine
   cure-tree
+  cure-ts-ast
+  cure-ts-parser
+  cure-ts-print
+  cure-ts-simplify
   cure-java-ast
   cure-java-print
   cure-java-parser

@@ -77,8 +77,12 @@ the same thing.
 # from crates.io
 cargo install cure-cli
 
-# or a prebuilt binary from GitHub Releases
-curl -L https://github.com/ejfkdev/cure/releases/latest/download/cure-<target>.tar.gz | tar xz
+# or a prebuilt binary via cargo-binstall
+cargo binstall cure-cli
+
+# or download a raw (uncompressed) binary from GitHub Releases:
+# assets are named cure-vX.Y.Z-<target>, no archive wrapper
+# https://github.com/ejfkdev/cure/releases
 
 # or from source
 git clone https://github.com/ejfkdev/cure
@@ -96,6 +100,12 @@ class A {
         return foo();
     }
 }
+```
+
+```bash
+echo 'const x = 1 + 2; console.log(x);' | cure --lang ts -
+# const x = 3;
+# console.log(3);
 ```
 
 ```text

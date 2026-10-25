@@ -58,6 +58,35 @@ fn backend_for_ext(ext: &str) -> Option<&'static LangBackend> {
     LANG_BACKENDS.iter().find(|b| b.exts.contains(&ext))
 }
 
+/// 显式语言名/别名 → 后端。
+fn backend_for_lang(name: &str) -> Option<&'static LangBackend> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "java" => Some(&LANG_BACKENDS[0]),
+        "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs"
+        | "typescript" | "javascript" => Some(&LANG_BACKENDS[1]),
+        _ => None,
+    }
+}
+
+fn selected_backend(opts: &Options, path: Option<&Path>) -> Result<&'static LangBackend, String> {
+    if let Some(lang) = &opts.lang {
+        return backend_for_lang(lang).ok_or_else(|| format!("未知语言 `{lang}`"));
+    }
+    if let Some(p) = path {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !ext.is_empty() {
+            if let Some(b) = backend_for_ext(&ext) {
+                return Ok(b);
+            }
+        }
+    }
+    Ok(&LANG_BACKENDS[0])
+}
+
 /// 全部已实现后端的后缀并集（目录遍历的默认收集集）。
 fn supported_exts() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
@@ -169,6 +198,8 @@ struct Options {
     /// JDK 路径（Class.forName 存在性精确验证；未指定走 java.base 白名单）
     jdk_home: Option<String>,
     strict: bool,
+    /// 显式语言后端（`--lang java|ts|js`）；未指定时按文件后缀/默认后端。
+    lang: Option<String>,
     stdin: bool,
     /// 工作线程数（0/None = 自动；见 worker_threads()）
     threads: usize,
@@ -212,6 +243,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         dead_code: false,
         jdk_home: None,
         strict: false,
+        lang: None,
         stdin: false,
         threads: 0,
     };
@@ -247,6 +279,16 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 i += 1;
                 let v = args.get(i).ok_or("missing value for --output")?;
                 opts.output = Some(PathBuf::from(v));
+            }
+            "--lang" | "-l" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for --lang")?;
+                if backend_for_lang(v).is_none() {
+                    return Err(format!(
+                        "未知语言 `{v}`（可选：java、ts/js/typescript/javascript、tsx/jsx/mjs/cjs）"
+                    ));
+                }
+                opts.lang = Some(v.to_ascii_lowercase());
             }
             "--ext" => {
                 i += 1;
@@ -477,8 +519,8 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         std::io::stdin()
             .read_to_string(&mut src)
             .map_err(|e| format!("读取 stdin 失败: {e}"))?;
-        // stdin 无文件名/后缀：按注册表首个后端处理（多语言后可加 --lang 选择）
-        let backend = &LANG_BACKENDS[0];
+        // stdin 无文件名/后缀：`--lang` 显式选择，否则回退 Java。
+        let backend = selected_backend(&opts, None)?;
         let r = (backend.process)(&src, &opts, None, "<stdin>")?;
         return Ok(final_code_opts(r.changed, r.errored, &opts));
     }
@@ -624,7 +666,9 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
-        let backend = if ext.is_empty() {
+        let backend = if let Some(lang) = &opts.lang {
+            backend_for_lang(lang).expect("validated --lang")
+        } else if ext.is_empty() {
             &LANG_BACKENDS[0]
         } else if let Some(b) = backend_for_ext(&ext) {
             b
@@ -713,7 +757,11 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                                 .and_then(|e| e.to_str())
                                 .map(|e| e.to_ascii_lowercase())
                                 .unwrap_or_default();
-                            let backend = backend_for_ext(&ext).unwrap_or(&LANG_BACKENDS[0]);
+                            let backend = if let Some(lang) = &opts.lang {
+                                backend_for_lang(lang).expect("validated --lang")
+                            } else {
+                                backend_for_ext(&ext).unwrap_or(&LANG_BACKENDS[0])
+                            };
                             let r = (backend.process)(&src, &opts, out_path.clone(), &display)?;
                             my.push((i, r));
                         }
@@ -1418,5 +1466,12 @@ mod tests {
         assert!(r.is_err());
         // 无输入
         assert!(run(&[]).is_err());
+        // 显式语言别名
+        assert_eq!(backend_for_lang("ts").unwrap().name, "typescript/javascript");
+        assert_eq!(backend_for_lang("js").unwrap().name, "typescript/javascript");
+        assert_eq!(backend_for_lang("java").unwrap().name, "java");
+        assert!(backend_for_lang("bogus").is_none());
+        let opts = parse_args(&["--lang".into(), "ts".into(), "-".into()]).unwrap();
+        assert_eq!(opts.lang.as_deref(), Some("ts"));
     }
 }

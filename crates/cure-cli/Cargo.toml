@@ -1,13 +1,13 @@
 [package]
 name = "cure-cli"
-description = "CLI for cure: fault-tolerant Java simplifier/formatter (source in, source out)"
+description = "CLI for cure: fault-tolerant Java and TypeScript/JavaScript simplifier/formatter (source in, source out)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
-keywords = ["java", "deobfuscation", "formatter", "cli"]
+keywords = ["java", "typescript", "javascript", "deobfuscation", "formatter"]
 categories = ["command-line-utilities", "development-tools"]
 
 # cargo-binstall: fetch the prebuilt release binary instead of compiling.
@@ -34,10 +34,10 @@ io-uring = ["dep:io-uring"]
 io-uring = { version = "0.7", optional = true }
 
 [dependencies]
-cure-ts-ast = { path = "../cure-ts-ast", version = "0.1.9" }
-cure-ts-parser = { path = "../cure-ts-parser", version = "0.1.9" }
-cure-ts-print = { path = "../cure-ts-print", version = "0.1.9" }
-cure-ts-simplify = { path = "../cure-ts-simplify", version = "0.1.9" }
+cure-ts-ast = { path = "../cure-ts-ast", version = "0.1.10" }
+cure-ts-parser = { path = "../cure-ts-parser", version = "0.1.10" }
+cure-ts-print = { path = "../cure-ts-print", version = "0.1.10" }
+cure-ts-simplify = { path = "../cure-ts-simplify", version = "0.1.10" }
 cure-java-parser = { workspace = true }
 cure-java-simplify = { workspace = true }
 cure-java-print = { workspace = true }

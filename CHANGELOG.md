@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-10-24
+
 ### 正确性（随机差分扩展——2026-10-24 第十五批）
 
 - 随机差分扩到 **5,000 例**，又抓到两个类型域错误：
@@ -540,5 +542,6 @@ var b=2;`——`b` 变成非导出（模块语义改变）。
 - 跨平台批量 I/O：Linux `io_uring` feature（read syscall 6,977 → 10，
   syscall 时长 −53%）；macOS/Windows 线程池；默认构建零运行时依赖
 
-[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/ejfkdev/cure/releases/tag/v0.1.10
 [0.1.0]: https://github.com/ejfkdev/cure/releases/tag/v0.1.0

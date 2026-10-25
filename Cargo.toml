@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ejfkdev/cure"
@@ -24,12 +24,12 @@ rust-version = "1.74"
 
 
 [workspace.dependencies]
-cure-engine = { path = "crates/cure-engine", version = "0.1.9" }
-cure-tree = { path = "crates/cure-tree", version = "0.1.9" }
-cure-java-ast = { path = "crates/cure-java-ast", version = "0.1.9" }
-cure-java-parser = { path = "crates/cure-java-parser", version = "0.1.9" }
-cure-java-print = { path = "crates/cure-java-print", version = "0.1.9" }
-cure-java-simplify = { path = "crates/cure-java-simplify", version = "0.1.9" }
+cure-engine = { path = "crates/cure-engine", version = "0.1.10" }
+cure-tree = { path = "crates/cure-tree", version = "0.1.10" }
+cure-java-ast = { path = "crates/cure-java-ast", version = "0.1.10" }
+cure-java-parser = { path = "crates/cure-java-parser", version = "0.1.10" }
+cure-java-print = { path = "crates/cure-java-print", version = "0.1.10" }
+cure-java-simplify = { path = "crates/cure-java-simplify", version = "0.1.10" }
 
 [profile.release]
 lto = "fat"
