@@ -1499,9 +1499,13 @@ impl<'a> Parser<'a> {
     }
 
     /// 嵌套类声明语句：扫 `class … { … }` 平衡。
+    /// 类声明自带终止（不需要分号）——压缩代码 `}class B{}let x` 里
+    /// 强制 consume_semi 会报 `expected ;`（diff.min.js 抓获）。
     fn skip_class_expr_stmt(&mut self) {
         self.skip_class_expr();
-        self.consume_semi();
+        if self.is_punct(";") {
+            self.advance();
+        }
     }
 
     fn parse_var_decl_stmt(&mut self) -> TsId {
@@ -2214,9 +2218,14 @@ impl<'a> Parser<'a> {
                 // `yield *` 的换行合法（只有 yield 与 * 之间禁换行）——
                 // starred 时强制解析操作数（`yield *\n foo` 曾被截成
                 // `yield *;`，Test262 staging/sm/generators 抓获）。
-                // `yield` 后同行的模板字面量是操作数（`yield \`…\``）；
-                // 只有换行才因 [no LineTerminator here] 结束 yield。
-                if (starred || !self.tk().newline_before)
+                // `yield` 后同行的**新模板**是操作数（`yield \`…\``）；
+                // 模板续接段（`${ yield }3…` 里的 `}3…`，cont=true）
+                // 属于外层模板，不是 yield 操作数。
+                let template_cont = matches!(
+                    self.tk().kind,
+                    TokKind::TemplateQuasi { cont: true, .. }
+                );
+                if (starred || (!self.tk().newline_before && !template_cont))
                     && !self.is_punct(";")
                     && !self.is_punct(")")
                     && !self.is_punct("]")
@@ -2276,6 +2285,10 @@ impl<'a> Parser<'a> {
             {
                 match t.text.as_str() {
                     "=>" => return Some(i),
+                    // 类型语法在深度 0 不含赋值号；出现 `=` 说明这是
+                    // 表达式语境（`(v=1) : cond ? … => …` 曾被误判为
+                    // 带返回类型的箭头，把后续三元吞掉）。
+                    "=" => return None,
                     ";" | "," | ")" | "]" | "}" => return None,
                     "{" => {
                         brace += 1;

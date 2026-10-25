@@ -1119,3 +1119,35 @@ console.log(f(true), f(false));
 "#,
     );
 }
+
+#[test]
+fn diff_minified_class_decl_asi() {
+    // 压缩代码的相邻类声明没有分号：`}class B{}let x`。
+    differential(
+        "minified_class_asi",
+        "(function(exports){class A{m(){return 1}}class B extends A{}let b=new B;function f(){return b.m()}exports.f=f})(globalThis);console.log(f());\n",
+    );
+}
+
+#[test]
+fn diff_yield_template_operand() {
+    // `yield \`…\`` 同行模板是操作数；只有换行才结束 yield。
+    differential(
+        "yield_template",
+        "function* g(x){yield `v=${x}`;yield\n`n`;}\nconsole.log([...g(1)].join(','));\n",
+    );
+}
+
+#[test]
+fn diff_paren_assign_ternary_arrow() {
+    // `(v=1) : cond ? … : v=h?()=>h(e,2):e` 不能被误判为带返回
+    // 类型的箭头（曾把后续三元吞掉）。
+    differential(
+        "paren_assign_ternary_arrow",
+        r#"var X = true, rt = () => false, t = true, h = (x, y) => x + y, v, ai = 9;
+if (X ? (v = 1) : rt(1) ? t ? v = h ? () => h(1, 2) : 0 : v = 3 : v = ai, v) {
+  console.log(v);
+}
+"#,
+    );
+}
