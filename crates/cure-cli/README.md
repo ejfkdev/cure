@@ -39,10 +39,14 @@ Highlights:
 - **Fault-tolerant** — parse errors never abort a run; broken regions are
   preserved verbatim while everything around them is simplified
   (`--strict` turns them into an error exit for CI).
-- **Python 3.15** — `.py`/`.pyi` back end: indentation-aware fault-tolerant
-  parser (PEP 701 f-strings, t-strings, `match`, walrus, `except*`, PEP 695
-  type parameters, `lazy import`), Python-semantics constant folding and
-  generator/scope-preserving dead-branch removal.
+- **Python 2.7 + 3.x** — `.py`/`.pyi` back end: one indentation-aware
+  fault-tolerant parser for both grammars (Python 2 print/exec/raise
+  statements, backticks, `<>`, long/old-octal literals, `ur` strings, tuple
+  parameters; PEP 701 f-strings, t-strings, `match`, walrus, `except*`, PEP
+  695, `lazy import`), Python-semantics constant folding that preserves
+  Python 2 int/long types and `True`/`False` rebinding, and generator/scope
+  guards. Verified over 35,548 stdlib/site-package files with 0 diagnostics,
+  0 idempotency drift and 0 compile regressions.
 - **Directory mode** — recursive, parallel (dynamic work queue, threads =
   CPU cores × 1.5), mirrors the tree into `<dir>-cure-out/`; the 371,674-file OpenJDK
   corpus (4.70 GB) in ~15 s / ~430 MiB peak RSS on an 18-core laptop

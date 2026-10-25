@@ -94,6 +94,8 @@ impl PyBoolOp {
 pub enum PyCmp {
     Eq,
     NotEq,
+    /// Python 2 `<>`（与 `!=` 同义，打印时保留原写法）
+    LtGt,
     Lt,
     LtE,
     Gt,
@@ -109,6 +111,7 @@ impl PyCmp {
         match self {
             PyCmp::Eq => "==",
             PyCmp::NotEq => "!=",
+            PyCmp::LtGt => "<>",
             PyCmp::Lt => "<",
             PyCmp::LtE => "<=",
             PyCmp::Gt => ">",
@@ -124,7 +127,7 @@ impl PyCmp {
         use crate::fold::ScalarCmp;
         match self {
             PyCmp::Eq => Some(ScalarCmp::Eq),
-            PyCmp::NotEq => Some(ScalarCmp::Ne),
+            PyCmp::NotEq | PyCmp::LtGt => Some(ScalarCmp::Ne),
             PyCmp::Lt => Some(ScalarCmp::Lt),
             PyCmp::LtE => Some(ScalarCmp::Le),
             PyCmp::Gt => Some(ScalarCmp::Gt),
@@ -331,6 +334,9 @@ pub enum NodeData {
         lower: bool,
         upper: bool,
         step: bool,
+        /// 是否写了第二个冒号（`a[0:2:]` 与 `a[0:2]` 在 Python 2 AST
+        /// 里 step 分别是 Name(None) 与 None，必须保留）。
+        step_colon: bool,
     },
     Await,
     Yield {
@@ -354,6 +360,8 @@ pub enum NodeData {
     },
     /// 显式括号（保留用户括号；打印/幂等稳定）。children: `[expr]`
     Paren,
+    /// Python 2 反引号 repr：`` `expr` ``。children: `[expr]`
+    Repr,
 
     // ---- statements ----
     ExprStmt,
@@ -429,6 +437,11 @@ pub enum NodeData {
     FromImport(String),
     Global(String),
     Nonlocal(String),
+    /// Python 2 print 语句；children: `[dest?, values...]`
+    Print {
+        dest: bool,
+        nl: bool,
+    },
     Pass,
     Break,
     Continue,
@@ -584,7 +597,13 @@ impl PyAst {
         self.push(NodeData::Subscript, vec![base, index])
     }
 
-    pub fn slice(&mut self, lower: Option<PyId>, upper: Option<PyId>, step: Option<PyId>) -> PyId {
+    pub fn slice(
+        &mut self,
+        lower: Option<PyId>,
+        upper: Option<PyId>,
+        step: Option<PyId>,
+        step_colon: bool,
+    ) -> PyId {
         let mut ch = Vec::new();
         if let Some(x) = lower {
             ch.push(x);
@@ -600,6 +619,28 @@ impl PyAst {
                 lower: lower.is_some(),
                 upper: upper.is_some(),
                 step: step.is_some(),
+                step_colon,
+            },
+            ch,
+        )
+    }
+
+    /// Python 2 反引号 repr 表达式。
+    pub fn repr_(&mut self, e: PyId) -> PyId {
+        self.push(NodeData::Repr, vec![e])
+    }
+
+    /// Python 2 print 语句（`nl=false` 表示末尾逗号抑制换行）。
+    pub fn print_stmt(&mut self, dest: Option<PyId>, values: Vec<PyId>, nl: bool) -> PyId {
+        let mut ch = Vec::with_capacity(values.len() + 1);
+        if let Some(d) = dest {
+            ch.push(d);
+        }
+        ch.extend(values);
+        self.push(
+            NodeData::Print {
+                dest: dest.is_some(),
+                nl,
             },
             ch,
         )
@@ -835,13 +876,15 @@ impl PyAst {
                     lower: l1,
                     upper: u1,
                     step: s1,
+                    step_colon: c1,
                 },
                 NodeData::Slice {
                     lower: l2,
                     upper: u2,
                     step: s2,
+                    step_colon: c2,
                 },
-            ) => l1 == l2 && u1 == u2 && s1 == s2,
+            ) => l1 == l2 && u1 == u2 && s1 == s2 && c1 == c2,
             (NodeData::Yield { from: x }, NodeData::Yield { from: y }) => x == y,
             (NodeData::Comp { kind: x }, NodeData::Comp { kind: y }) => x == y,
             (
@@ -949,6 +992,10 @@ impl PyAst {
                 },
             ) => norm_text(x) == norm_text(y) && g1 == g2,
             (NodeData::Raise { from: x }, NodeData::Raise { from: y }) => x == y,
+            (
+                NodeData::Print { dest: d1, nl: n1 },
+                NodeData::Print { dest: d2, nl: n2 },
+            ) => d1 == d2 && n1 == n2,
             (NodeData::Import(x), NodeData::Import(y))
             | (NodeData::FromImport(x), NodeData::FromImport(y))
             | (NodeData::Global(x), NodeData::Global(y))

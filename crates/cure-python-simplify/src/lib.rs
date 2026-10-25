@@ -71,6 +71,18 @@ impl<'a> Pass<'a> {
         self.changed = true;
     }
 
+    /// Python 2 的 `1L` 是 long，与 int 的 `type()`/repr 不同；涉及 long 的
+    /// 运算不能折成普通整数（值相同但类型变了）。
+    fn is_py2_long(&self, id: PyId) -> bool {
+        match self.ast.data(id) {
+            NodeData::Literal(l) if l.kind == LitKind::Int => {
+                let t = l.raw.trim_end();
+                t.len() > 1 && matches!(t.as_bytes().last(), Some(b'L' | b'l'))
+            }
+            _ => false,
+        }
+    }
+
     fn as_int(&self, id: PyId) -> Option<i64> {
         match self.ast.data(id) {
             NodeData::Literal(l) if l.kind == LitKind::Int => l.int,
@@ -358,6 +370,14 @@ impl<'a> Pass<'a> {
                 }
                 vec![id]
             }
+            NodeData::Print { .. } => {
+                let ch = self.ast.children(id).to_vec();
+                for (i, &e) in ch.iter().enumerate() {
+                    let e2 = self.simplify_expr(e);
+                    self.ast.set_child(id, i, e2);
+                }
+                vec![id]
+            }
             _ => vec![id],
         }
     }
@@ -406,7 +426,10 @@ impl<'a> Pass<'a> {
                 let r = self.simplify_expr(ch[1]);
                 self.ast.set_child(id, 0, l);
                 self.ast.set_child(id, 1, r);
-                if self.enabled("py_const_fold") {
+                if self.enabled("py_const_fold")
+                    && !self.is_py2_long(l)
+                    && !self.is_py2_long(r)
+                {
                     if let (Some(a), Some(b)) = (self.as_int(l), self.as_int(r)) {
                         if let Some(v) = fold_int(op, a, b) {
                             self.set_int(id, v, "py_const_fold");
@@ -427,18 +450,22 @@ impl<'a> Pass<'a> {
                             }
                         }
                         PyUn::Minus | PyUn::Plus | PyUn::Invert => {
-                            if let Some(a) = self.as_int(v2) {
-                                let v = match op {
-                                    PyUn::Minus => a.checked_neg(),
-                                    PyUn::Plus => Some(a),
-                                    PyUn::Invert => Some(!a),
-                                    _ => None,
-                                };
-                                if let Some(v) = v {
-                                    if op == PyUn::Minus && self.minus_is_print_neutral(v2, a) {
-                                        self.set_int_quiet(id, v);
-                                    } else {
-                                        self.set_int(id, v, "py_const_fold");
+                            if !self.is_py2_long(v2) {
+                                if let Some(a) = self.as_int(v2) {
+                                    let v = match op {
+                                        PyUn::Minus => a.checked_neg(),
+                                        PyUn::Plus => Some(a),
+                                        PyUn::Invert => Some(!a),
+                                        _ => None,
+                                    };
+                                    if let Some(v) = v {
+                                        if op == PyUn::Minus
+                                            && self.minus_is_print_neutral(v2, a)
+                                        {
+                                            self.set_int_quiet(id, v);
+                                        } else {
+                                            self.set_int(id, v, "py_const_fold");
+                                        }
                                     }
                                 }
                             }
@@ -643,7 +670,7 @@ impl<'a> Pass<'a> {
                 self.ast.set_child(id, 0, b2);
                 id
             }
-            NodeData::Paren => {
+            NodeData::Paren | NodeData::Repr => {
                 let v = self.ast.children(id)[0];
                 let v2 = self.simplify_expr(v);
                 self.ast.set_child(id, 0, v2);

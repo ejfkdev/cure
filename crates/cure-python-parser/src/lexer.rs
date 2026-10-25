@@ -37,9 +37,9 @@ pub struct LexError {
 }
 
 const OPS: &[&str] = &[
-    "**=", "//=", ">>=", "<<=", "...", "==", "!=", "<=", ">=", ":=", "->", "**", "//", "<<", ">>",
-    "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "@=", "(", ")", "[", "]", "{", "}", ":", ",",
-    ";", ".", "+", "-", "*", "/", "%", "@", "&", "|", "^", "~", "<", ">", "=",
+    "**=", "//=", ">>=", "<<=", "...", "==", "!=", "<>", "<=", ">=", ":=", "->", "**", "//", "<<",
+    ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "@=", "(", ")", "[", "]", "{", "}", ":",
+    ",", ";", ".", "+", "-", "*", "/", "%", "@", "&", "|", "^", "~", "<", ">", "=", "`",
 ];
 
 pub fn tokenize(src: &str) -> (Vec<Token>, Vec<LexError>) {
@@ -401,23 +401,28 @@ impl<'a> Lexer<'a> {
     }
 
     fn scan_number(&mut self) {
-        let mut prev = '\0';
         if self.peek() == Some('0')
             && matches!(self.peek_at(1), Some('x' | 'X' | 'o' | 'O' | 'b' | 'B'))
         {
+            let base = self.peek_at(1).unwrap_or('x').to_ascii_lowercase();
             self.bump();
             self.bump();
             while let Some(c) = self.peek() {
-                if c.is_ascii_hexdigit() || c == '_' {
-                    prev = c;
+                let ok = match base {
+                    'x' => c.is_ascii_hexdigit() || c == '_',
+                    'o' => matches!(c, '0'..='7' | '_'),
+                    'b' => matches!(c, '0' | '1' | '_'),
+                    _ => false,
+                };
+                if ok {
                     self.bump();
                 } else {
                     break;
                 }
             }
-            if matches!(prev, 'j' | 'J') {
+            if matches!(self.peek(), Some('l' | 'L')) {
                 self.bump();
-            } else if self.peek().is_some_and(|c| matches!(c, 'j' | 'J')) {
+            } else if matches!(self.peek(), Some('j' | 'J')) {
                 self.bump();
             }
             return;
@@ -431,6 +436,15 @@ impl<'a> Lexer<'a> {
                 seen_dot = true;
                 self.bump();
             } else if (c == 'e' || c == 'E') && !seen_exp {
+                // 指数必须至少跟一位数字：`1else` 要切成 `1` + `else`
+                // （CPython 的 tokenizer 同样规则）。
+                let mut k = 1;
+                if matches!(self.peek_at(k), Some('+' | '-')) {
+                    k += 1;
+                }
+                if !self.peek_at(k).is_some_and(|d| d.is_ascii_digit()) {
+                    break;
+                }
                 seen_exp = true;
                 self.bump();
                 if matches!(self.peek(), Some('+' | '-')) {
@@ -440,7 +454,9 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        if matches!(self.peek(), Some('j' | 'J')) {
+        if matches!(self.peek(), Some('l' | 'L')) {
+            self.bump();
+        } else if matches!(self.peek(), Some('j' | 'J')) {
             self.bump();
         }
     }
@@ -452,7 +468,6 @@ impl<'a> Lexer<'a> {
         }
         let prefix = &self.src[self.pos.saturating_sub(prefix_len)..self.pos];
         let is_f = prefix.contains(['f', 'F', 't', 'T']);
-        let is_raw = prefix.contains(['r', 'R']);
         let quote = self.peek().unwrap_or('"');
         let triple = self.peek_at(1) == Some(quote) && self.peek_at(2) == Some(quote);
         let qn = if triple { 3 } else { 1 };
@@ -464,14 +479,13 @@ impl<'a> Lexer<'a> {
                 self.err("unterminated string literal");
                 return;
             };
-            if c == '\\' && !is_raw {
-                self.bump();
-                if self.peek().is_some() {
+            if c == '\\' {
+                // f-string 里花括号仍按语法解析：`\{{` 是反斜杠 + 转义
+                // 花括号（`{{`），不能把 `{` 当成被反斜杠吃掉的字符。
+                if is_f && matches!(self.peek_at(1), Some('{' | '}')) {
                     self.bump();
+                    continue;
                 }
-                continue;
-            }
-            if c == '\\' && is_raw {
                 // raw 字符串里反斜杠仍阻止引号终止
                 self.bump();
                 if self.peek().is_some() {

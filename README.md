@@ -11,15 +11,19 @@
 formatter that turns decompiled code back into something a human would have
 written. The engine and CLI are language-agnostic — **Java**,
 **TypeScript/JavaScript** (`ts`/`tsx`/`mts`/`cts`/`js`/`jsx`/`mjs`/`cjs`) and
-**Python** (`py`/`pyi`) are the backends implemented today; the pipeline
-below shows the Java experience. The TS/JS backend ships the same engine with
-ECMAScript semantics (f64 / ToInt32 folding domains, ±2^53 exactness,
-per-file binding/scope resolution for `var` hoisting and closure-capture
-guards, optional-chain and destructuring opacity, ECMA number formatting).
-The Python backend targets CPython 3.15 syntax — indentation and implicit
-joins, PEP 701 f-strings and t-strings, `match`/`case`, walrus, `except*`,
-PEP 695 type parameters, `lazy import` — with Python truthiness,
-floor-division/power semantics and generator/scope preservation.
+**Python** (`py`/`pyi`, Python 2.7 and 3.x through 3.15) are the backends
+implemented today; the pipeline below shows the Java experience. The TS/JS
+backend ships the same engine with ECMAScript semantics (f64 / ToInt32
+folding domains, ±2^53 exactness, per-file binding/scope resolution for
+`var` hoisting and closure-capture guards, optional-chain and destructuring
+opacity, ECMA number formatting). The Python backend accepts both grammars —
+Python 2 `print`/`exec`/`raise` statements, backticks, `<>`, long and
+old-style octal literals, `ur` strings, tuple parameters and
+`except E, e`; plus PEP 701 f-strings/t-strings, `match`, walrus, `except*`,
+PEP 695 type parameters and `lazy import` — with Python truthiness,
+floor-division/power semantics and generator/scope preservation. Python 2
+int/long distinctions and `True`/`False` rebinding are kept sound; forms
+whose meaning differs between versions stay byte-preserved when ambiguous.
 
 ```java
 // decompiled input                          // after cure
@@ -70,13 +74,17 @@ the same thing.
   (including `const` type parameters), `satisfies`/`as const`, `#x in o`,
   RegExp `v` flags and optional chains. Unsupported constructs stay verbatim
   instead of aborting.
-- **Python 3.15 backend** — `.py`/`.pyi` parse → simplify → print with a
-  fault-tolerant indentation-aware parser. Constant folding follows Python
-  semantics (exact integer arithmetic inside the i64 domain, floor division
-  and modulo, `and`/`or` returning an operand, truthiness of
-  `None`/`False`/`0`/`""`); dead branches are never dropped when they
-  contain `yield`, `global` or `nonlocal`, so generators keep their PEP 479
-  marking and scoping stays intact.
+- **Python backend (2.7 + 3.15)** — `.py`/`.pyi` parse → simplify → print
+  with a fault-tolerant, indentation-aware parser for both grammars. Python 2
+  statements and literals (`print`, `exec`, `raise E, V`, backticks, `<>`,
+  `1L`, `0777`, `ur"..."`, tuple parameters, `except E, e`, unparenthesized
+  comprehension tuples) coexist with modern syntax (PEP 701, t-strings,
+  `match`, walrus, `except*`, PEP 695, `lazy import`). Constant folding
+  follows Python semantics (exact integers in the i64 domain, floor
+  division/modulo, `and`/`or` returning an operand, truthiness); Python 2
+  int/long types and `True`/`False` rebinding are preserved, and
+  version-dependent forms stay byte-preserved when ambiguous. Dead branches
+  containing `yield`/`global`/`nonlocal` are never dropped.
 - **64+ simplification rules** (language-agnostic engine rules + Java, TS and
   Python packs), including control-flow flattening recovery, statement-level
   `StringBuilder` chain recovery, XOR-noise removal, and partial evaluation
@@ -177,9 +185,9 @@ otherwise the locale is auto-detected. Full option reference: `cure --help`.
 | 5. ECMAScript conformance | [Test262](https://github.com/tc39/test262), six layers: (a) sync original vs cured in fresh `node` vm contexts, exception status + stdout compared (34,007 executable cases); (b) **async** cases executed with `$DONE`/microtask/timer draining (5,423 executed); (c) **module** cases linked and evaluated as ESM with a filesystem fixture loader (358 executed); (d) **compile-only on all 53,910 files** including async/module/negative; (e) **print round-trip**: parse → print (no simplify) → parse, ASTs structurally equal ignoring `Paren`/literal spelling/`Group` expansion (49,159 checked); (f) **simplify idempotency**: cure twice over the same corpus, byte-identical output (49,159 checked) | ECMAScript semantics: f64/ToInt32 domains, ±2^53, TDZ, Annex B hoisting, eval scoping, destructuring, generator/`yield` grammar, sparse arrays, async/await ordering, ESM linking/live bindings; printer/paren/decorator drift; fixed-point convergence |
 | 6. Real-world JS/TS | 4,358 `.js/.mjs/.cjs` files (~568 MB) plus 1,334 `.ts/.tsx/.mts/.cts` files from a global npm install (undici, zod, minisearch, pnpm, yarn, vite-plus, Lark CLI, bytenode, …): every valid file must still compile after cure; a second cure pass must produce byte-identical output. Both corpora run at **0 parser diagnostics** and **0 second-pass differences** in default and preserve modes, and every cured file parses cleanly with Oxc (`oxfmt`, 0 syntax errors) | real-package syntax (minified bundles, top-level await, import attributes), complex type syntax, idempotency under module-level constant propagation |
 | 7. Randomized JS differential | Deterministic PRNG generates valid programs mixing declarations, shadowing, `var` hoisting, closures, loops, ternaries, short circuits and templates; original vs cured run under `node` (stdout + exit code) and a second cure must be byte-identical (`CURE_FUZZ_CASES` scales the sample) | rule-combination semantics and first/second-pass convergence; 5,000 cases used during development |
-| 8. Python 3.15 stdlib | 2,459 `.py`/`.pyi` files under CPython 3.15's stdlib (2,456 UTF-8 sources): parse → print compared with CPython `ast.dump`; a second cure must be byte-identical; every simplified file is compiled by CPython; 12 curated programs also run side-by-side | **0** parser diagnostics; **2,453/2,456** round-trips AST-identical (3 fixtures are intentionally invalid); **2,456/2,456** idempotent, 0 drift; **2,447/2,447** compilable outputs (9 originals were already uncompilable, 0 broken); curated stdout/exit codes match |
+| 8. Python (2.7 + 3.13–3.15) | CPython 2.7 stdlib (1,609 UTF-8 sources), a 4,135-file Python 2 package corpus (Django 1.11, Twisted 20.3, pip 20.3, setuptools 44, requests, six, PyYAML), CPython 3.13/3.14/3.15 stdlibs (2,188 / 2,288 / 2,456 sources), 18,128 Python 3.14 site-packages files plus 1,083 / 422 files from the 3.13 / 3.15 sites: parse → print compared with that interpreter's `ast.dump`; a second cure must be byte-identical; every simplified file compiled by the same interpreter; curated programs executed | **0** parser diagnostics in all corpora; **32,289** AST-identical round-trips (5,736 Python 2 + 26,553 Python 3; 20 intentionally invalid/foreign fixtures excluded), **35,548/35,548** idempotent with 0 drift, **32,274** compile checks with **0 regressions** (35 originals were already uncompilable); curated stdout/exit codes match |
 
-`cargo test` runs 484 tests. The Test262 semantic differential reaches
+`cargo test` runs 504 tests. The Test262 semantic differential reaches
 **33,963/34,007 (99.87%) identical runs** in default mode; the only 44
 excluded cases compare `Function.prototype.toString` **source text** (cure
 reformats function bodies) or use arrow functions as computed-property keys,
@@ -197,17 +205,24 @@ t262_sem|t262_async|t262_module|t262_compile|t262_roundtrip|t262_idem`); they sk
 during development (`x && true` mis-fold, `((Cast) x).method()` postfix loss,
 `new` treated as a type name).
 
-The Python differential covers the CPython 3.15 standard library: 2,459
-`.py`/`.pyi` files (2,456 UTF-8 sources), **0 parser diagnostics**,
-**2,453/2,456** parse → print round-trips AST-identical under CPython's own
-`ast.dump` (the other 3 are intentionally invalid fixtures), **2,456/2,456**
-simplify-idempotent with 0 drift, and **2,447/2,447** simplified files
-accepted by `compile()` (9 originals were already uncompilable; cure broke
-none). A directory run rewrites 2,363 files with 2,176 observable edits, and
-a second run performs **0 edits** on byte-identical output. Twelve curated
-programs (constants, control flow, short-circuit side effects, generators,
-classes/exceptions, comprehensions/walrus, 3.15 syntax, async, match) run
-side-by-side under CPython with identical stdout and exit codes.
+The Python differential spans CPython 2.7 and 3.13–3.15. The 2.7 standard
+library (1,609 UTF-8 sources) and a 4,135-file Python 2 package corpus
+(Django 1.11, Twisted 20.3, pip, setuptools 44, requests, six, PyYAML) run at
+**0 parser diagnostics**; 1,607 + 4,129 parse → print round-trips are
+AST-identical under CPython 2.7 (the rest are deliberately invalid/foreign
+fixtures), all 5,744 files are idempotent, and every simplified file that
+CPython 2.7 could compile before still compiles (1,600 + 4,129; 15
+originals were already invalid). The 3.13/3.14/3.15 stdlibs and the 3.14
+site-packages tree add 26,553 AST-identical round-trips with 0 diagnostics,
+0 idempotency drift and 0 compile regressions; the 3.6 and 3.8 stdlibs are
+also clean (1,578 and 1,661 files). Across all corpora that is **32,289 AST
+comparisons, 35,548 idempotent files and 32,274 compilations, with 0
+regressions**. Curated Python 2 and 3 programs (print/exec/raise forms,
+backticks, `<>`, long/int types, tuple parameters, decorators with
+triple-quoted arguments) execute side-by-side with identical stdout and exit
+codes. Non-UTF-8 source files (PEP 263 encodings other than UTF-8) are
+currently skipped by the CLI; the Python 2 stdlib corpus above was transcoded
+to UTF-8 for testing.
 
 ### Adversarial case studies
 
@@ -279,7 +294,10 @@ threads (cores × 1.5):
 |---|---|---|---|
 | Single file (stdin → stdout) | 1 | <10 ms | ~2 MiB |
 | Vendored test corpora | 3,999 | 0.6 s | ~110 MiB |
+| CPython 2.7 stdlib, output tree written | 1,609 | 0.23 s | ~90 MiB |
+| Python 2 package corpus, output tree written | 4,135 | 0.54 s | ~90 MiB |
 | CPython 3.15 stdlib, output tree written | 2,456 | 0.3 s | ~150 MiB |
+| Python 3.14 site-packages, output tree written | 18,128 | 2.3 s | ~320 MiB |
 | OpenJDK full source corpus, `--check` | 371,674 / 4.70 GB | 14.8 s | ~430 MiB |
 | OpenJDK full source corpus, output tree written | 371,674 / 4.70 GB | 27.5 s | ~430 MiB |
 
@@ -311,7 +329,7 @@ cure-java-parser   fault-tolerant Java lexer/parser (byte-borrowed tokens,
 cure-java-print    canonical Java printer/formatter
 cure-java-simplify Java rule pack + facade over cure-engine
 cure-python-ast    Python NodeData + PyId arena
-cure-python-parser fault-tolerant indentation-aware parser (CPython 3.15)
+cure-python-parser fault-tolerant indentation-aware parser (Python 2.7–3.15)
 cure-python-print  canonical 4-space Python printer
 cure-python-simplify Python constant/control-flow rules over cure-engine
 cure-cli           the `cure` binary: parallel pipeline, cross-platform
@@ -329,9 +347,9 @@ frontends (see also the ~100-line toy language in `cure-tree/tests/kit.rs`).
 
 - ✅ Java backend at production robustness: 371k-file corpus, 0 failures
 - ✅ TS/JS backend: Test262 six layers, 0 parser diagnostics on npm corpora
-- ✅ Python 3.15 backend: CPython stdlib 2,456 sources, 0 diagnostics,
-  AST-identical round-trips, idempotent and compilable output
-- ✅ 12 vendored Java corpora, three-layer verification, 484 tests
+- ✅ Python 2.7 + 3.x backend: 35,548 stdlib/site-package files, 0
+  diagnostics, 0 idempotency drift, 0 compile regressions
+- ✅ 12 vendored Java corpora, three-layer verification, 504 tests
 - 🔜 Restoration rules V2 (reflective `addSuppressed` shapes, nested
   two-resource try-with-resources)
 - 🔜 Python rule-pack expansion (local propagation, docstring/whitespace

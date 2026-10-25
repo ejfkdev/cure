@@ -154,8 +154,15 @@ impl<'a> Printer<'a> {
                 generics_raw,
                 is_async,
             } => {
-                for line in deco_raw.lines().filter(|l| !l.trim().is_empty()) {
-                    self.line(line.trim_end());
+                // 第一行加当前缩进；其余行是源文件绝对缩进（含三引号
+                // 字符串内的空行/行尾空格），必须逐字节输出。
+                let mut dl = deco_raw.lines();
+                if let Some(first) = dl.next() {
+                    self.line(first);
+                }
+                for line in dl {
+                    self.out.push_str(line);
+                    self.out.push('\n');
                 }
                 let mut s = String::new();
                 if *is_async {
@@ -189,8 +196,15 @@ impl<'a> Printer<'a> {
                 header_raw,
                 deco_raw,
             } => {
-                for line in deco_raw.lines().filter(|l| !l.trim().is_empty()) {
-                    self.line(line.trim_end());
+                // 第一行加当前缩进；其余行是源文件绝对缩进（含三引号
+                // 字符串内的空行/行尾空格），必须逐字节输出。
+                let mut dl = deco_raw.lines();
+                if let Some(first) = dl.next() {
+                    self.line(first);
+                }
+                for line in dl {
+                    self.out.push_str(line);
+                    self.out.push('\n');
                 }
                 let mut s = format!("class {name}");
                 s.push_str(header_raw);
@@ -325,6 +339,33 @@ impl<'a> Printer<'a> {
                     .collect();
                 self.line(&format!("del {}", list.join(", ")));
             }
+            NodeData::Print { dest, nl } => {
+                let ch = self.ast.children(id);
+                let mut s = String::from("print");
+                let mut i = 0;
+                if *dest {
+                    s.push_str(" >>");
+                    if let Some(&d) = ch.first() {
+                        s.push_str(&self.expr_string(d, Prec::Lambda));
+                    }
+                    i = 1;
+                }
+                if i < ch.len() {
+                    if *dest {
+                        s.push(',');
+                    }
+                    s.push(' ');
+                    let vals: Vec<String> = ch[i..]
+                        .iter()
+                        .map(|&e| self.expr_string(e, Prec::Lambda))
+                        .collect();
+                    s.push_str(&vals.join(", "));
+                }
+                if !*nl {
+                    s.push(',');
+                }
+                self.line(&s);
+            }
             NodeData::Import(raw) => self.line(raw.trim()),
             NodeData::FromImport(raw) => self.line(raw.trim()),
             NodeData::Global(raw) => self.line(&format!("global {}", raw.trim())),
@@ -333,17 +374,16 @@ impl<'a> Printer<'a> {
             NodeData::Break => self.line("break"),
             NodeData::Continue => self.line("continue"),
             NodeData::RawStmt(raw) => {
-                let base = self.indent;
+                // 续行保留源文件里的绝对缩进：三引号字符串内容、反斜杠
+                // 续行里不能按代码层级重新缩进（会改变字符串值）。
                 let text = raw.trim_end();
-                for line in text.lines() {
-                    if line.is_empty() {
-                        self.out.push('\n');
-                    } else {
-                        self.indent = base;
-                        self.ind();
-                        self.out.push_str(line);
-                        self.out.push('\n');
-                    }
+                let mut lines = text.lines();
+                if let Some(first) = lines.next() {
+                    self.line(first);
+                }
+                for line in lines {
+                    self.out.push_str(line);
+                    self.out.push('\n');
                 }
             }
             _ => {
@@ -703,10 +743,14 @@ impl<'a> Printer<'a> {
                 //   否则空/单元素 tuple 会退化成标量。
                 if let NodeData::Tuple = self.ast.data(ch[1]) {
                     let items = self.ast.children(ch[1]).to_vec();
-                    let has_slice = items
-                        .iter()
-                        .any(|&it| matches!(self.ast.data(it), NodeData::Slice { .. }));
-                    if has_slice {
+                    if items.is_empty() {
+                        // `a[()]`
+                        self.out.push_str("()");
+                    } else {
+                        // 下标位的 tuple/slice-list 一律裸逗号打印：
+                        // `a[(1, 2)]` 与 `a[1, 2]` 在 CPython 2/3 的 AST
+                        // 相同，而带括号会让 `a[..., ...]`（Python 2
+                        // ExtSlice）变成非法的 tuple display。
                         for (i, &it) in items.iter().enumerate() {
                             if i > 0 {
                                 self.out.push_str(", ");
@@ -714,9 +758,9 @@ impl<'a> Printer<'a> {
                             let s = self.expr_string(it, Prec::Lambda);
                             self.out.push_str(&s);
                         }
-                    } else {
-                        let s = self.expr_string(ch[1], Prec::Lambda);
-                        self.out.push_str(&s);
+                        if items.len() == 1 {
+                            self.out.push(',');
+                        }
                     }
                 } else {
                     let s = self.expr_string(ch[1], Prec::Lambda);
@@ -724,7 +768,12 @@ impl<'a> Printer<'a> {
                 }
                 self.out.push(']');
             }
-            NodeData::Slice { lower, upper, step } => {
+            NodeData::Slice {
+                lower,
+                upper,
+                step,
+                step_colon,
+            } => {
                 let ch = self.ast.children(id).to_vec();
                 let mut i = 0;
                 if *lower {
@@ -742,9 +791,9 @@ impl<'a> Printer<'a> {
                     }
                     i += 1;
                 }
-                if *step {
+                if *step_colon {
                     self.out.push(':');
-                    {
+                    if *step {
                         let s = self.expr_string(ch[i], Prec::Lambda);
                         self.out.push_str(&s);
                     }
@@ -856,6 +905,13 @@ impl<'a> Printer<'a> {
                     self.out.push_str(&s);
                     self.out.push(')');
                 }
+            }
+            NodeData::Repr => {
+                let inner = self.ast.children(id)[0];
+                self.out.push('`');
+                let s = self.expr_string(inner, Prec::Lambda);
+                self.out.push_str(&s);
+                self.out.push('`');
             }
             NodeData::NamedExpr { name } => {
                 let v = self.ast.children(id)[0];

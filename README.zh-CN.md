@@ -10,12 +10,15 @@
 **cure** 是容错式、语义保持的代码简化 / 格式化引擎，把反编译出来的代码
 还原成「像人手写的」样子。引擎与 CLI 均语言无关——**当前实现的语言
 后端：Java、TypeScript/JavaScript**（ts/tsx/mts/cts/js/jsx/mjs/cjs）与
-**Python**（py/pyi）；下文示例即 Java 后端的实际体验。TS/JS 后端同引擎、
-按 ECMAScript 语义：f64/ToInt32 折叠域、±2^53 精确性、按文件的绑定/作用域
-解析（var 提升与闭包捕获守卫）、可选链/解构不透明、ECMA 数字格式化。
-Python 后端面向 CPython 3.15 语法——缩进与隐式续行、PEP 701 f-string 与
-t-string、match/case、海象运算符、except*、PEP 695 类型参数、lazy import，
-并按 Python 真值、整除/幂语义以及生成器/作用域约束保持语义。
+**Python**（py/pyi，Python 2.7 与 3.x，覆盖至 3.15）；下文示例即 Java
+后端的实际体验。TS/JS 后端同引擎、按 ECMAScript 语义：f64/ToInt32 折叠域、
+±2^53 精确性、按文件的绑定/作用域解析（var 提升与闭包捕获守卫）、
+可选链/解构不透明、ECMA 数字格式化。Python 后端同时接受两套语法——Python 2
+的 print/exec/raise 语句、反引号、`<>`、long 与旧式八进制字面量、ur 字符串、
+元组形参、`except E, e`，以及 PEP 701 f-string/t-string、match、海象、
+except*、PEP 695 类型参数、lazy import——并按 Python 真值、整除/幂语义以及
+生成器/作用域约束保持语义。Python 2 的 int/long 区分与 True/False 重绑定
+也保持健全；两个版本语义不同的写法（print、exec）在歧义时逐字节保留。
 
 ```java
 // 反编译输入                                 // cure 处理后
@@ -58,11 +61,14 @@ class B {                                     class B {
   static 块、`using`/`await using`、导入属性/`defer`/`source`、顶层
   await、泛型函数/箭头（含 `const` 类型参数）、`satisfies`/`as const`、
   `#x in o`、RegExp `v` 标志与可选链；未建模结构原文保真，不中断。
-- **Python 3.15 后端** —— `.py`/`.pyi` 全流程解析 → 简化 → 打印，容错缩进
-  解析器。常量折叠遵循 Python 语义（i64 精确域内的整数运算、向下取整除法/
-  取模、`and`/`or` 返回操作数、`None`/`False`/`0`/`""` 真值）；含 `yield`、
-  `global`、`nonlocal` 的死分支一律不删，生成器标记（PEP 479）与作用域保持
-  不变。
+- **Python 后端（2.7 + 3.15）** —— `.py`/`.pyi` 全流程解析 → 简化 → 打印，
+  容错缩进解析器同时接受两套语法：Python 2 的 print/exec/raise 语句、反引号、
+  `<>`、`1L`、`0777`、`ur"..."`、元组形参、`except E, e`、无括号推导式元组，
+  与 PEP 701、t-string、match、海象、except*、PEP 695、lazy import 共存。
+  常量折叠遵循 Python 语义（i64 精确域整数、向下取整除法/取模、`and`/`or`
+  返回操作数、真值）；Python 2 int/long 类型与 True/False 重绑定保持健全，
+  版本相关写法在歧义时逐字节保留；含 `yield`/`global`/`nonlocal` 的死分支
+  一律不删。
 - **64+ 条简化规则**（引擎通用 + Java/TS/Python 规则包），含控制流扁平化
   还原、语句级 StringBuilder 链还原、XOR 噪声剥除、纯字面量 JDK 调用
   的部分求值（"虚拟执行"）。
@@ -158,9 +164,9 @@ cure [选项] <文件>... | <目录> | -
 | 5. ECMAScript 规范符合性 | [Test262](https://github.com/tc39/test262) 六层：(a) 同步用例原版与 cure 版各在全新 `node` vm 上下文执行，比较异常状态 + stdout（34,007 个可执行用例）；(b) **async 用例**执行并排空 `$DONE`/微任务/定时器（5,423 个执行）；(c) **module 用例**按 ESM 链接（相对 fixture 文件系统加载）并求值（358 个执行）；(d) **全部 53,910 个文件做编译差分**（含 async/module/负向）；(e) **打印往返**：解析 → 打印（不简化）→ 再解析，忽略 `Paren`/字面量拼写/`Group` 展开后 AST 结构等价（49,159 个检查）；(f) **简化幂等**：同一语料跑两遍 cure，输出逐字节一致（49,159 个检查） | ECMAScript 语义、打印器/括号/装饰器漂移、定点收敛；外加合法文件 cure 后可编译、输出幂等 |
 | 6. 真实 JS/TS 语料 | 全局 npm 安装中的 4,358 个 `.js/.mjs/.cjs`（约 568 MB）与 1,334 个 `.ts/.tsx/.mts/.cts`（undici、zod、minisearch、pnpm、yarn、vite-plus、Lark CLI、bytenode…）：合法文件在 cure 后必须仍可编译；第二轮 cure 输出必须逐字节一致。两种语料均 **0 解析诊断 / 0 二轮差异**（默认与保真模式），cure 产物经 Oxc（`oxfmt`）解析 **0 语法错误** | 真实包语法（压缩 bundle、顶层 await、导入属性）、复杂类型语法与模块常量传播下的幂等性 |
 | 7. 随机 JS 差分 | 确定性 PRNG 生成合法程序（声明/遮蔽/`var` 提升/闭包/循环/三元/短路/模板混合）；原版与 cure 版在 `node` 下比较 stdout + 退出码，并要求二次 cure 逐字节一致（`CURE_FUZZ_CASES` 控制样本数） | 规则组合语义与首轮/二轮收敛；开发中跑过 5,000 例 |
-| 8. Python 3.15 标准库 | CPython 3.15 标准库中的 2,459 个 `.py`/`.pyi`（2,456 个 UTF-8 源文件）：解析 → 打印后用 CPython `ast.dump` 比较；二次 cure 必须逐字节一致；每个简化产物交给 CPython 编译；另有 12 个精选程序对拍运行 | **0** 解析诊断；**2,453/2,456** 往返 AST 等价（3 个夹具本就非法）；**2,456/2,456** 幂等、0 漂移；**2,447/2,447** 产物可编译（9 个原文件本不可编译，0 破坏）；精选程序 stdout/退出码一致 |
+| 8. Python（2.7 + 3.13–3.15） | CPython 2.7 标准库（1,609 个 UTF-8 源文件）、4,135 文件 Python 2 包语料（Django 1.11、Twisted 20.3、pip 20.3、setuptools 44、requests、six、PyYAML）、CPython 3.13/3.14/3.15 标准库（2,188 / 2,288 / 2,456 源文件）、18,128 个 Python 3.14 site-packages 文件与 3.13/3.15 site 的 1,083 / 422 个文件：解析 → 打印后用对应解释器的 `ast.dump` 比较；二次 cure 必须逐字节一致；每个简化产物交给同一解释器编译；精选程序实际执行 | 所有语料 **0** 解析诊断；**32,289** 次 AST 等价往返（Python 2 5,736 + Python 3 26,553；已排除 20 个故意非法/异构夹具）；**35,548/35,548** 幂等、0 漂移；**32,274** 次编译检查 **0 破坏**（35 个原文件本就不可编译）；精选程序 stdout/退出码一致 |
 
-`cargo test` 共 484 个测试。默认模式下 Test262 语义差分
+`cargo test` 共 504 个测试。默认模式下 Test262 语义差分
 **33,963/34,007（99.87%）执行结果逐字节一致**；仅 44 个用例被排除——它们比较
 `Function.prototype.toString` 的**源码文本**（cure 会重排函数体格式），
 或用箭头函数作计算属性名（键依赖同一文本）。使用
@@ -175,14 +181,20 @@ t262_sem|t262_async|t262_module|t262_compile|t262_roundtrip|t262_idem`）；语�
 语义/解析 bug**（`x && true` 误折叠、`((Cast) x).method()` 后缀丢失、
 `new` 被当类型名）。
 
-Python 差分覆盖 CPython 3.15 标准库：2,459 个 `.py`/`.pyi`（2,456 个 UTF-8
-源文件），**0 解析诊断**；**2,453/2,456** 解析 → 打印往返在 CPython
-`ast.dump` 下结构等价（其余 3 个是故意非法的测试夹具）；**2,456/2,456**
-简化幂等、0 漂移；**2,447/2,447** 简化产物通过 CPython `compile()`（9 个
-原文件本就不可编译，cure 未破坏任何一个）。目录运行改写 2,363 个文件、
-2,176 次可见编辑；对输出再跑一轮为 **0 编辑**且逐字节一致。另有 12 个
-精选程序（常量、控制流、短路副作用、生成器、类/异常、推导式/海象、3.15
-语法、async、match）在 CPython 下与 cure 版对拍 stdout 与退出码。
+Python 差分覆盖 CPython 2.7 与 3.13–3.15。2.7 标准库（1,609 个 UTF-8
+源文件）与 4,135 文件的 Python 2 包语料（Django 1.11、Twisted 20.3、pip、
+setuptools 44、requests、six、PyYAML）均为 **0 解析诊断**；1,607 + 4,129
+个解析 → 打印往返在 CPython 2.7 `ast.dump` 下结构等价（其余为故意非法/
+异构夹具），5,744 个文件全部幂等，原本可被 CPython 2.7 编译的文件
+（1,600 + 4,129）在简化后仍全部可编译（另有 15 个原文件本就非法）。
+3.13/3.14/3.15 标准库与 3.14 site-packages 再贡献 26,553 个 AST 等价
+往返，0 诊断、0 幂等漂移、0 编译破坏；3.6 与 3.8 标准库（1,578 / 1,661
+个文件）同样 0 诊断且幂等。全部语料合计 **32,289 次 AST 比较、35,548 个
+幂等文件、32,274 次编译，0 破坏**。另有 Python 2/3 精选程序（print/exec/
+raise 形态、反引号、`<>`、long/int 类型、元组形参、带三引号参数的装饰器）
+在对应解释器下与 cure 版对拍 stdout 与退出码，结果一致。CLI 目前只读取
+UTF-8 源码；其他 PEP 263 编码文件会跳过（上面的 Python 2 标准库语料已
+转码为 UTF-8 后测试）。
 
 ### 对抗性案例
 
@@ -245,7 +257,10 @@ release 构建、18 核 Apple Silicon 笔记本、页缓存热、默认线程数
 |---|---|---|---|
 | 单文件（stdin → stdout） | 1 | <10 ms | ~2 MiB |
 | 入库测试语料 | 3,999 | 0.6 s | ~110 MiB |
+| CPython 2.7 标准库，写出输出树 | 1,609 | 0.23 s | ~90 MiB |
+| Python 2 包语料，写出输出树 | 4,135 | 0.54 s | ~90 MiB |
 | CPython 3.15 标准库，写出输出树 | 2,456 | 0.3 s | ~150 MiB |
+| Python 3.14 site-packages，写出输出树 | 18,128 | 2.3 s | ~320 MiB |
 | OpenJDK 全源码语料，`--check` | 371,674 / 4.70 GB | 14.8 s | ~430 MiB |
 | OpenJDK 全源码语料，写出输出树 | 371,674 / 4.70 GB | 27.5 s | ~430 MiB |
 
@@ -269,7 +284,7 @@ cure-java-parser   容错 Java 词法/解析器（token 全借用、源零拷贝
 cure-java-print    规范化 Java 打印器/格式化器
 cure-java-simplify Java 规则包 + cure-engine 门面
 cure-python-ast    Python NodeData + PyId arena
-cure-python-parser 容错缩进词法/解析器（CPython 3.15）
+cure-python-parser 容错缩进词法/解析器（Python 2.7–3.15）
 cure-python-print  规范化 4 空格 Python 打印器
 cure-python-simplify Python 常量/控制流规则包（基于 cure-engine）
 cure-cli           `cure` 二进制：并行管线、跨平台批量 I/O（io_uring/线程池）、目录模式
@@ -285,9 +300,9 @@ cure-cli           `cure` 二进制：并行管线、跨平台批量 I/O（io_ur
 
 - ✅ Java 后端达到生产级健壮性：37 万文件语料 0 失败
 - ✅ TS/JS 后端：Test262 六层全绿，npm 语料 0 解析诊断
-- ✅ Python 3.15 后端：CPython 标准库 2,456 源文件，0 诊断、AST 往返等价、
-  输出幂等且可编译
-- ✅ 12 套入库 Java 语料、三层验证、484 个测试
+- ✅ Python 2.7 + 3.x 后端：35,548 个标准库/site-packages 文件，0 诊断、
+  0 幂等漂移、0 编译破坏
+- ✅ 12 套入库 Java 语料、三层验证、504 个测试
 - 🔜 还原规则 V2（反射 addSuppressed 形态、嵌套双资源 try-with-resources）
 - 🔜 Python 规则包扩展（局部传播、docstring/空白规范化、反编译形态还原）
 

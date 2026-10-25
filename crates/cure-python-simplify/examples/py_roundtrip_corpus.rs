@@ -63,14 +63,17 @@ fn main() {
         .take(10)
         .map(|t| t.id.clone())
         .collect();
-    let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/py_ast_driver.py");
-    let mut child = Command::new("python3")
+    let driver = std::env::var("PY_DRIVER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/py_ast_driver.py"));
+    let py_bin = std::env::var("PY_BIN").unwrap_or_else(|_| "python3".into());
+    let mut child = Command::new(&py_bin)
         .arg(driver)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .expect("spawn python3");
+        .expect("spawn python driver");
     let mut stdin = child.stdin.take().unwrap();
     let writer = std::thread::spawn(move || {
         for t in &tests {

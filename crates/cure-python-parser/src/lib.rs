@@ -24,7 +24,10 @@ pub struct ParseOutcome {
 type R<T> = Result<T, String>;
 
 pub fn parse(src: &str) -> ParseOutcome {
+    // UTF-8 BOM 不是 Python 源代码的一部分（CPython 自行剥离）。
+    let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     let (toks, lex_errs) = tokenize(src);
+    let bool_names = bool_literals_are_shadowed(&toks);
     let mut p = Parser {
         src,
         toks,
@@ -33,6 +36,8 @@ pub fn parse(src: &str) -> ParseOutcome {
         errors: Vec::new(),
         indent_stack: vec![String::new()],
         depth: 0,
+        no_cond_lambda: false,
+        bool_names,
     };
     for e in lex_errs {
         p.errors.push(ParseError {
@@ -42,6 +47,11 @@ pub fn parse(src: &str) -> ParseOutcome {
         });
     }
     let mut items = Vec::new();
+    // 保留 shebang / PEP 263 编码声明：Python 2 源码没有它就无法按
+    // UTF-8 解码非 ASCII 内容，改成别的编码也可能改变语义。
+    if let Some(header) = leading_header(src) {
+        items.push(p.ast.raw_stmt(&header));
+    }
     while !p.at_eof() {
         let before = p.pos;
         if p.eat_kind(TokKind::Newline)
@@ -71,6 +81,12 @@ struct Parser<'a> {
     errors: Vec<ParseError>,
     indent_stack: Vec<String>,
     depth: usize,
+    /// 推导式 iterable 顶层的 lambda：Python 2 把随后的 `if` 归给 comp_if，
+    /// 而不是 lambda 体的条件表达式。
+    no_cond_lambda: bool,
+    /// Python 2 允许 `True = 0`/`False = 1`；一旦出现绑定，模块内所有
+    /// True/False 都按普通名字处理，避免把被遮蔽的条件折成常量。
+    bool_names: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -176,19 +192,41 @@ impl<'a> Parser<'a> {
             let first = self.pos;
             let mut decos = Vec::new();
             let base = self.indent_stack.last().cloned().unwrap_or_default();
+            let target = "    ".repeat(self.indent_stack.len().saturating_sub(1));
             while self.at_op("@") {
                 let s = self.pos;
                 while !self.at_eof() && self.tk().kind != TokKind::Newline {
                     self.advance();
                 }
-                let raw = self.slice_tokens(s, self.pos).trim().to_string();
-                // 续行保留源缩进；打印层会逐行加当前缩进，先把基准
-                // 缩进剥掉，避免装饰器里的三引号字符串内容被整体右移。
-                let raw = strip_continuation_indent(&raw, &base);
-                decos.push(raw);
+                let raw = self.slice_tokens(s, self.pos).trim_end().to_string();
+                let raw_start = self.toks[s].start as usize;
+                let spans: Vec<(usize, usize)> = self.toks[s..self.pos]
+                    .iter()
+                    .filter(|t| t.kind == TokKind::Str)
+                    .map(|t| {
+                        (
+                            (t.start as usize).saturating_sub(raw_start),
+                            (t.end as usize).saturating_sub(raw_start),
+                        )
+                    })
+                    .collect();
+                decos.push(reindent_decorator(&raw, &spans, &base, &target));
                 self.eat_newlines();
             }
-            let deco = decos.join("\n");
+            // 首个装饰器行由打印层加当前缩进；后续装饰器行是绝对缩进，
+            // 这里补上所在块的基准缩进（每个装饰器的续行本身已绝对）。
+            let deco = decos
+                .iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    if i == 0 {
+                        d.clone()
+                    } else {
+                        format!("{target}{d}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             let mut is_async = false;
             if self.at_kw("async") && self.at_kw_at(1, "def") {
                 is_async = true;
@@ -290,11 +328,47 @@ impl<'a> Parser<'a> {
         }
         if self.tk().kind == TokKind::Newline {
             self.advance();
+            Ok(())
+        } else if self.at_eof() || self.tk().kind == TokKind::Dedent {
+            Ok(())
+        } else {
+            Err(format!("unexpected `{}` after statement", self.tk().text))
         }
-        Ok(())
     }
 
     fn parse_small_stmt(&mut self) -> R<PyId> {
+        // `print[1, 2]` / `print{...}` 在 Python 2 是 print 语句，在 Python 3
+        // 是下标；两种语义都只能靠原文保全（下标 tuple 会被加点号）。
+        if (self.at_kw("print") || self.at_kw("exec"))
+            && (self.at_op_at(1, "[") || self.at_op_at(1, "{"))
+            && self.next_token_adjacent()
+        {
+            let s = self.pos;
+            return Ok(self.capture_line_from(s));
+        }
+        // `print (a), b` / `print(a) if x else b`：Python 2 是 print 语句，
+        // Python 3 是（或非法）表达式；只有调用恰好构成整条语句时才按
+        // 表达式处理，其余原文保全。
+        if self.at_kw("print") && self.at_op_at(1, "(") && !self.print_call_is_whole_stmt() {
+            let s = self.pos;
+            return Ok(self.capture_line_from(s));
+        }
+        // `print -1 + 2` 在 Python 3 是合法的二元表达式（运行时 TypeError），
+        // 折叠成 `print 1` 会把合法程序变成语法错误；整行原文保全。
+        if self.at_kw("print") && (self.at_op_at(1, "-") || self.at_op_at(1, "+")) {
+            let s = self.pos;
+            return Ok(self.capture_line_from(s));
+        }
+        if self.at_kw("print") && self.looks_like_print_stmt() {
+            return self.parse_print_stmt();
+        }
+        // `exec` 在 Python 3 可以是普通名字；无论哪种形态，整行原文
+        // 保全都保持原版本语义（Python 2 的 exec 语句与 Python 3 的
+        // exec() 调用在参数逗号处语义不同）。
+        if self.at_kw("exec") {
+            let s = self.pos;
+            return Ok(self.capture_line_from(s));
+        }
         if self.at_kw("pass") {
             self.advance();
             return Ok(self.ast.simple(NodeData::Pass));
@@ -317,12 +391,17 @@ impl<'a> Parser<'a> {
             return Ok(self.ast.return_(value));
         }
         if self.at_kw("raise") {
+            let raise_start = self.pos;
             self.advance();
             let exc = if self.at_stmt_end() || self.at_kw("from") {
                 None
             } else {
                 Some(self.parse_test()?)
             };
+            // Python 2: raise E, V[, TB] —— 逗号形式整体保留原文
+            if self.at_op(",") {
+                return Ok(self.capture_line_from(raise_start));
+            }
             let cause = if self.eat_kw("from") {
                 Some(self.parse_test()?)
             } else {
@@ -388,11 +467,22 @@ impl<'a> Parser<'a> {
         if self.at_op(":") {
             self.advance();
             let ann_start = self.pos;
-            while !self.at_eof()
-                && !self.at_op("=")
-                && self.tk().kind != TokKind::Newline
-                && !self.at_op(";")
-            {
+            // 注解里可以有 `Field(min_length=1)` 这类带 `=` 的下标参数；
+            // 只有深度 0 的 `=` / `;` / 换行才结束注解。
+            let mut depth = 0i32;
+            while !self.at_eof() {
+                let t = self.tk();
+                if t.kind == TokKind::Op {
+                    match t.text.as_str() {
+                        "(" | "[" | "{" => depth += 1,
+                        ")" | "]" | "}" => depth -= 1,
+                        "=" | ";" if depth <= 0 => break,
+                        _ => {}
+                    }
+                }
+                if t.kind == TokKind::Newline && depth <= 0 {
+                    break;
+                }
                 self.advance();
             }
             let annotation = self.slice_tokens(ann_start, self.pos).trim().to_string();
@@ -869,6 +959,12 @@ impl<'a> Parser<'a> {
                     self.expect_name()?;
                 } else if self.eat_op("/") {
                     // positional-only marker
+                } else if self.at_op("(") {
+                    // Python 2 tuple parameter: `lambda (a, b): ...`
+                    self.skip_balanced("(", ")")?;
+                    if self.eat_op("=") {
+                        let _ = self.parse_test()?;
+                    }
                 } else {
                     self.expect_name()?;
                     if self.eat_op("=") {
@@ -882,7 +978,12 @@ impl<'a> Parser<'a> {
             }
             let params = self.slice_tokens(s, self.pos).trim().to_string();
             self.expect_op(":")?;
-            let body = self.parse_test()?;
+            let no_cond = std::mem::take(&mut self.no_cond_lambda);
+            let body = if no_cond {
+                self.parse_or()?
+            } else {
+                self.parse_test()?
+            };
             return Ok(self
                 .ast
                 .push(NodeData::Lambda { params_raw: params }, vec![body]));
@@ -898,6 +999,17 @@ impl<'a> Parser<'a> {
             return Ok(self.ast.if_exp(body, cond, orelse));
         }
         Ok(body)
+    }
+
+    fn parse_comp_iter_item(&mut self) -> R<PyId> {
+        if self.at_kw("lambda") {
+            self.no_cond_lambda = true;
+            let r = self.parse_test();
+            self.no_cond_lambda = false;
+            r
+        } else {
+            self.parse_or()
+        }
     }
 
     fn parse_comp_ifs(&mut self) -> R<Vec<PyId>> {
@@ -949,6 +1061,8 @@ impl<'a> Parser<'a> {
                 PyCmp::Eq
             } else if self.eat_op("!=") {
                 PyCmp::NotEq
+            } else if self.eat_op("<>") {
+                PyCmp::LtGt
             } else if self.eat_op("<=") {
                 PyCmp::LtE
             } else if self.eat_op(">=") {
@@ -1158,7 +1272,8 @@ impl<'a> Parser<'a> {
                 } else {
                     Some(self.parse_named_expr()?)
                 };
-                let step = if self.eat_op(":") {
+                let step_colon = self.eat_op(":");
+                let step = if step_colon {
                     if self.at_op(",") || self.at_op("]") {
                         None
                     } else {
@@ -1167,7 +1282,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                let s = self.ast.slice(lower, upper, step);
+                let s = self.ast.slice(lower, upper, step, step_colon);
                 items.push(s);
             } else if let Some(l) = lower {
                 items.push(l);
@@ -1209,7 +1324,27 @@ impl<'a> Parser<'a> {
             let in_pos = self.scan_to_kw("in")?;
             let target_raw = self.slice_tokens(tstart, in_pos).trim().to_string();
             self.advance();
-            let iter = self.parse_or()?;
+            // Python 2 允许推导式 iterable 是未加括号的 tuple：
+            // `[x for x in a, b]`（Python 3 已移除）。
+            let first = self.parse_comp_iter_item()?;
+            let mut items = vec![first];
+            while self.eat_op(",") {
+                if self.at_kw("for")
+                    || self.at_kw("if")
+                    || self.at_op("]")
+                    || self.at_op(")")
+                    || self.at_op("}")
+                    || self.tk().kind == TokKind::Newline
+                {
+                    break;
+                }
+                items.push(self.parse_comp_iter_item()?);
+            }
+            let iter = if items.len() == 1 {
+                items.pop().unwrap()
+            } else {
+                self.ast.push(NodeData::Tuple, items)
+            };
             let ifs = self.parse_comp_ifs()?;
             let if_count = ifs.len();
             let mut ch = vec![iter];
@@ -1243,8 +1378,8 @@ impl<'a> Parser<'a> {
             TokKind::Name => {
                 self.advance();
                 match t.text.as_str() {
-                    "True" => Ok(self.ast.bool(true)),
-                    "False" => Ok(self.ast.bool(false)),
+                    "True" if !self.bool_names => Ok(self.ast.bool(true)),
+                    "False" if !self.bool_names => Ok(self.ast.bool(false)),
                     "None" => Ok(self.ast.none()),
                     _ => Ok(self.ast.name(&t.text)),
                 }
@@ -1279,6 +1414,12 @@ impl<'a> Parser<'a> {
                 "(" => self.parse_paren(),
                 "[" => self.parse_list(),
                 "{" => self.parse_brace(),
+                "`" => {
+                    self.advance();
+                    let e = self.parse_testlist_star()?;
+                    self.expect_op("`")?;
+                    Ok(self.ast.repr_(e))
+                }
                 _ => Err(format!("unexpected `{}`", t.text)),
             },
             _ => Err(format!("unexpected token `{}`", t.text)),
@@ -1441,8 +1582,145 @@ impl<'a> Parser<'a> {
         self.src.get(s..e).unwrap_or("").to_string()
     }
 
+    /// Python 2 print 是语句；`print(...)`/`print[0]` 这类在 Python 3
+    /// 合法（或打印对象相同）的形态仍按表达式解析，打印结果不变。
+    fn looks_like_print_stmt(&self) -> bool {
+        let t = self.tk_at(1);
+        match t.kind {
+            TokKind::Newline | TokKind::Eof | TokKind::Name | TokKind::Number | TokKind::Str => {
+                true
+            }
+            TokKind::Op => match t.text.as_str() {
+                ">>" | ";" | "-" | "+" | "~" | "`" => true,
+                // `print [1]`（有空格）是 print 语句；紧邻的 `print[1]`
+                // 已在 parse_small_stmt 里按原文保全。
+                "[" | "{" => !self.next_token_adjacent(),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// `print(...)` 之后是否立刻结束当前简单语句（只有这种形态在
+    /// Python 2/3 下语义一致，可以安全地当调用处理）。
+    fn print_call_is_whole_stmt(&self) -> bool {
+        let mut i = self.pos + 1;
+        let mut depth = 0i32;
+        while i < self.toks.len() {
+            let t = &self.toks[i];
+            match t.kind {
+                TokKind::Eof => return false,
+                TokKind::Op => match t.text.as_str() {
+                    "(" => depth += 1,
+                    ")" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let Some(next) = self.toks.get(i + 1) else {
+                                return true;
+                            };
+                            return next.kind == TokKind::Newline
+                                || next.kind == TokKind::Eof
+                                || next.kind == TokKind::Dedent
+                                || (next.kind == TokKind::Op && next.text == ";");
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// 当前 token 与下一个 token 之间没有空白（用于区分 Python 2 语句
+    /// 与 Python 3 的下标/调用形态）。
+    fn next_token_adjacent(&self) -> bool {
+        self.pos + 1 < self.toks.len()
+            && self.toks[self.pos].end == self.toks[self.pos + 1].start
+    }
+
+    fn parse_print_stmt(&mut self) -> R<PyId> {
+        self.expect_kw("print")?;
+        let mut dest = None;
+        if self.eat_op(">>") {
+            dest = Some(self.parse_test()?);
+        }
+        let mut values = Vec::new();
+        let mut nl = true;
+        if dest.is_some() {
+            if self.eat_op(",") {
+                nl = false;
+                if !self.at_stmt_end() {
+                    values.push(self.parse_test()?);
+                    nl = true;
+                }
+                while !self.at_stmt_end() {
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                    nl = false;
+                    if self.at_stmt_end() {
+                        break;
+                    }
+                    values.push(self.parse_test()?);
+                    nl = true;
+                }
+            }
+        } else if !self.at_stmt_end() {
+            values.push(self.parse_test()?);
+            while !self.at_stmt_end() {
+                if !self.eat_op(",") {
+                    break;
+                }
+                nl = false;
+                if self.at_stmt_end() {
+                    break;
+                }
+                values.push(self.parse_test()?);
+                nl = true;
+            }
+        }
+        Ok(self.ast.print_stmt(dest, values, nl))
+    }
+
+    /// 捕获到当前逻辑行结束（深度 0 的换行或分号），不吞缩进块。
+    fn capture_line_from(&mut self, start: usize) -> PyId {
+        if start >= self.toks.len() {
+            return self.ast.raw_stmt("");
+        }
+        let byte_start = self.toks[start].start as usize;
+        let mut depth = 0i32;
+        let mut i = start;
+        while i < self.toks.len() {
+            let t = &self.toks[i];
+            if t.kind == TokKind::Eof {
+                break;
+            }
+            if t.kind == TokKind::Op {
+                match t.text.as_str() {
+                    "(" | "[" | "{" => depth += 1,
+                    ")" | "]" | "}" => depth -= 1,
+                    ";" if depth <= 0 => break,
+                    _ => {}
+                }
+            }
+            if t.kind == TokKind::Newline && depth <= 0 {
+                break;
+            }
+            i += 1;
+        }
+        let byte_end = if i > start {
+            self.toks[i - 1].end as usize
+        } else {
+            byte_start
+        };
+        self.pos = i;
+        let raw = self.src.get(byte_start..byte_end).unwrap_or("");
+        self.ast.raw_stmt(raw.trim_end())
+    }
+
     fn capture_raw_from(&mut self, start: usize) -> PyId {
-        let base = self.indent_stack.last().cloned().unwrap_or_default();
         let byte_start = self.toks[start].start as usize;
         let mut i = start;
         // 装饰器行可能有多条：先逐条吃到各自换行
@@ -1499,12 +1777,7 @@ impl<'a> Parser<'a> {
         };
         self.pos = i;
         let raw = self.src.get(byte_start..byte_end).unwrap_or("");
-        let stripped = raw
-            .lines()
-            .map(|line| line.strip_prefix(&base).unwrap_or(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.ast.raw_stmt(stripped.trim_end())
+        self.ast.raw_stmt(raw.trim_end())
     }
 }
 
@@ -1527,23 +1800,6 @@ fn from_paren_list(p: &mut Parser<'_>, first: PyId, close: &str) -> R<PyId> {
     }
 }
 
-/// 多行原文的续行剥离基准缩进（首行已无缩进）。
-fn strip_continuation_indent(raw: &str, base: &str) -> String {
-    if base.is_empty() || !raw.contains('\n') {
-        return raw.to_string();
-    }
-    let mut out = String::with_capacity(raw.len());
-    for (i, line) in raw.lines().enumerate() {
-        if i > 0 {
-            out.push('\n');
-            out.push_str(line.strip_prefix(base).unwrap_or(line));
-        } else {
-            out.push_str(line);
-        }
-    }
-    out
-}
-
 fn string_prefix(raw: &str) -> &str {
     let n = raw
         .char_indices()
@@ -1553,13 +1809,324 @@ fn string_prefix(raw: &str) -> &str {
     &raw[..n]
 }
 
+/// 把装饰器续行的代码缩进从源文件基准缩进改写成打印器的 4 空格层级。
+/// 三引号/多行字符串内部的物理行保持原样（空格是字符串值的一部分）。
+fn reindent_decorator(
+    raw: &str,
+    str_spans: &[(usize, usize)],
+    base: &str,
+    target: &str,
+) -> String {
+    if raw.contains('\n') == false {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut off = 0usize;
+    for (i, line) in raw.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+            let in_string = str_spans
+                .iter()
+                .any(|&(s, e)| s < off && off < e);
+            if in_string || line.trim().is_empty() {
+                out.push_str(line);
+            } else if !base.is_empty() {
+                if let Some(rest) = line.strip_prefix(base) {
+                    out.push_str(target);
+                    out.push_str(rest);
+                } else {
+                    out.push_str(line);
+                }
+            } else {
+                out.push_str(line);
+            }
+        } else {
+            out.push_str(line);
+        }
+        off += line.len() + 1;
+    }
+    out
+}
+
+/// Python 2 的 True/False 可以被赋值；检测到绑定后就不要再把它们
+/// 当字面量折叠（Python 3 里这种绑定本身是语法错误，按名字处理也无害）。
+fn bool_literals_are_shadowed(toks: &[Token]) -> bool {
+    for (i, t) in toks.iter().enumerate() {
+        if t.kind != TokKind::Name || !matches!(t.text.as_str(), "True" | "False") {
+            continue;
+        }
+        let mut stmt_start = i;
+        while stmt_start > 0 {
+            let p = &toks[stmt_start - 1];
+            if matches!(
+                p.kind,
+                TokKind::Newline | TokKind::Indent | TokKind::Dedent
+            ) || (p.kind == TokKind::Op && p.text == ";")
+            {
+                break;
+            }
+            stmt_start -= 1;
+        }
+        let mut base_depth = 0i32;
+        for n in &toks[stmt_start..i] {
+            if n.kind == TokKind::Op {
+                match n.text.as_str() {
+                    "(" | "[" | "{" => base_depth += 1,
+                    ")" | "]" | "}" => base_depth -= 1,
+                    _ => {}
+                }
+            }
+        }
+        // 1) True/False 之后、同一逻辑语句内出现赋值号（且不是调用里的
+        //    关键字参数）。
+        let mut depth = base_depth;
+        let mut j = i + 1;
+        while j < toks.len() {
+            let n = &toks[j];
+            match n.kind {
+                TokKind::Newline | TokKind::Eof => break,
+                TokKind::Op => match n.text.as_str() {
+                    "(" | "[" | "{" => depth += 1,
+                    ")" | "]" | "}" => {
+                        depth -= 1;
+                        if depth < 0 {
+                            break;
+                        }
+                    }
+                    ";" if depth <= base_depth => break,
+                    // `if True: x = 1` 的 `=` 在 suite 里；`f(True):` 的冒号
+                    // 在调用之外，都不是 True 的赋值。
+                    ":" if depth <= base_depth => break,
+                    "=" if depth < base_depth || (depth == base_depth && base_depth == 0) => {
+                        return true
+                    }
+                    "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**=" | "&=" | "|=" | "^="
+                    | "<<=" | ">>="
+                        if depth < base_depth
+                            || (depth == base_depth && base_depth == 0) =>
+                    {
+                        return true
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+            j += 1;
+        }
+        // `for True in ...` / `for a, True in ...`：向回找最近的 for/in，
+        // 先遇到 for 说明 True 在目标列表里；先遇到 in 说明它在 iterable。
+        {
+            let mut k = i;
+            while k > 0 {
+                k -= 1;
+                let n = &toks[k];
+                if matches!(
+                    n.kind,
+                    TokKind::Newline | TokKind::Indent | TokKind::Dedent | TokKind::Eof
+                ) || (n.kind == TokKind::Op && n.text == ";")
+                {
+                    break;
+                }
+                if n.kind == TokKind::Name && n.text == "in" {
+                    // True 在 iterable 里，不是 for 目标。
+                    break;
+                }
+                if n.kind == TokKind::Name && n.text == "for" {
+                    return true;
+                }
+            }
+        }
+        // 2) 前置绑定关键字：`as True`、`global True`、`del True`、`def True`。
+        let prev = toks[..i]
+            .iter()
+            .rev()
+            .find(|p| {
+                !matches!(
+                    p.kind,
+                    TokKind::Newline | TokKind::Indent | TokKind::Dedent | TokKind::Eof
+                )
+            });
+        if let Some(prev) = prev {
+            if prev.kind == TokKind::Name
+                && matches!(
+                    prev.text.as_str(),
+                    "as" | "global" | "nonlocal" | "del" | "def" | "class"
+                )
+            {
+                return true;
+            }
+        }
+        // 3) 同一逻辑语句里位于 def/lambda/except 的头部（冒号之前）：
+        //    `def f(True)`、`lambda True:`、`except E, True:`；import/from
+        //    里的名字也都是绑定。
+        let start = stmt_start;
+        // `with x as (True, y):` / `import x as True` 等 as 绑定。
+        if (start..i).any(|k| {
+            toks[k].kind == TokKind::Name && toks[k].text == "as"
+        }) {
+            let mut d = 0i32;
+            let mut colon = None;
+            for k in start..toks.len() {
+                let n = &toks[k];
+                if matches!(n.kind, TokKind::Newline | TokKind::Eof) {
+                    break;
+                }
+                if n.kind == TokKind::Op {
+                    match n.text.as_str() {
+                        "(" | "[" | "{" => d += 1,
+                        ")" | "]" | "}" => d -= 1,
+                        ":" if d <= 0 => {
+                            colon = Some(k);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if colon.map_or(true, |c| i < c) {
+                return true;
+            }
+        }
+        let mut is_def = false;
+        let mut is_lambda = false;
+        let mut is_except = false;
+        let mut has_import = false;
+        for n in &toks[start..=i] {
+            if n.kind == TokKind::Name {
+                match n.text.as_str() {
+                    "def" => is_def = true,
+                    "lambda" => is_lambda = true,
+                    "except" => is_except = true,
+                    "import" | "from" => has_import = true,
+                    _ => {}
+                }
+            }
+        }
+        if has_import {
+            return true;
+        }
+        let header = is_def || is_lambda || is_except;
+        if header {
+            // 头部第一个深度 0 的冒号；它之后是函数体/lambda 体，不是绑定区。
+            let mut d = 0i32;
+            let mut colon = None;
+            for k in start..toks.len() {
+                let n = &toks[k];
+                if matches!(n.kind, TokKind::Newline | TokKind::Eof) {
+                    break;
+                }
+                if n.kind == TokKind::Op {
+                    match n.text.as_str() {
+                        "(" | "[" | "{" => d += 1,
+                        ")" | "]" | "}" => d -= 1,
+                        ":" if d <= 0 => {
+                            colon = Some(k);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if colon.is_some_and(|c| i >= c) {
+                continue;
+            }
+            if is_def || is_lambda {
+                // 形参名出现在 `(`/`,`/`lambda`/`*`/`**` 之后；
+                // 默认值在 `=` 之后，不是绑定。
+                let bind_prev = toks[..i].iter().rev().find(|p| {
+                    !matches!(
+                        p.kind,
+                        TokKind::Newline | TokKind::Indent | TokKind::Dedent | TokKind::Eof
+                    )
+                });
+                if let Some(prev) = bind_prev {
+                    if prev.kind == TokKind::Op
+                        && matches!(prev.text.as_str(), "(" | "," | "*" | "**")
+                    {
+                        return true;
+                    }
+                    if prev.kind == TokKind::Name && prev.text == "lambda" {
+                        return true;
+                    }
+                }
+            } else {
+                // `except E, True:`：深度 0 的逗号之后是绑定目标；
+                // `except (E, True):` 里的逗号在括号内，是类型值。
+                let mut d = 0i32;
+                let mut depth0_comma = false;
+                for k in start..i {
+                    let n = &toks[k];
+                    if n.kind == TokKind::Op {
+                        match n.text.as_str() {
+                            "(" | "[" | "{" => d += 1,
+                            ")" | "]" | "}" => d -= 1,
+                            "," if d <= 0 => depth0_comma = true,
+                            _ => {}
+                        }
+                    }
+                }
+                if depth0_comma {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 模块开头的 shebang 与编码声明（最多前两行）。
+fn leading_header(src: &str) -> Option<String> {
+    let lines: Vec<&str> = src.lines().take(2).collect();
+    let mut keep = 0usize;
+    if let Some(first) = lines.first() {
+        let t = first.trim_start_matches([' ', '\t', '\x0c']);
+        if t.starts_with("#!") {
+            keep = 1;
+            if lines.get(1).is_some_and(|l| is_coding_line(l)) {
+                keep = 2;
+            }
+        } else if is_coding_line(first) {
+            keep = 1;
+        } else if (t.is_empty() || t.starts_with('#'))
+            && lines.get(1).is_some_and(|l| is_coding_line(l))
+        {
+            // PEP 263 允许第一行为空行或注释、第二行写编码声明。
+            keep = 2;
+        }
+    }
+    if keep == 0 {
+        return None;
+    }
+    Some(
+        lines[..keep]
+            .iter()
+            .map(|l| l.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn is_coding_line(line: &str) -> bool {
+    let t = line.trim_start_matches([' ', '\t', '\x0c']);
+    t.starts_with('#') && (t.contains("coding:") || t.contains("coding="))
+}
+
 fn number_literal(raw: &str) -> Literal {
     let clean: String = raw.chars().filter(|&c| c != '_').collect();
-    let lower = clean.to_ascii_lowercase();
+    // Python 2 long 后缀（`10L` / `0xFFL`）：打印保留原文，值去掉后缀。
+    let body = if clean.len() > 1 && clean.ends_with(['l', 'L']) {
+        &clean[..clean.len() - 1]
+    } else {
+        clean.as_str()
+    };
+    let lower = body.to_ascii_lowercase();
     if lower.ends_with('j') {
         return Literal::raw_str(raw, LitKind::Complex);
     }
-    if lower.contains('.') || lower.contains('e') {
+    let prefixed = lower.starts_with("0x")
+        || lower.starts_with("0o")
+        || lower.starts_with("0b");
+    if !prefixed && (lower.contains('.') || lower.contains('e')) {
         return Literal::raw_str(raw, LitKind::Float);
     }
     let v = if let Some(h) = lower.strip_prefix("0x") {
@@ -1568,6 +2135,12 @@ fn number_literal(raw: &str) -> Literal {
         i64::from_str_radix(o, 8).ok()
     } else if let Some(b) = lower.strip_prefix("0b") {
         i64::from_str_radix(b, 2).ok()
+    } else if lower.len() > 1
+        && lower.starts_with('0')
+        && lower.bytes().all(|b| (b'0'..=b'7').contains(&b))
+    {
+        // Python 2 旧式八进制 `0777`
+        i64::from_str_radix(&lower[1..], 8).ok()
     } else {
         lower.parse::<i64>().ok()
     };
