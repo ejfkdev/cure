@@ -11,7 +11,9 @@
 use std::path::{Path, PathBuf};
 
 use cure_ts_parser::{
-    parse, parse_module, parse_module_with_source, parse_with_source,
+    parse_js as parse, parse_js_module as parse_module,
+    parse_js_module_with_source as parse_module_with_source,
+    parse_js_with_source as parse_with_source,
 };
 use cure_ts_print::print_module;
 

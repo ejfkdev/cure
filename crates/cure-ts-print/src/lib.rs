@@ -935,6 +935,7 @@ impl<'a> Printer<'a> {
                 params_raw,
                 name,
                 generics_raw,
+                ret_raw,
                 space,
                 arrow,
                 is_async,
@@ -949,7 +950,8 @@ impl<'a> Printer<'a> {
                         self.push_raw(&g);
                     }
                     let ps = params_raw.trim();
-                    if is_plain_ident(ps) {
+                    let has_ret = !ret_raw.trim().is_empty();
+                    if is_plain_ident(ps) && !has_ret {
                         self.out.push_str(ps);
                     } else {
                         // 多参/模式/默认值/类型注解——括号必需
@@ -961,6 +963,10 @@ impl<'a> Printer<'a> {
                             self.push_raw(&ps2);
                             self.out.push(')');
                         }
+                    }
+                    if has_ret {
+                        let r = ret_raw.trim().to_string();
+                        self.push_raw(&r);
                     }
                     self.out.push_str(" => ");
                 } else {
@@ -985,7 +991,12 @@ impl<'a> Printer<'a> {
                     self.out.push('(');
                     let pr = params_raw.trim().to_string();
                     self.push_raw(&pr);
-                    self.out.push_str(") ");
+                    self.out.push(')');
+                    if !ret_raw.trim().is_empty() {
+                        let r = ret_raw.trim().to_string();
+                        self.push_raw(&r);
+                    }
+                    self.out.push(' ');
                 }
                 let body = self.ast.children(e)[0];
                 self.print_lambda_body(body);

@@ -1,6 +1,6 @@
 use cure_engine::Lang;
 use cure_ts_ast::TsId;
-use cure_ts_parser::parse;
+use cure_ts_parser::parse_js as parse;
 
 fn prepare(src: &str) -> (cure_ts_parser::ParseOutcome, TsId) {
     let mut out = parse(src);

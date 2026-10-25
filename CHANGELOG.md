@@ -7,6 +7,34 @@
 
 ## [0.1.10] - 2026-10-25
 
+### 兼容（复杂 TypeScript 类型语法——2026-10-25 第十七批）
+
+- **类型声明原文保真扩展**：`type X<T> = …`（泛型参数）、`export type/
+  interface/enum/declare/namespace` 整体捕获到语句边界；多行 union /
+  conditional / mapped types 不再在首个换行处被拆散。
+- **类型注解扫描**：变量/解构/类字段注解按 `{…}`/`[…]`/`<…>`/`=>`
+  深度扫描（`T[K]`、`Record<string, any>[]`、`Promise<{ [K in keyof T]:
+  T[K] }>`）；无分号 ambient 声明与下一成员/声明按行首形态终止。
+- **返回类型**：函数声明/函数表达式/箭头/类方法/对象方法支持对象、
+  元组、函数、条件类型；箭头返回类型前瞻允许裸 `{…}`；`as` 类型
+  在深度 0 的 `?`/`:` 处终止（修复三元分支被吞成类型）。
+- **泛型调用/new**：`f<T>(x)`、`o.m<T>(x)`、`new C<T>()`、`new C<T>`、
+  实例化表达式 `f<T>` 擦除类型实参；仅在 TS 模式启用——`.js/.mjs/
+  .cjs` 下 `a < b > (c)` 仍按比较链解析（`ParseOptions.ts_syntax`）。
+- **类成员**：明确赋值 `field!: T`、可选 `field?: T`/`m?()`、泛型方法、
+  无体 overload（含对象返回类型）。
+- **参数列表判定**：剩余参数 `...args`、参数类型中的函数类型
+  `cb: () => T`、泛型/元组类型中的 `|`/`&` 不再误判为非参数列表
+  （曾导致类成员吞到 EOF）。
+- 修复 `yield` 同行模板操作数：`yield \`…\`` 之前因模板 token 被
+  排除在操作数之外而拆成两条语句（真实 npm 语料 `@tufjs/models`
+  发生器方法抓获）。
+- 新增 `tests/typescript_types.rs`（5 组：复杂类型声明、泛型调用/new、
+  类型化函数/箭头、`as` 三元、JS 比较链守卫）。
+- 回归：全局 npm **1,334 个 TS/TSX/MTS/CTS 文件 0 解析诊断、两轮输出
+  0 差异**，cure 产物经 Oxc `oxfmt` 解析 **0 语法错误**；JS 六层与
+  npm 语料全绿；`cargo test --workspace` **468 通过**。
+
 ### 新增（函数源码保真模式——2026-10-25 第十六批）
 
 - **`--preserve-function-source`**（库侧 `Config::preserve_function_source`

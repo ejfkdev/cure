@@ -53,6 +53,13 @@ the same thing.
   CRLF included), so `Function.prototype.toString()` matches the original.
   Bindings referenced from preserved regions are frozen; the rest of the
   module is still simplified.
+- **Complex TypeScript types** — type aliases with generic/mapped/
+  conditional/tuple/template-literal types, interfaces/namespaces/ambient
+  declarations, definite assignment (`x!: T`), optional members, generic
+  calls (`f<T>()`) and `new C<T>()`, typed function expressions and arrows
+  (including object return types and rest parameters), `as`/`satisfies`
+  with parenthesized types. Type declarations are preserved verbatim while
+  value-level code is still simplified.
 - **Modern TS/JS syntax** — decorators (class/member), `accessor`, private
   fields/methods, static blocks, `using`/`await using`, import
   attributes/`defer`/`source`, top-level await, generic functions/arrows
@@ -151,9 +158,9 @@ otherwise the locale is auto-detected. Full option reference: `cure --help`.
 | 4. Decompiled apps | 144,592 files from 5 real-world Android APKs run through [ddc](https://github.com/ejfkdev/ddc), then cure (full + `--dead-code`) | same invariants + javac differential: every package whose ddc output compiles must still compile after cure |
 | 5. ECMAScript conformance | [Test262](https://github.com/tc39/test262), six layers: (a) sync original vs cured in fresh `node` vm contexts, exception status + stdout compared (34,007 executable cases); (b) **async** cases executed with `$DONE`/microtask/timer draining (5,423 executed); (c) **module** cases linked and evaluated as ESM with a filesystem fixture loader (358 executed); (d) **compile-only on all 53,910 files** including async/module/negative; (e) **print round-trip**: parse → print (no simplify) → parse, ASTs structurally equal ignoring `Paren`/literal spelling/`Group` expansion (49,159 checked); (f) **simplify idempotency**: cure twice over the same corpus, byte-identical output (49,159 checked) | ECMAScript semantics: f64/ToInt32 domains, ±2^53, TDZ, Annex B hoisting, eval scoping, destructuring, generator/`yield` grammar, sparse arrays, async/await ordering, ESM linking/live bindings; printer/paren/decorator drift; fixed-point convergence |
 | 7. Randomized JS differential | Deterministic PRNG generates valid programs mixing declarations, shadowing, `var` hoisting, closures, loops, ternaries, short circuits and templates; original vs cured run under `node` (stdout + exit code) and a second cure must be byte-identical (`CURE_FUZZ_CASES` scales the sample) | rule-combination semantics and first/second-pass convergence; 5,000 cases used during development |
-| 6. Real-world JS | 4,358 `.js/.mjs/.cjs` files (~568 MB) from a global npm install (undici, pnpm, yarn, vite-plus, Lark CLI, bytenode, …): every valid file must still compile after cure; a second cure pass must produce byte-identical output | real-package syntax (minified bundles, top-level await, import attributes), idempotency under module-level constant propagation |
+| 6. Real-world JS/TS | 4,358 `.js/.mjs/.cjs` files (~568 MB) plus 1,334 `.ts/.tsx/.mts/.cts` files from a global npm install (undici, zod, minisearch, pnpm, yarn, vite-plus, Lark CLI, bytenode, …): every valid file must still compile after cure; a second cure pass must produce byte-identical output. The cured TS corpus parses cleanly with Oxc (`oxfmt`, 0 syntax errors) and has **0 parser diagnostics / 0 second-pass differences** | real-package syntax (minified bundles, top-level await, import attributes), complex type syntax, idempotency under module-level constant propagation |
 
-`cargo test` runs 463 tests. The Test262 semantic differential reaches
+`cargo test` runs 468 tests. The Test262 semantic differential reaches
 **33,963/34,007 (99.87%) identical runs** in default mode; the only 44
 excluded cases compare `Function.prototype.toString` **source text** (cure
 reformats function bodies) or use arrow functions as computed-property keys,

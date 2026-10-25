@@ -21,13 +21,7 @@ use cure_engine::Config;
 use cure_java_parser::parse;
 use cure_java_print::print_unit;
 use cure_java_simplify::simplify_unit;
-use cure_ts_parser::{
-    parse as ts_parse, parse_module as ts_parse_module,
-    parse_module_with_source as ts_parse_module_with_source,
-    parse_script as ts_parse_script,
-    parse_script_with_source as ts_parse_script_with_source,
-    parse_with_source as ts_parse_with_source,
-};
+use cure_ts_parser::{parse_with_options, ParseOptions};
 use cure_ts_print::print_module as ts_print;
 use cure_ts_simplify::simplify_unit as ts_simplify_unit;
 
@@ -904,24 +898,28 @@ fn process_source_ts(
     // 是运算符；`.cjs`/`.cts` = CommonJS；其余按顶层 import/export
     // 自动判定）。
     let disp = display.to_ascii_lowercase();
-    let capture = opts.preserve_function_source;
-    let mut outcome = if disp.ends_with(".mjs") || disp.ends_with(".mts") {
-        if capture {
-            ts_parse_module_with_source(src)
-        } else {
-            ts_parse_module(src)
-        }
+    let module_goal = if disp.ends_with(".mjs") || disp.ends_with(".mts") {
+        Some(true)
     } else if disp.ends_with(".cjs") || disp.ends_with(".cts") {
-        if capture {
-            ts_parse_script_with_source(src)
-        } else {
-            ts_parse_script(src)
-        }
-    } else if capture {
-        ts_parse_with_source(src)
+        Some(false)
     } else {
-        ts_parse(src)
+        None
     };
+    // `.js/.jsx/.mjs/.cjs` 关闭歧义 TS 泛型形态（`a < b > (c)` 是
+    // 比较链而非 `a<b>(c)` 调用）；`.ts/.tsx/.mts/.cts` 及未知来源
+    // 保留 TS 语法。
+    let ts_syntax = !(disp.ends_with(".js")
+        || disp.ends_with(".jsx")
+        || disp.ends_with(".mjs")
+        || disp.ends_with(".cjs"));
+    let mut outcome = parse_with_options(
+        src,
+        ParseOptions {
+            module_goal,
+            capture_source: opts.preserve_function_source,
+            ts_syntax,
+        },
+    );
     if opts.preserve_function_source {
         outcome.ast.set_preserve_source(true);
     }

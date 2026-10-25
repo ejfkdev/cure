@@ -19,7 +19,7 @@ use std::path::Path;
 use std::process::Command;
 
 use cure_engine::Config;
-use cure_ts_parser::parse;
+use cure_ts_parser::{parse_js as parse, parse_with_options, ParseOptions};
 use cure_ts_print::print_module;
 use cure_ts_simplify::simplify_unit;
 
@@ -630,10 +630,11 @@ fn parse_print_roundtrip_clean() {
         "var n = 0x1F + 0b101 + 0o17 + 1_000 + 12n;\n",
     ];
     for (i, src) in srcs.iter().enumerate() {
-        let mut out = parse(src);
+        // 本组含 TS 断言（`x as unknown as string`），走 TS 解析。
+        let mut out = parse_with_options(src, ParseOptions::default());
         assert!(out.errors.is_empty(), "#{i} 源解析失败: {:#?}", out.errors);
         let printed = print_module(&out.ast, &out.unit);
-        let re = parse(&printed);
+        let re = parse_with_options(&printed, ParseOptions::default());
         assert!(
             re.errors.is_empty(),
             "#{i} 打印输出不可再解析：{:#?}\n== printed ==\n{printed}",
@@ -763,7 +764,7 @@ console.log(f(), g());
 #[test]
 fn export_group_keeps_all_exports() {
     let src = "export var a = 1, b = 2;\n";
-    let mut out = cure_ts_parser::parse_module(src);
+    let mut out = cure_ts_parser::parse_js_module(src);
     assert!(out.errors.is_empty(), "{:?}", out.errors);
     let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
     let printed = print_module(&out.ast, &out.unit);
@@ -796,12 +797,12 @@ fn decorators_are_preserved() {
 #[test]
 fn module_top_level_await_keeps_operator() {
     let src = "await (g());\n";
-    let mut out = cure_ts_parser::parse_module(src);
+    let mut out = cure_ts_parser::parse_js_module(src);
     assert!(out.errors.is_empty(), "{:?}", out.errors);
     let _ = simplify_unit(&mut out.ast, &mut out.unit, &Config::default());
     let once = print_module(&out.ast, &out.unit);
     assert!(once.contains("await g()") || once.contains("await (g())"), "{once}");
-    let mut out2 = cure_ts_parser::parse_module(&once);
+    let mut out2 = cure_ts_parser::parse_js_module(&once);
     assert!(out2.errors.is_empty(), "{once}: {:?}", out2.errors);
     let _ = simplify_unit(&mut out2.ast, &mut out2.unit, &Config::default());
     assert_eq!(once, print_module(&out2.ast, &out2.unit));

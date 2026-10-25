@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use cure_engine::Config;
-use cure_ts_parser::{parse_module, parse_module_with_source};
+use cure_ts_parser::{parse_js_module as parse_module, parse_js_module_with_source as parse_module_with_source};
 use cure_ts_print::print_module;
 use cure_ts_simplify::simplify_unit;
 

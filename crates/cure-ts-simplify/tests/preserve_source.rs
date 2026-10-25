@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::Command;
 
 use cure_engine::Config;
-use cure_ts_parser::parse_with_source;
+use cure_ts_parser::parse_js_with_source as parse_with_source;
 use cure_ts_print::print_module;
 use cure_ts_simplify::simplify_unit;
 
@@ -128,7 +128,7 @@ fn crlf_line_terminators_are_preserved() {
 #[test]
 fn default_mode_keeps_reformatting() {
     let src = "function f(a,  b) { return a +  b; }\nconsole.log(f.toString());\n";
-    let mut outcome = cure_ts_parser::parse(src);
+    let mut outcome = cure_ts_parser::parse_js(src);
     assert!(outcome.errors.is_empty());
     let _ = simplify_unit(&mut outcome.ast, &mut outcome.unit, &Config::default());
     let out = print_module(&outcome.ast, &outcome.unit);
