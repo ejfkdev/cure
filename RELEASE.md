@@ -11,9 +11,9 @@ to crates.io in dependency order.
    `## [X.Y.Z] - YYYY-MM-DD` and refresh the compare links.
 3. **Verify locally**:
    - `cargo test --workspace --release`
-   - `cargo publish --dry-run -p cure-engine` and `-p cure-tree` (the two
-     crates with no `cure-*` dependency; later crates can only be dry-run
-     after their upstream version is on crates.io)
+   - `cargo publish --dry-run -p cure-engine` (the only crate with no
+     `cure-*` dependency; later crates can only be dry-run after their
+     upstream version is on crates.io)
    - Optional full corpora: the Test262 six-layer examples and the npm
      corpus checks documented in README.
 4. **Commit** the version bump and docs.
