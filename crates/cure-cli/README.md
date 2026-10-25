@@ -45,9 +45,12 @@ Highlights:
   parameters; PEP 701 f-strings, t-strings, `match`, walrus, `except*`, PEP
   695, `lazy import`), Python-semantics constant folding that preserves
   Python 2 int/long types and `True`/`False` rebinding, and generator/scope
-  guards. A 12-rule pack includes literal string/builtin/subscript folding,
-  if/else-to-conditional, nested-if merging, else-after-terminal removal,
-  dead stores/expressions and `return None` cleanup. Verified over 35,548
+  guards. A 25-rule pack includes literal string/builtin/subscript folding,
+  if/else-to-conditional (including adjacent `return` branches), nested-if
+  merging, else-after-terminal and empty-branch removal, not/is/in
+  rewriting, redundant-paren removal, function-scope dead-assignment
+  elimination, string accumulation and assign-back folding, trailing
+  return/continue and empty-finally cleanup. Verified over 35,548
   stdlib/site-package files with 0 diagnostics, 0 idempotency drift and 0
   compile regressions.
 - **Directory mode** — recursive, parallel (dynamic work queue, threads =

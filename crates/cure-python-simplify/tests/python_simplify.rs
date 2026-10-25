@@ -171,7 +171,7 @@ else:
     assert!(out.contains("if a and b:"), "{out}");
     assert!(!out.contains("p = 9"), "{out}");
     assert!(out.contains("p = 10"), "{out}");
-    assert!(out.contains("def g():\n    return"), "{out}");
+    assert!(out.contains("def g():\n    pass"), "{out}");
     assert!(!out.contains("1 + 2"), "{out}");
     // elif 链在固定点后可以折成嵌套条件表达式（语义相同）。
     assert!(out.contains("return 1 if c else 2 if d else 3"), "{out}");
@@ -450,4 +450,226 @@ class C:
 print(__doc__, C.__doc__, C.m.__doc__)
 "#;
     differential(&PathBuf::from(py), src, "py3_doc");
+}
+
+#[test]
+fn extended_structural_rules() {
+    let src = r#"def p1(c):
+    if c:
+        pass
+    else:
+        return 2
+    return 1
+def p2(c):
+    if c:
+        return 1
+    return 2
+def p3(c):
+    return True if c else False
+def p4(c):
+    return False if c else True
+def p5(c):
+    while c:
+        c = c - 1 if c > 0 else 0
+        continue
+    return 9
+def p6(c):
+    try:
+        return c
+    finally:
+        pass
+def p7(x):
+    assert True
+    assert 1, side()
+    return x is not None
+def p8(x):
+    return not (x is None)
+def p9(x):
+    return not (x in [1, 2])
+def p10():
+    s = "a"
+    s += "b"
+    s += "c"
+    return s
+def p11():
+    x = 2
+    x = x + 3
+    x = x * 2
+    return x
+def p12():
+    ("doc")
+"#;
+    let out = cured(src);
+    assert!(out.contains("return 1 if c else 2"), "{out}");
+    assert!(out.contains("return bool(c)"), "{out}");
+    assert!(out.contains("return not c"), "{out}");
+    assert!(!out.contains("continue"), "{out}");
+    assert!(out.contains("def p6(c):\n    return c"), "{out}");
+    assert!(!out.contains("assert"), "{out}");
+    assert!(out.contains("return x is not None"), "{out}");
+    assert!(out.contains("return x not in [1, 2]"), "{out}");
+    assert!(out.contains("s = 'abc'"), "{out}");
+    assert!(out.contains("x = 10"), "{out}");
+    assert!(out.contains("def p12():\n    (\"doc\")"), "{out}");
+    assert!(!out.contains("def p12():\n    pass"), "{out}");
+    assert_idempotent(src);
+}
+
+#[test]
+fn dead_assign_uses_function_scope_liveness() {
+    let src = r#"def f():
+    x = 1
+    return 2
+def g():
+    x = side()
+    return 2
+def h():
+    x = 1
+    def k(a=x):
+        return a
+    return k()
+def i():
+    x = 1
+    return locals()
+def j():
+    global x
+    x = 1
+    return 2
+def l():
+    x = 1
+    y = x
+    return y
+def m():
+    x = 1
+    "not doc"
+    return 2
+class C:
+    x = 1
+"#;
+    let out = cured(src);
+    assert!(out.contains("def f():\n    return 2"), "{out}");
+    assert!(out.contains("def g():\n    side()\n    return 2"), "{out}");
+    assert!(out.contains("def h():\n    x = 1"), "{out}");
+    assert!(out.contains("def i():\n    x = 1"), "{out}");
+    assert!(out.contains("def j():\n    global x\n    x = 1"), "{out}");
+    assert!(out.contains("def l():\n    x = 1"), "{out}");
+    assert!(out.contains("def m():\n    pass\n    \"not doc\""), "{out}");
+    assert!(out.contains("class C:\n    x = 1"), "{out}");
+    assert_idempotent(src);
+}
+
+#[test]
+fn extended_rules_run_under_python3() {
+    let Some(py) = python3() else {
+        eprintln!("skip python3 extended differential");
+        return;
+    };
+    let src = r#"def side():
+    return 3
+def p1(c):
+    if c:
+        pass
+    else:
+        return 2
+    return 1
+def p2(c):
+    if c:
+        return 1
+    return 2
+def p3(c):
+    return True if c else False
+def p4(c):
+    return False if c else True
+def p5(c):
+    while c:
+        c = c - 1 if c > 0 else 0
+        continue
+    return 9
+def p6(c):
+    try:
+        return c
+    finally:
+        pass
+def p7(x):
+    assert True
+    assert 1, side()
+    return x is not None
+def p8(x):
+    return not (x is None)
+def p9(x):
+    return not (x in [1, 2])
+def p10():
+    s = "a"
+    s += "b"
+    s += "c"
+    return s
+def p11():
+    x = 2
+    x = x + 3
+    x = x * 2
+    return x
+def p12():
+    ("doc")
+print(p1(0), p1(1), p2(0), p2(1), p3(0), p3(1), p4(0), p4(1))
+print(p5(0), p5(1), p6(5), p7(None), p8(None), p9(1), p9(3), p10(), p11(), p12.__doc__)
+"#;
+    differential(&PathBuf::from(py), src, "py3_ext");
+}
+
+#[test]
+fn extended_rules_run_under_python2_if_available() {
+    let Some(py) = python2() else {
+        eprintln!("skip python2 extended differential: set CURE_PY2");
+        return;
+    };
+    let src = r#"def side():
+    return 3
+def p1(c):
+    if c:
+        pass
+    else:
+        return 2
+    return 1
+def p2(c):
+    if c:
+        return 1
+    return 2
+def p3(c):
+    return True if c else False
+def p4(c):
+    return False if c else True
+def p5(c):
+    while c:
+        c = c - 1 if c > 0 else 0
+        continue
+    return 9
+def p6(c):
+    try:
+        return c
+    finally:
+        pass
+def p7(x):
+    assert True
+    assert 1, side()
+    return x is not None
+def p8(x):
+    return not (x is None)
+def p9(x):
+    return not (x in [1, 2])
+def p10():
+    s = "a"
+    s += "b"
+    s += "c"
+    return s
+def p11():
+    x = 2
+    x = x + 3
+    x = x * 2
+    return x
+def p12():
+    ("doc")
+print p1(0), p1(1), p2(0), p2(1), p3(0), p3(1), p4(0), p4(1)
+print p5(0), p5(1), p6(5), p7(None), p8(None), p9(1), p9(3), p10(), p11(), p12.__doc__
+"#;
+    differential(&py, src, "py2_ext");
 }

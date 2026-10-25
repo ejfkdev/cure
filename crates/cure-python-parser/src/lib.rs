@@ -66,6 +66,7 @@ pub fn parse(src: &str) -> ParseOutcome {
         }
     }
     let module = p.ast.module(items);
+    p.ast.set_bool_literals_shadowed(p.bool_names);
     ParseOutcome {
         ast: p.ast,
         module,
@@ -1905,13 +1906,12 @@ fn bool_literals_are_shadowed(toks: &[Token]) -> bool {
                     // `if True: x = 1` 的 `=` 在 suite 里；`f(True):` 的冒号
                     // 在调用之外，都不是 True 的赋值。
                     ":" if depth <= base_depth => break,
-                    "=" if depth < base_depth || (depth == base_depth && base_depth == 0) => {
-                        return true
-                    }
+                    // 只有绝对深度 0 的 `=` 是语句级赋值；调用里的
+                    // `f(True, x=1)` / 外层调用的关键字参数不算。
+                    "=" if depth == 0 => return true,
                     "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**=" | "&=" | "|=" | "^="
                     | "<<=" | ">>="
-                        if depth < base_depth
-                            || (depth == base_depth && base_depth == 0) =>
+                        if depth == 0 =>
                     {
                         return true
                     }

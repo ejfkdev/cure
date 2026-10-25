@@ -166,7 +166,7 @@ cure [选项] <文件>... | <目录> | -
 | 7. 随机 JS 差分 | 确定性 PRNG 生成合法程序（声明/遮蔽/`var` 提升/闭包/循环/三元/短路/模板混合）；原版与 cure 版在 `node` 下比较 stdout + 退出码，并要求二次 cure 逐字节一致（`CURE_FUZZ_CASES` 控制样本数） | 规则组合语义与首轮/二轮收敛；开发中跑过 5,000 例 |
 | 8. Python（2.7 + 3.13–3.15） | CPython 2.7 标准库（1,609 个 UTF-8 源文件）、4,135 文件 Python 2 包语料（Django 1.11、Twisted 20.3、pip 20.3、setuptools 44、requests、six、PyYAML）、CPython 3.13/3.14/3.15 标准库（2,188 / 2,288 / 2,456 源文件）、18,128 个 Python 3.14 site-packages 文件与 3.13/3.15 site 的 1,083 / 422 个文件：解析 → 打印后用对应解释器的 `ast.dump` 比较；二次 cure 必须逐字节一致；每个简化产物交给同一解释器编译；精选程序实际执行 | 所有语料 **0** 解析诊断；**32,289** 次 AST 等价往返（Python 2 5,736 + Python 3 26,553；已排除 20 个故意非法/异构夹具）；**35,548/35,548** 幂等、0 漂移；**32,274** 次编译检查 **0 破坏**（35 个原文件本就不可编译）；精选程序 stdout/退出码一致 |
 
-`cargo test` 共 519 个测试。默认模式下 Test262 语义差分
+`cargo test` 共 523 个测试。默认模式下 Test262 语义差分
 **33,963/34,007（99.87%）执行结果逐字节一致**；仅 44 个用例被排除——它们比较
 `Function.prototype.toString` 的**源码文本**（cure 会重排函数体格式），
 或用箭头函数作计算属性名（键依赖同一文本）。使用
@@ -190,9 +190,10 @@ setuptools 44、requests、six、PyYAML）均为 **0 解析诊断**；1,607 + 4,
 3.13/3.14/3.15 标准库与 3.14 site-packages 再贡献 26,553 个 AST 等价
 往返，0 诊断、0 幂等漂移、0 编译破坏；3.6 与 3.8 标准库（1,578 / 1,661
 个文件）同样 0 诊断且幂等。全部语料合计 **32,289 次 AST 比较、35,548 个
-幂等文件、32,274 次编译，0 破坏**；简化器共执行 **133,243 次改写**
-（Python 2 标准库 5,501、Py2 包 4,864、Python 3.15 标准库 7,700、
-Python 3.14 site-packages 97,951），docstring 与版本可见类型保持原样。另有 Python 2/3 精选程序（print/exec/
+幂等文件、32,274 次编译，0 破坏**；简化器共执行 **179,873 次改写**
+（Python 2 标准库 7,833、Py2 包 6,763、Python 3.15 标准库 12,098、
+Python 3.14 site-packages 111,340，其余 3.13/3.14/3.6/3.8 语料
+41,839），docstring 与版本可见类型保持原样。另有 Python 2/3 精选程序（print/exec/
 raise 形态、反引号、`<>`、long/int 类型、元组形参、带三引号参数的装饰器）
 在对应解释器下与 cure 版对拍 stdout 与退出码，结果一致。CLI 目前只读取
 UTF-8 源码；其他 PEP 263 编码文件会跳过（上面的 Python 2 标准库语料已
@@ -245,18 +246,29 @@ UTF-8 源码；其他 PEP 263 编码文件会跳过（上面的 Python 2 标准�
 `try_unwrap_rethrow`（`catch (E e) { throw e; }` 纯重抛剥除——fernflower
 最高频残迹，66 文件语料 ≥23 处）、new_string_char_array_fold（`new String(CHAR_ARRAY)`）、empty_finally_strip、try_unwrap_no_catch、static_array_index_fold（字面量数组下标）、const_method_inline（单 return helper 内联——解密器）、trailing_continue（标签感知尾 continue 删除）、
 
-**Python 专属（12）**：`py_const_fold`（整数/布尔/字符串字面量、字符串
+**Python 专属（25）**：`py_const_fold`（整数/布尔/字符串字面量、字符串
 `+`/`*`、比较、真值、`and`/`or` 返回操作数；long/浮点/复杂字面量不折）、
 `py_call_fold`（字面量 str 的 upper/lower/swapcase/capitalize/strip/
 replace/startswith/endswith/join，以及防遮蔽的 len/ord/chr/str/int/abs/
 bool/min/max）、`py_subscript_fold`（字面量字符串/列表/元组的下标与切片）、
 `py_const_if`、`py_if_ternary`（单赋值/单 return 分支合成条件表达式）、
-`py_nested_if`（`if a: if b:` → `if a and b:`）、
-`py_else_after_terminal`（if 体必然终止时去掉 else）、`py_dead_store`
-（相邻纯字面量覆盖）、`py_dead_expr`（裸数字/None/... 表达式）、
-`py_return_none`（`return None` → `return`）、`py_unreachable`、
-`py_pass_cleanup`。docstring、Python 2 int/long、被遮蔽的 True/False/
-内建（含 exec 与 import *）以及版本歧义写法都有守卫。
+`py_if_return`（`if c: return a` 后接 `return b` → `return a if c else b`）、
+`py_if_empty`（删除 `else: pass`、pass-only 分支取反）、`py_nested_if`
+（`if a: if b:` → `if a and b:`）、`py_else_after_terminal`（if 体必然
+终止时去掉 else）、`py_bool_cond`（`True if c else False` → `bool(c)`
+及其反向）、`py_ternary_not`（`a if not c else b` → `b if c else a`）、
+`py_not_is_in`（`not (x is y)` / `not (x in y)` → `x is not y` /
+`x not in y`）、`py_paren_removal`（原子表达式外的冗余括号）、
+`py_dead_store`（相邻纯字面量覆盖）、`py_dead_assign`（函数作用域活跃性：
+未被读取的局部纯值可删，有副作用的右值降为表达式）、`py_dead_expr`
+（裸数字/None/... 表达式）、`py_str_accum`（`s = "a"; s += "b"` →
+`s = "ab"`）、`py_assign_back_fold`（`x = 2; x = x + 3` → `x = 5`，仅
+纯 int/字符串链）、`py_return_none`（`return None` → `return`）、
+`py_trailing_return`（删除函数末尾隐式 `return`）、`py_trailing_continue`
+（删除循环末尾 `continue`）、`py_empty_finally`（`finally: pass`）、
+`py_assert_true`（恒真断言）、`py_unreachable`、`py_pass_cleanup`。
+docstring、Python 2 int/long、被遮蔽的 True/False/内建（含 exec 与
+import *）、locals/vars/dir/eval 反射以及版本歧义写法都有守卫。
 
 ## 性能
 
@@ -311,9 +323,9 @@ cure-cli           `cure` 二进制：并行管线、跨平台批量 I/O（io_ur
 - ✅ TS/JS 后端：Test262 六层全绿，npm 语料 0 解析诊断
 - ✅ Python 2.7 + 3.x 后端：35,548 个标准库/site-packages 文件，0 诊断、
   0 幂等漂移、0 编译破坏
-- ✅ 12 套入库 Java 语料、三层验证、519 个测试
+- ✅ 12 套入库 Java 语料、三层验证、523 个测试
 - 🔜 还原规则 V2（反射 addSuppressed 形态、嵌套双资源 try-with-resources）
-- 🔜 Python 规则包扩展（局部传播、docstring/空白规范化、反编译形态还原）
+- 🔜 Python 规则包后续（局部传播、反编译形态还原）
 
 ## 许可证
 

@@ -35,7 +35,7 @@
   （三引号字符串内容不被重排）、装饰器续行按 token 感知重排（字符串
   内部不动）、参数表末行带注释时 `)` 换行、切片尾冒号（`a[0:2:]`）与
   下标元组（`a[..., ...]`）保留、`Paren(NamedExpr)` 不重复加括号。
-- **规则（12 条）**：
+- **规则（25 条）**：
   - `py_const_fold`：整数/布尔/字符串字面量、字符串 `+`/`*`、比较、真值、
     `and`/`or` 操作数语义；i128 计算/i64 回验，long、不精确大整数与
     不确定浮点不折。
@@ -45,15 +45,24 @@
     `import *`、builtins/`__builtins__` 都会关闭对应折叠）。
   - `py_subscript_fold`：字面量字符串/列表/元组的下标与切片（越界、
     step 0、非 ASCII/转义字符串不折）。
-  - `py_const_if` / `py_if_ternary` / `py_nested_if` /
-    `py_else_after_terminal` / `py_dead_store` / `py_dead_expr` /
-    `py_return_none` / `py_unreachable` / `py_pass_cleanup`：
-    条件内联与终态 else 消除、嵌套 if 合并、单赋值/单 return 分支合成
-    条件表达式、相邻纯字面量死存、裸数字表达式、`return None`、不可达
-    与 pass 清理。
+  - 控制流/结构：`py_const_if` / `py_if_ternary` / `py_if_return`（相邻
+    `if c: return a` 与 `return b` 合成 `return a if c else b`）/
+    `py_if_empty`（`else: pass` 与 pass-only 分支取反）/ `py_nested_if` /
+    `py_else_after_terminal` / `py_bool_cond`（`True if c else False` ↔
+    `bool(c)`）/ `py_ternary_not` / `py_not_is_in`（`not (x is y)` →
+    `x is not y`，含括号剥离）/ `py_paren_removal`（原子表达式外的冗余
+    括号；多行字符串与可能改变优先级的形态不动）。
+  - 数据流/清理：`py_dead_store` / `py_dead_assign`（函数作用域活跃性：
+    未被读取的局部纯值可删，有副作用的右值降为表达式；遇到
+    locals/vars/dir/eval/exec 反射、global/nonlocal 时关闭）/
+    `py_dead_expr` / `py_str_accum`（相邻字符串累加折叠）/ `py_assign_back_fold`
+    （`x = 2; x = x + 3` → `x = 5`，仅纯 int/字符串链）/ `py_return_none` /
+    `py_trailing_return` / `py_trailing_continue` / `py_empty_finally` /
+    `py_assert_true` / `py_unreachable` / `py_pass_cleanup`。
   - 语义守卫：docstring 不会被折叠/内联创建（必要时保留 `pass`）；
     `yield`/`global`/`nonlocal` 不因分支删除而丢失；Python 2 int/long、
-    True/False 重绑定、print/exec 歧义形态逐字节保留。
+    True/False 重绑定（含简化器自身不再产出被遮蔽的 True/False）、
+    print/exec 歧义形态逐字节保留。
 - **解析修复（真实语料抓获）**：类字段注解中的 `Field(min_length=1)` 等
   方括号内 `=`；raw f-string 的 `\{{` 花括号；多装饰器/2 空格缩进/
   三引号参数；`1else` 指数 tokenizer；Python 2 推导式 lambda 条件与
@@ -78,12 +87,15 @@
   3.13/3.15 site（1,083 / 422 文件）全绿；3.6/3.8 标准库（1,578 / 1,661
   文件）0 诊断且幂等。
 - 全部语料合计 **32,289 次 AST 比较、35,548 个幂等文件、32,274 次编译、
-  0 破坏**；简化器执行 **133,243 次改写**（Py2 标准库 5,501、Py2 包
-  4,864、Py3.15 标准库 7,700、Py3.14 site-packages 97,951），docstring
-  与类型语义保持；目录二次运行均为 **0 编辑**、逐字节一致。
+  0 破坏**；简化器执行 **179,873 次改写**（Py2 标准库 7,833、Py2 包
+  6,763、Py3.15 标准库 12,098、Py3.14 site-packages 111,340，其余
+  3.13/3.14/3.6/3.8 语料 41,839），docstring 与类型语义保持；目录二次
+  运行均为 **0 编辑**、逐字节一致。
 - 精选 Python 2/3 程序（print/exec/raise、反引号、`<>`、long/int 类型、
   元组形参、装饰器三引号参数）与 CPython 对拍 stdout/退出码一致；
-  `cargo test --workspace` **519 通过**（含 Python 2/边界/简化回归）。
+  表达式差分（4,056 个）和新增的语句级差分（800 个函数 × 4 组输入，
+  Python 2.7 与 3.15 各 6,400 个结果）全部一致；
+  `cargo test --workspace` **523 通过**（含 Python 2/边界/简化回归）。
 
 ## [0.1.11] - 2026-10-25
 

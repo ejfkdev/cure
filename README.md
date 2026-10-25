@@ -187,7 +187,7 @@ otherwise the locale is auto-detected. Full option reference: `cure --help`.
 | 7. Randomized JS differential | Deterministic PRNG generates valid programs mixing declarations, shadowing, `var` hoisting, closures, loops, ternaries, short circuits and templates; original vs cured run under `node` (stdout + exit code) and a second cure must be byte-identical (`CURE_FUZZ_CASES` scales the sample) | rule-combination semantics and first/second-pass convergence; 5,000 cases used during development |
 | 8. Python (2.7 + 3.13–3.15) | CPython 2.7 stdlib (1,609 UTF-8 sources), a 4,135-file Python 2 package corpus (Django 1.11, Twisted 20.3, pip 20.3, setuptools 44, requests, six, PyYAML), CPython 3.13/3.14/3.15 stdlibs (2,188 / 2,288 / 2,456 sources), 18,128 Python 3.14 site-packages files plus 1,083 / 422 files from the 3.13 / 3.15 sites: parse → print compared with that interpreter's `ast.dump`; a second cure must be byte-identical; every simplified file compiled by the same interpreter; curated programs executed | **0** parser diagnostics in all corpora; **32,289** AST-identical round-trips (5,736 Python 2 + 26,553 Python 3; 20 intentionally invalid/foreign fixtures excluded), **35,548/35,548** idempotent with 0 drift, **32,274** compile checks with **0 regressions** (35 originals were already uncompilable); curated stdout/exit codes match |
 
-`cargo test` runs 519 tests. The Test262 semantic differential reaches
+`cargo test` runs 523 tests. The Test262 semantic differential reaches
 **33,963/34,007 (99.87%) identical runs** in default mode; the only 44
 excluded cases compare `Function.prototype.toString` **source text** (cure
 reformats function bodies) or use arrow functions as computed-property keys,
@@ -217,9 +217,10 @@ site-packages tree add 26,553 AST-identical round-trips with 0 diagnostics,
 0 idempotency drift and 0 compile regressions; the 3.6 and 3.8 stdlibs are
 also clean (1,578 and 1,661 files). Across all corpora that is **32,289 AST
 comparisons, 35,548 idempotent files and 32,274 compilations, with 0
-regressions**; the simplifier performs **133,243 rewrites** (5,501 Python 2
-stdlib, 4,864 Python 2 packages, 7,700 Python 3.15 stdlib, 97,951 Python
-3.14 site-packages), while docstrings and version-visible types stay intact.
+regressions**; the simplifier performs **179,873 rewrites** (7,833 Python 2
+stdlib, 6,763 Python 2 packages, 12,098 Python 3.15 stdlib, 111,340 Python
+3.14 site-packages; the remaining 3.13/3.14/3.6/3.8 corpora add 41,839),
+while docstrings and version-visible types stay intact.
 Curated Python 2 and 3 programs (print/exec/raise forms,
 backticks, `<>`, long/int types, tuple parameters, decorators with
 triple-quoted arguments) execute side-by-side with identical stdout and exit
@@ -281,20 +282,33 @@ when evaluation succeeds, never on the exception path),
 fernflower leftover, ≥23 sites in a 66-file corpus),
 new_string_char_array_fold (`new String(CHAR_ARRAY)`), empty_finally_strip, try_unwrap_no_catch, static_array_index_fold (literal array indexing), const_method_inline (single-return helper inlining — string decrypters), trailing_continue (label-aware tail continue removal).
 
-**Python (12):** `py_const_fold` (integer/boolean/string literals, string
+**Python (25):** `py_const_fold` (integer/boolean/string literals, string
 `+`/`*`, comparisons, truthiness, `and`/`or` operand-return semantics;
 long/float/exotic literals are never folded), `py_call_fold` (literal `str`
 methods — upper/lower/swapcase/capitalize/strip/replace/startswith/endswith/
 join — plus shadow-safe `len`/`ord`/`chr`/`str`/`int`/`abs`/`bool`/`min`/
 `max`), `py_subscript_fold` (literal string/list/tuple index and slice),
 `py_const_if`, `py_if_ternary` (single-assignment or single-return branches →
-conditional expression), `py_nested_if` (`if a: if b:` → `if a and b:`),
+conditional expression), `py_if_return` (`if c: return a` followed by
+`return b` → `return a if c else b`), `py_if_empty` (`else: pass` removal and
+pass-only branch inversion), `py_nested_if` (`if a: if b:` → `if a and b:`),
 `py_else_after_terminal` (drop `else` when the `if` body always terminates),
-`py_dead_store` (adjacent pure-literal overwrite), `py_dead_expr` (bare
-numeric/`None`/`...` expressions), `py_return_none` (`return None` →
-`return`), `py_unreachable` and `py_pass_cleanup`. Docstrings, Python 2
+`py_bool_cond` (`True if c else False` → `bool(c)` and its inverse),
+`py_ternary_not` (`a if not c else b` → `b if c else a`), `py_not_is_in`
+(`not (x is y)` / `not (x in y)` → `x is not y` / `x not in y`),
+`py_paren_removal` (redundant parentheses around atoms), `py_dead_store`
+(adjacent pure-literal overwrite), `py_dead_assign` (function-scope liveness:
+an unread local with a pure RHS is removed, an effectful RHS survives as an
+expression), `py_dead_expr` (bare numeric/`None`/`...` expressions),
+`py_str_accum` (`s = "a"; s += "b"` → `s = "ab"`), `py_assign_back_fold`
+(`x = 2; x = x + 3` → `x = 5` for pure int/string chains), `py_return_none`
+(`return None` → `return`), `py_trailing_return` (drop an implicit trailing
+`return`), `py_trailing_continue` (drop a loop-tail `continue`),
+`py_empty_finally` (`finally: pass`), `py_assert_true` (constant-true
+assertions), `py_unreachable` and `py_pass_cleanup`. Docstrings, Python 2
 int/long types, shadowed `True`/`False`/builtins (including `exec` and
-`import *`) and version-ambiguous forms are guarded.
+`import *`), locals/vars/dir/eval introspection and version-ambiguous forms
+are guarded.
 
 ## Performance
 
@@ -360,11 +374,11 @@ frontends (see also the ~100-line toy language in `cure-tree/tests/kit.rs`).
 - ✅ TS/JS backend: Test262 six layers, 0 parser diagnostics on npm corpora
 - ✅ Python 2.7 + 3.x backend: 35,548 stdlib/site-package files, 0
   diagnostics, 0 idempotency drift, 0 compile regressions
-- ✅ 12 vendored Java corpora, three-layer verification, 519 tests
+- ✅ 12 vendored Java corpora, three-layer verification, 523 tests
 - 🔜 Restoration rules V2 (reflective `addSuppressed` shapes, nested
   two-resource try-with-resources)
-- 🔜 Python rule-pack expansion (local propagation, docstring/whitespace
-  normalization, decompiler-shape restoration)
+- 🔜 Further Python rule-pack work (local propagation, decompiler-shape
+  restoration)
 
 ## License
 

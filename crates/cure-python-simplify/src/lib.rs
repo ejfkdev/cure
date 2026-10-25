@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cure_engine::Config;
 use cure_python_ast::{
-    ArgKind, CompKind, LitKind, Literal, NodeData, PyAst, PyBin, PyBoolOp, PyId, PyUn,
+    ArgKind, CallArg, CompKind, LitKind, Literal, NodeData, PyAst, PyBin, PyBoolOp, PyCmp, PyId,
+    PyUn,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -34,11 +35,24 @@ pub fn default_rules() -> &'static [&'static str] {
         "py_subscript_fold",
         "py_const_if",
         "py_if_ternary",
+        "py_if_return",
+        "py_if_empty",
         "py_nested_if",
         "py_else_after_terminal",
+        "py_bool_cond",
+        "py_ternary_not",
+        "py_not_is_in",
+        "py_paren_removal",
         "py_dead_store",
+        "py_dead_assign",
         "py_dead_expr",
+        "py_str_accum",
+        "py_assign_back_fold",
         "py_return_none",
+        "py_trailing_return",
+        "py_trailing_continue",
+        "py_empty_finally",
+        "py_assert_true",
         "py_unreachable",
         "py_pass_cleanup",
     ]
@@ -49,6 +63,7 @@ pub fn simplify_module(ast: &mut PyAst, module: PyId, cfg: &Config) -> Report {
     let mut shadowed = BTreeSet::new();
     collect_shadowed(ast, module, &mut shadowed);
     let unicode_literals = uses_unicode_literals(ast, module);
+    let bool_shadowed = ast.bool_literals_shadowed();
     for _ in 0..32 {
         let mut pass = Pass {
             ast,
@@ -58,6 +73,8 @@ pub fn simplify_module(ast: &mut PyAst, module: PyId, cfg: &Config) -> Report {
             docstring_guard: false,
             shadowed: shadowed.clone(),
             unicode_literals,
+            bool_shadowed,
+            dead_scope: None,
         };
         pass.simplify_block(module, true);
         total.edits += pass.report.edits;
@@ -84,6 +101,10 @@ struct Pass<'a> {
     /// `from __future__ import unicode_literals`：Python 2 下 str()/chr()
     /// 仍返回 bytes，不能把结果折成（会变成 unicode 的）普通字面量。
     unicode_literals: bool,
+    /// True/False 在 Python 2 可被重绑定；此时不生成布尔字面量。
+    bool_shadowed: bool,
+    /// 当前函数体的活跃名字分析；仅函数内部做死赋值删除，模块/类体为 None。
+    dead_scope: Option<DeadScope>,
 }
 
 impl<'a> Pass<'a> {
@@ -163,6 +184,9 @@ impl<'a> Pass<'a> {
     }
 
     fn set_bool(&mut self, id: PyId, v: bool, rule: &'static str) {
+        if self.bool_shadowed {
+            return;
+        }
         *self.ast.data_mut(id) = NodeData::Literal(Literal::boolean(v));
         self.ast.set_children(id, vec![]);
         self.hit(rule);
@@ -184,6 +208,9 @@ impl<'a> Pass<'a> {
         rule: &'static str,
     ) -> bool {
         if self.docstring_guard && matches!(lit.kind, LitKind::Str | LitKind::Bytes) {
+            return false;
+        }
+        if self.bool_shadowed && lit.kind == LitKind::Bool {
             return false;
         }
         *self.ast.data_mut(id) = NodeData::Literal(lit);
@@ -224,6 +251,15 @@ impl<'a> Pass<'a> {
                 }
             }
         }
+        if self.enabled("py_if_return") {
+            self.fold_if_return(&mut new);
+        }
+        if self.enabled("py_str_accum") {
+            self.fold_str_accum(&mut new);
+        }
+        if self.enabled("py_assign_back_fold") {
+            self.fold_assign_back(&mut new);
+        }
         // 相邻字面量死存：`x = 1; x = [2]` → 第一条可删（两侧都无副作用）。
         if self.enabled("py_dead_store") {
             let mut i = 0;
@@ -257,6 +293,17 @@ impl<'a> Pass<'a> {
             if new.len() != before {
                 self.hit("py_pass_cleanup");
             }
+        }
+        if scope
+            && self.dead_scope.is_some()
+            && self.enabled("py_trailing_return")
+            && new
+                .last()
+                .is_some_and(|&s| matches!(self.ast.data(s), NodeData::Return))
+            && self.ast.children(*new.last().unwrap()).is_empty()
+        {
+            new.pop();
+            self.hit("py_trailing_return");
         }
         if new.is_empty() {
             let p = self.ast.simple(NodeData::Pass);
@@ -297,6 +344,29 @@ impl<'a> Pass<'a> {
                         return orelse
                             .map(|o| self.ast.children(o).to_vec())
                             .unwrap_or_default();
+                    }
+                }
+                if self.enabled("py_if_empty") {
+                    if let Some(o) = orelse {
+                        let och = self.ast.children(o).to_vec();
+                        let bch = self.ast.children(body).to_vec();
+                        let body_pass =
+                            bch.len() == 1 && matches!(self.ast.data(bch[0]), NodeData::Pass);
+                        let else_pass =
+                            och.len() == 1 && matches!(self.ast.data(och[0]), NodeData::Pass);
+                        if else_pass {
+                            self.ast.set_children(id, vec![test, body]);
+                            self.hit("py_if_empty");
+                            return vec![id];
+                        }
+                        let is_elif =
+                            och.len() == 1 && matches!(self.ast.data(och[0]), NodeData::If);
+                        if body_pass && !is_elif {
+                            let not = self.ast.unary(PyUn::Not, test);
+                            let new_if = self.ast.if_(not, o, None);
+                            self.hit("py_if_empty");
+                            return vec![new_if];
+                        }
                     }
                 }
                 if self.enabled("py_if_ternary") {
@@ -345,6 +415,7 @@ impl<'a> Pass<'a> {
                 let test = self.simplify_expr(ch[0]);
                 self.ast.set_child(id, 0, test);
                 self.simplify_block(ch[1], false);
+                self.strip_trailing_continue(ch[1]);
                 let orelse = ch.get(2).copied();
                 if let Some(o) = orelse {
                     self.simplify_block(o, false);
@@ -368,15 +439,27 @@ impl<'a> Pass<'a> {
                 let iter = self.simplify_expr(ch[0]);
                 self.ast.set_child(id, 0, iter);
                 self.simplify_block(ch[1], false);
+                self.strip_trailing_continue(ch[1]);
                 if let Some(&o) = ch.get(2) {
                     self.simplify_block(o, false);
                 }
                 let _ = (target_raw, is_async);
                 vec![id]
             }
-            NodeData::FunctionDef { .. } | NodeData::ClassDef { .. } => {
+            NodeData::FunctionDef { .. } => {
                 let body = self.ast.children(id)[0];
+                let saved = self.dead_scope.take();
+                self.dead_scope = Some(analyze_function(self.ast, body));
                 self.simplify_block(body, true);
+                self.dead_scope = saved;
+                vec![id]
+            }
+            NodeData::ClassDef { .. } => {
+                let body = self.ast.children(id)[0];
+                let saved = self.dead_scope.take();
+                self.dead_scope = None;
+                self.simplify_block(body, true);
+                self.dead_scope = saved;
                 vec![id]
             }
             NodeData::With { .. } => {
@@ -385,10 +468,10 @@ impl<'a> Pass<'a> {
                 vec![id]
             }
             NodeData::Try {
+                star,
                 handler_count,
                 has_else,
                 has_finally,
-                ..
             } => {
                 let ch = self.ast.children(id).to_vec();
                 self.simplify_block(ch[0], false);
@@ -403,6 +486,29 @@ impl<'a> Pass<'a> {
                 }
                 if has_finally {
                     self.simplify_block(ch[idx], false);
+                    let fidx = idx;
+                    let fch = self.ast.children(ch[fidx]).to_vec();
+                    let empty = fch.len() == 1
+                        && matches!(self.ast.data(fch[0]), NodeData::Pass);
+                    if self.enabled("py_empty_finally") && empty {
+                        if handler_count == 0 && !has_else {
+                            let body = self.ast.children(ch[0]).to_vec();
+                            self.hit("py_empty_finally");
+                            return body;
+                        }
+                        let nch = ch[..fidx].to_vec();
+                        let n = self.ast.push(
+                            NodeData::Try {
+                                star,
+                                handler_count,
+                                has_else,
+                                has_finally: false,
+                            },
+                            nch,
+                        );
+                        self.hit("py_empty_finally");
+                        return vec![n];
+                    }
                 }
                 vec![id]
             }
@@ -461,6 +567,23 @@ impl<'a> Pass<'a> {
                 }
                 let v = self.simplify_expr(ch[targets]);
                 self.ast.set_child(id, targets, v);
+                if self.enabled("py_dead_assign") && targets == 1 {
+                    if let Some(ds) = &self.dead_scope {
+                        if !ds.introspection {
+                            if let NodeData::Name(n) = self.ast.data(ch[0]) {
+                                if !ds.reads.contains(n) && !ds.forbidden.contains(n) {
+                                    if is_pure_value(self.ast, v) {
+                                        self.hit("py_dead_assign");
+                                        return vec![];
+                                    }
+                                    let stmt = self.ast.expr_stmt(v);
+                                    self.hit("py_dead_assign");
+                                    return vec![stmt];
+                                }
+                            }
+                        }
+                    }
+                }
                 vec![id]
             }
             NodeData::AugAssign { .. } => {
@@ -522,6 +645,10 @@ impl<'a> Pass<'a> {
                     let m = self.simplify_expr(ch[1]);
                     self.ast.set_child(id, 1, m);
                 }
+                if self.enabled("py_assert_true") && self.truthy_lit(t) == Some(true) {
+                    self.hit("py_assert_true");
+                    return vec![];
+                }
                 vec![id]
             }
             NodeData::Delete => {
@@ -541,6 +668,196 @@ impl<'a> Pass<'a> {
                 vec![id]
             }
             _ => vec![id],
+        }
+    }
+
+    fn strip_trailing_continue(&mut self, body: PyId) {
+        if !self.enabled("py_trailing_continue") {
+            return;
+        }
+        let ch = self.ast.children(body).to_vec();
+        if ch.last().is_some_and(|&s| matches!(self.ast.data(s), NodeData::Continue)) {
+            let mut kept = ch;
+            kept.pop();
+            if kept.is_empty() {
+                kept.push(self.ast.simple(NodeData::Pass));
+            }
+            self.ast.set_children(body, kept);
+            self.hit("py_trailing_continue");
+        }
+    }
+
+    /// `if c: return a` 后紧跟 `return b` → `return a if c else b`。
+    fn fold_if_return(&mut self, new: &mut Vec<PyId>) {
+        let mut i = 0;
+        while i + 1 < new.len() {
+            let ifid = new[i];
+            let next = new[i + 1];
+            let mut merged = None;
+            if let NodeData::If = self.ast.data(ifid) {
+                let ch = self.ast.children(ifid).to_vec();
+                if ch.len() == 2 {
+                    let bch = self.ast.children(ch[1]).to_vec();
+                    if bch.len() == 1 && matches!(self.ast.data(bch[0]), NodeData::Return) {
+                        let r1 = self.ast.children(bch[0]).to_vec();
+                        if r1.len() == 1 && matches!(self.ast.data(next), NodeData::Return) {
+                            let r2 = self.ast.children(next).to_vec();
+                            if r2.len() == 1 {
+                                let ie = self.ast.if_exp(r1[0], ch[0], r2[0]);
+                                merged = Some(self.ast.return_(Some(ie)));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(r) = merged {
+                new[i] = r;
+                new.remove(i + 1);
+                self.hit("py_if_return");
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// `s = "a"; s += "b"; s += "c"` → `s = "abc"`（仅纯字符串字面量）。
+    fn fold_str_accum(&mut self, new: &mut Vec<PyId>) {
+        let mut i = 0;
+        while i < new.len() {
+            let first = new[i];
+            let (name, val) = match self.ast.data(first) {
+                NodeData::Assign { targets: 1 } => {
+                    let ch = self.ast.children(first).to_vec();
+                    let name = match self.ast.data(ch[0]) {
+                        NodeData::Name(n) => n.clone(),
+                        _ => {
+                            i += 1;
+                            continue;
+                        }
+                    };
+                    match self.as_plain_str(ch[1]) {
+                        Some(s) => (name, s.to_string()),
+                        None => {
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let mut acc = val;
+            let mut j = i + 1;
+            while j < new.len() {
+                let s = new[j];
+                let part = match self.ast.data(s) {
+                    NodeData::AugAssign { op: PyBin::Add } => {
+                        let ch = self.ast.children(s).to_vec();
+                        let same = matches!(self.ast.data(ch[0]), NodeData::Name(n) if n == &name);
+                        if !same {
+                            None
+                        } else {
+                            self.as_plain_str(ch[1]).map(str::to_string)
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(part) = part else { break };
+                acc.push_str(&part);
+                j += 1;
+            }
+            if j > i + 1 {
+                if let Some(lit) = literal::make_str(&acc) {
+                    let ch = self.ast.children(first).to_vec();
+                    *self.ast.data_mut(ch[1]) = NodeData::Literal(lit);
+                    self.ast.set_children(ch[1], vec![]);
+                    new.drain(i + 1..j);
+                    self.hit("py_str_accum");
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// `x = <literal>; x = x + <literal>` → 单条字面量赋值。
+    fn fold_assign_back(&mut self, new: &mut Vec<PyId>) {
+        let mut i = 0;
+        while i + 1 < new.len() {
+            let first = new[i];
+            let second = new[i + 1];
+            let mut done = false;
+            if let NodeData::Assign { targets: 1 } = self.ast.data(first) {
+                let fch = self.ast.children(first).to_vec();
+                let name = match self.ast.data(fch[0]) {
+                    NodeData::Name(n) => n.clone(),
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                };
+                let is_str = self.as_plain_str(fch[1]).is_some();
+                let is_int = matches!(
+                    self.ast.data(fch[1]),
+                    NodeData::Literal(Literal {
+                        kind: LitKind::Int,
+                        ..
+                    })
+                ) && !self.is_py2_long(fch[1]);
+                if is_str || is_int {
+                    if let NodeData::Assign { targets: 1 } = self.ast.data(second) {
+                        let sch = self.ast.children(second).to_vec();
+                        let same = matches!(self.ast.data(sch[0]), NodeData::Name(n) if n == &name);
+                        if same {
+                            if let NodeData::Binary { op } = self.ast.data(sch[1]) {
+                                let bch = self.ast.children(sch[1]).to_vec();
+                                let mut lit = None;
+                                if is_str && *op == PyBin::Add {
+                                    let a = self.as_plain_str(fch[1]).map(str::to_string);
+                                    let left_name = matches!(self.ast.data(bch[0]), NodeData::Name(n) if n == &name);
+                                    let right_name = matches!(self.ast.data(bch[1]), NodeData::Name(n) if n == &name);
+                                    if let (Some(a), true, Some(b)) = (
+                                        a,
+                                        left_name,
+                                        self.as_plain_str(bch[1]).map(str::to_string),
+                                    ) {
+                                        lit = literal::make_str(&format!("{a}{b}"));
+                                    } else if let (Some(a), true, Some(b)) = (
+                                        self.as_plain_str(fch[1]).map(str::to_string),
+                                        right_name,
+                                        self.as_plain_str(bch[0]).map(str::to_string),
+                                    ) {
+                                        lit = literal::make_str(&format!("{b}{a}"));
+                                    }
+                                } else if is_int {
+                                    let a = self.as_int(fch[1]);
+                                    let left_name = matches!(self.ast.data(bch[0]), NodeData::Name(n) if n == &name);
+                                    if left_name {
+                                        if let (Some(a), Some(b)) = (a, self.as_int(bch[1])) {
+                                            if !self.is_py2_long(bch[1]) {
+                                                if let Some(v) = fold_int(*op, a, b) {
+                                                    lit = Some(Literal::int(v));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(lit) = lit {
+                                    *self.ast.data_mut(fch[1]) = NodeData::Literal(lit);
+                                    self.ast.set_children(fch[1], vec![]);
+                                    new.remove(i + 1);
+                                    self.hit("py_assign_back_fold");
+                                    done = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !done {
+                i += 1;
+            }
         }
     }
 
@@ -685,6 +1002,32 @@ impl<'a> Pass<'a> {
                 let v = self.ast.children(id)[0];
                 let v2 = self.simplify_expr(v);
                 self.ast.set_child(id, 0, v2);
+                if op == PyUn::Not && self.enabled("py_not_is_in") {
+                    // `not (x in y)` 的内层比较器通常带括号，需要先剥掉再改写；
+                    // 改写后比较表达式与原式同优先级，括号不再需要。
+                    let mut cmp = v2;
+                    while let NodeData::Paren = self.ast.data(cmp) {
+                        cmp = self.ast.children(cmp)[0];
+                    }
+                    if let NodeData::Compare { ops } = self.ast.data(cmp) {
+                        if ops.len() == 1 {
+                            let newop = match ops[0] {
+                                PyCmp::Is => Some(PyCmp::IsNot),
+                                PyCmp::IsNot => Some(PyCmp::Is),
+                                PyCmp::In => Some(PyCmp::NotIn),
+                                PyCmp::NotIn => Some(PyCmp::In),
+                                _ => None,
+                            };
+                            if let Some(newop) = newop {
+                                if let NodeData::Compare { ops } = self.ast.data_mut(cmp) {
+                                    ops[0] = newop;
+                                }
+                                self.hit("py_not_is_in");
+                                return cmp;
+                            }
+                        }
+                    }
+                }
                 if self.enabled("py_const_fold") {
                     match op {
                         PyUn::Not => {
@@ -863,6 +1206,43 @@ impl<'a> Pass<'a> {
                         }
                     }
                 }
+                if self.enabled("py_ternary_not") {
+                    if let NodeData::Unary { op: PyUn::Not } = self.ast.data(test) {
+                        let inner = self.ast.children(test)[0];
+                        let swapped = self.ast.if_exp(orelse, inner, body);
+                        self.hit("py_ternary_not");
+                        return swapped;
+                    }
+                }
+                if self.enabled("py_bool_cond") {
+                    let b = |ast: &PyAst, id: PyId| match ast.data(id) {
+                        NodeData::Literal(Literal {
+                            kind: LitKind::Bool,
+                            bool_val: Some(v),
+                            ..
+                        }) => Some(*v),
+                        _ => None,
+                    };
+                    if let (Some(a), Some(c)) = (b(self.ast, body), b(self.ast, orelse)) {
+                        if a != c {
+                            if !a {
+                                let not = self.ast.unary(PyUn::Not, test);
+                                self.hit("py_bool_cond");
+                                return not;
+                            }
+                            if !self.shadowed.contains("bool") {
+                                let f = self.ast.name("bool");
+                                let call = self.ast.call(
+                                    f,
+                                    vec![test],
+                                    vec![CallArg::pos()],
+                                );
+                                self.hit("py_bool_cond");
+                                return call;
+                            }
+                        }
+                    }
+                }
                 id
             }
             NodeData::Tuple | NodeData::List | NodeData::Set => {
@@ -960,7 +1340,30 @@ impl<'a> Pass<'a> {
                 self.ast.set_child(id, 0, b2);
                 id
             }
-            NodeData::Paren | NodeData::Repr => {
+            NodeData::Paren => {
+                let v = self.ast.children(id)[0];
+                let v2 = self.simplify_expr(v);
+                // 只删除原子表达式外的冗余括号；复杂表达式/负字面量/
+                // 跨行字符串的括号由打印器优先级或隐式续行决定，保留。
+                let removable = matches!(
+                    self.ast.data(v2),
+                    NodeData::Name(_)
+                        | NodeData::Attribute { .. }
+                        | NodeData::Subscript
+                        | NodeData::Call { .. }
+                        | NodeData::List
+                        | NodeData::Set
+                        | NodeData::Dict
+                        | NodeData::Repr
+                ) && !has_multiline_raw(self.ast, v2);
+                if self.enabled("py_paren_removal") && removable {
+                    self.hit("py_paren_removal");
+                    return v2;
+                }
+                self.ast.set_child(id, 0, v2);
+                id
+            }
+            NodeData::Repr => {
                 let v = self.ast.children(id)[0];
                 let v2 = self.simplify_expr(v);
                 self.ast.set_child(id, 0, v2);
@@ -1007,19 +1410,41 @@ fn has_scope_or_yield(ast: &PyAst, id: PyId) -> bool {
     }
 }
 
-fn is_doc_expr(ast: &PyAst, id: PyId) -> bool {
+/// 子表达式里是否存在跨物理行的字符串/原文：这类表达式依赖外层括号
+/// 做隐式续行，不能删括号。
+fn has_multiline_raw(ast: &PyAst, id: PyId) -> bool {
     match ast.data(id) {
-        NodeData::ExprStmt => {
-            let e = ast.children(id)[0];
-            matches!(
-                ast.data(e),
-                NodeData::Literal(Literal {
-                    kind: LitKind::Str | LitKind::Bytes,
-                    ..
-                })
-            )
+        NodeData::Literal(l) => l.raw.contains('\n') || l.raw.contains('\r'),
+        NodeData::Raw(s) => s.contains('\n') || s.contains('\r'),
+        NodeData::Lambda { params_raw } => {
+            params_raw.contains('\n') || ast.children(id).iter().any(|&c| has_multiline_raw(ast, c))
         }
-        _ => false,
+        NodeData::CompFor { target_raw, .. } => {
+            target_raw.contains('\n') || ast.children(id).iter().any(|&c| has_multiline_raw(ast, c))
+        }
+        _ => ast.children(id).iter().any(|&c| has_multiline_raw(ast, c)),
+    }
+}
+
+fn is_doc_expr(ast: &PyAst, id: PyId) -> bool {
+    if let NodeData::ExprStmt = ast.data(id) {
+        let mut e = ast.children(id)[0];
+        while matches!(ast.data(e), NodeData::Paren) {
+            if let Some(&c) = ast.children(e).first() {
+                e = c;
+            } else {
+                break;
+            }
+        }
+        matches!(
+            ast.data(e),
+            NodeData::Literal(Literal {
+                kind: LitKind::Str | LitKind::Bytes,
+                ..
+            })
+        )
+    } else {
+        false
     }
 }
 
@@ -1062,6 +1487,193 @@ fn uses_unicode_literals(ast: &PyAst, id: PyId) -> bool {
         }
     }
     ast.children(id).iter().any(|&c| uses_unicode_literals(ast, c))
+}
+
+#[derive(Default)]
+struct DeadScope {
+    reads: BTreeSet<String>,
+    forbidden: BTreeSet<String>,
+    introspection: bool,
+}
+
+fn analyze_function(ast: &PyAst, body: PyId) -> DeadScope {
+    let mut ds = DeadScope::default();
+    collect_reads(ast, body, &mut ds);
+    ds
+}
+
+fn add_words(raw: &str, out: &mut BTreeSet<String>) {
+    let mut cur = String::new();
+    for c in raw.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            cur.push(c);
+        } else {
+            if !cur.is_empty() {
+                out.insert(std::mem::take(&mut cur));
+            }
+        }
+    }
+    if !cur.is_empty() {
+        out.insert(cur);
+    }
+}
+
+fn collect_target_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
+    match ast.data(id) {
+        NodeData::Name(_) => {}
+        NodeData::Attribute { .. } => {
+            if let Some(&b) = ast.children(id).first() {
+                collect_reads(ast, b, ds);
+            }
+        }
+        NodeData::Subscript => {
+            for &c in ast.children(id) {
+                collect_reads(ast, c, ds);
+            }
+        }
+        NodeData::Tuple | NodeData::List | NodeData::Starred | NodeData::Paren => {
+            for &c in ast.children(id) {
+                collect_target_reads(ast, c, ds);
+            }
+        }
+        _ => collect_reads(ast, id, ds),
+    }
+}
+
+/// 收集函数体里可能被读取的名字。保守地包含 raw 片段里的所有标识符；
+/// `locals()/vars()/dir()/eval()/exec()/breakpoint()` 会让局部变量可被
+/// 反射读取，因此关闭该函数的死赋值删除。
+fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
+    match ast.data(id) {
+        NodeData::Name(n) => {
+            ds.reads.insert(n.clone());
+            return;
+        }
+        NodeData::Assign { targets } => {
+            let ch = ast.children(id);
+            for &t in &ch[..*targets] {
+                collect_target_reads(ast, t, ds);
+            }
+            if let Some(&v) = ch.get(*targets) {
+                collect_reads(ast, v, ds);
+            }
+            return;
+        }
+        NodeData::AnnAssign { annotation_raw } => {
+            add_words(annotation_raw, &mut ds.reads);
+            let ch = ast.children(id);
+            if let Some(&t) = ch.first() {
+                collect_target_reads(ast, t, ds);
+            }
+            if let Some(&v) = ch.get(1) {
+                collect_reads(ast, v, ds);
+            }
+            return;
+        }
+        NodeData::AugAssign { .. } => {
+            for &c in ast.children(id) {
+                collect_reads(ast, c, ds);
+            }
+            return;
+        }
+        NodeData::For { target_raw, .. } | NodeData::CompFor { target_raw, .. } => {
+            add_words(target_raw, &mut ds.reads);
+            for &c in ast.children(id) {
+                collect_reads(ast, c, ds);
+            }
+            return;
+        }
+        NodeData::With { items_raw, .. } => {
+            add_words(items_raw, &mut ds.reads);
+            for &c in ast.children(id) {
+                collect_reads(ast, c, ds);
+            }
+            return;
+        }
+        NodeData::ExceptHandler { clause_raw } => {
+            add_words(clause_raw, &mut ds.reads);
+            for &c in ast.children(id) {
+                collect_reads(ast, c, ds);
+            }
+            return;
+        }
+        NodeData::FunctionDef {
+            params_raw,
+            ret_raw,
+            deco_raw,
+            generics_raw,
+            ..
+        } => {
+            // 默认值/装饰器/注解在外层作用域求值；函数体是闭包读取。
+            add_words(params_raw, &mut ds.reads);
+            add_words(ret_raw, &mut ds.reads);
+            add_words(deco_raw, &mut ds.reads);
+            add_words(generics_raw, &mut ds.reads);
+            if let Some(&b) = ast.children(id).first() {
+                collect_reads(ast, b, ds);
+            }
+            return;
+        }
+        NodeData::ClassDef {
+            header_raw,
+            deco_raw,
+            ..
+        } => {
+            add_words(header_raw, &mut ds.reads);
+            add_words(deco_raw, &mut ds.reads);
+            if let Some(&b) = ast.children(id).first() {
+                collect_reads(ast, b, ds);
+            }
+            return;
+        }
+        NodeData::Lambda { params_raw } => {
+            add_words(params_raw, &mut ds.reads);
+            if let Some(&b) = ast.children(id).first() {
+                collect_reads(ast, b, ds);
+            }
+            return;
+        }
+        NodeData::Case { pattern_raw, .. } => {
+            add_words(pattern_raw, &mut ds.reads);
+            for &c in ast.children(id) {
+                collect_reads(ast, c, ds);
+            }
+            return;
+        }
+        NodeData::Global(raw) | NodeData::Nonlocal(raw) => {
+            add_words(raw, &mut ds.reads);
+            add_words(raw, &mut ds.forbidden);
+            return;
+        }
+        NodeData::RawStmt(raw) => {
+            add_words(raw, &mut ds.reads);
+            if raw.trim_start().starts_with("exec") {
+                ds.introspection = true;
+            }
+            return;
+        }
+        NodeData::Import(_) | NodeData::FromImport(_) => return,
+        NodeData::Call { .. } => {
+            if let Some(&f) = ast.children(id).first() {
+                if let NodeData::Name(n) = ast.data(f) {
+                    if matches!(
+                        n.as_str(),
+                        "locals" | "vars" | "dir" | "eval" | "exec" | "breakpoint"
+                    ) {
+                        ds.introspection = true;
+                    }
+                }
+            }
+            for &c in ast.children(id) {
+                collect_reads(ast, c, ds);
+            }
+            return;
+        }
+        _ => {}
+    }
+    for &c in ast.children(id) {
+        collect_reads(ast, c, ds);
+    }
 }
 
 const FOLD_BUILTINS: &[&str] = &[

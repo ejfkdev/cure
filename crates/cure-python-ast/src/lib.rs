@@ -460,6 +460,9 @@ pub struct PyAst {
     nodes: Vec<Node>,
     /// 解析时记录的源行号（诊断/调试；不影响语义）。
     lines: HashMap<PyId, u32>,
+    /// 模块里 True/False 被当作可重绑定的名字（Python 2 的赋值/exec
+    /// 等）；此时简化器不得再生成 True/False 字面量。
+    bool_shadowed: bool,
 }
 
 impl Default for PyAst {
@@ -473,6 +476,7 @@ impl PyAst {
         Self {
             nodes: Vec::new(),
             lines: HashMap::new(),
+            bool_shadowed: false,
         }
     }
 
@@ -489,6 +493,14 @@ impl PyAst {
 
     pub fn set_line(&mut self, id: PyId, line: u32) {
         self.lines.insert(id, line);
+    }
+
+    pub fn set_bool_literals_shadowed(&mut self, v: bool) {
+        self.bool_shadowed = v;
+    }
+
+    pub fn bool_literals_shadowed(&self) -> bool {
+        self.bool_shadowed
     }
 
     pub fn line_of(&self, id: PyId) -> Option<u32> {

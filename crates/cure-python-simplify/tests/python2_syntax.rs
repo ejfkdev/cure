@@ -135,7 +135,7 @@ fn py2_shadowed_true_false_are_not_folded() {
 
     // 形参/for 目标/lambda 参数同样是绑定。
     let out = cured("def f(True):\n    if True:\n        return 1\n    return 2\n");
-    assert!(out.contains("if True:"), "形参 True 未识别：\n{out}");
+    assert!(out.contains("1 if True else 2"), "形参 True 未识别：\n{out}");
     let out = cured("g = lambda True: 1 if True else 2\n");
     assert!(out.contains("if True"), "lambda 形参 True 未识别：\n{out}");
 
