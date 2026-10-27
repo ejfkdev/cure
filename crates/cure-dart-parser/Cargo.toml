@@ -1,0 +1,14 @@
+[package]
+name = "cure-dart-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Fault-tolerant Dart lexer and token-document parser (Dart 1/2/3 syntax) for cure"
+keywords = ["dart", "parser", "lexer", "deobfuscator"]
+categories = ["development-tools", "parser-implementations"]
+
+[dependencies]
+cure-dart-ast = { path = "../cure-dart-ast", version = "0.3.0" }

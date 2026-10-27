@@ -3,7 +3,161 @@
 本项目所有显著变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.3.0] - 2026-10-27
+
+### 新增（Dart 1/2/3 后端）
+
+- **新语言后端**：新增 `cure-dart-ast` / `cure-dart-parser` /
+  `cure-dart-print` / `cure-dart-simplify` 四个 crate 并接入 CLI；
+  `--lang dart`（别名 `dart3`）与 `.dart` 自动识别，目录模式、`--check`、
+  `--diff`、`--report`、`--stats`、`--disable`、`-w`、`-j` 全部可用。
+- **无损 token 模型**：Dart 1/2/3 不建版本分支——词法层完整保留所有
+  token 与注释，结构层只建立括号配对与「块/集合/switch」花括号分类。
+  未建模语法（Dart 2 遗留 `final` 形参、旧式函数 typedef，Dart 3
+  records/patterns、class 修饰符、extension type、switch 表达式、macro）
+  原样保留，因此同一后端接受所有版本写法。注释、raw/三引号/插值字符串
+  （含 `${...}` 内的嵌套字符串）、二/十六进制与下划线数字、全部运算符
+  形态均逐字节保真。
+- **规则（24 条）**：`dart_const_fold`（32 位整数/bool/字符串及
+  `.length`/`.codeUnitAt`/`.contains`/`.indexOf`/`.isEven`/`.bitLength`/
+  `toRadixString` 等确定性字面量成员；`%` 按 Dart Euclidean 语义、`~/`
+  截断、移位/溢出超界不折；`/` 与浮点不折；带运算符优先级与一元前缀
+  上下文检查（含 Dart 的「位运算优先于相等」优先级），`x - 1 + 2`、
+  `x & 0x60 == 0`、`-1 % 3` 不会被折错；控制流条件里的 bool 折叠跳过，
+  三元选择交给 `dart_ternary_const`，避免改变 late 变量流分析）、
+  `dart_ternary_const` / `dart_ternary_bool` / `dart_ternary_not`
+  （常量条件；`dart_ternary_const` 只在控制流条件之外选择同类字面量分支；
+  `c ? true : false` 仅在条件可证为 bool 时折成 `c`；`!c ? a : b` →
+  `c ? b : a`）、`dart_bool_literal_op`（`true && x`/`false || x` → `x`、
+  `false && x`/`true || x` → 字面量、`x && true`/`x || false` → `x`；
+  保留的操作数必须可证为 bool，动态值保留运行时 bool 检查；
+  Dart 3 模式上下文跳过）、`dart_double_negation`（操作数可证为 bool
+  时才去掉双否定，避免动态值类型检查差异）、`dart_negated_eq`
+  （`!(a == b)` → `a != b`、`!(a is T)` → `a is! T`，按上下文补括号）、
+  `dart_const_if`（常量 bool 且分支为块，保留块作用域；分支含
+  赋值/`return`/`yield`/for-in 时跳过，避免改变流分析）、
+  `dart_if_return`（`if` + return / else-return → 带括号条件的三元 return，
+  仅当两分支是同类字面量，避免三元 LUB 改变静态返回类型；其他情况保留
+  独立 return；if-case 模式不动）、`dart_if_assign_ternary`（同目标赋值分支 →
+  `x = cond ? a : b`，仅同类字面量 RHS）、`dart_else_after_terminal`
+  （then 分支必然终止且 `if` 是直接语句时去掉 else，else 块保留为裸块；
+  无括号 else/循环体/标签语句不动）、`dart_nested_if`（单层嵌套 if 合并为
+  `a && b`）、`dart_empty_then`（`if (c) {} else X` → `if (!c) X`）、
+  `dart_assign_compound`（`x = x + y` → `x += y`，仅普通标识符且 RHS
+  顶层没有更松/同级运算符，`x = x * 10 + digit` 不动；不做
+  `x = x ?? y` → `x ??= y`，因为 `??=` 在变量非空时可能跳过 setter，
+  而原式总会赋值）、
+  `dart_unreachable`（直接终止语句后的代码；含
+  `return`/`yield`、赋值或 for-in 的不可达区间保留，避免改变返回类型
+  推断和 late 变量 definite assignment；带标签块跳过）、
+  `dart_trailing_continue`（循环尾 `continue;`）、`dart_trailing_return`
+  （无注释的函数/闭包末尾裸 `return;`）、`dart_empty_finally`
+  （仅在仍有 catch/on 时删除空 finally）、`dart_try_unwrap`（仅 rethrow
+  的 `catch`/`on` 子句删除；删空后或只剩空 `finally` 时解包为裸块，
+  保留作用域）、`dart_adjacent_strings`（简单字面量 `'a' 'b'` 隐式拼接）、
+  `dart_paren_removal`（仅原子表达式，避开控制条件/
+  调用实参/函数表达式）、`dart_empty_else`、`dart_string_interp`
+  （`${ident}` → `$ident`，后续字符必须是 ASCII 且不能延长标识符；
+  非 ASCII ID_Continue 字符保守跳过；raw/嵌套字符串不动）。
+  注意不删除 `new`：Dart 1 要求构造调用带 `new`，删除会破坏旧版本语义。
+- **格式化器**：2 空格缩进、块/集合区分、switch case 缩进、泛型尖括号
+  紧凑、`operator[]=` 与可空类型后接 `..` 的词法边界保持、注解与跨行块
+  注释的换行保持、原始空行段落保留；`return !x` 与 `is! T` 的间距修正。
+  全语料 token 序列与格式均幂等。
+- **验证**：300 个 pub-cache 包的 **19,176** 个 `.dart` 文件，
+  0 解析诊断；19,176/19,176 逐 token 往返一致、二次运行 0 编辑 0 字节
+  差异；`dart format --output=none` 在 cure 前后拒绝同一批 90 个 Dart 3
+  已移除语法的旧文件（0 新增失败）。Dart 1.24.3 / 2.19.6 / 3.13 均作为
+  oracle：精选版本语法（旧 typedef、`final` 形参、null safety、super
+  形参、primary constructor、dot shorthand）与 479 文件抽样中，Dart 1
+  下 173 个有效、Dart 2.19 下 477 个有效，cure 后均 **0 新增失败**；
+  精选程序在 Dart 1/2/3 上 stdout 一致；语句级 fuzzer（35 函数 × 3 输入
+  × 10 seed，Dart 1/2/3）0 失配，另有规则定向 fuzzer、类型化表达式
+  fuzzer 与 Dart 3 pattern fuzzer 各 10–20 seed；全语料 2.2 s / ~217 MiB，
+  执行 2,132 次安全改写（7,120 个文件变化，418 个结构简化）。
+- **性能**：Dart 词法器不再复制整个文件为 `Vec<char>`，token 文本改用
+  `Box<str>`，括号配对索引压到 `u32`（4 B/节点）、花括号分类压到
+  `u8`；模式上下文改为每轮一次 O(n) 掩码（替代逐 token 回扫），
+  `--check` 全量约 1.3 s（禁用 11 条新规则约 1.1 s），全量写出
+  19,176 文件约 2.2 s / ~217 MiB。
+- **测试修复的语义问题**：switch 表达式 pattern（`pattern => value`）
+  的 `&&`/`||` 曾按布尔运算折叠；Dart 的 `&`/`|`/`^` 与 `==` 的相对
+  优先级曾按 C 处理；`x = x ?? y` → `x ??= y` 会跳过 setter；
+  `true && x`、`x && true` 等对动态非 bool 值会丢掉运行时类型检查；
+  带注释的函数尾 `return;` 可能是 dart2js 内联屏障；`x = x * 10 + digit`
+  曾被折成 `x *= 10 + digit`；三元规则曾跨过 `??=`/`+=` 把 `!` 加到
+  赋值目标外；`if` + return 曾在无括号 else 分支里吞掉外层的
+  `return`；`if`/else 两分支表达式类型不同时三元 LUB 会退化为
+  `Object`（shelf_static 的 `Response`/`Future<Response>`）；去掉无括号
+  else/循环体里的 `else` 会让裸块逃出原作用域（stream_channel）；
+  不可达赋值被删会让 late 变量变成 definitely unassigned
+  （_fe_analyzer_shared for_each）；把 `1 > 2` 之类分析器不折叠的条件
+  改成 `false`、或三元选分支时丢掉含赋值的分支，都会改变 late 变量的
+  definite assignment；`${x}` 后紧跟组合符号时压缩成 `$x́` 会改变标识符。
+  均已加守卫并补回归测试；`// ignore:` 注释的独立行/行尾位置也由打印器
+  保持。
+- **真实包测试**：用离线 pub 缓存对 50+ 个纯 Dart 包运行原始/处理后
+  的 `dart test`（petitparser 1,602、xml 5,876、characters 17,520、
+  collection 1,706、yaml_edit 1,052、crypto 822 等，约 3 万条测试），
+  以上 convert/collection/glob/shelf_static/stream_channel 问题均由
+  此发现并修复；修复后各包通过/失败集合与原包一致。
+- **文档/发布**：`cure rules` 汇总为 **118** 条（67 Java + 27 Python + 24
+  Dart）；README（中英）增加 Dart 后端、规则与验证；`publish.sh` 扩展到
+  19 个 crate。
+
+### 修复与增强（四语言，2026-10-26）
+
+- **TypeScript/JavaScript 解析器**：
+  - 类声明与类表达式的类型参数默认值可以是对象类型字面量：
+    `class A<T extends object = {}>`、`const C = class<T = {}> { … }`
+    曾把默认值里的 `{}` 当成类体，`>` 报语法错误并把后续成员挤乱；
+    类头扫描现在跟踪尖括号深度。
+  - 匿名泛型类表达式（`class<T> {}`）不再被当成标识符 `class`。
+  - 函数体里的 TS 重载签名（`function f(a: string): string;`）曾按
+    “缺少函数体”报错并合成空块 `{}`，把签名变成第二个实现；现在整条
+    原文保留。
+  - JSX 补齐：`<>…</>` 片段、`{...props}` 展开属性、`{/* 注释 */}`
+    空表达式容器不再报语法错误。
+  - 泛型装饰器 `@Deco<T>()`、`@ns.Wrap<T>(x)`、`@Plain<T>` 的类型实参
+    曾被留在装饰器前缀之外，`<T>()` 变成独立语句、装饰器整体丢失
+    （类不再被装饰）；现在整条装饰器（含类型实参与调用）原文保留。
+    `@Deco() export default class …` / `@Deco() export class …` 的
+    装饰器前缀也不再被 export 分支丢弃。
+  - `.ts/.mts/.cts` 里的尖括号类型断言 `<Foo<Bar>>z` 曾被当成 JSX
+    元素一路吞到语句边界（后续语句并进 Raw、并多打一个 `;`）；现在按
+    TS 语义解析并打印成等价的 `z as Foo<Bar>`（在 `.tsx` 里也合法），
+    `.tsx/.jsx` 仍按 JSX 原文捕获。
+- **TypeScript 类型实参保真**：`f<number>(1)`、`new Box<string>(…)`、
+    `o.m<T>?.(x)`、`f<T>` 实例化表达式与 ``tag<T>`…` `` 的类型实参
+    以前被直接吞掉（运行时擦除，但类型层可见——`useState<T|null>(null)`
+    会退化成 `useState(null)` 并推断成 `null`）。现在包成 `TypeArgs`
+    原文节点逐字节打印，并标记为不透明区域（不参与表达式化简）。
+- **TypeScript 打印器**：类体的 `}` 不再粘在最后一个成员后
+  （`constructor() {}}`）；无函数体签名不再多打一个空格
+  （`string ;`）。
+- **Dart 打印器**：顶层声明体 `}` 后必换行（`class A {}` 后紧跟记录
+  返回类型 `(int, String) f()` 曾粘成 `}(int, …)`）；`final (i, v)`、
+  `case [_, ...]`、`yield* [x]`、对象模式 `(:final value)` 的间距；
+  switch 表达式每个分支独占一行。
+- **Dart 新规则**（23 → 24）：`dart_trailing_assign_return`
+  （`final y = expr; return y;` → `return expr;`；要求该局部名在块内
+  只出现这两处，初始值限定为上下文不敏感形态，避免返回位置推断改变
+  具化泛型类型；`const`/`late`/带类型注解/多声明器/调用/集合字面量
+  均跳过）。
+- **Python 新规则**（25 → 27）：
+  - `py_double_not`：`not not x` → `bool(x)`（两者都只调用一次真值
+    协议并返回真正的 bool；`bool` 被遮蔽时不改写）。
+  - `py_trailing_assign_return`：`y = expr; return y` → `return expr`；
+    要求该名字在函数内只被这条 return 读取（嵌套闭包、`global`/
+    `nonlocal`、`del` 与 raw 片段引用都计入计数），且函数没有
+    `locals()`/`vars()`/`dir()`/`eval()`/`exec()` 反射。
+- **验证**：workspace 全测试通过；Dart pub-cache 当前树 19,176 文件
+  0 解析诊断、0 token 漂移、格式往返 0 漂移、二次运行 0 字节差异，
+  `dart format` 仍在同一批 90 个旧语法文件上失败（0 新增）；Python
+  3.14 stdlib 2,456 文件 0 解析诊断、编译失败集合与原树完全一致
+  （同一批 8 个故意非法测试文件）；JS 语料 200 文件 0 诊断、二次运行
+  0 差异、全部产物 `node --check` 通过；Java 语料三检与新增
+  records/pattern-switch 特性矩阵、编译/运行差分均通过。
 
 ## [0.2.0] - 2026-10-26
 
@@ -715,7 +869,8 @@ var b=2;`——`b` 变成非导出（模块语义改变）。
 - 跨平台批量 I/O：Linux `io_uring` feature（read syscall 6,977 → 10，
   syscall 时长 −53%）；macOS/Windows 线程池；默认构建零运行时依赖
 
-[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ejfkdev/cure/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ejfkdev/cure/releases/tag/v0.2.0
 [0.1.11]: https://github.com/ejfkdev/cure/releases/tag/v0.1.11
 [0.1.10]: https://github.com/ejfkdev/cure/releases/tag/v0.1.10

@@ -20,6 +20,7 @@ __pycache__/
 venv/
 .pytest_cache/
 .ruff_cache/
+.dart_tool/
 
 # 性能/覆盖率采样
 *.profraw

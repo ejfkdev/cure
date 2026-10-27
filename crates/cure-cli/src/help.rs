@@ -19,7 +19,7 @@ pub(crate) fn print_version() {
             env!("CARGO_PKG_VERSION")
         ),
         CliLang::En => println!(
-            "cure {} — fault-tolerant code simplifier/formatter (backends: java, typescript/javascript, python 2.7/3.x)\n{REPO_URL}",
+            "cure {} — fault-tolerant code simplifier/formatter (backends: java, typescript/javascript, python 2.7/3.x, dart)\n{REPO_URL}",
             env!("CARGO_PKG_VERSION")
         ),
     }
@@ -29,7 +29,7 @@ fn print_help_en() {
     let v = env!("CARGO_PKG_VERSION");
     println!("cure {v} — fault-tolerant, semantic-preserving code simplifier/formatter");
     println!("Decompiled code in, human-written-looking code out.");
-    println!("Supported languages: java, typescript/javascript (ts/tsx/mts/cts/js/jsx/mjs/cjs), python 2.7/3.x (py/pyi).");
+    println!("Supported languages: java, typescript/javascript (ts/tsx/mts/cts/js/jsx/mjs/cjs), python 2.7/3.x (py/pyi), dart (dart).");
     println!("{REPO_URL}  (MIT license)");
     println!();
     println!("Usage:");
@@ -40,7 +40,7 @@ fn print_help_en() {
     println!("  cure help [COMMAND]                this help, or one command's");
     println!("  cure version | -h | -V");
     println!();
-    println!("Languages: java, typescript/javascript, python 2.7/3.x (this release).");
+    println!("Languages: java, typescript/javascript, python 2.7/3.x, dart (Dart 1/2/3).");
     println!("The CLI and engine are language-agnostic: a new backend registers in");
     println!("LANG_BACKENDS and gets the whole pipeline (traversal, parallelism,");
     println!("--check/--diff/--stats, batched I/O).");
@@ -59,7 +59,7 @@ fn print_help_en() {
     println!("      --check              dry run: exit 2 if rewritable; write nothing");
     println!("  -j, --threads <N>        worker threads (default: CPU cores × 1.5)");
     println!("      --format-only        format only, no simplification");
-    println!("  -l, --lang <name>        force java | ts/js/typescript/javascript | py/python/python3/pyi");
+    println!("  -l, --lang <name>        force java | ts/js/typescript/javascript | py/python/python3/pyi | dart");
     println!("      --ext <list>         only given extensions (comma/space separated)");
     println!("      --copy-other         dir mode: copy non-source files verbatim");
     println!("      --diff               print unified diffs of rewritten files");
@@ -88,6 +88,10 @@ fn print_help_en() {
     println!("  cure Script.py");
     println!("  cure src/ -l py");
     println!();
+    println!("  # Dart (Dart 1/2/3 syntax)");
+    println!("  cure Script.dart");
+    println!("  cure lib/ -l dart");
+    println!();
     println!("  # a directory — mirror into src-cure-out/, hierarchy preserved");
     println!("  cure src/");
     println!("  cure src/ -o out/                  # another output root");
@@ -109,7 +113,7 @@ fn print_help_zh() {
     let v = env!("CARGO_PKG_VERSION");
     println!("cure {v} — 容错式、语义保持的代码简化 / 格式化器");
     println!("反编译代码进，像人手写的代码出。");
-    println!("已支持语言：java、typescript/javascript（ts/tsx/mts/cts/js/jsx/mjs/cjs）、python 2.7/3.x（py/pyi）。");
+    println!("已支持语言：java、typescript/javascript（ts/tsx/mts/cts/js/jsx/mjs/cjs）、python 2.7/3.x（py/pyi）、dart。");
     println!("{REPO_URL}  (MIT 许可证)");
     println!();
     println!("用法:");
@@ -120,7 +124,7 @@ fn print_help_zh() {
     println!("  cure help [子命令]                本帮助，或某子命令的帮助");
     println!("  cure version | -h | -V");
     println!();
-    println!("语言后端: java、typescript/javascript、python 2.7/3.x（本版）。");
+    println!("语言后端: java、typescript/javascript、python 2.7/3.x、dart（Dart 1/2/3）。");
     println!("CLI 与引擎均语言无关：在 LANG_BACKENDS 登记一条即获得全部基础设施");
     println!("（目录遍历/并行/--check/--diff/--stats/批量 I/O）。");
     println!();
@@ -138,7 +142,7 @@ fn print_help_zh() {
     println!("  -j, --threads <N>        并行工作线程数（默认=CPU 核心数 × 1.5）");
     println!("      --format-only        仅格式化，不做简化");
     println!(
-        "  -l, --lang <语言>      强制 java | ts/js/typescript/javascript | py/python/python3/pyi"
+        "  -l, --lang <语言>      强制 java | ts/js/typescript/javascript | py/python/python3/pyi | dart"
     );
     println!("      --ext <后缀列表>     只处理指定后缀（逗号或空格分隔）");
     println!("      --copy-other         目录模式：不受处理的文件原样拷入输出树");
@@ -166,6 +170,10 @@ fn print_help_zh() {
     println!("  # Python 2.7 / 3.x（.py/.pyi 自动识别；-l py 强制指定）");
     println!("  cure Script.py");
     println!("  cure src/ -l py");
+    println!();
+    println!("  # Dart（Dart 1/2/3 语法）");
+    println!("  cure Script.dart");
+    println!("  cure lib/ -l dart");
     println!();
     println!("  # 目录——镜像到 src-cure-out/，保持层级结构");
     println!("  cure src/");
@@ -203,12 +211,14 @@ fn rule_catalog() -> (Vec<&'static str>, Vec<&'static str>) {
 fn print_rules_en() {
     let (defaults, opt_in) = rule_catalog();
     let py = cure_python_simplify::default_rules();
+    let dart = cure_dart_simplify::default_rules();
     let java = defaults.len() + opt_in.len();
     println!(
-        "cure rules — {} simplification rules ({} Java + {} Python)",
-        java + py.len(),
+        "cure rules — {} simplification rules ({} Java + {} Python + {} Dart)",
+        java + py.len() + dart.len(),
         java,
-        py.len()
+        py.len(),
+        dart.len()
     );
     println!("Names are what --disable takes.");
     println!();
@@ -230,18 +240,25 @@ fn print_rules_en() {
         println!("  {n}");
     }
     println!();
+    println!("Dart (default, {}):", dart.len());
+    for n in dart {
+        println!("  {n}");
+    }
+    println!();
     println!("Example:  cure --disable cff_recover --disable xor_noise src/");
 }
 
 fn print_rules_zh() {
     let (defaults, opt_in) = rule_catalog();
     let py = cure_python_simplify::default_rules();
+    let dart = cure_dart_simplify::default_rules();
     let java = defaults.len() + opt_in.len();
     println!(
-        "cure rules — 共 {} 条简化规则（Java {} + Python {}）",
-        java + py.len(),
+        "cure rules — 共 {} 条简化规则（Java {} + Python {} + Dart {}）",
+        java + py.len() + dart.len(),
         java,
-        py.len()
+        py.len(),
+        dart.len()
     );
     println!("名字即 --disable 的取值。");
     println!();
@@ -260,6 +277,11 @@ fn print_rules_zh() {
     println!();
     println!("Python（默认启用，{} 条）：", py.len());
     for n in py {
+        println!("  {n}");
+    }
+    println!();
+    println!("Dart（默认启用，{} 条）：", dart.len());
+    for n in dart {
         println!("  {n}");
     }
     println!();

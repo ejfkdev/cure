@@ -140,9 +140,11 @@ impl<'a> Printer<'a> {
                 }
                 let sig = sig_raw.trim_end().to_string();
                 self.push_raw(&sig);
-                self.out.push(' ');
                 match body {
-                    Some(b) => self.print_block_like(*b),
+                    Some(b) => {
+                        self.out.push(' ');
+                        self.print_block_like(*b)
+                    }
                     // print_module 统一补条目换行——这里再加会多空行。
                     None => self.out.push(';'),
                 }
@@ -222,7 +224,9 @@ impl<'a> Printer<'a> {
             self.print_class_member(m);
         }
         self.indent -= 1;
-        self.ind();
+        // 类体收尾：成员最后一个 token 后必须换行，否则 `}` 粘在
+        // 成员收尾（`constructor() {}}`）。
+        self.nl_indent();
         self.out.push('}');
     }
 
@@ -232,9 +236,11 @@ impl<'a> Printer<'a> {
             ClassMember::Method { sig_raw, body } => {
                 let sig = sig_raw.trim_end().trim_end_matches(';').to_string();
                 self.push_raw(&sig);
-                self.out.push(' ');
                 match body {
-                    Some(b) => self.print_block_like(*b),
+                    Some(b) => {
+                        self.out.push(' ');
+                        self.print_block_like(*b)
+                    }
                     None => self.out.push(';'),
                 }
             }
@@ -764,6 +770,13 @@ impl<'a> Printer<'a> {
                 self.out.push('(');
                 self.print_expr(inner, Prec::Seq);
                 self.out.push(')');
+            }
+            NodeData::TypeArgs { raw } => {
+                // `f<T>` / `f?.<T>`：类型实参原文紧贴基址（尖括号内的
+                // 原文来自源文件，逐字节保留）。
+                let base = self.ast.children(e)[0];
+                self.print_expr(base, Prec::Member);
+                self.out.push_str(raw);
             }
             NodeData::Binary { op } => self.print_binary(e, *op, my_prec),
             NodeData::Unary { op } => self.print_unary(e, *op),
@@ -1457,6 +1470,45 @@ mod tests {
         assert!(out.contains("} catch (e) {"));
         assert!(out.contains("} finally {"));
         assert!(out.contains("case 1:"));
+    }
+
+    #[test]
+    fn class_closing_brace_gets_own_line() {
+        // 类体最后一个成员后必须换行：曾输出 `constructor() {}}`
+        //（粘连成非法/难读形态）。
+        let out = roundtrip("class A {\n  constructor() {}\n}\nclass B {\n  x = 1;\n}\n");
+        assert!(out.contains("class A {\n    constructor() {}\n}\n"), "{out}");
+        assert!(out.contains("class B {\n    x = 1;\n}\n"), "{out}");
+    }
+
+    #[test]
+    fn type_arguments_are_printed_verbatim() {
+        let out = roundtrip(
+            "const a = f<number>(1);\nconst b = new Foo<A<B<C>>>(2);\nconst c = o.m<T>?.(3);\nconst d = f<T>;\nconst e = tag<T>`x`;\n",
+        );
+        assert!(out.contains("f<number>(1)"), "{out}");
+        assert!(out.contains("new Foo<A<B<C>>>(2)"), "{out}");
+        assert!(out.contains("o.m<T>?.(3)"), "{out}");
+        assert!(out.contains("const d = f<T>;"), "{out}");
+        assert!(out.contains("tag<T>`x`"), "{out}");
+    }
+
+    #[test]
+    fn jsx_spread_fragment_and_comment_containers_round_trip() {
+        let out = roundtrip("const el = <div {...props}>{/* c */}<><span /></></div>;\n");
+        assert!(out.contains("{...props}"), "{out}");
+        assert!(out.contains("{/* c */}"), "{out}");
+        assert!(out.contains("<><span /></>"), "{out}");
+    }
+
+    #[test]
+    fn bodyless_signatures_print_without_extra_space() {
+        let out = roundtrip(
+            "function f(a: string): string;\nfunction f(a: any): any {\n  return a;\n}\nclass C {\n  abstract m(x: number): string;\n}\n",
+        );
+        assert!(out.contains("function f(a: string): string;"), "{out}");
+        assert!(!out.contains("string ;"), "{out}");
+        assert!(out.contains("abstract m(x: number): string;"), "{out}");
     }
 }
 

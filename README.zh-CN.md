@@ -9,8 +9,9 @@
 
 **cure** 是容错式、语义保持的代码简化 / 格式化引擎，把反编译出来的代码
 还原成「像人手写的」样子。引擎与 CLI 均语言无关——**当前实现的语言
-后端：Java、TypeScript/JavaScript**（ts/tsx/mts/cts/js/jsx/mjs/cjs）与
-**Python**（py/pyi，Python 2.7 与 3.x，覆盖至 3.15）；下文示例即 Java
+后端：Java、TypeScript/JavaScript**（ts/tsx/mts/cts/js/jsx/mjs/cjs）、
+**Python**（py/pyi，Python 2.7 与 3.x，覆盖至 3.15）与 **Dart**（dart，
+Dart 1/2/3）；下文示例即 Java
 后端的实际体验。TS/JS 后端同引擎、按 ECMAScript 语义：f64/ToInt32 折叠域、
 ±2^53 精确性、按文件的绑定/作用域解析（var 提升与闭包捕获守卫）、
 可选链/解构不透明、ECMA 数字格式化。Python 后端同时接受两套语法——Python 2
@@ -19,6 +20,9 @@
 except*、PEP 695 类型参数、lazy import——并按 Python 真值、整除/幂语义以及
 生成器/作用域约束保持语义。Python 2 的 int/long 区分与 True/False 重绑定
 也保持健全；两个版本语义不同的写法（print、exec）在歧义时逐字节保留。
+Dart 后端是 token 保真式：每个 token 与注释都保留，未建模语法（Dart 2
+遗留修饰符、records/patterns、extension types、macro）原样通过，安全
+改写只作用于 token 文档。
 
 ```java
 // 反编译输入                                 // cure 处理后
@@ -69,8 +73,18 @@ class B {                                     class B {
   返回操作数、真值）；Python 2 int/long 类型与 True/False 重绑定保持健全，
   版本相关写法在歧义时逐字节保留；含 `yield`/`global`/`nonlocal` 的死分支
   一律不删。
-- **92 条简化规则**（66 条 Java 默认 + 1 条 Java 选配 + 25 条 Python；
-  其中 33 条为引擎通用规则），含控制流扁平化还原、语句级 StringBuilder
+- **Dart 后端（1/2/3）** —— `.dart` 在无损 token 文档上解析 → 简化 → 打印。
+  每个 token 与注释都保留；嵌套块注释、raw/三引号/插值字符串（含
+  `${...}` 内的嵌套字符串）、二/十六进制与下划线分隔数字、全部运算符
+  形态都能正确词法化。Dart 2 的 `final` 形参与旧式函数 typedef，以及
+  Dart 3 的 records、patterns、class 修饰符、extension type、switch 表达式，
+  以及 Dart 3.13 primary constructor / dot shorthand，都因未建模语法
+  原样保留而通过。安全改写覆盖常量与字面量成员折叠、常量/布尔三元、
+  `if (const)`、if→三元（return/赋值）、else-after-terminal、嵌套 if 合并、
+  空 then 反转、不可达语句、循环尾 `continue`、函数尾 `return`、
+  复合赋值、仅 rethrow 的 try 解包、空 `finally`、相邻字符串字面量、
+  原子括号、空 `else` 与 `${ident}` 压缩；`new` 因 Dart 1 要求而保留。
+- **118 条简化规则**（67 条 Java + 27 条 Python + 24 条 Dart），含控制流扁平化还原、语句级 StringBuilder
   链还原、XOR 噪声剥除、纯字面量 JDK 调用的部分求值（"虚拟执行"）。
 - **真实代码库规模** —— OpenJDK 全源码语料（371,674 文件 / 4.7 GB）
   在 18 核笔记本上约 15 秒处理完，0 解析失败、0 panic。TS/JS 侧：
@@ -165,8 +179,9 @@ cure [选项] <文件>... | <目录> | -
 | 6. 真实 JS/TS 语料 | 全局 npm 安装中的 4,358 个 `.js/.mjs/.cjs`（约 568 MB）与 1,334 个 `.ts/.tsx/.mts/.cts`（undici、zod、minisearch、pnpm、yarn、vite-plus、Lark CLI、bytenode…）：合法文件在 cure 后必须仍可编译；第二轮 cure 输出必须逐字节一致。两种语料均 **0 解析诊断 / 0 二轮差异**（默认与保真模式），cure 产物经 Oxc（`oxfmt`）解析 **0 语法错误** | 真实包语法（压缩 bundle、顶层 await、导入属性）、复杂类型语法与模块常量传播下的幂等性 |
 | 7. 随机 JS 差分 | 确定性 PRNG 生成合法程序（声明/遮蔽/`var` 提升/闭包/循环/三元/短路/模板混合）；原版与 cure 版在 `node` 下比较 stdout + 退出码，并要求二次 cure 逐字节一致（`CURE_FUZZ_CASES` 控制样本数） | 规则组合语义与首轮/二轮收敛；开发中跑过 5,000 例 |
 | 8. Python（2.7 + 3.13–3.15） | CPython 2.7 标准库（1,609 个 UTF-8 源文件）、4,135 文件 Python 2 包语料（Django 1.11、Twisted 20.3、pip 20.3、setuptools 44、requests、six、PyYAML）、CPython 3.13/3.14/3.15 标准库（2,188 / 2,288 / 2,456 源文件）、18,128 个 Python 3.14 site-packages 文件与 3.13/3.15 site 的 1,083 / 422 个文件：解析 → 打印后用对应解释器的 `ast.dump` 比较；二次 cure 必须逐字节一致；每个简化产物交给同一解释器编译；精选程序实际执行 | 所有语料 **0** 解析诊断；**32,289** 次 AST 等价往返（Python 2 5,736 + Python 3 26,553；已排除 20 个故意非法/异构夹具）；**35,548/35,548** 幂等、0 漂移；**32,274** 次编译检查 **0 破坏**（35 个原文件本就不可编译）；精选程序 stdout/退出码一致 |
+| 9. Dart（1/2/3） | 300 个 pub-cache 包的 19,176 个 `.dart` 文件（analyzer、build_runner、ffigen、fluent_ui、json_serializable、win32 及 Dart/Flutter 工具链；含生成代码与 Dart 2 遗留写法）：解析 → 打印 → 再解析，逐 token 比较（kind+text，含注释）；二次 cure 必须逐字节一致；每个产物交给 `dart format --output=none` 校验 | **0** 解析诊断；**19,176/19,176** token 往返一致且二次运行 0 漂移；`dart format` 在 cure 前后拒绝同一批 90 个 Dart 3 已移除语法的旧文件（0 个新增失败）；Dart 1/2/3 SDK 的精选版本语法与 479 文件抽样 0 新增失败；精选程序输出一致 |
 
-`cargo test` 共 523 个测试。默认模式下 Test262 语义差分
+`cargo test` 共 602 个测试。默认模式下 Test262 语义差分
 **33,963/34,007（99.87%）执行结果逐字节一致**；仅 44 个用例被排除——它们比较
 `Function.prototype.toString` 的**源码文本**（cure 会重排函数体格式），
 或用箭头函数作计算属性名（键依赖同一文本）。使用
@@ -198,6 +213,36 @@ raise 形态、反引号、`<>`、long/int 类型、元组形参、带三引号�
 在对应解释器下与 cure 版对拍 stdout 与退出码，结果一致。CLI 目前只读取
 UTF-8 源码；其他 PEP 263 编码文件会跳过（上面的 Python 2 标准库语料已
 转码为 UTF-8 后测试）。
+
+Dart 差分覆盖 300 个 pub-cache 包的 19,176 个 `.dart` 文件（analyzer、
+build_runner、ffigen、fluent_ui、json_serializable、win32 等，包含生成
+代码与 Dart 2 遗留写法）。解析器 **0 诊断**；仅格式化往返对全部文件
+**逐 token 相同**（注释与字符串内容也在内），二次 cure **0 编辑、0 字节
+差异**。`dart format --output=none` 在 cure 前后接受同一文件集：90 个
+使用 Dart 3 已移除语法（遗留 `final` 形参、旧式函数 typedef）的源文件
+两次都被拒绝，**没有新增失败**。精选程序（常量折叠、相邻字符串合并、
+`if (true)` 选择）在 Dart 3.13 上 stdout 一致；简化器在 7,120 个文件中
+执行 **2,132 次**安全 token 编辑（418 个结构简化；其中
+`dart_trailing_assign_return` 309 次）。Dart 1.24.3、2.19.6、3.13 都作为
+oracle：精选版本语料（旧 typedef/`final` 形参到 null safety、super 形参、
+primary constructor、dot shorthand）加 479 文件抽样——Dart 1 下 173 个
+文件有效、Dart 2.19 下 477 个有效，cure 后 **0 新增失败**。版本 fixtures 位于
+`crates/cure-dart-simplify/tests/fixtures/`，覆盖指令、旧 typedef、null
+safety、super 形参、records/patterns、class 修饰符、extension type、
+primary constructor 与 dot shorthand。SDK 检查是
+常驻测试（`DART1_BIN` / `DART2_BIN` 指向解压后的 SDK）；token/幂等
+harness：`DART_ROOT=<语料> cargo run --release -p cure-dart-simplify
+--example dart_roundtrip`。语句级差分 fuzzer（`scripts/dart_fuzz.py`）
+生成 35 个混合 if/return、if/赋值、循环、`continue`、空 finally 与
+不可达尾部的函数，每组 3 个输入、10 个 seed（**1,050 个结果**）在
+Dart 3.13/2.19 上运行，Dart 1.24 跑 5 个 seed，stdout/退出码 0 失配。
+另有三个端到端差分 fuzzer：`scripts/dart_rules_fuzz.py`（调用日志、
+短路、try/finally、null safety）、`scripts/dart_expr_fuzz.py`（随机类型化
+int/bool/String 表达式与嵌套控制流）、`scripts/dart_pattern_fuzz.py`
+（switch 语句/表达式、if-case、逻辑/关系/列表/map/record 模式与 guard）。
+真实包差分：50+ 个纯 Dart pub-cache 包在 cure 前后分别运行自己的
+`dart test`（约 3 万条测试，含 petitparser 1,602、xml 5,876、
+characters 17,520），退出码与通过/失败计数一致。
 
 ### 对抗性案例
 
@@ -258,17 +303,67 @@ bool/min/max）、`py_subscript_fold`（字面量字符串/列表/元组的下�
 终止时去掉 else）、`py_bool_cond`（`True if c else False` → `bool(c)`
 及其反向）、`py_ternary_not`（`a if not c else b` → `b if c else a`）、
 `py_not_is_in`（`not (x is y)` / `not (x in y)` → `x is not y` /
-`x not in y`）、`py_paren_removal`（原子表达式外的冗余括号）、
+`x not in y`）、`py_double_not`（`not not x` → `bool(x)`：两者都只调用
+一次真值协议并返回真正的 bool）、`py_paren_removal`（原子表达式外的冗余括号）、
 `py_dead_store`（相邻纯字面量覆盖）、`py_dead_assign`（函数作用域活跃性：
 未被读取的局部纯值可删，有副作用的右值降为表达式）、`py_dead_expr`
 （裸数字/None/... 表达式）、`py_str_accum`（`s = "a"; s += "b"` →
 `s = "ab"`）、`py_assign_back_fold`（`x = 2; x = x + 3` → `x = 5`，仅
-纯 int/字符串链）、`py_return_none`（`return None` → `return`）、
+纯 int/字符串链）、`py_trailing_assign_return`（`y = expr; return y` →
+`return expr`；要求该名字在函数内只被这条 return 读取、不是
+`global`/`nonlocal`，且函数没有 `locals()`/`vars()`/`dir()`/`eval()`/
+`exec()` 反射）、`py_return_none`（`return None` → `return`）、
 `py_trailing_return`（删除函数末尾隐式 `return`）、`py_trailing_continue`
 （删除循环末尾 `continue`）、`py_empty_finally`（`finally: pass`）、
 `py_assert_true`（恒真断言）、`py_unreachable`、`py_pass_cleanup`。
 docstring、Python 2 int/long、被遮蔽的 True/False/内建（含 exec 与
 import *）、locals/vars/dir/eval 反射以及版本歧义写法都有守卫。
+
+**Dart 专属（24）**：`dart_const_fold`（32 位整数/bool/字符串运算与比较，
+以及 `.length`、`.codeUnitAt`、`.contains`、`.indexOf`、`.isEven`、
+`.bitLength`、`toRadixString` 等确定性字面量成员；`/` 与浮点不折；按
+Dart 的 Euclidean `%`、截断 `~/` 与移位范围建模，并遵循 Dart 的
+「位运算优先于相等」优先级及一元前缀上下文，避免把 `x - 1 + 2`、
+`x & 0x60 == 0`、`-1 % 3` 折错；控制流条件里的 bool 折叠跳过，三元选择
+交给 `dart_ternary_const`，因为 Dart 的流分析对 late 变量 definite
+assignment 的处理不同）、
+`dart_ternary_const` / `dart_ternary_bool` / `dart_ternary_not`
+（常量条件；`dart_ternary_const` 只在控制流条件之外选择同类字面量分支；
+仅在条件可证为 bool 时 `c ? true : false` → `c`、`!c ? a : b` →
+`c ? b : a`）、`dart_bool_literal_op`
+（`true && x` → `x`、`false && x` → `false`、`x && true` → `x` 及 `||`
+对偶；保留的操作数必须可证为 bool，动态值保留原有运行时 bool 检查；
+Dart 3 模式上下文跳过）、`dart_double_negation`（仅操作数本身可证
+为 bool 时）、`dart_negated_eq`（`!(a == b)` → `a != b`、`!(a is T)` →
+`a is! T`，必要时补括号）、`dart_const_if`（常量 bool 条件且分支为块；
+选中块保留作用域；分支含赋值/`return`/`yield`/for-in 时保守跳过）、`dart_if_return`（`if (c) return a;` 加 `return b;`
+或 else-return → `return (c) ? (a) : (b);`，仅当两分支是同类字面量，
+保证三元静态类型与原 return 一致；其他情况保留独立 return；if-case 模式不动）、
+`dart_if_assign_ternary`（两边同目标赋值 → `x = (c) ? (a) : (b);`，
+仅同类字面量 RHS）、`dart_else_after_terminal`（then 分支必然终止且
+`if` 是直接语句（不是无括号 else/循环体）时去掉 else；else 块保留为
+裸块以保持作用域）、`dart_nested_if`（块内唯一嵌套 if →
+`if ((a) && (b))`）、`dart_empty_then`（`if (c) {} else X` →
+`if (!c) X`）、`dart_assign_compound`（`x = x + y` → `x += y`，仅普通
+标识符且 RHS 顶层没有更松运算符，`x = x * 10 + digit` 不动；
+`x = x ?? y` 保留，因为 `??=` 在 x 非空时可能跳过 setter）、`dart_unreachable`
+（直接 `return`/`break`/`continue`/`throw` 后的语句；含
+`return`/`yield`、赋值或 for-in 的不可达区间保留，以免改变返回类型推断
+和 late 变量 definite assignment；带标签块跳过）、
+`dart_trailing_continue`（循环尾 `continue;`）、`dart_trailing_return`
+（无注释的函数/闭包末尾裸 `return;`）、`dart_trailing_assign_return`
+（`final y = expr; return y;` → `return expr;`；该局部变量只在这里被
+读取，且初始值限定为上下文不敏感形态——标识符/字面量/运算符，不含
+调用与集合字面量，避免返回位置推断改变具化泛型类型）、`dart_empty_finally`
+（仅在仍有 `catch`/`on` 时删除空 `finally`）、`dart_try_unwrap`
+（仅 rethrow 的 `catch`/`on` 子句删除；删空后或只剩空 `finally` 时把
+`try` 解包为裸块，保留作用域）、`dart_adjacent_strings`
+（简单字面量的隐式 `'a' 'b'` 拼接）、`dart_paren_removal`
+（仅原子表达式；控制条件、调用实参与函数表达式不动）、`dart_empty_else`
+（删除 `else {}`）、`dart_string_interp`（`${ident}` → `$ident`，且后续
+字符必须是 ASCII 且不能延长标识符；非 ASCII 的 ID_Continue 字符保守跳过）。
+注释、raw/三引号字符串、嵌套插值、Dart 3 模式与
+所有未建模结构一律不重写。
 
 ## 性能
 
@@ -282,6 +377,7 @@ release 构建、18 核 Apple Silicon 笔记本、页缓存热、默认线程数
 | Python 2 包语料，写出输出树 | 4,135 | 0.38 s | ~75 MiB |
 | CPython 3.15 标准库，写出输出树 | 2,456 | 0.35 s | ~150 MiB |
 | Python 3.14 site-packages，写出输出树 | 18,128 | 1.6 s | ~285 MiB |
+| Dart pub-cache 语料，写出输出树 | 19,176 | 2.2 s | ~217 MiB |
 | OpenJDK 全源码语料，`--check` | 371,674 / 4.70 GB | 14.8 s | ~430 MiB |
 | OpenJDK 全源码语料，写出输出树 | 371,674 / 4.70 GB | 27.5 s | ~430 MiB |
 
@@ -308,13 +404,18 @@ cure-python-ast    Python NodeData + PyId arena
 cure-python-parser 容错缩进词法/解析器（Python 2.7–3.15）
 cure-python-print  规范化 4 空格 Python 打印器
 cure-python-simplify Python 常量/控制流规则包（基于 cure-engine）
+cure-dart-ast      无损 Dart token 文档 + 括号/花括号结构
+cure-dart-parser   Dart 1/2/3 词法器（嵌套注释、插值字符串）
+cure-dart-print    保留注释的 Dart token 格式化器
+cure-dart-simplify Dart 安全 token 改写（折叠/常量 if/new/括号）
 cure-cli           `cure` 二进制：并行管线、跨平台批量 I/O（io_uring/线程池）、目录模式
 ```
 
 `Lang` trait 是语言边界。数值/字符串折叠语义全部走语言钩子
 （`fold_lit_bin` / `fold_lit_cmp` / `fold_lit_neg` / `reassoc_delta`）——
 引擎不硬编码任何语言的算术。每个语言前端在 `cure-engine` + `cure-tree`
-之上提供自己的 AST + parser + printer + 规则包；TS/JS 与 Python 后端就是
+之上提供自己的 AST + parser + printer + 规则包；TS/JS、Python 与 Dart
+后端就是
 两个这样的前端（另见 `cure-tree/tests/kit.rs` 里 ~100 行的玩具语言）。
 
 ## 状态与路线
@@ -323,9 +424,14 @@ cure-cli           `cure` 二进制：并行管线、跨平台批量 I/O（io_ur
 - ✅ TS/JS 后端：Test262 六层全绿，npm 语料 0 解析诊断
 - ✅ Python 2.7 + 3.x 后端：35,548 个标准库/site-packages 文件，0 诊断、
   0 幂等漂移、0 编译破坏
-- ✅ 12 套入库 Java 语料、三层验证、523 个测试
+- ✅ Dart 1/2/3 后端：19,176 个 pub-cache 文件，0 诊断、0 token 漂移、
+  0 格式漂移、0 新增 `dart format` 失败
+- ✅ 12 套入库 Java 语料、三层验证、602 个测试
 - 🔜 还原规则 V2（反射 addSuppressed 形态、嵌套双资源 try-with-resources）
 - 🔜 Python 规则包后续（局部传播、反编译形态还原）
+- ℹ️ 注释保真：Dart 后端逐 token 保留注释；Java/Python/TS 从 AST 重新
+  打印，独立注释不会重新输出；TypeScript 的 `--preserve-function-source`
+  会把函数/类/对象字面量内部的注释逐字节保留。
 
 ## 许可证
 

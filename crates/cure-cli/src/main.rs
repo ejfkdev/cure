@@ -2,7 +2,8 @@
 //!
 //! `cure` —— 容错式代码简化 / 格式化命令行工具。CLI 与引擎均语言无关，
 //! **当前实现的语言后端：Java、TypeScript/JavaScript**（ts/tsx/mts/cts/
-//! js/jsx/mjs/cjs）与 **Python**（py/pyi）——新语言在 [`LANG_BACKENDS`]
+//! js/jsx/mjs/cjs）、**Python**（py/pyi）与 **Dart**（dart，Dart 1/2/3）
+//! ——新语言在 [`LANG_BACKENDS`]
 //! 登记一条（后缀 + 管线函数）即获得目录遍历 / 并行 / `--check` /
 //! `--diff` / `--stats` / 跨平台批量 I/O 的全部基础设施。
 //!
@@ -18,6 +19,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use cure_engine::Config;
+use cure_dart_parser::parse as dart_parse;
+use cure_dart_print::print_module as dart_print;
+use cure_dart_simplify::simplify_module as dart_simplify;
 use cure_java_parser::parse;
 use cure_java_print::print_unit;
 use cure_java_simplify::simplify_unit;
@@ -59,6 +63,11 @@ const LANG_BACKENDS: &[LangBackend] = &[
         exts: &["py", "pyi"],
         process: process_source_py,
     },
+    LangBackend {
+        name: "dart",
+        exts: &["dart"],
+        process: process_source_dart,
+    },
 ];
 
 /// 后缀 → 后端（O(后端数)，无哈希）。
@@ -73,6 +82,7 @@ fn backend_for_lang(name: &str) -> Option<&'static LangBackend> {
         "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs"
         | "typescript" | "javascript" => Some(&LANG_BACKENDS[1]),
         "py" | "python" | "python3" | "pyi" => Some(&LANG_BACKENDS[2]),
+        "dart" | "dart3" => Some(&LANG_BACKENDS[3]),
         _ => None,
     }
 }
@@ -924,12 +934,17 @@ fn process_source_ts(
         || disp.ends_with(".jsx")
         || disp.ends_with(".mjs")
         || disp.ends_with(".cjs"));
+    // `.ts/.mts/.cts` 里 JSX 不合法：表达式起始的 `<` 是 TS 尖括号类型
+    // 断言（`<Foo>z`），不能按 JSX 吞到语句边界；`.tsx/.jsx` 与无扩展
+    // 来源保持 JSX 捕获。
+    let jsx = !(disp.ends_with(".ts") || disp.ends_with(".mts") || disp.ends_with(".cts"));
     let mut outcome = parse_with_options(
         src,
         ParseOptions {
             module_goal,
             capture_source: opts.preserve_function_source,
             ts_syntax,
+            jsx,
         },
     );
     if opts.preserve_function_source {
@@ -1107,6 +1122,114 @@ fn process_source_py(
         }
     }
     let printed = py_print(&outcome.ast, outcome.module);
+    if need_lines {
+        result.lines_after = printed.lines().count();
+        if result.nodes_before > 0 && result.nodes_after == 0 {
+            result.nodes_after = result.nodes_before;
+            result.decisions_after = result.decisions_before;
+            result.depth_after = result.depth_before;
+        }
+    }
+    if had_errors {
+        eprintln!(
+            "cure: {display}: {} 处语法问题已跳过（保留原文）:",
+            outcome.errors.len()
+        );
+        for e in outcome.errors.iter().take(5) {
+            eprintln!("  {display}:{}:{}: {}", e.line, e.col, e.message);
+        }
+        if outcome.errors.len() > 5 {
+            eprintln!("  … 其余 {} 处省略", outcome.errors.len() - 5);
+        }
+    }
+    result.changed = printed != src;
+    if opts.diff && result.changed {
+        result.diff_text = unified_diff(src, &printed, display);
+    }
+    if opts.check {
+        return Ok(result);
+    }
+    match out_path {
+        Some(p) => fs::write(&p, printed).map_err(|e| format!("写入 {} 失败: {e}", p.display()))?,
+        None => {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(printed.as_bytes())
+                .map_err(|e| format!("写出失败: {e}"))?;
+            if !printed.ends_with('\n') {
+                let _ = stdout.write_all(b"\n");
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn process_source_dart(
+    src: &str,
+    opts: &Options,
+    out_path: Option<PathBuf>,
+    display: &str,
+) -> Result<FileResult, String> {
+    let mut outcome = dart_parse(src);
+    let had_errors = !outcome.errors.is_empty();
+    let need_lines = opts.stats || opts.report;
+    let lines_before = if need_lines { src.lines().count() } else { 0 };
+    let (nodes_b, dec_b, depth_b) = if need_lines {
+        cure_dart_ast::unit_metrics(&outcome.ast)
+    } else {
+        (0, 0, 0)
+    };
+    let mut result = FileResult {
+        errored: had_errors,
+        lines_before,
+        nodes_before: nodes_b,
+        decisions_before: dec_b,
+        depth_before: depth_b,
+        display: display.to_string(),
+        ..Default::default()
+    };
+    if !opts.format_only {
+        let mut cfg = Config::default();
+        for r in &opts.disabled {
+            cfg.disabled_rules.insert(r.clone());
+        }
+        cfg.remove_dead_methods = opts.dead_code;
+        let report = dart_simplify(&mut outcome.ast, &cfg);
+        if need_lines {
+            let (n, d, dep) = cure_dart_ast::unit_metrics(&outcome.ast);
+            result.nodes_after = n;
+            result.decisions_after = d;
+            result.depth_after = dep;
+        }
+        result.edits = report.edits;
+        result.by_rule = report.by_rule.iter().map(|(k, v)| (*k, *v)).collect();
+        if opts.report {
+            eprintln!(
+                "cure: {display}: {} 次改写 / {} 轮",
+                report.edits, report.iterations
+            );
+            if need_lines {
+                eprintln!(
+                    "  结构：节点 {}→{} / 判定点 {}→{} / 嵌套 {}→{}",
+                    nodes_b,
+                    result.nodes_after,
+                    dec_b,
+                    result.decisions_after,
+                    depth_b,
+                    result.depth_after
+                );
+            }
+            if !report.by_rule.is_empty() {
+                let detail: Vec<String> = report
+                    .by_rule
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect();
+                eprintln!("  逐规则：{}", detail.join(", "));
+            }
+        }
+    }
+    let printed = dart_print(&outcome.ast);
     if need_lines {
         result.lines_after = printed.lines().count();
         if result.nodes_before > 0 && result.nodes_after == 0 {

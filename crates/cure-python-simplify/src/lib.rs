@@ -42,12 +42,14 @@ pub fn default_rules() -> &'static [&'static str] {
         "py_bool_cond",
         "py_ternary_not",
         "py_not_is_in",
+        "py_double_not",
         "py_paren_removal",
         "py_dead_store",
         "py_dead_assign",
         "py_dead_expr",
         "py_str_accum",
         "py_assign_back_fold",
+        "py_trailing_assign_return",
         "py_return_none",
         "py_trailing_return",
         "py_trailing_continue",
@@ -259,6 +261,16 @@ impl<'a> Pass<'a> {
         }
         if self.enabled("py_assign_back_fold") {
             self.fold_assign_back(&mut new);
+        }
+        // `y = <expr>; return y`（y 在函数内只被这里读取一次）→ `return <expr>`。
+        if self.enabled("py_trailing_assign_return") && self.dead_scope.is_some() {
+            let mut i = 0;
+            while i + 1 < new.len() {
+                if self.try_trailing_assign_return(&mut new, i) {
+                    continue;
+                }
+                i += 1;
+            }
         }
         // 相邻字面量死存：`x = 1; x = [2]` → 第一条可删（两侧都无副作用）。
         if self.enabled("py_dead_store") {
@@ -861,6 +873,57 @@ impl<'a> Pass<'a> {
         }
     }
 
+    /// `y = <expr>; return y` → `return <expr>`。
+    ///
+    /// 条件（全部满足才改写）：
+    /// - `y` 是单个裸名字目标（不是属性/下标/解包）；
+    /// - 目标名字在整个函数体内只被这条 return 读取一次（嵌套函数、
+    ///   `global`/`nonlocal`、`del`、raw 片段里的引用都计入，保守）；
+    /// - 函数内没有 `locals()/vars()/eval()/exec()` 之类的反射读取；
+    /// - 下一句就是 `return y`（相邻，任何语句都会先归约）。
+    ///
+    /// 语义：`return <expr>` 求值顺序与「先赋值再读回」完全相同；删掉的
+    /// 局部绑定在函数内不可观察（已被「只读一次」排除）。
+    fn try_trailing_assign_return(&mut self, new: &mut Vec<PyId>, i: usize) -> bool {
+        if self
+            .dead_scope
+            .as_ref()
+            .is_none_or(|ds| ds.introspection)
+        {
+            return false;
+        }
+        let assign = new[i];
+        let NodeData::Assign { targets: 1 } = self.ast.data(assign) else {
+            return false;
+        };
+        let ach = self.ast.children(assign).to_vec();
+        let name = match self.ast.data(ach[0]) {
+            NodeData::Name(n) => n.clone(),
+            _ => return false,
+        };
+        let ds = self.dead_scope.as_ref().unwrap();
+        if ds.forbidden.contains(&name) || ds.counts.get(&name).copied().unwrap_or(0) != 1 {
+            return false;
+        }
+        let ret = new[i + 1];
+        if !matches!(self.ast.data(ret), NodeData::Return) {
+            return false;
+        }
+        let rch = self.ast.children(ret).to_vec();
+        if rch.len() != 1
+            || !matches!(self.ast.data(rch[0]), NodeData::Name(n) if n == &name)
+        {
+            return false;
+        }
+        // 被改写的赋值本身可能带 annotation（AnnAssign 走不到这里），
+        // 目标必须是纯名字。
+        let new_ret = self.ast.return_(Some(ach[1]));
+        new[i] = new_ret;
+        new.remove(i + 1);
+        self.hit("py_trailing_assign_return");
+        true
+    }
+
     /// `if c: x = a else: x = b` → `x = a if c else b`；
     /// `if c: return a else: return b` → `return a if c else b`。
     fn merge_if_ternary(
@@ -1026,6 +1089,21 @@ impl<'a> Pass<'a> {
                                 return cmp;
                             }
                         }
+                    }
+                }
+                if op == PyUn::Not && self.enabled("py_double_not") && !self.bool_shadowed {
+                    // `not (not x)` → `bool(x)`：两者都只调一次 truthiness
+                    //（`__bool__`/`__len__`）并返回真 bool。
+                    let mut inner = v2;
+                    while let NodeData::Paren = self.ast.data(inner) {
+                        inner = self.ast.children(inner)[0];
+                    }
+                    if matches!(self.ast.data(inner), NodeData::Unary { op: PyUn::Not }) {
+                        let operand = self.ast.children(inner)[0];
+                        let f = self.ast.name("bool");
+                        let call = self.ast.call(f, vec![operand], vec![CallArg::pos()]);
+                        self.hit("py_double_not");
+                        return call;
                     }
                 }
                 if self.enabled("py_const_fold") {
@@ -1494,6 +1572,9 @@ struct DeadScope {
     reads: BTreeSet<String>,
     forbidden: BTreeSet<String>,
     introspection: bool,
+    /// 名字出现次数（Name 节点 + raw 片段里的标识符词）。尾赋值返回要求
+    /// 目标名字只有 return 这一处读取（计数只用于保守判定：只会偏大）。
+    counts: BTreeMap<String, usize>,
 }
 
 fn analyze_function(ast: &PyAst, body: PyId) -> DeadScope {
@@ -1515,6 +1596,16 @@ fn add_words(raw: &str, out: &mut BTreeSet<String>) {
     }
     if !cur.is_empty() {
         out.insert(cur);
+    }
+}
+
+/// `add_words` 的计数版本：raw 片段里的标识符同时计入 reads 与 counts。
+fn add_words_counted(raw: &str, ds: &mut DeadScope) {
+    let mut words = BTreeSet::new();
+    add_words(raw, &mut words);
+    for w in words {
+        *ds.counts.entry(w.clone()).or_insert(0) += 1;
+        ds.reads.insert(w);
     }
 }
 
@@ -1546,6 +1637,7 @@ fn collect_target_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
 fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
     match ast.data(id) {
         NodeData::Name(n) => {
+            *ds.counts.entry(n.clone()).or_insert(0) += 1;
             ds.reads.insert(n.clone());
             return;
         }
@@ -1560,7 +1652,7 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
             return;
         }
         NodeData::AnnAssign { annotation_raw } => {
-            add_words(annotation_raw, &mut ds.reads);
+            add_words_counted(annotation_raw, ds);
             let ch = ast.children(id);
             if let Some(&t) = ch.first() {
                 collect_target_reads(ast, t, ds);
@@ -1577,21 +1669,21 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
             return;
         }
         NodeData::For { target_raw, .. } | NodeData::CompFor { target_raw, .. } => {
-            add_words(target_raw, &mut ds.reads);
+            add_words_counted(target_raw, ds);
             for &c in ast.children(id) {
                 collect_reads(ast, c, ds);
             }
             return;
         }
         NodeData::With { items_raw, .. } => {
-            add_words(items_raw, &mut ds.reads);
+            add_words_counted(items_raw, ds);
             for &c in ast.children(id) {
                 collect_reads(ast, c, ds);
             }
             return;
         }
         NodeData::ExceptHandler { clause_raw } => {
-            add_words(clause_raw, &mut ds.reads);
+            add_words_counted(clause_raw, ds);
             for &c in ast.children(id) {
                 collect_reads(ast, c, ds);
             }
@@ -1605,10 +1697,10 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
             ..
         } => {
             // 默认值/装饰器/注解在外层作用域求值；函数体是闭包读取。
-            add_words(params_raw, &mut ds.reads);
-            add_words(ret_raw, &mut ds.reads);
-            add_words(deco_raw, &mut ds.reads);
-            add_words(generics_raw, &mut ds.reads);
+            add_words_counted(params_raw, ds);
+            add_words_counted(ret_raw, ds);
+            add_words_counted(deco_raw, ds);
+            add_words_counted(generics_raw, ds);
             if let Some(&b) = ast.children(id).first() {
                 collect_reads(ast, b, ds);
             }
@@ -1619,34 +1711,34 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
             deco_raw,
             ..
         } => {
-            add_words(header_raw, &mut ds.reads);
-            add_words(deco_raw, &mut ds.reads);
+            add_words_counted(header_raw, ds);
+            add_words_counted(deco_raw, ds);
             if let Some(&b) = ast.children(id).first() {
                 collect_reads(ast, b, ds);
             }
             return;
         }
         NodeData::Lambda { params_raw } => {
-            add_words(params_raw, &mut ds.reads);
+            add_words_counted(params_raw, ds);
             if let Some(&b) = ast.children(id).first() {
                 collect_reads(ast, b, ds);
             }
             return;
         }
         NodeData::Case { pattern_raw, .. } => {
-            add_words(pattern_raw, &mut ds.reads);
+            add_words_counted(pattern_raw, ds);
             for &c in ast.children(id) {
                 collect_reads(ast, c, ds);
             }
             return;
         }
         NodeData::Global(raw) | NodeData::Nonlocal(raw) => {
-            add_words(raw, &mut ds.reads);
+            add_words_counted(raw, ds);
             add_words(raw, &mut ds.forbidden);
             return;
         }
         NodeData::RawStmt(raw) => {
-            add_words(raw, &mut ds.reads);
+            add_words_counted(raw, ds);
             if raw.trim_start().starts_with("exec") {
                 ds.introspection = true;
             }

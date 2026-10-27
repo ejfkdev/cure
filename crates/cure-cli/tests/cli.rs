@@ -261,13 +261,16 @@ fn rules_subcommand_lists_catalog() {
             .args(args)
             .assert()
             .success()
-            .stdout(predicate::str::contains("92 simplification rules (67 Java + 25 Python)"))
+            .stdout(predicate::str::contains(
+                "118 simplification rules (67 Java + 27 Python + 24 Dart)",
+            ))
             .stdout(predicate::str::contains("const_fold_bin"))
             .stdout(predicate::str::contains("cff_recover"))
-            // 默认/选配分组、Python 目录与 --disable 提示
+            // 默认/选配分组、Python/Dart 目录与 --disable 提示
             .stdout(predicate::str::contains("Java enabled by default"))
             .stdout(predicate::str::contains("Java opt-in"))
-            .stdout(predicate::str::contains("Python (default, 25)"))
+            .stdout(predicate::str::contains("Python (default, 27)"))
+            .stdout(predicate::str::contains("Dart (default, 24)"))
             .stdout(predicate::str::contains("--disable"));
     }
 }
@@ -401,4 +404,48 @@ fn metrics_unit_counting() {
     assert!(before.nodes > 40, "{before:?}");
     assert!(before.max_depth >= 2, "{before:?}");
     let _ = &mut out;
+}
+
+#[test]
+fn dart_backend_extension_and_lang() {
+    let dir = TempDir::new().unwrap();
+    let p = tmp_java(
+        &dir,
+        "main.dart",
+        "class A { A(this.x); final int x; }\n\
+         void main() { var a = new A(1); print(1 + 2); }\n",
+    );
+    cure()
+        .arg(&p)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("var a = new A(1);"))
+        .stdout(predicate::str::contains("print(3);"));
+    let txt = tmp_java(&dir, "sample.txt", "void main() { print(1 + 2); }\n");
+    cure()
+        .arg("--lang")
+        .arg("dart")
+        .arg(&txt)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("print(3);"));
+}
+
+#[test]
+fn dart_backend_keeps_comments_and_versions() {
+    let dir = TempDir::new().unwrap();
+    let p = tmp_java(
+        &dir,
+        "legacy.dart",
+        "typedef int Legacy(int x);\n\
+         // keep me\n\
+         void main() { var s = r'${raw}'; print(s); }\n",
+    );
+    cure()
+        .arg(&p)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("typedef int Legacy(int x);"))
+        .stdout(predicate::str::contains("// keep me"))
+        .stdout(predicate::str::contains("r'${raw}'"));
 }

@@ -208,6 +208,12 @@ pub enum NodeData {
     /// `arr[index]` / `arr?.[index]`。children: `[array, index]`。
     Index { optional: bool },
     Paren,
+    /// `base<TypeArgs>` / `base?.<TypeArgs>`（TS 泛型调用/实例化表达式的
+    /// 类型实参）。运行时擦除但**类型层可见**——丢弃会改变类型推断
+    ///（`useState<T|null>(null)` → `useState(null)` 推断成 `null`）。
+    /// children: `[base]`；raw 是包含尖括号的原文（`<T>` / `?.<T>`）。
+    /// 标记为不透明：类型实参不参与表达式化简。
+    TypeArgs { raw: String },
     Ternary,
     /// `new Callee(args…)`。children: `[callee, arg…]`（callee 为表达式）。
     New,
@@ -511,6 +517,7 @@ impl TsAst {
             NodeData::Member { .. } => NodeKind::Member,
             NodeData::Index { .. } => NodeKind::Index,
             NodeData::Paren => NodeKind::Paren,
+            NodeData::TypeArgs { .. } => NodeKind::Paren,
             NodeData::Ternary => NodeKind::Ternary,
             NodeData::New => NodeKind::New,
             NodeData::ArrayLit => NodeKind::ArrayLit,
@@ -811,6 +818,10 @@ impl TsAst {
     }
     pub fn paren(&mut self, e: TsId) -> TsId {
         self.push(NodeData::Paren, vec![e])
+    }
+    /// TS 类型实参包装（`base<T>` / `base?.<T>`）。
+    pub fn type_args(&mut self, base: TsId, raw: &str) -> TsId {
+        self.push(NodeData::TypeArgs { raw: raw.into() }, vec![base])
     }
     pub fn ternary(&mut self, c: TsId, a: TsId, b: TsId) -> TsId {
         self.push(NodeData::Ternary, vec![c, a, b])
@@ -2176,6 +2187,9 @@ impl Lang for TsAst {
         match self.data(id) {
             // 不可解析原文 / 类表达式原文
             NodeData::Raw { .. } | NodeData::ClassExpr { .. } => true,
+            // TS 类型实参：类型层可见（丢弃会改变推断），整块不参与
+            // 表达式化简（基址仍作为普通子节点被分析）。
+            NodeData::TypeArgs { .. } => true,
             // 解构模式：绑定名在原文里（事件盲区）——含模式的名字必须
             // 以不透明拒绝传播/删除
             NodeData::Destruct { .. } | NodeData::DestructStmt { .. } => true,
@@ -2205,6 +2219,7 @@ impl Lang for TsAst {
             NodeData::Literal(_)
             | NodeData::This
             | NodeData::Paren
+            | NodeData::TypeArgs { .. }
             | NodeData::Block
             | NodeData::ModuleBlock
             | NodeData::Group
@@ -2452,6 +2467,7 @@ impl Lang for TsAst {
                 s1 == s2 && n1 == n2 && p1 == p2
             }
             (NodeData::Call { optional: o1 }, NodeData::Call { optional: o2 }) => o1 == o2,
+            (NodeData::TypeArgs { raw: a }, NodeData::TypeArgs { raw: b }) => a == b,
             (NodeData::DestructStmt { kw: k1, pattern: p1 }, NodeData::DestructStmt { kw: k2, pattern: p2 }) => {
                 k1 == k2 && p1 == p2
             }

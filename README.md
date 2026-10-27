@@ -10,8 +10,9 @@
 **cure** is a fault-tolerant, semantic-preserving code simplifier and
 formatter that turns decompiled code back into something a human would have
 written. The engine and CLI are language-agnostic — **Java**,
-**TypeScript/JavaScript** (`ts`/`tsx`/`mts`/`cts`/`js`/`jsx`/`mjs`/`cjs`) and
-**Python** (`py`/`pyi`, Python 2.7 and 3.x through 3.15) are the backends
+**TypeScript/JavaScript** (`ts`/`tsx`/`mts`/`cts`/`js`/`jsx`/`mjs`/`cjs`),
+**Python** (`py`/`pyi`, Python 2.7 and 3.x through 3.15) and **Dart**
+(`dart`, Dart 1/2/3) are the backends
 implemented today; the pipeline below shows the Java experience. The TS/JS
 backend ships the same engine with ECMAScript semantics (f64 / ToInt32
 folding domains, ±2^53 exactness, per-file binding/scope resolution for
@@ -24,6 +25,10 @@ PEP 695 type parameters and `lazy import` — with Python truthiness,
 floor-division/power semantics and generator/scope preservation. Python 2
 int/long distinctions and `True`/`False` rebinding are kept sound; forms
 whose meaning differs between versions stay byte-preserved when ambiguous.
+The Dart backend is token-preserving: every token and comment is kept,
+unmodelled syntax (legacy Dart 2 modifiers, records/patterns, extension
+types, macros) stays verbatim, and safe rewrites operate on the token
+document.
 
 ```java
 // decompiled input                          // after cure
@@ -64,7 +69,9 @@ the same thing.
 - **Complex TypeScript types** — type aliases with generic/mapped/
   conditional/tuple/template-literal types, interfaces/namespaces/ambient
   declarations, definite assignment (`x!: T`), optional members, generic
-  calls (`f<T>()`) and `new C<T>()`, typed function expressions and arrows
+  calls (`f<T>()`) and `new C<T>()` with type arguments printed verbatim (also
+  `f?.<T>()`, `f<T>` instantiation expressions and `tag<T>` templates),
+  typed function expressions and arrows
   (including object return types and rest parameters), `as`/`satisfies`
   with parenthesized types. Type declarations are preserved verbatim while
   value-level code is still simplified.
@@ -85,11 +92,25 @@ the same thing.
   int/long types and `True`/`False` rebinding are preserved, and
   version-dependent forms stay byte-preserved when ambiguous. Dead branches
   containing `yield`/`global`/`nonlocal` are never dropped.
-- **92 simplification rules** (66 Java defaults + 1 Java opt-in + 25
-  Python; 33 of the Java defaults are language-agnostic engine rules),
-  including control-flow flattening recovery, statement-level
-  `StringBuilder` chain recovery, XOR-noise removal, and partial evaluation
-  ("virtual execution") of literal-only JDK calls.
+- **Dart backend (1/2/3)** — `.dart` parse → simplify → print on a lossless
+  token document. Every token and comment is preserved; nested block
+  comments, raw/triple/interpolated strings (including nested strings inside
+  `${...}`), binary/hex numbers with separators and all operator forms lex
+  correctly. Legacy Dart 2 `final` parameters and old-style function
+  typedefs, plus Dart 3 records, patterns, class modifiers, extension types,
+  switch expressions, Dart 3.13 primary constructors and dot shorthands,
+  pass through unchanged because unmodelled syntax
+  stays as tokens. Safe rewrites cover constants and literal-member folding,
+  constant/boolean ternaries, `if (const)`, if→ternary for
+  returns/assignments, else-after-terminal, nested-if merging, empty-then
+  inversion, unreachable statements, loop-tail `continue`, trailing `return`,
+  compound assignments, rethrow-only `try` unwrapping, empty `finally`,
+  adjacent string literals, atom parentheses, empty `else` and `${ident}`
+  compaction; `new` is preserved because Dart 1 required it.
+- **118 simplification rules** (67 Java + 27 Python + 24 Dart), including
+  control-flow flattening recovery, statement-level `StringBuilder` chain
+  recovery, XOR-noise removal, and partial evaluation ("virtual execution")
+  of literal-only JDK calls.
 - **Scales to real codebases** — the full OpenJDK source corpus
   (371,674 files, 4.7 GB) processes in ~15 s on an 18-core laptop, with
   0 parse failures and 0 panics. On the JS/TS side, a 13 MB minified
@@ -187,8 +208,9 @@ otherwise the locale is auto-detected. Full option reference: `cure --help`.
 | 6. Real-world JS/TS | 4,358 `.js/.mjs/.cjs` files (~568 MB) plus 1,334 `.ts/.tsx/.mts/.cts` files from a global npm install (undici, zod, minisearch, pnpm, yarn, vite-plus, Lark CLI, bytenode, …): every valid file must still compile after cure; a second cure pass must produce byte-identical output. Both corpora run at **0 parser diagnostics** and **0 second-pass differences** in default and preserve modes, and every cured file parses cleanly with Oxc (`oxfmt`, 0 syntax errors) | real-package syntax (minified bundles, top-level await, import attributes), complex type syntax, idempotency under module-level constant propagation |
 | 7. Randomized JS differential | Deterministic PRNG generates valid programs mixing declarations, shadowing, `var` hoisting, closures, loops, ternaries, short circuits and templates; original vs cured run under `node` (stdout + exit code) and a second cure must be byte-identical (`CURE_FUZZ_CASES` scales the sample) | rule-combination semantics and first/second-pass convergence; 5,000 cases used during development |
 | 8. Python (2.7 + 3.13–3.15) | CPython 2.7 stdlib (1,609 UTF-8 sources), a 4,135-file Python 2 package corpus (Django 1.11, Twisted 20.3, pip 20.3, setuptools 44, requests, six, PyYAML), CPython 3.13/3.14/3.15 stdlibs (2,188 / 2,288 / 2,456 sources), 18,128 Python 3.14 site-packages files plus 1,083 / 422 files from the 3.13 / 3.15 sites: parse → print compared with that interpreter's `ast.dump`; a second cure must be byte-identical; every simplified file compiled by the same interpreter; curated programs executed | **0** parser diagnostics in all corpora; **32,289** AST-identical round-trips (5,736 Python 2 + 26,553 Python 3; 20 intentionally invalid/foreign fixtures excluded), **35,548/35,548** idempotent with 0 drift, **32,274** compile checks with **0 regressions** (35 originals were already uncompilable); curated stdout/exit codes match |
+| 9. Dart (1/2/3) | 19,176 `.dart` files from a 300-package pub-cache corpus (analyzer, build_runner, ffigen, fluent_ui, json_serializable, win32, Dart/Flutter tooling; legacy Dart 2 forms included): parse → print → re-parse with token-sequence equality (kind+text, comments included); a second cure must be byte-identical; every output tested with `dart format --output=none` | **0** parser diagnostics; **19,176/19,176** token-preserving round-trips and idempotent second passes with 0 drift; `dart format` rejects the same 90 legacy-invalid source files before and after cure (0 new failures); Dart 1/2/3 SDK checks on curated version syntax and a 479-file sample show 0 new failures; curated programs run identically |
 
-`cargo test` runs 523 tests. The Test262 semantic differential reaches
+`cargo test` runs 602 tests. The Test262 semantic differential reaches
 **33,963/34,007 (99.87%) identical runs** in default mode; the only 44
 excluded cases compare `Function.prototype.toString` **source text** (cure
 reformats function bodies) or use arrow functions as computed-property keys,
@@ -228,6 +250,43 @@ triple-quoted arguments) execute side-by-side with identical stdout and exit
 codes. Non-UTF-8 source files (PEP 263 encodings other than UTF-8) are
 currently skipped by the CLI; the Python 2 stdlib corpus above was transcoded
 to UTF-8 for testing.
+
+The Dart differential covers 19,176 `.dart` files from 300 pub-cache
+packages (analyzer, build_runner, ffigen, fluent_ui, json_serializable,
+win32 and more, including generated code and legacy Dart 2 forms). The
+parser reports **0 diagnostics**; format-only round-trips are
+**token-identical** (comments and string contents included) for every file,
+and a second cure produces **0 edits and 0 byte differences**. `dart format
+--output=none` accepts the same file set before and after cure: 90 sources
+use syntax removed from Dart 3 (legacy `final` parameters, old function
+typedefs) and are rejected both times, with **0 new failures**. Curated
+programs (constant folding, adjacent-string merging, `if (true)` selection)
+execute with identical stdout on Dart 3.13; the simplifier performs **2,132** safe
+token edits across 7,120 changed files (418 structural; 309 of the edits come
+from `dart_trailing_assign_return`). Dart 1.24.3, Dart 2.19.6 and Dart 3.13 are
+all used as oracles: a curated version corpus (old typedefs and `final`
+params through null safety, super parameters, primary constructors and dot
+shorthands) plus a 479-file sample — **173** files valid under Dart 1 and
+**477** under Dart 2.19, with **0 new failures** after cure. Version fixtures under
+`crates/cure-dart-simplify/tests/fixtures/` cover directives, old typedefs,
+null safety, super parameters, records/patterns, class modifiers, extension
+types, primary constructors and dot shorthands. The SDK checks
+are standing tests (`DART1_BIN` / `DART2_BIN` select the extracted SDKs); the
+token/idempotency harness is
+`DART_ROOT=<corpus> cargo run --release -p cure-dart-simplify --example dart_roundtrip`.
+A statement-level differential fuzzer (`scripts/dart_fuzz.py`) generates
+35 functions mixing if/return, if/assign, loops, `continue`, empty `finally`
+and unreachable tails, runs them for three input pairs over 10 seeds
+(**1,050 outcomes**) on Dart 3.13 and 2.19 and 5 seeds on Dart 1.24, with 0
+stdout/exit mismatches. Three additional differential fuzzers cover the rule
+set end to end: `scripts/dart_rules_fuzz.py` (method calls, short-circuit
+logs, try/finally, null safety), `scripts/dart_expr_fuzz.py` (random typed
+int/bool/String expressions with nested control flow) and
+`scripts/dart_pattern_fuzz.py` (switch statements/expressions, if-case,
+logical/relational/list/map/record patterns and guards). Real-package
+differential: 50+ pure-Dart pub-cache packages run their own `dart test`
+suites before and after cure (~30,000 tests, including petitparser 1,602,
+xml 5,876 and characters 17,520); exit status and pass/fail counts match.
 
 ### Adversarial case studies
 
@@ -297,12 +356,18 @@ pass-only branch inversion), `py_nested_if` (`if a: if b:` → `if a and b:`),
 `py_bool_cond` (`True if c else False` → `bool(c)` and its inverse),
 `py_ternary_not` (`a if not c else b` → `b if c else a`), `py_not_is_in`
 (`not (x is y)` / `not (x in y)` → `x is not y` / `x not in y`),
+`py_double_not` (`not not x` → `bool(x)`; both call the truthiness
+protocol exactly once and return a real bool),
 `py_paren_removal` (redundant parentheses around atoms), `py_dead_store`
 (adjacent pure-literal overwrite), `py_dead_assign` (function-scope liveness:
 an unread local with a pure RHS is removed, an effectful RHS survives as an
 expression), `py_dead_expr` (bare numeric/`None`/`...` expressions),
 `py_str_accum` (`s = "a"; s += "b"` → `s = "ab"`), `py_assign_back_fold`
-(`x = 2; x = x + 3` → `x = 5` for pure int/string chains), `py_return_none`
+(`x = 2; x = x + 3` → `x = 5` for pure int/string chains),
+`py_trailing_assign_return` (`y = expr; return y` → `return expr` when the
+local name is read only by that return in the whole function, is not
+`global`/`nonlocal`, and the function does not call
+`locals()`/`vars()`/`dir()`/`eval()`/`exec()`), `py_return_none`
 (`return None` → `return`), `py_trailing_return` (drop an implicit trailing
 `return`), `py_trailing_continue` (drop a loop-tail `continue`),
 `py_empty_finally` (`finally: pass`), `py_assert_true` (constant-true
@@ -310,6 +375,61 @@ assertions), `py_unreachable` and `py_pass_cleanup`. Docstrings, Python 2
 int/long types, shadowed `True`/`False`/builtins (including `exec` and
 `import *`), locals/vars/dir/eval introspection and version-ambiguous forms
 are guarded.
+
+**Dart (24):** `dart_const_fold` (32-bit int/bool/string arithmetic and
+comparisons plus deterministic literal members such as `.length`,
+`.codeUnitAt`, `.contains`, `.indexOf`, `.isEven`, `.bitLength` and
+`toRadixString`; `/` and floating point are never folded; Dart's Euclidean
+`%`, truncating `~/` and shift ranges are modelled, with Dart's
+bitwise-over-equality precedence plus operator and unary-context checks so
+`x - 1 + 2`, `x & 0x60 == 0` and `-1 % 3` keep their grouping; boolean folds
+are skipped inside control-flow conditions and ternary branch selection is
+left to `dart_ternary_const`, because Dart's flow analysis treats late-variable
+definite assignment differently),
+`dart_ternary_const`, `dart_ternary_bool` and `dart_ternary_not` (constant
+conditions; `dart_ternary_const` selects only same-type literal branches
+outside control-flow conditions, `c ? true : false` → `c` only when `c` is
+provably bool, and `!c ? a : b` → `c ? b : a`), `dart_bool_literal_op` (`true && x` → `x`,
+`false && x` → `false`, `x && true` → `x`, and the `||` duals; the kept
+operand must be provably bool, so a dynamic value keeps its runtime bool
+check; pattern contexts are skipped), `dart_double_negation` (only when the
+operand itself is provably bool), `dart_negated_eq` (`!(a == b)` → `a != b`, `!(a is T)` →
+`a is! T`, parentheses added when the surrounding precedence requires them),
+`dart_const_if` (constant bool condition with block branches; the selected
+block keeps its scope; branches containing assignments/`return`/`yield`/for-in
+are left alone to preserve flow analysis), `dart_if_return` (`if (c) return a;` followed by
+`return b;` or an else-return → `return (c) ? (a) : (b);` only when both
+branches are same-kind literals, so the ternary keeps the original static
+type; other returns stay separate; if-case patterns are left alone),
+`dart_if_assign_ternary` (matching `x = a;` branches → `x = (c) ? (a) : (b);`
+for same-kind literal RHS only), `dart_else_after_terminal` (drop `else` when
+the then-branch always terminates and the `if` is a direct statement, not an
+unbraced else/loop body; the else block is kept as a bare block to preserve
+scope), `dart_nested_if` (single nested `if` in a block →
+`if ((a) && (b))`), `dart_empty_then` (`if (c) {} else X` → `if (!c) X`),
+`dart_assign_compound` (`x = x + y` → `x += y` for plain identifiers when
+the RHS has no looser operator, so `x = x * 10 + digit` stays;
+`x = x ?? y` is deliberately left alone because `??=` may skip a setter), `dart_unreachable` (statements after a direct
+`return`/`break`/`continue`/`throw`; unreachable `return`/`yield`, assignments
+and for-in are kept because they participate in return-type inference and
+late-variable definite assignment; labeled blocks are skipped), `dart_trailing_continue` (loop-tail `continue;`),
+`dart_trailing_return` (a bare `return;` at the end of a comment-free
+function/closure body), `dart_trailing_assign_return`
+(`final y = expr; return y;` → `return expr;` when the local is read only
+there; the initializer is limited to context-insensitive forms—identifiers,
+literals and operators, no calls/collection literals—so return-position
+inference cannot change a reified generic type),
+`dart_empty_finally` (`finally {}` is removed only when a `catch`/`on` clause
+remains), `dart_try_unwrap` (rethrow-only `catch`/`on` clauses are removed;
+a `try` left with no clauses, or with only an empty `finally`, becomes a bare
+block so scope is preserved), `dart_adjacent_strings` (implicit `'a' 'b'`
+concatenation of simple literals), `dart_paren_removal` (atoms only; control
+conditions, call arguments and function expressions are left alone),
+`dart_empty_else` (`else {}` removal) and `dart_string_interp`
+(`${identifier}` → `$identifier` when the following character is ASCII and
+cannot extend the identifier; non-ASCII ID_Continue characters are
+conservatively left alone). Comments, raw/triple strings, nested interpolation, Dart 3
+patterns and every unmodelled construct are never rewritten.
 
 ## Performance
 
@@ -324,6 +444,7 @@ threads (cores × 1.5):
 | Python 2 package corpus, output tree written | 4,135 | 0.38 s | ~75 MiB |
 | CPython 3.15 stdlib, output tree written | 2,456 | 0.35 s | ~150 MiB |
 | Python 3.14 site-packages, output tree written | 18,128 | 1.6 s | ~285 MiB |
+| Dart pub-cache corpus, output tree written | 19,176 | 2.2 s | ~217 MiB |
 | OpenJDK full source corpus, `--check` | 371,674 / 4.70 GB | 14.8 s | ~430 MiB |
 | OpenJDK full source corpus, output tree written | 371,674 / 4.70 GB | 27.5 s | ~430 MiB |
 
@@ -358,6 +479,10 @@ cure-python-ast    Python NodeData + PyId arena
 cure-python-parser fault-tolerant indentation-aware parser (Python 2.7–3.15)
 cure-python-print  canonical 4-space Python printer
 cure-python-simplify Python constant/control-flow rules over cure-engine
+cure-dart-ast      lossless Dart token document + bracket/brace structure
+cure-dart-parser   Dart 1/2/3 lexer (nested comments, interpolated strings)
+cure-dart-print    comment-preserving Dart token formatter
+cure-dart-simplify safe Dart token rewrites (fold, const-if, new, parens)
 cure-cli           the `cure` binary: parallel pipeline, cross-platform
                    batch I/O (io_uring / thread pool), directory mode
 ```
@@ -366,8 +491,9 @@ The `Lang` trait is the language boundary. Numeric/string folding semantics
 live behind language hooks (`fold_lit_bin` / `fold_lit_cmp` / `fold_lit_neg` /
 `reassoc_delta`) — the engine hardcodes no language's arithmetic. Each
 language frontend provides its own AST + parser + printer + rule pack on top
-of `cure-engine` + `cure-tree`; the TS/JS and Python backends are two such
-frontends (see also the ~100-line toy language in `cure-tree/tests/kit.rs`).
+of `cure-engine` + `cure-tree`; the TS/JS, Python and Dart backends are three
+such frontends (see also the ~100-line toy language in
+`cure-tree/tests/kit.rs`).
 
 ## Status & roadmap
 
@@ -375,11 +501,17 @@ frontends (see also the ~100-line toy language in `cure-tree/tests/kit.rs`).
 - ✅ TS/JS backend: Test262 six layers, 0 parser diagnostics on npm corpora
 - ✅ Python 2.7 + 3.x backend: 35,548 stdlib/site-package files, 0
   diagnostics, 0 idempotency drift, 0 compile regressions
-- ✅ 12 vendored Java corpora, three-layer verification, 523 tests
+- ✅ Dart 1/2/3 backend: 19,176 pub-cache files, 0 diagnostics, 0 token
+  drift, 0 format drift, 0 new `dart format` failures
+- ✅ 12 vendored Java corpora, three-layer verification, 602 tests
 - 🔜 Restoration rules V2 (reflective `addSuppressed` shapes, nested
   two-resource try-with-resources)
 - 🔜 Further Python rule-pack work (local propagation, decompiler-shape
   restoration)
+- ℹ️ Comment preservation: the Dart backend keeps every token and comment.
+  Java/Python/TS print from an AST, so standalone comments are not re-emitted;
+  TypeScript `--preserve-function-source` keeps comments inside
+  functions/classes/object literals byte-for-byte.
 
 ## License
 

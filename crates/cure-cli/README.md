@@ -8,8 +8,8 @@
 [cure](https://github.com/ejfkdev/cure) simplification engine: a
 fault-tolerant, semantic-preserving code simplifier/formatter that turns
 decompiled code back into something a human would have written. The CLI is
-language-agnostic (**Java, TypeScript/JavaScript and Python are the backends
-implemented today**) — a new language registers in `LANG_BACKENDS`
+language-agnostic (**Java, TypeScript/JavaScript, Python and Dart are the
+backends implemented today**) — a new language registers in `LANG_BACKENDS`
 (extensions + pipeline function) and inherits traversal, parallelism,
 `--check`/`--diff`/`--stats`, and the cross-platform batched I/O for free.
 
@@ -32,6 +32,12 @@ echo 'const x = 1 + 2; console.log(x);' | cure --lang ts -
 printf 'x = 1 + 2\nprint(x)\n' | cure --lang py -
 # x = 3
 # print(3)
+
+printf 'void main(){ var x = new A(1); print(1 + 2); }\n' | cure --lang dart -
+# void main() {
+#   var x = new A(1);
+#   print(3);
+# }
 ```
 
 Highlights:
@@ -45,7 +51,7 @@ Highlights:
   parameters; PEP 701 f-strings, t-strings, `match`, walrus, `except*`, PEP
   695, `lazy import`), Python-semantics constant folding that preserves
   Python 2 int/long types and `True`/`False` rebinding, and generator/scope
-  guards. A 25-rule pack includes literal string/builtin/subscript folding,
+  guards. A 27-rule pack includes literal string/builtin/subscript folding,
   if/else-to-conditional (including adjacent `return` branches), nested-if
   merging, else-after-terminal and empty-branch removal, not/is/in
   rewriting, redundant-paren removal, function-scope dead-assignment
@@ -53,6 +59,18 @@ Highlights:
   return/continue and empty-finally cleanup. Verified over 35,548
   stdlib/site-package files with 0 diagnostics, 0 idempotency drift and 0
   compile regressions.
+- **Dart 1/2/3** — `.dart` token-preserving back end: every token and
+  comment is kept, unmodelled syntax (legacy Dart 2 modifiers, records,
+  patterns, extension types, macros) stays verbatim, and safe rewrites cover
+  constant folding (32-bit int/bool/string, Euclidean `%`, truncating `~/`,
+  literal string/int members), boolean/ternary/logic simplification,
+  negated comparisons, if→ternary for returns/assignments, nested-if merge,
+  empty-then inversion, else-after-terminal, unreachable statements,
+  loop-tail `continue`, trailing `return`, compound assignments, rethrow-only
+  try unwrapping, empty `finally`, adjacent-string merging, atom parentheses,
+  empty `else` and `${ident}` interpolation compaction. Verified over 19,229 pub-cache files:
+  0 diagnostics, token-identical round-trips, 0 idempotency drift, and no
+  new `dart format` failures.
 - **Directory mode** — recursive, parallel (dynamic work queue, threads =
   CPU cores × 1.5), mirrors the tree into `<dir>-cure-out/`; the 371,674-file OpenJDK
   corpus (4.70 GB) in ~15 s / ~430 MiB peak RSS on an 18-core laptop

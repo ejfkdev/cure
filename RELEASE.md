@@ -1,6 +1,6 @@
 # Release checklist
 
-`cure` ships six raw binaries from a tag (`vX.Y.Z`) and publishes 15 crates
+`cure` ships six raw binaries from a tag (`vX.Y.Z`) and publishes 19 crates
 to crates.io in dependency order.
 
 1. **Bump the version everywhere**: `scripts/bump-version.sh X.Y.Z`
@@ -30,7 +30,7 @@ to crates.io in dependency order.
    The tag subject and body become the GitHub Release description. The
    release workflow builds all six targets, stages raw
    `cure-vX.Y.Z-<target>` assets, and runs `scripts/publish.sh` for
-   crates.io (15 crates, idempotent on re-runs).
+   crates.io (19 crates, idempotent on re-runs).
 6. **Preconditions**: repository secret `CARGO_REGISTRY_TOKEN` must be valid
    (crates.io token with `publish-new` + `publish-update`); CI must be green
    on the tagged commit.

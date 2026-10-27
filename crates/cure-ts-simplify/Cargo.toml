@@ -11,9 +11,9 @@ keywords = ["typescript", "javascript", "simplifier", "deobfuscator"]
 categories = ["development-tools"]
 
 [dependencies]
-cure-engine = { path = "../cure-engine", version = "0.2.0" }
-cure-ts-ast = { path = "../cure-ts-ast", version = "0.2.0" }
+cure-engine = { path = "../cure-engine", version = "0.3.0" }
+cure-ts-ast = { path = "../cure-ts-ast", version = "0.3.0" }
 
 [dev-dependencies]
-cure-ts-parser = { path = "../cure-ts-parser", version = "0.2.0" }
-cure-ts-print = { path = "../cure-ts-print", version = "0.2.0" }
+cure-ts-parser = { path = "../cure-ts-parser", version = "0.3.0" }
+cure-ts-print = { path = "../cure-ts-print", version = "0.3.0" }

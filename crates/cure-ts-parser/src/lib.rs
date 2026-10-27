@@ -38,6 +38,9 @@ pub struct ParseOptions {
     /// `new C<T>()` / 实例化表达式）；JS 文件应关闭，避免把
     /// `a < b > (c)` 误读成泛型调用。
     pub ts_syntax: bool,
+    /// 表达式起始的 `<` 是 JSX 元素（`.tsx`/`.jsx`）。关闭时按 TS
+    /// 尖括号类型断言 `<T>expr` 解析（`.ts/.mts/.cts` 里 JSX 不合法）。
+    pub jsx: bool,
 }
 
 impl Default for ParseOptions {
@@ -46,13 +49,14 @@ impl Default for ParseOptions {
             module_goal: None,
             capture_source: false,
             ts_syntax: true,
+            jsx: true,
         }
     }
 }
 
 /// 按显式配置解析（CLI 依扩展名选择 TS/JS 与 script/module）。
 pub fn parse_with_options(src: &str, opts: ParseOptions) -> ParseOutcome {
-    parse_inner(src, opts.module_goal, opts.capture_source, opts.ts_syntax)
+    parse_inner(src, opts.module_goal, opts.capture_source, opts.ts_syntax, opts.jsx)
 }
 
 /// JS 语义解析（关闭有歧义的 TS 泛型形态；Test262/npm 语料用）。
@@ -89,6 +93,7 @@ pub fn parse_js_module_with_source(src: &str) -> ParseOutcome {
             module_goal: Some(true),
             capture_source: true,
             ts_syntax: false,
+            ..Default::default()
         },
     )
 }
@@ -100,6 +105,7 @@ pub fn parse_js_script_with_source(src: &str) -> ParseOutcome {
             module_goal: Some(false),
             capture_source: true,
             ts_syntax: false,
+            ..Default::default()
         },
     )
 }
@@ -110,33 +116,33 @@ pub fn parse_js_script_with_source(src: &str) -> ParseOutcome {
 /// 默认允许 TS 歧义形态（泛型调用 `f<T>(x)` / `new C<T>()`）。**纯 JS
 /// 输入请用 [`parse_js`]**——否则 `a < b > (c)` 会被当作泛型调用。
 pub fn parse(src: &str) -> ParseOutcome {
-    parse_inner(src, None, false, true)
+    parse_inner(src, None, false, true, true)
 }
 
 /// 按 module 目标解析（ESM：顶层 await 是运算符）。
 pub fn parse_module(src: &str) -> ParseOutcome {
-    parse_inner(src, Some(true), false, true)
+    parse_inner(src, Some(true), false, true, true)
 }
 
 /// 按 script 目标解析（顶层 await 按标识符/普通名）。
 pub fn parse_script(src: &str) -> ParseOutcome {
-    parse_inner(src, Some(false), false, true)
+    parse_inner(src, Some(false), false, true, true)
 }
 
 /// 解析并记录函数/类/对象字面量的源码区间（供
 /// `preserve_function_source` 原样打印）。默认解析不承担这份内存。
 pub fn parse_with_source(src: &str) -> ParseOutcome {
-    parse_inner(src, None, true, true)
+    parse_inner(src, None, true, true, true)
 }
 
 /// [`parse_with_source`] 的 module 目标版本。
 pub fn parse_module_with_source(src: &str) -> ParseOutcome {
-    parse_inner(src, Some(true), true, true)
+    parse_inner(src, Some(true), true, true, true)
 }
 
 /// [`parse_with_source`] 的 script 目标版本。
 pub fn parse_script_with_source(src: &str) -> ParseOutcome {
-    parse_inner(src, Some(false), true, true)
+    parse_inner(src, Some(false), true, true, true)
 }
 
 fn parse_inner(
@@ -144,6 +150,7 @@ fn parse_inner(
     module_goal: Option<bool>,
     capture_source: bool,
     ts_syntax: bool,
+    jsx: bool,
 ) -> ParseOutcome {
     let mut shebang = String::new();
     let body = if let Some(rest) = src.strip_prefix("#!") {
@@ -171,6 +178,7 @@ fn parse_inner(
         too_deep: false,
         capture_source,
         ts_syntax,
+        jsx,
     };
     if capture_source {
         p.ast.set_source(body);
@@ -221,6 +229,8 @@ struct Parser<'a> {
     capture_source: bool,
     /// 允许 TS 歧义形态（泛型调用/`new` 类型实参）。
     ts_syntax: bool,
+    /// 表达式起始 `<` 按 JSX 捕获（否则按 TS 尖括号断言）。
+    jsx: bool,
 }
 
 /// 递归上限。正常源码远低于此；超出者整文件 Raw 保真。
@@ -495,7 +505,14 @@ impl<'a> Parser<'a> {
                 self.unit.items.push(f);
                 return;
             }
-            if let Some(c) = self.try_parse_class_decl("export default".into()) {
+            // 装饰器在 export 之前（`@Deco<T>() export default class …`）：
+            // 前缀必须与 export default 拼接，否则装饰器被静默丢弃。
+            let default_prefix = if deco_raw.is_empty() {
+                "export default".to_string()
+            } else {
+                format!("{deco_raw}export default")
+            };
+            if let Some(c) = self.try_parse_class_decl(default_prefix) {
                 self.unit.items.push(TopItem::Class(c));
                 return;
             }
@@ -779,6 +796,9 @@ impl<'a> Parser<'a> {
         //（`class B extends class { } { … }`——曾把父类体当成本类体，
         // 成员全部落到类外；Test262 sm/class 家族抓获）。
         let mut pd = 0i32;
+        // 尖括号深度（类型参数/类型实参）：`class A<T = {}>` 的 `{}` 是
+        // 类型而非类体。
+        let mut ad = 0i32;
         loop {
             if self.at_eof() {
                 break;
@@ -799,8 +819,31 @@ impl<'a> Parser<'a> {
                         self.advance();
                         continue;
                     }
-                    ";" if pd == 0 => break,
-                    "{" if pd == 0 => break,
+                    // 类型参数/类型实参里的 `{}`（`class A<T = {}>`）不是
+                    // 类体：类头扫描跟踪尖括号深度，`pd == 0 && ad == 0`
+                    // 才算类体起点（曾把默认对象类型当空类体，`>` 报错）。
+                    "<" if pd == 0 => {
+                        ad += 1;
+                        self.advance();
+                        continue;
+                    }
+                    ">" if pd == 0 && ad > 0 => {
+                        ad -= 1;
+                        self.advance();
+                        continue;
+                    }
+                    ">>" if pd == 0 && ad > 0 => {
+                        ad -= 2;
+                        self.advance();
+                        continue;
+                    }
+                    ">>>" if pd == 0 && ad > 0 => {
+                        ad -= 3;
+                        self.advance();
+                        continue;
+                    }
+                    ";" if pd == 0 && ad == 0 => break,
+                    "{" if pd == 0 && ad == 0 => break,
                     _ => {}
                 }
             } else if pd == 0 && t.kind == TokKind::Ident && t.text == "class" {
@@ -1034,6 +1077,30 @@ impl<'a> Parser<'a> {
                     if self.tk().kind == TokKind::Ident {
                         self.advance();
                     }
+                } else {
+                    break;
+                }
+            } else if self.is_punct("<") {
+                // 泛型装饰器：`@Deco<T>()` / `@ns.Deco<T>`。类型实参属于
+                // 装饰器原文；否则 `@Deco` 留在前缀、`<T>()` 变成独立
+                // 语句（装饰器整体丢失）。
+                let after = self.generic_args_ahead().or_else(|| {
+                    // 无调用形态 `@Deco<T>`：后续是声明关键字时也按类型
+                    // 实参处理（装饰器位置不存在 `a < b > c` 比较歧义）。
+                    let close = self.match_angle(self.pos)?;
+                    let t = self.toks.get(close + 1)?;
+                    let decl = t.kind == TokKind::Eof
+                        || (t.kind == TokKind::Ident
+                            && matches!(
+                                t.text.as_str(),
+                                "class" | "abstract" | "export" | "function" | "const" | "let"
+                                    | "var" | "interface" | "type" | "enum" | "namespace"
+                                    | "declare"
+                            ));
+                    decl.then_some(close + 1)
+                });
+                if let Some(after) = after {
+                    self.pos = after;
                 } else {
                     break;
                 }
@@ -1469,6 +1536,15 @@ impl<'a> Parser<'a> {
         }
         let body = if self.is_punct("{") {
             self.enter_async(is_async, |p| p.parse_block())
+        } else if self.is_punct(";") {
+            // TS 重载签名（`function f(a: string): string;`）：无函数体。
+            // 必须整条原文保真——曾按错误路径合成空块 `{}`，把签名变成
+            // 实现（重复实现直接语法错误）。
+            self.advance();
+            let text = self.raw_between(fn_start, self.pos);
+            let id = self.ast.raw(text.trim());
+            self.set_span_here(id, fn_start);
+            return Some(id);
         } else {
             self.pos = start;
             return None;
@@ -2756,10 +2832,14 @@ impl<'a> Parser<'a> {
         loop {
             let t = self.tk().clone();
             // 泛型调用/实例化表达式：`f<T>(x)`、`f<T>`、`tag<T>\`x\``。
-            // 类型实参运行时擦除，只吞掉不建节点。
+            // 类型实参运行时擦除，但类型层可见（`useState<T|null>(null)`
+            // 丢弃后推断成 `null`）——包成 TypeArgs 原文节点保真。
             if t.kind == TokKind::Punct && t.text == "<" {
                 if let Some(after) = self.generic_args_ahead() {
+                    let rs = self.pos;
                     self.pos = after;
+                    let raw = self.raw_between(rs, self.pos);
+                    e = self.ast.type_args(e, raw.trim());
                     continue;
                 }
             }
@@ -2771,15 +2851,26 @@ impl<'a> Parser<'a> {
                         e = self.ast.member(e, &name, false);
                     }
                     "?." => {
+                        let qs = self.pos;
                         self.advance();
+                        let mut wrapped = false;
                         if self.is_punct("<") {
                             if let Some(after) = self.generic_args_ahead() {
                                 self.pos = after;
+                                let raw = self.raw_between(qs, self.pos);
+                                e = self.ast.type_args(e, raw.trim());
+                                wrapped = true;
                             }
                         }
                         if self.is_punct("(") {
                             let args = self.parse_call_args();
-                            e = self.ast.opt_call(e, args);
+                            // `?.<T>` 已在 TypeArgs 原文里：用普通调用，
+                            // 打印结果仍是 `f?.<T>(...)`（可选短路语义保留）。
+                            e = if wrapped {
+                                self.ast.call(e, args)
+                            } else {
+                                self.ast.opt_call(e, args)
+                            };
                         } else if self.is_punct("[") {
                             self.advance();
                             let idx = self.parse_expr();
@@ -2889,10 +2980,13 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            // `new Foo<T>(…)` / `new Foo<T>`：类型实参擦除。
+            // `new Foo<T>(…)` / `new Foo<T>`：类型实参原文保留。
             if self.is_punct("<") {
                 if let Some(after) = self.generic_args_ahead() {
+                    let rs = self.pos;
                     self.pos = after;
+                    let raw = self.raw_between(rs, self.pos);
+                    e = self.ast.type_args(e, raw.trim());
                 }
             }
             // `new tag\`x\``：标签模板是 MemberExpression，属于 callee
@@ -3149,10 +3243,12 @@ impl<'a> Parser<'a> {
                     self.parse_function_expr(true, st)
                 }
                 "class" if self.tk_at(1).kind == TokKind::Ident || self.tk_at(1).kind == TokKind::Punct => {
-                    // 类表达式（class / class Name …）
+                    // 类表达式（class / class Name …），含匿名泛型形态
+                    // `class<T = {}> { … }`（下一个 token 是 `<`）。
                     if self.tk_at(1).kind == TokKind::Ident
                         || self.is_punct_at(1, "extends")
                         || self.is_punct_at(1, "{")
+                        || self.is_punct_at(1, "<")
                         || self.is_kw_at(1, "extends")
                     {
                         let s = self.pos;
@@ -3264,8 +3360,34 @@ impl<'a> Parser<'a> {
                     self.ast.array_lit(elems)
                 }
                 "{" => self.parse_obj_lit(),
+                "<" if !self.jsx && self.ts_syntax => {
+                    // TS 尖括号类型断言 `<T>expr`（`.ts/.mts/.cts`）：
+                    // 打印成等价的 `expr as T`，在 .tsx 里也合法。
+                    // 泛型箭头 `<T>(x) => …` 已在 try_parse_arrow 处理。
+                    let lt = self.pos;
+                    if let Some(close) = self.match_angle(lt) {
+                        // 类型原文 = `<` 之后到收尾 `>`（含 `>>`/`>>>`
+                        // 里的前几个 `>`）之前：`<Foo<Bar>>z` 的类型是
+                        // `Foo<Bar>`。用字节偏移切片，避免丢嵌套泛型。
+                        let lt_end = self.toks[lt].end as usize;
+                        let close_end = self.toks[close].end as usize;
+                        let header = self.src.get(lt_end..close_end).unwrap_or("");
+                        let ty = header
+                            .strip_suffix('>')
+                            .unwrap_or(header)
+                            .trim()
+                            .to_string();
+                        self.pos = close + 1;
+                        let inner = self.parse_unary();
+                        self.ast.ts_as(&ty, inner)
+                    } else {
+                        self.err_here("expected type in assertion");
+                        self.advance();
+                        self.ast.raw("<")
+                    }
+                }
                 "<" => {
-                    // JSX 元素（.tsx）——原文捕获
+                    // JSX 元素（.tsx/.jsx）——原文捕获
                     let raw = self.capture_jsx();
                     self.ast.raw(&raw)
                 }
@@ -3584,8 +3706,9 @@ impl<'a> Parser<'a> {
         // 找类体 `{`：**括号/方括号深度 0** 的 `{` 才是类体。extends
         // 里的箭头/函数体处于括号内（`class extends (() => {}) {}`）——
         // 曾把箭头体当类体，类表达式原文被截断（Test262 heritage-arrow
-        // 家族抓获）。
+        // 家族抓获）。类型参数里的 `{}`（`class<T = {}>`）同样不是类体。
         let mut pd = 0i32;
+        let mut ad = 0i32;
         loop {
             if self.at_eof() {
                 return;
@@ -3606,8 +3729,28 @@ impl<'a> Parser<'a> {
                         self.advance();
                         continue;
                     }
-                    ";" | "," if pd == 0 => return,
-                    "{" if pd == 0 => break,
+                    "<" if pd == 0 => {
+                        ad += 1;
+                        self.advance();
+                        continue;
+                    }
+                    ">" if pd == 0 && ad > 0 => {
+                        ad -= 1;
+                        self.advance();
+                        continue;
+                    }
+                    ">>" if pd == 0 && ad > 0 => {
+                        ad -= 2;
+                        self.advance();
+                        continue;
+                    }
+                    ">>>" if pd == 0 && ad > 0 => {
+                        ad -= 3;
+                        self.advance();
+                        continue;
+                    }
+                    ";" | "," if pd == 0 && ad == 0 => return,
+                    "{" if pd == 0 && ad == 0 => break,
                     _ => {}
                 }
             } else if pd == 0 && t.kind == TokKind::Ident && t.text == "class" {
@@ -3668,7 +3811,12 @@ impl<'a> Parser<'a> {
                         self.advance();
                         if self.is_punct("/") {
                             self.advance();
-                            let name = self.expect_member_name();
+                            // 片段结束 `</>`：没有名字（name 为空）。
+                            let name = if self.is_punct(">") {
+                                String::new()
+                            } else {
+                                self.expect_member_name()
+                            };
                             if self.is_punct(">") {
                                 self.advance();
                             }
@@ -3712,10 +3860,19 @@ impl<'a> Parser<'a> {
                                             attr_depth += 1;
                                             self.advance();
                                             if attr_depth == 1 {
-                                                let _ = self.parse_expr();
+                                                // `{...props}` 展开属性 / `{}` 空容器
+                                                if self.is_punct("...") {
+                                                    self.advance();
+                                                }
                                                 if self.is_punct("}") {
                                                     self.advance();
                                                     attr_depth -= 1;
+                                                } else {
+                                                    let _ = self.parse_expr();
+                                                    if self.is_punct("}") {
+                                                        self.advance();
+                                                        attr_depth -= 1;
+                                                    }
                                                 }
                                             }
                                         }
@@ -3737,9 +3894,18 @@ impl<'a> Parser<'a> {
                     }
                     "{" => {
                         self.advance();
-                        let _ = self.parse_expr();
+                        // `{...children}` 展开 / `{/* 注释 */}`（注释被词法器
+                        // 丢弃后只剩空容器）。
+                        if self.is_punct("...") {
+                            self.advance();
+                        }
                         if self.is_punct("}") {
                             self.advance();
+                        } else {
+                            let _ = self.parse_expr();
+                            if self.is_punct("}") {
+                                self.advance();
+                            }
                         }
                     }
                     _ => { self.advance(); },
@@ -4009,5 +4175,53 @@ mod tests {
     fn comma_seq_and_paren() {
         let out = roundtrip_ok("for (i = 0, j = 1; i < j; i++, j--) { f(i, j); }\n");
         assert!(out.errors.is_empty());
+    }
+
+    #[test]
+    fn class_type_param_default_object_type() {
+        // `= {}` 是类型参数默认值（对象类型字面量），不是类体起点。
+        let out = roundtrip_ok("class A<T extends object = {}> { x: T; }\n");
+        assert!(out.errors.is_empty(), "{:#?}", out.errors);
+        let out = roundtrip_ok("class B<T = Record<string, () => void>> { y: T; }\n");
+        assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    }
+
+    #[test]
+    fn generic_type_args_and_jsx_forms_parse_cleanly() {
+        let out = roundtrip_ok(
+            "const a = f<number>(1);\nconst b = new Foo<string>;\nconst c = o.m<T>?.(2);\nconst d = f<T>;\n",
+        );
+        assert!(out.errors.is_empty(), "{:#?}", out.errors);
+        let out = roundtrip_ok(
+            "const el = <div {...props} data-x={1}>{/* c */}<></></div>;\n",
+        );
+        assert!(out.errors.is_empty(), "{:#?}", out.errors);
+        let out = roundtrip_ok(
+            "@Deco<T>()\n@ns.Wrap<T>(1)\n@Plain<T>\nclass A<T extends B<C> = {}> implements D<E> {}\n",
+        );
+        assert!(out.errors.is_empty(), "{:#?}", out.errors);
+        let out = roundtrip_ok("@Deco<T>()\nexport default class B<T> {}\n@Deco()\nexport class C {}\n");
+        assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    }
+
+    #[test]
+    fn angle_bracket_assertions_parse_in_ts_mode() {
+        // `.ts` 模式（jsx=false）：`<Foo<Bar>>z` 是类型断言，不能按 JSX
+        // 吞到语句边界（曾把后续语句并进 Raw 并多打一个 `;`）。
+        let out = parse_with_options(
+            "const a = <Foo<Bar>>z;\nconst b = <T>(x + 1);\nconst c = <T>(y) => y;\n",
+            ParseOptions { jsx: false, ..Default::default() },
+        );
+        assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    }
+
+    #[test]
+    fn nested_overload_signatures_are_bodyless() {
+        // 函数体内的 TS 重载签名：无函数体，必须原文保留（曾合成 `{}`
+        // 变成实现，第二个签名直接语法错误）。
+        let out = roundtrip_ok(
+            "function outer() {\n  function f(a: string): string;\n  function f(a: number): number;\n  function f(a: any): any { return a; }\n  return f(1);\n}\n",
+        );
+        assert!(out.errors.is_empty(), "{:#?}", out.errors);
     }
 }

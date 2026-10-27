@@ -1,0 +1,13 @@
+[package]
+name = "cure-dart-ast"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Lossless Dart token document (Dart 1/2/3 syntax) for the cure simplifier engine"
+keywords = ["dart", "ast", "deobfuscator", "simplifier"]
+categories = ["development-tools"]
+
+[dependencies]

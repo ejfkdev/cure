@@ -508,8 +508,9 @@ def p12():
     assert!(!out.contains("assert"), "{out}");
     assert!(out.contains("return x is not None"), "{out}");
     assert!(out.contains("return x not in [1, 2]"), "{out}");
-    assert!(out.contains("s = 'abc'"), "{out}");
-    assert!(out.contains("x = 10"), "{out}");
+    // 尾赋值返回把累加结果直接返回（s = 'abc'; return s → return 'abc'）
+    assert!(out.contains("return 'abc'"), "{out}");
+    assert!(out.contains("return 10"), "{out}");
     assert!(out.contains("def p12():\n    (\"doc\")"), "{out}");
     assert!(!out.contains("def p12():\n    pass"), "{out}");
     assert_idempotent(src);
@@ -552,7 +553,8 @@ class C:
     assert!(out.contains("def h():\n    x = 1"), "{out}");
     assert!(out.contains("def i():\n    x = 1"), "{out}");
     assert!(out.contains("def j():\n    global x\n    x = 1"), "{out}");
-    assert!(out.contains("def l():\n    x = 1"), "{out}");
+    // x = 1; y = x; return y → return 1（x/y 均只读一次）
+    assert!(out.contains("def l():\n    return 1"), "{out}");
     assert!(out.contains("def m():\n    pass\n    \"not doc\""), "{out}");
     assert!(out.contains("class C:\n    x = 1"), "{out}");
     assert_idempotent(src);
@@ -610,8 +612,35 @@ def p11():
     return x
 def p12():
     ("doc")
+class Toggle:
+    def __init__(self, v):
+        self.v = v
+        self.calls = 0
+    def __bool__(self):
+        self.calls += 1
+        return self.v
+def p13(t):
+    r = not not t
+    return (r, t.calls)
+def p14(x):
+    y = x + 1
+    return y
+def p15(xs):
+    y = xs
+    def inner():
+        return y
+    return inner() is xs
+def p16(xs):
+    y = xs
+    return y
+def p17(x):
+    y = x
+    print("side", y)
+    return y
 print(p1(0), p1(1), p2(0), p2(1), p3(0), p3(1), p4(0), p4(1))
 print(p5(0), p5(1), p6(5), p7(None), p8(None), p9(1), p9(3), p10(), p11(), p12.__doc__)
+print(p13(Toggle(True)), p13(Toggle(False)))
+print(p14(1), p15([2]), p16([3]), p17(4))
 "#;
     differential(&PathBuf::from(py), src, "py3_ext");
 }
@@ -672,4 +701,47 @@ print p1(0), p1(1), p2(0), p2(1), p3(0), p3(1), p4(0), p4(1)
 print p5(0), p5(1), p6(5), p7(None), p8(None), p9(1), p9(3), p10(), p11(), p12.__doc__
 "#;
     differential(&py, src, "py2_ext");
+}
+
+#[test]
+fn double_not_and_trailing_assign_return() {
+    let src = r#"def a(x):
+    return not not x
+def b(x):
+    return not (not x)
+def c(x):
+    y = x + 1
+    return y
+def d(x):
+    y = x + 1
+    print(y)
+    return y
+def e(x):
+    def inner():
+        return y
+    y = x
+    return y
+def f(x):
+    global G
+    y = x
+    G = y
+    return y
+def g(x):
+    y = x
+    return y
+def h():
+    return locals()
+def i(x):
+    y = x
+    return y
+"#;
+    let out = cured(src);
+    assert!(out.contains("return bool(x)"), "{out}");
+    assert!(out.contains("def c(x):\n    return x + 1"), "{out}");
+    assert!(out.contains("def d(x):\n    y = x + 1\n    print(y)\n    return y"), "{out}");
+    assert!(out.contains("def e(x):"), "{out}");
+    assert!(out.contains("y = x\n    return y"), "{out}");
+    assert!(out.contains("def g(x):\n    return x"), "{out}");
+    assert!(out.contains("def h():\n    return locals()"), "{out}");
+    assert_idempotent(src);
 }

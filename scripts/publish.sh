@@ -36,6 +36,7 @@ fi
 # CLI 发布时找不到上游 crate）：
 # engine → tree → ts-ast → ts-parser → ts-print → ts-simplify
 #        → python-ast → python-parser → python-print → python-simplify
+#        → dart-ast → dart-parser → dart-print → dart-simplify
 #        → java-ast → java-print → java-parser → java-simplify → cli
 CRATES=(
   cure-engine
@@ -48,6 +49,10 @@ CRATES=(
   cure-python-parser
   cure-python-print
   cure-python-simplify
+  cure-dart-ast
+  cure-dart-parser
+  cure-dart-print
+  cure-dart-simplify
   cure-java-ast
   cure-java-print
   cure-java-parser

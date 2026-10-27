@@ -68,7 +68,7 @@ console.log(n);
 }
 
 #[test]
-fn generic_calls_and_new_erase_type_args() {
+fn generic_calls_and_new_preserve_type_args() {
     let src = r#"const a = new WeakMap<object, Set<string>>();
 const b = new Map<string, Array<number>>();
 const c = f<number>(1);
@@ -79,13 +79,15 @@ const h = f<string>;
 console.log(a, b, c, d, e, g, h);
 "#;
     let out = cure_ts(src);
-    assert!(out.contains("new WeakMap()"), "{out}");
-    assert!(out.contains("new Map()"), "{out}");
-    assert!(out.contains("f(1)"), "{out}");
-    assert!(out.contains("o.m(2)"), "{out}");
-    assert!(out.contains("new Foo()"), "{out}");
-    assert!(out.contains("new ns.Foo(3)"), "{out}");
-    assert!(out.contains("const h = f;"), "{out}");
+    // 类型实参不参与运行时求值，但**类型层可见**：必须原文保留
+    //（`useState<T|null>(null)` 丢弃后会推断成 `null`）。
+    assert!(out.contains("new WeakMap<object, Set<string>>()"), "{out}");
+    assert!(out.contains("new Map<string, Array<number>>()"), "{out}");
+    assert!(out.contains("f<number>(1)"), "{out}");
+    assert!(out.contains("o.m<string>(2)"), "{out}");
+    assert!(out.contains("new Foo<string>"), "{out}");
+    assert!(out.contains("new ns.Foo<A, B<C>>(3)"), "{out}");
+    assert!(out.contains("const h = f<string>;"), "{out}");
 }
 
 #[test]

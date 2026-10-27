@@ -1,0 +1,17 @@
+[package]
+name = "cure-dart-print"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Comment-preserving Dart source printer/formatter for cure"
+keywords = ["dart", "formatter", "printer", "deobfuscator"]
+categories = ["development-tools"]
+
+[dependencies]
+cure-dart-ast = { path = "../cure-dart-ast", version = "0.3.0" }
+
+[dev-dependencies]
+cure-dart-parser = { path = "../cure-dart-parser", version = "0.3.0" }

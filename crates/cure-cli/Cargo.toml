@@ -1,13 +1,13 @@
 [package]
 name = "cure-cli"
-description = "CLI for cure: fault-tolerant Java, TypeScript/JavaScript and Python simplifier/formatter (source in, source out)"
+description = "CLI for cure: fault-tolerant Java, TypeScript/JavaScript, Python and Dart simplifier/formatter (source in, source out)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
-keywords = ["java", "typescript", "javascript", "python", "deobfuscation"]
+keywords = ["java", "typescript", "python", "dart", "deobfuscation"]
 categories = ["command-line-utilities", "development-tools"]
 
 # cargo-binstall: fetch the prebuilt release binary instead of compiling.
@@ -34,14 +34,18 @@ io-uring = ["dep:io-uring"]
 io-uring = { version = "0.7", optional = true }
 
 [dependencies]
-cure-ts-ast = { path = "../cure-ts-ast", version = "0.2.0" }
-cure-ts-parser = { path = "../cure-ts-parser", version = "0.2.0" }
-cure-ts-print = { path = "../cure-ts-print", version = "0.2.0" }
-cure-ts-simplify = { path = "../cure-ts-simplify", version = "0.2.0" }
-cure-python-ast = { path = "../cure-python-ast", version = "0.2.0" }
-cure-python-parser = { path = "../cure-python-parser", version = "0.2.0" }
-cure-python-print = { path = "../cure-python-print", version = "0.2.0" }
-cure-python-simplify = { path = "../cure-python-simplify", version = "0.2.0" }
+cure-ts-ast = { path = "../cure-ts-ast", version = "0.3.0" }
+cure-ts-parser = { path = "../cure-ts-parser", version = "0.3.0" }
+cure-ts-print = { path = "../cure-ts-print", version = "0.3.0" }
+cure-ts-simplify = { path = "../cure-ts-simplify", version = "0.3.0" }
+cure-python-ast = { path = "../cure-python-ast", version = "0.3.0" }
+cure-python-parser = { path = "../cure-python-parser", version = "0.3.0" }
+cure-python-print = { path = "../cure-python-print", version = "0.3.0" }
+cure-python-simplify = { path = "../cure-python-simplify", version = "0.3.0" }
+cure-dart-ast = { path = "../cure-dart-ast", version = "0.3.0" }
+cure-dart-parser = { path = "../cure-dart-parser", version = "0.3.0" }
+cure-dart-print = { path = "../cure-dart-print", version = "0.3.0" }
+cure-dart-simplify = { path = "../cure-dart-simplify", version = "0.3.0" }
 cure-java-parser = { workspace = true }
 cure-java-simplify = { workspace = true }
 cure-java-print = { workspace = true }
