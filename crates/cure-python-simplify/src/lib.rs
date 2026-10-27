@@ -888,7 +888,7 @@ impl<'a> Pass<'a> {
         if self
             .dead_scope
             .as_ref()
-            .is_none_or(|ds| ds.introspection)
+            .map_or(true, |ds| ds.introspection)
         {
             return false;
         }
