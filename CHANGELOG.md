@@ -3,6 +3,15 @@
 本项目所有显著变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.3.1] - 2026-10-27
+
+### 修复
+
+- **MSRV 1.74**：`py_trailing_assign_return` 里用了 1.82 才稳定的
+  `Option::is_none_or`，导致声明 `rust-version = 1.74` 的 0.3.0 crate
+  在 1.74–1.81 上无法编译（CI 的 MSRV 检查报警）。改用 `map_or`，
+  `cargo check --workspace` 在 1.74 上通过；行为不变。
+
 ## [0.3.0] - 2026-10-27
 
 ### 新增（Dart 1/2/3 后端）
@@ -869,7 +878,8 @@ var b=2;`——`b` 变成非导出（模块语义改变）。
 - 跨平台批量 I/O：Linux `io_uring` feature（read syscall 6,977 → 10，
   syscall 时长 −53%）；macOS/Windows 线程池；默认构建零运行时依赖
 
-[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/ejfkdev/cure/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ejfkdev/cure/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ejfkdev/cure/releases/tag/v0.2.0
 [0.1.11]: https://github.com/ejfkdev/cure/releases/tag/v0.1.11
