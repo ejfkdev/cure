@@ -2007,6 +2007,10 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
                 // 同时进 forbidden（传播/尾返回不能改写被删除的名字）。
                 collect_reads(ast, t, ds);
                 collect_target_names(ast, t, &mut ds.forbidden);
+                // `del y` 之后 y 不再有值：任何以 `y = <literal>` 为源的
+                // 常量传播、尾返回折叠或语句删除都会把 UnboundLocalError
+                // 变成正常返回（或让可能抛异常的裸读变成 no-op）。
+                collect_deleted_names(ast, t, &mut ds.forbidden);
             }
             return;
         }
@@ -2142,6 +2146,22 @@ fn collect_target_names(ast: &PyAst, id: PyId, out: &mut BTreeSet<String>) {
         NodeData::Tuple | NodeData::List | NodeData::Starred => {
             for &c in ast.children(id) {
                 collect_target_names(ast, c, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `del y` 里被删除的名字（递归解包目标）。属性/下标目标只删元素或属性，
+/// 基址名字仍然有值，不能进 forbidden。
+fn collect_deleted_names(ast: &PyAst, id: PyId, out: &mut BTreeSet<String>) {
+    match ast.data(id) {
+        NodeData::Name(n) => {
+            out.insert(n.clone());
+        }
+        NodeData::Tuple | NodeData::List | NodeData::Starred => {
+            for &c in ast.children(id) {
+                collect_deleted_names(ast, c, out);
             }
         }
         _ => {}

@@ -3,6 +3,28 @@
 本项目所有显著变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- **`del name` 之后的名字不再被常量传播/尾返回/死表达式改写**（Python）：
+  `del y` 只把 y 记进 reads，没有记进 `forbidden`，于是
+  ```python
+  def f():
+      v = 5
+      del v
+      try:
+          return v
+      except UnboundLocalError:
+          return 'unbound'
+  ```
+  被简化成 `return 5`（UnboundLocalError 变成正常返回），同一函数里
+  `del v` 之后的裸读 `v` 也会被替换成字面量再被当作死表达式删掉。
+  现在 `collect_reads` 的 `NodeData::Delete` 分支把被删除的裸名字（含
+  解包/元组目标）全部加入 `forbidden`；`del obj.attr` / `del box[k]`
+  只删内容、基址仍绑定，不受影响。补 `py_del_unbinds_and_forbids_propagation`
+  差分回归测试（原版 vs 简化版 stdout/退出码）。
+
 ## [0.4.1] - 2026-10-31
 
 ### 修复
