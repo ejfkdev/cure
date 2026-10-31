@@ -3,6 +3,26 @@
 本项目所有显著变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.4.1] - 2026-10-31
+
+### 修复
+
+- **行尾指令注释不再因简化换行/失效**（Python / Dart）：带工具指令注释
+  的语句（Python `# type: ignore`、`# noqa`、`# fmt:`、`# pyright:`、
+  `# pylint:`、`# mypy:`、`# pragma:`、`# nosec`、`# isort:`；Dart
+  `// ignore:`、`// coverage:ignore-*`、`// dart format`）此前可能被常量
+  传播、死赋值/死存储、不可达清理、尾 `return` 删除或尾赋值合并移除，
+  注释顺延到下一行，导致 mypy/flake8/pylint/analyzer 的抑制失效或误伤
+  后续代码。现在这些语句不再被删除或合并，只允许同一行内的安全替换
+  （如 `return y + x; // ignore: …` → `return 6 + x; // ignore: …`）。
+  补 Python/Dart 回归测试；TS/JS 的指令冻结机制此前已覆盖，行为一致。
+- 无指令注释的同类代码仍按原规则简化。
+
+### 验证
+
+- workspace 全测试（debug + release，618 项）通过；MSRV 1.74
+  `cargo check --workspace` 通过。
+
 ## [0.4.0] - 2026-10-31
 
 ### 修复（版本兼容性）
@@ -938,7 +958,8 @@ var b=2;`——`b` 变成非导出（模块语义改变）。
 - 跨平台批量 I/O：Linux `io_uring` feature（read syscall 6,977 → 10，
   syscall 时长 −53%）；macOS/Windows 线程池；默认构建零运行时依赖
 
-[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/ejfkdev/cure/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ejfkdev/cure/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/ejfkdev/cure/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ejfkdev/cure/compare/v0.2.0...v0.3.0

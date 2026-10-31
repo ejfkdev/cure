@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ejfkdev/cure"
@@ -32,20 +32,20 @@ rust-version = "1.74"
 
 
 [workspace.dependencies]
-cure-engine = { path = "crates/cure-engine", version = "0.4.0" }
-cure-tree = { path = "crates/cure-tree", version = "0.4.0" }
-cure-java-ast = { path = "crates/cure-java-ast", version = "0.4.0" }
-cure-java-parser = { path = "crates/cure-java-parser", version = "0.4.0" }
-cure-java-print = { path = "crates/cure-java-print", version = "0.4.0" }
-cure-java-simplify = { path = "crates/cure-java-simplify", version = "0.4.0" }
-cure-python-ast = { path = "crates/cure-python-ast", version = "0.4.0" }
-cure-python-parser = { path = "crates/cure-python-parser", version = "0.4.0" }
-cure-python-print = { path = "crates/cure-python-print", version = "0.4.0" }
-cure-python-simplify = { path = "crates/cure-python-simplify", version = "0.4.0" }
-cure-dart-ast = { path = "crates/cure-dart-ast", version = "0.4.0" }
-cure-dart-parser = { path = "crates/cure-dart-parser", version = "0.4.0" }
-cure-dart-print = { path = "crates/cure-dart-print", version = "0.4.0" }
-cure-dart-simplify = { path = "crates/cure-dart-simplify", version = "0.4.0" }
+cure-engine = { path = "crates/cure-engine", version = "0.4.1" }
+cure-tree = { path = "crates/cure-tree", version = "0.4.1" }
+cure-java-ast = { path = "crates/cure-java-ast", version = "0.4.1" }
+cure-java-parser = { path = "crates/cure-java-parser", version = "0.4.1" }
+cure-java-print = { path = "crates/cure-java-print", version = "0.4.1" }
+cure-java-simplify = { path = "crates/cure-java-simplify", version = "0.4.1" }
+cure-python-ast = { path = "crates/cure-python-ast", version = "0.4.1" }
+cure-python-parser = { path = "crates/cure-python-parser", version = "0.4.1" }
+cure-python-print = { path = "crates/cure-python-print", version = "0.4.1" }
+cure-python-simplify = { path = "crates/cure-python-simplify", version = "0.4.1" }
+cure-dart-ast = { path = "crates/cure-dart-ast", version = "0.4.1" }
+cure-dart-parser = { path = "crates/cure-dart-parser", version = "0.4.1" }
+cure-dart-print = { path = "crates/cure-dart-print", version = "0.4.1" }
+cure-dart-simplify = { path = "crates/cure-dart-simplify", version = "0.4.1" }
 
 [profile.release]
 lto = "fat"

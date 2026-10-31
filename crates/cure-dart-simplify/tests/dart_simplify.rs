@@ -1423,3 +1423,28 @@ int n(int x) {
     assert!(out.contains("final f = () => 7;"), "{out}");
     assert_idempotent(src);
 }
+
+#[test]
+fn local_propagation_keeps_directive_comments() {
+    let src = r#"int f(int x) {
+  final y = 5; // ignore: unused_local_variable
+  return y + x;
+}
+int g(int x) {
+  final y = 6;
+  return y + x; // ignore: dead_code
+}
+"#;
+    let out = cured(src);
+    // 行尾指令所在声明不能被删除或替换，注释必须留在原行。
+    assert!(
+        out.contains("final y = 5; // ignore: unused_local_variable"),
+        "{out}"
+    );
+    assert!(out.contains("return y + x;"), "{out}");
+    assert!(
+        out.contains("return 6 + x; // ignore: dead_code"),
+        "{out}"
+    );
+    assert_idempotent(src);
+}

@@ -120,6 +120,18 @@ impl<'a> Pass<'a> {
         self.changed = true;
     }
 
+    /// 语句行尾是否带工具指令注释（`# type: ignore` / `# noqa` / …）。
+    /// 这类语句不能被删除或合并：指令必须继续附着在原来的行上。
+    fn has_directive_comment(&self, id: PyId) -> bool {
+        let Some(sp) = self.ast.span(id) else {
+            return false;
+        };
+        self.ast
+            .comments()
+            .iter()
+            .any(|c| !c.own_line && c.line == sp.end_line && is_directive_text(&c.text))
+    }
+
     /// Python 2 的 `1L` 是 long，与 int 的 `type()`/repr 不同；涉及 long 的
     /// 运算不能折成普通整数（值相同但类型变了）。
     fn is_py2_long(&self, id: PyId) -> bool {
@@ -254,7 +266,7 @@ impl<'a> Pass<'a> {
                 if pos + 1 < new.len()
                     && !new[pos + 1..]
                         .iter()
-                        .any(|&s| has_scope_or_yield(self.ast, s))
+                        .any(|&s| has_scope_or_yield(self.ast, s) || self.has_directive_comment(s))
                 {
                     new.truncate(pos + 1);
                     self.hit("py_unreachable");
@@ -284,6 +296,10 @@ impl<'a> Pass<'a> {
         if self.enabled("py_dead_store") {
             let mut i = 0;
             while i + 1 < new.len() {
+                if self.has_directive_comment(new[i]) || self.has_directive_comment(new[i + 1]) {
+                    i += 1;
+                    continue;
+                }
                 if let Some(name) = dead_store_target(self.ast, new[i]) {
                     if overwrites_with_pure(self.ast, new[i + 1], &name) {
                         new.remove(i);
@@ -305,7 +321,9 @@ impl<'a> Pass<'a> {
             for (i, &s) in new.iter().enumerate() {
                 if i == 0 && keep_first {
                     kept.push(s);
-                } else if !matches!(self.ast.data(s), NodeData::Pass) {
+                } else if !matches!(self.ast.data(s), NodeData::Pass)
+                    || self.has_directive_comment(s)
+                {
                     kept.push(s);
                 }
             }
@@ -321,6 +339,9 @@ impl<'a> Pass<'a> {
                 .last()
                 .is_some_and(|&s| matches!(self.ast.data(s), NodeData::Return))
             && self.ast.children(*new.last().unwrap()).is_empty()
+            && !new
+                .last()
+                .is_some_and(|&s| self.has_directive_comment(s))
         {
             new.pop();
             self.hit("py_trailing_return");
@@ -564,6 +585,7 @@ impl<'a> Pass<'a> {
                 self.ast.set_child(id, 0, e2);
                 if self.enabled("py_dead_expr")
                     && !self.docstring_guard
+                    && !self.has_directive_comment(id)
                     && matches!(
                         self.ast.data(e2),
                         NodeData::Literal(Literal {
@@ -590,7 +612,10 @@ impl<'a> Pass<'a> {
                 }
                 let v = self.simplify_expr(ch[targets]);
                 self.ast.set_child(id, targets, v);
-                if self.enabled("py_dead_assign") && targets == 1 {
+                if self.enabled("py_dead_assign")
+                    && targets == 1
+                    && !self.has_directive_comment(id)
+                {
                     if let Some(ds) = &self.dead_scope {
                         if !ds.introspection {
                             if let NodeData::Name(n) = self.ast.data(ch[0]) {
@@ -904,6 +929,9 @@ impl<'a> Pass<'a> {
             return false;
         }
         let assign = new[i];
+        if self.has_directive_comment(assign) || self.has_directive_comment(new[i + 1]) {
+            return false;
+        }
         let NodeData::Assign { targets: 1 } = self.ast.data(assign) else {
             return false;
         };
@@ -959,6 +987,9 @@ impl<'a> Pass<'a> {
         let Some(&first) = ch.get(idx) else {
             return;
         };
+        if self.has_directive_comment(first) {
+            return;
+        }
         let NodeData::Assign { targets: 1 } = self.ast.data(first) else {
             return;
         };
@@ -2501,6 +2532,24 @@ fn cmp_int(op: cure_python_ast::fold::ScalarCmp, a: i64, b: i64) -> bool {
         Gt => a > b,
         Ge => a >= b,
     }
+}
+
+/// 行尾工具指令关键字（需要保留语句本身）。
+fn is_directive_text(t: &str) -> bool {
+    let lower = t.to_ascii_lowercase();
+    [
+        "type:",
+        "noqa",
+        "fmt:",
+        "pyright:",
+        "pylint:",
+        "mypy:",
+        "pragma:",
+        "isort:",
+        "nosec",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
 }
 
 fn fold_int(op: PyBin, a: i64, b: i64) -> Option<i64> {

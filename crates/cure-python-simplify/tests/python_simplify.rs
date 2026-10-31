@@ -985,6 +985,41 @@ def f(a):
 }
 
 #[test]
+fn directive_statements_are_never_removed_or_merged() {
+    // 被简化删除/合并的语句必须保留：行尾指令要留在原来的行上，
+    // 否则 mypy / flake8 / pylint 的抑制会失效或换行生效。
+    let src = r#"def f(x):
+    y = 5  # type: ignore
+    return y + x
+"#;
+    let out = cured(src);
+    assert!(out.contains("y = 5  # type: ignore"), "{out}");
+    assert!(out.contains("return y + x"), "{out}");
+    assert_idempotent(src);
+
+    // 死赋值 / 死存储：有指令的语句保留，无指令的仍可删除。
+    let src = r#"def g():
+    x = 1  # noqa: F841
+    y = compute()  # type: ignore
+    y = 2
+    return y
+"#;
+    let out = cured(src);
+    assert!(out.contains("x = 1  # noqa: F841"), "{out}");
+    assert!(out.contains("y = compute()  # type: ignore"), "{out}");
+    assert!(out.contains("return 2"), "{out}");
+    assert_idempotent(src);
+
+    // 不可达清理遇到指令语句时停止裁剪。
+    let src = "def h():\n    x = 1  # type: ignore\n    return x\n    print(x)\n";
+    let out = cured(src);
+    assert!(out.contains("x = 1  # type: ignore"), "{out}");
+    assert!(out.contains("return x"), "{out}");
+    assert!(!out.contains("print(x)"), "{out}");
+    assert_idempotent(src);
+}
+
+#[test]
 fn comments_in_raw_signature_fields_are_not_duplicated() {
     let src = "@deco(  # deco note\n    1)\ndef f(a,  # param note\n      b):\n    return a + b\n";
     let out = cured(src);

@@ -2487,6 +2487,27 @@ fn assign_compound(ast: &mut DartAst, report: &mut Report) -> bool {
 /// （声明、for 目标、参数表、catch 参数、模式声明、多声明器）都会让
 /// 整条规则跳过。字符串插值里出现同名标识符也跳过（token 模型无法
 /// 改写插值内部）。
+/// 分号后同一行是否紧跟工具指令注释（`// ignore:` 等）。
+fn trailing_directive(ast: &DartAst, semi: usize) -> bool {
+    let line = ast.tokens[semi].line;
+    let Some(t) = ast.tokens.get(semi + 1) else {
+        return false;
+    };
+    if !t.is_comment() || t.line != line {
+        return false;
+    }
+    let lower = t.text.to_ascii_lowercase();
+    [
+        "ignore:",
+        "ignore_for_file:",
+        "coverage:ignore",
+        "dart format",
+        "analyzer:",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+}
+
 fn local_propagation(ast: &mut DartAst, report: &mut Report) -> bool {
     let mut edits: Vec<Edit> = Vec::new();
     for decl_start in 0..ast.tokens.len() {
@@ -2515,6 +2536,11 @@ fn local_propagation(ast: &mut DartAst, report: &mut Report) -> bool {
             continue;
         };
         if ast.text(semi) != ";" {
+            continue;
+        }
+        // 行尾 `// ignore:` / `// coverage:ignore-*` 等指令必须留在原行：
+        // 删除声明会把注释挤到下一行，抑制可能因此失效或误伤别的代码。
+        if trailing_directive(ast, semi) {
             continue;
         }
         let lit = &ast.tokens[lit_i];

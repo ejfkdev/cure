@@ -11,7 +11,7 @@ keywords = ["dart", "formatter", "printer", "deobfuscator"]
 categories = ["development-tools"]
 
 [dependencies]
-cure-dart-ast = { path = "../cure-dart-ast", version = "0.4.0" }
+cure-dart-ast = { path = "../cure-dart-ast", version = "0.4.1" }
 
 [dev-dependencies]
-cure-dart-parser = { path = "../cure-dart-parser", version = "0.4.0" }
+cure-dart-parser = { path = "../cure-dart-parser", version = "0.4.1" }
