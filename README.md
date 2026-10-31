@@ -79,7 +79,9 @@ the same thing.
   fields/methods, static blocks, `using`/`await using`, import
   attributes/`defer`/`source`, top-level await, generic functions/arrows
   (including `const` type parameters), `satisfies`/`as const`, `#x in o`,
-  RegExp `v` flags and optional chains. Unsupported constructs stay verbatim
+  RegExp `v` flags and optional chains, plus zero-argument IIFE inlining
+  (`(() => expr)()`, `(function(){ return expr; })()`) when the body is
+  scope-neutral. Unsupported constructs stay verbatim
   instead of aborting.
 - **Python backend (2.7 + 3.x)** — `.py`/`.pyi` parse → simplify → print
   with a fault-tolerant, indentation-aware parser for both grammars. Python 2
@@ -107,7 +109,7 @@ the same thing.
   compound assignments, rethrow-only `try` unwrapping, empty `finally`,
   adjacent string literals, atom parentheses, empty `else` and `${ident}`
   compaction; `new` is preserved because Dart 1 required it.
-- **118 simplification rules** (67 Java + 27 Python + 24 Dart), including
+- **120 simplification rules** (67 Java + 28 Python + 25 Dart), including
   control-flow flattening recovery, statement-level `StringBuilder` chain
   recovery, XOR-noise removal, and partial evaluation ("virtual execution")
   of literal-only JDK calls.
@@ -357,7 +359,11 @@ pass-only branch inversion), `py_nested_if` (`if a: if b:` → `if a and b:`),
 `py_ternary_not` (`a if not c else b` → `b if c else a`), `py_not_is_in`
 (`not (x is y)` / `not (x in y)` → `x is not y` / `x not in y`),
 `py_double_not` (`not not x` → `bool(x)`; both call the truthiness
-protocol exactly once and return a real bool),
+protocol exactly once and return a real bool), `py_local_propagation`
+(the first statement's `y = <scalar literal>` is inlined into every read
+when `y` is bound only once, is not a parameter/`global`/`nonlocal`/`del`
+target, no nested scope rebinds it, and the function has no
+`locals()`/`eval` introspection),
 `py_paren_removal` (redundant parentheses around atoms), `py_dead_store`
 (adjacent pure-literal overwrite), `py_dead_assign` (function-scope liveness:
 an unread local with a pure RHS is removed, an effectful RHS survives as an
@@ -376,7 +382,7 @@ int/long types, shadowed `True`/`False`/builtins (including `exec` and
 `import *`), locals/vars/dir/eval introspection and version-ambiguous forms
 are guarded.
 
-**Dart (24):** `dart_const_fold` (32-bit int/bool/string arithmetic and
+**Dart (25):** `dart_const_fold` (32-bit int/bool/string arithmetic and
 comparisons plus deterministic literal members such as `.length`,
 `.codeUnitAt`, `.contains`, `.indexOf`, `.isEven`, `.bitLength` and
 `toRadixString`; `/` and floating point are never folded; Dart's Euclidean
@@ -418,7 +424,11 @@ function/closure body), `dart_trailing_assign_return`
 (`final y = expr; return y;` → `return expr;` when the local is read only
 there; the initializer is limited to context-insensitive forms—identifiers,
 literals and operators, no calls/collection literals—so return-position
-inference cannot change a reified generic type),
+inference cannot change a reified generic type), `dart_local_propagation`
+(a single-token `final/var/const y = <scalar literal>` is inlined into every
+read in its block when all occurrences are unambiguous expression operands;
+declarations, parameters, patterns, `for` headers, multi-declarators,
+interpolation and member-access positions make the rule skip),
 `dart_empty_finally` (`finally {}` is removed only when a `catch`/`on` clause
 remains), `dart_try_unwrap` (rethrow-only `catch`/`on` clauses are removed;
 a `try` left with no clauses, or with only an empty `finally`, becomes a bare
@@ -509,9 +519,15 @@ such frontends (see also the ~100-line toy language in
 - 🔜 Further Python rule-pack work (local propagation, decompiler-shape
   restoration)
 - ℹ️ Comment preservation: the Dart backend keeps every token and comment.
-  Java/Python/TS print from an AST, so standalone comments are not re-emitted;
-  TypeScript `--preserve-function-source` keeps comments inside
-  functions/classes/object literals byte-for-byte.
+  Python preserves every statement-level comment (leading, trailing, blocks)
+  and its file header; TypeScript/JavaScript preserve the file-header block
+  and line-level directives (`// @ts-ignore`, `// @ts-expect-error`,
+  `/*#__PURE__*/`, `eslint-disable-next-line`, …) together with the verbatim
+  source lines of their statement, so `@ts-ignore` still suppresses the same
+  line; Java preserves the leading file header. Narrative comments elsewhere
+  in TS/JS/Java are still not re-emitted (Python keeps them). TypeScript
+  `--preserve-function-source` keeps comments inside functions/classes/object
+  literals byte-for-byte.
 
 ## License
 

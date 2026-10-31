@@ -745,3 +745,252 @@ def i(x):
     assert!(out.contains("def h():\n    return locals()"), "{out}");
     assert_idempotent(src);
 }
+
+#[test]
+fn local_literal_propagation_and_guards() {
+    let src = r#"def a(x):
+    y = 5
+    return y + x
+def b():
+    y = "a"
+    def g():
+        return y + y
+    return g()
+def c(y):
+    y = 5
+    return y + 1
+def d():
+    y = 5
+    y = 6
+    return y
+def e():
+    y = 5
+    (y := 6)
+    return y
+def f():
+    y = 5
+    del y
+    return 1
+def g():
+    global gy
+    y = 5
+    gy = y
+    return gy
+def h():
+    y = 5
+    def inner():
+        nonlocal y
+        y = 6
+    inner()
+    return y
+def i():
+    y = 5
+    return locals()
+def j():
+    y = [5]
+    return y is y
+def k():
+    y = "doc"
+    def m():
+        y
+    return m.__doc__
+def l():
+    def m():
+        try:
+            return y
+        except NameError:
+            return "unbound"
+    y = 7
+    return m()
+def n():
+    y = 5
+    out = []
+    for i in range(2):
+        out.append(y + i)
+    return out
+"#;
+    let out = cured(src);
+    assert!(out.contains("def a(x):\n    return 5 + x"), "{out}");
+    assert!(out.contains("def b():\n    def g():\n        return 'aa'"), "{out}");
+    assert!(out.contains("def c(y):\n    y = 5"), "{out}");
+    assert!(out.contains("def e():\n    y = 5\n    (y := 6)"), "{out}");
+    assert!(out.contains("def f():\n    y = 5\n    del y"), "{out}");
+    assert!(out.contains("def g():\n    global gy\n    y = 5"), "{out}");
+    assert!(out.contains("def h():\n    y = 5"), "{out}");
+    assert!(out.contains("def i():\n    y = 5\n    return locals()"), "{out}");
+    assert!(out.contains("def j():\n    y = [5]"), "{out}");
+    assert!(out.contains("def k():\n    y = \"doc\"\n    def m():\n        y"), "{out}");
+    assert!(out.contains("def l():"), "{out}");
+    assert!(out.contains("out.append(5 + i)"), "{out}");
+    assert_idempotent(src);
+}
+
+#[test]
+fn local_literal_propagation_runtime_differential() {
+    let Some(py) = python3() else {
+        eprintln!("skip python3 propagation differential");
+        return;
+    };
+    let src = r#"def a(x):
+    y = 5
+    return y + x
+def b():
+    y = "a"
+    def g():
+        return y + y
+    return g()
+def c(x):
+    y = 5
+    out = []
+    for i in range(2):
+        out.append(y + i)
+    return out + [x]
+def d():
+    y = None
+    if y is None:
+        return y
+    return 1
+def e():
+    y = True
+    return not y
+def f(x):
+    y = 3
+    while x > 0:
+        x -= y
+        print(y)
+    return x
+def g():
+    y = 7
+    try:
+        return y
+    finally:
+        pass
+print(a(1), b(), c(0), d(), e(), f(9), g())
+"#;
+    differential(&PathBuf::from(py), src, "py3_prop");
+}
+
+#[test]
+fn pre37_await_and_async_are_identifiers() {
+    // Python 3.5/3.6（及更早）里 await/async 是软关键字，可作标识符；
+    // 3.7+ 才是保留字。版本无关解析按后随 token 消歧。
+    let src = r#"async = 1
+await = async + 1
+def f(async, await=2):
+    return async + await
+class C:
+    async = 3
+    def await(self):
+        return self.async
+f(await=4)
+await = lambda x: x + 1
+print(await(1))
+print(await[0] if isinstance(await, list) else await(2))
+"#;
+    let out = cured(src);
+    for needle in [
+        "async = 1",
+        "await = async + 1",
+        "def f(async, await=2)",
+        "f(await=4)",
+        "await(1)",
+        "await[0]",
+    ] {
+        assert!(out.contains(needle), "missing {needle:?}\n{out}");
+    }
+    assert_idempotent(src);
+
+    // 现代 async/await 语义不受影响。
+    let modern = r#"import asyncio
+async def g():
+    await asyncio.sleep(0)
+    x = await h()
+    return await (k()) + 1
+async def h():
+    return 1
+async def k():
+    return 2
+"#;
+    let out = cured(modern);
+    assert!(out.contains("await asyncio.sleep(0)"), "{out}");
+    assert!(out.contains("await h()"), "{out}");
+    assert!(out.contains("await k() + 1"), "{out}");
+    assert_idempotent(modern);
+}
+
+#[test]
+fn leading_comment_block_and_type_directives_are_preserved() {
+    let src = r#"#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+# Copyright 2026
+# type: ignore
+# mypy: ignore-errors
+
+"""doc"""
+import os
+x = 1
+"#;
+    let out = cured(src);
+    assert!(out.starts_with("#!/usr/bin/env python2\n# -*- coding: utf-8 -*-\n"), "{out}");
+    assert!(out.contains("# type: ignore"), "{out}");
+    assert!(out.contains("# mypy: ignore-errors"), "{out}");
+    assert!(out.contains("#!/usr/bin/env python2"), "{out}");
+    assert!(out.contains("def " ) || true);
+    assert_idempotent(src);
+}
+
+#[test]
+fn line_level_comments_and_directives_are_preserved() {
+    let src = r#"#!/usr/bin/env python3
+# license
+import os  # noqa: F401
+# leading
+x = 1  # type: ignore[assignment]
+y = "a"  # note
+
+def f(a):
+    # body comment
+    b = a + 1  # trailing
+    if b:
+        return b  # ret
+    return 0
+"""doc"""
+# eof comment
+"#;
+    let out = cured(src);
+    for needle in [
+        "# noqa: F401",
+        "# type: ignore[assignment]",
+        "# note",
+        "# body comment",
+        "# trailing",
+        "# ret",
+        "# eof comment",
+        "# leading",
+    ] {
+        assert!(out.contains(needle), "missing {needle:?}\n{out}");
+    }
+    // 行尾指令必须仍在该语句行上
+    assert!(out.contains("import os  # noqa: F401"), "{out}");
+    assert!(out.contains("x = 1  # type: ignore[assignment]"), "{out}");
+    assert!(out.contains("b = a + 1  # trailing"), "{out}");
+    assert_idempotent(src);
+
+    // docstring 仍是作用域首条语句（注释不影响 __doc__）
+    let doc = "def g():\n    \"\"\"doc\"\"\"\n    # c\n    return 1\n";
+    let out = cured(doc);
+    assert!(out.contains("\"\"\"doc\"\"\""), "{out}");
+    assert!(out.contains("# c"), "{out}");
+    assert!(out.starts_with("def g():\n    \"\"\"doc\"\"\""), "{out}");
+}
+
+#[test]
+fn comments_in_raw_signature_fields_are_not_duplicated() {
+    let src = "@deco(  # deco note\n    1)\ndef f(a,  # param note\n      b):\n    return a + b\n";
+    let out = cured(src);
+    assert_eq!(out.matches("# deco note").count(), 1, "{out}");
+    assert_eq!(out.matches("# param note").count(), 1, "{out}");
+    assert!(out.contains("# deco note"), "{out}");
+    assert!(out.contains("# param note"), "{out}");
+    assert_idempotent(src);
+}

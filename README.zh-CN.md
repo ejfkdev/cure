@@ -64,7 +64,9 @@ class B {                                     class B {
 - **最新 TS/JS 语法** —— 类/成员装饰器、`accessor`、私有字段/方法、
   static 块、`using`/`await using`、导入属性/`defer`/`source`、顶层
   await、泛型函数/箭头（含 `const` 类型参数）、`satisfies`/`as const`、
-  `#x in o`、RegExp `v` 标志与可选链；未建模结构原文保真，不中断。
+  `#x in o`、RegExp `v` 标志与可选链，以及作用域中性的零参 IIFE 内联
+  （`(() => expr)()`、`(function(){ return expr; })()`）；未建模结构原文
+  保真，不中断。
 - **Python 后端（2.7 + 3.x，至 3.15）** —— `.py`/`.pyi` 全流程解析 → 简化 → 打印，
   容错缩进解析器同时接受两套语法：Python 2 的 print/exec/raise 语句、反引号、
   `<>`、`1L`、`0777`、`ur"..."`、元组形参、`except E, e`、无括号推导式元组，
@@ -84,7 +86,7 @@ class B {                                     class B {
   空 then 反转、不可达语句、循环尾 `continue`、函数尾 `return`、
   复合赋值、仅 rethrow 的 try 解包、空 `finally`、相邻字符串字面量、
   原子括号、空 `else` 与 `${ident}` 压缩；`new` 因 Dart 1 要求而保留。
-- **118 条简化规则**（67 条 Java + 27 条 Python + 24 条 Dart），含控制流扁平化还原、语句级 StringBuilder
+- **120 条简化规则**（67 条 Java + 28 条 Python + 25 条 Dart），含控制流扁平化还原、语句级 StringBuilder
   链还原、XOR 噪声剥除、纯字面量 JDK 调用的部分求值（"虚拟执行"）。
 - **真实代码库规模** —— OpenJDK 全源码语料（371,674 文件 / 4.7 GB）
   在 18 核笔记本上约 15 秒处理完，0 解析失败、0 panic。TS/JS 侧：
@@ -304,7 +306,10 @@ bool/min/max）、`py_subscript_fold`（字面量字符串/列表/元组的下�
 及其反向）、`py_ternary_not`（`a if not c else b` → `b if c else a`）、
 `py_not_is_in`（`not (x is y)` / `not (x in y)` → `x is not y` /
 `x not in y`）、`py_double_not`（`not not x` → `bool(x)`：两者都只调用
-一次真值协议并返回真正的 bool）、`py_paren_removal`（原子表达式外的冗余括号）、
+一次真值协议并返回真正的 bool）、`py_local_propagation`（函数首条
+`y = <标量字面量>` 且 y 只绑定一次、不是形参/`global`/`nonlocal`/`del`
+目标、嵌套作用域不重绑定、函数无 locals/eval 反射时，把字面量内联到
+所有读取位）、`py_paren_removal`（原子表达式外的冗余括号）、
 `py_dead_store`（相邻纯字面量覆盖）、`py_dead_assign`（函数作用域活跃性：
 未被读取的局部纯值可删，有副作用的右值降为表达式）、`py_dead_expr`
 （裸数字/None/... 表达式）、`py_str_accum`（`s = "a"; s += "b"` →
@@ -319,7 +324,7 @@ bool/min/max）、`py_subscript_fold`（字面量字符串/列表/元组的下�
 docstring、Python 2 int/long、被遮蔽的 True/False/内建（含 exec 与
 import *）、locals/vars/dir/eval 反射以及版本歧义写法都有守卫。
 
-**Dart 专属（24）**：`dart_const_fold`（32 位整数/bool/字符串运算与比较，
+**Dart 专属（25）**：`dart_const_fold`（32 位整数/bool/字符串运算与比较，
 以及 `.length`、`.codeUnitAt`、`.contains`、`.indexOf`、`.isEven`、
 `.bitLength`、`toRadixString` 等确定性字面量成员；`/` 与浮点不折；按
 Dart 的 Euclidean `%`、截断 `~/` 与移位范围建模，并遵循 Dart 的
@@ -354,7 +359,10 @@ Dart 3 模式上下文跳过）、`dart_double_negation`（仅操作数本身可
 （无注释的函数/闭包末尾裸 `return;`）、`dart_trailing_assign_return`
 （`final y = expr; return y;` → `return expr;`；该局部变量只在这里被
 读取，且初始值限定为上下文不敏感形态——标识符/字面量/运算符，不含
-调用与集合字面量，避免返回位置推断改变具化泛型类型）、`dart_empty_finally`
+调用与集合字面量，避免返回位置推断改变具化泛型类型）、
+`dart_local_propagation`（单 token 的 `final/var/const y = <标量字面量>`
+在块内所有出现都是明确的表达式操作数时内联到读取位；声明/参数/模式/
+`for` 头/多声明器/字符串插值/成员访问位都会让规则跳过）、`dart_empty_finally`
 （仅在仍有 `catch`/`on` 时删除空 `finally`）、`dart_try_unwrap`
 （仅 rethrow 的 `catch`/`on` 子句删除；删空后或只剩空 `finally` 时把
 `try` 解包为裸块，保留作用域）、`dart_adjacent_strings`
@@ -429,9 +437,14 @@ cure-cli           `cure` 二进制：并行管线、跨平台批量 I/O（io_ur
 - ✅ 12 套入库 Java 语料、三层验证、602 个测试
 - 🔜 还原规则 V2（反射 addSuppressed 形态、嵌套双资源 try-with-resources）
 - 🔜 Python 规则包后续（局部传播、反编译形态还原）
-- ℹ️ 注释保真：Dart 后端逐 token 保留注释；Java/Python/TS 从 AST 重新
-  打印，独立注释不会重新输出；TypeScript 的 `--preserve-function-source`
-  会把函数/类/对象字面量内部的注释逐字节保留。
+- ℹ️ 注释保真：Dart 后端逐 token 保留注释；Python 保留语句级全部注释
+  （独立行、行尾、空行与文件头）；TypeScript/JavaScript 保留文件头块和
+  行级指令（`// @ts-ignore`、`@ts-expect-error`、`/*#__PURE__*/`、
+  `eslint-disable-next-line` 等），并按原文行结构输出其所属语句，保证
+  `@ts-ignore` 抑制的行不变；Java 保留文件头注释块。TS/JS/Java 代码中间
+  的普通叙述性注释仍不会重新输出（Python 会保留）。
+  TypeScript 的 `--preserve-function-source` 会把函数/类/对象字面量内部
+  的注释逐字节保留。
 
 ## 许可证
 

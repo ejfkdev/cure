@@ -644,3 +644,73 @@ fn raw_local_decl_stops_at_block_close() {
     let closes = p1.matches('}').count();
     assert_eq!(opens, closes, "unbalanced: {p1}");
 }
+
+#[test]
+fn java25_compact_source_file_is_accepted() {
+    // JEP 512 紧凑源文件：省略外层 class，顶层直接写字段/方法，
+    // main 可以是实例方法；辅助类可以在后面。
+    let src = r#"import module java.base;
+
+static int counter = 1;
+
+String label = "x";
+
+int add(int a, int b) {
+    return a + b;
+}
+
+void main() {
+    System.out.println(add(counter, 3) + label);
+}
+
+class Helper {
+    String value() {
+        return "h";
+    }
+}
+"#;
+    let out = parse(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let p1 = fmt(src);
+    assert!(p1.contains("void main()"), "{p1}");
+    assert!(p1.contains("class Helper"), "{p1}");
+    assert_eq!(p1, fmt(&p1), "not idempotent:\n{p1}");
+}
+
+#[test]
+fn java27_preview_primitive_patterns_are_preserved() {
+    // JDK 27 预览：基元模式 + 未命名变量；解析器必须容错保真。
+    let src = r#"class P {
+    static String f(Object o) {
+        return switch (o) {
+            case int i when i > 0 -> "pos";
+            case int i -> "int";
+            case long l -> "long";
+            case double d -> "double";
+            case boolean b -> "bool";
+            case null, default -> "other";
+        };
+    }
+    static int g(java.util.List<String> xs) {
+        for (var _ : xs) { }
+        return xs.size();
+    }
+}
+"#;
+    let out = parse(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let p1 = fmt(src);
+    assert!(p1.contains("case int i when i > 0"), "{p1}");
+    assert_eq!(p1, fmt(&p1), "not idempotent:\n{p1}");
+}
+
+#[test]
+fn leading_file_comments_are_preserved() {
+    let src = "/*\n * Copyright 2026\n */\n//noinspection unchecked\npackage foo;\n\nimport java.util.List;\n\nclass A { List<String> xs; }\n";
+    let out = parse(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let p1 = fmt(src);
+    assert!(p1.starts_with("/*\n * Copyright 2026\n */\n//noinspection unchecked\n"), "{p1}");
+    assert!(p1.contains("package foo;"), "{p1}");
+    assert_eq!(p1, fmt(&p1), "not idempotent:\n{p1}");
+}

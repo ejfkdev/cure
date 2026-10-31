@@ -1003,6 +1003,19 @@ List<int> t22(int x) { final y = [x]; return y; }
 int t23(int x) { final y = x; return y + 1; }
 int t24(int x) { final y = x; int inner() => y; return inner(); }
 int t25(int x) { final y = x; print(y); return y; }
+int t26(int x) { final n = 5; return n + x; }
+String t27() { final y = 'a'; final z = y + y; return z; }
+int t28(int x) {
+  final n = 2;
+  var sum = 0;
+  for (var i = 0; i < x; i++) { sum += n * i; }
+  return sum;
+}
+bool t29(bool c) { final t = true; if (t) { return c; } return !t; }
+int t30(int x) {
+  final y = 6;
+  return x > y ? y : x;
+}
 void main() {
   print(t1(true)); print(t1(false));
   print(t2(true)); print(t2(false));
@@ -1021,6 +1034,7 @@ void main() {
   print(t18());
   print(t19());
   print(t20(1)); print(t21(2)); print(t22(3)); print(t23(4)); print(t24(5)); print(t25(6));
+  print(t26(1)); print(t27()); print(t28(4)); print(t29(true)); print(t29(false)); print(t30(9)); print(t30(2));
   t14();
 }
 "#;
@@ -1328,4 +1342,84 @@ int g(int x) {
   return y;
 }
 "#);
+}
+
+#[test]
+fn local_literal_propagation_and_guards() {
+    let src = r#"int a(int x) {
+  final y = 5;
+  return y + x;
+}
+String b() {
+  final y = 'a';
+  final z = y + y;
+  return z;
+}
+int c(int x) {
+  final n = 2;
+  var sum = 0;
+  for (var i = 0; i < x; i++) {
+    sum += n * i;
+  }
+  return sum;
+}
+bool d(bool c) {
+  final t = true;
+  if (t) { return c; }
+  return !t;
+}
+int e(int x) {
+  final y = 1;
+  int f(int y) => y + 1;
+  return f(x) + y;
+}
+int g(List<int> xs) {
+  final y = 2;
+  return xs.map((v) => v * y).reduce((a, b) => a + b);
+}
+String h(int x) {
+  final y = 'v';
+  return 'value=$y';
+}
+int i(int x) {
+  final y = 3;
+  return y.toString().length;
+}
+int j(int x) {
+  final y = 4;
+  final z = y;
+  return z + x;
+}
+int k(int x) {
+  final y = 5;
+  int y2 = 1, z2 = 2;
+  return y + x + y2 + z2;
+}
+int m(int x) {
+  final y = 7;
+  final f = () => y;
+  return f() + x;
+}
+int n(int x) {
+  final y = 8;
+  return x > y ? y : x;
+}
+"#;
+    let out = cured(src);
+    assert!(out.contains("int a(int x) {\n  return 5 + x;\n}"), "{out}");
+    assert!(out.contains("String b() {\n  return 'aa';\n}"), "{out}");
+    assert!(out.contains("sum += 2 * i;"), "{out}");
+    assert!(out.contains("if (true) {"), "{out}");
+    // 参数遮蔽：整条跳过
+    assert!(out.contains("final y = 1;\n  int f(int y) => y + 1;"), "{out}");
+    assert!(out.contains("xs.map((v) => v * 2)"), "{out}");
+    // 插值 / 成员访问 / for 头 / 类型位：保守跳过
+    assert!(out.contains("final y = 'v';\n  return 'value=$y';"), "{out}");
+    assert!(out.contains("final y = 3;\n  return y.toString()"), "{out}");
+    assert!(out.contains("final y = 8;\n  return x > y ? y : x;"), "{out}");
+    assert!(out.contains("return 4 + x;"), "{out}");
+    // 类型化多声明器存在时仍可传播不同名的常量
+    assert!(out.contains("return 5 + x + y2 + z2;"), "{out}");
+    assert!(out.contains("final f = () => 7;"), "{out}");
+    assert_idempotent(src);
 }

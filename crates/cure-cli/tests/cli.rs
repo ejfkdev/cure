@@ -262,15 +262,15 @@ fn rules_subcommand_lists_catalog() {
             .assert()
             .success()
             .stdout(predicate::str::contains(
-                "118 simplification rules (67 Java + 27 Python + 24 Dart)",
+                "120 simplification rules (67 Java + 28 Python + 25 Dart)",
             ))
             .stdout(predicate::str::contains("const_fold_bin"))
             .stdout(predicate::str::contains("cff_recover"))
             // 默认/选配分组、Python/Dart 目录与 --disable 提示
             .stdout(predicate::str::contains("Java enabled by default"))
             .stdout(predicate::str::contains("Java opt-in"))
-            .stdout(predicate::str::contains("Python (default, 27)"))
-            .stdout(predicate::str::contains("Dart (default, 24)"))
+            .stdout(predicate::str::contains("Python (default, 28)"))
+            .stdout(predicate::str::contains("Dart (default, 25)"))
             .stdout(predicate::str::contains("--disable"));
     }
 }

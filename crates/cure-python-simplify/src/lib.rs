@@ -43,6 +43,7 @@ pub fn default_rules() -> &'static [&'static str] {
         "py_ternary_not",
         "py_not_is_in",
         "py_double_not",
+        "py_local_propagation",
         "py_paren_removal",
         "py_dead_store",
         "py_dead_assign",
@@ -238,6 +239,13 @@ impl<'a> Pass<'a> {
                 );
             let mut v = self.simplify_stmt(stmt);
             self.docstring_guard = saved;
+            // 单条语句被改写时继承原语句的源码行区间：行级注释（`# noqa`、
+            // `# type: ignore`）仍能附着到正确位置。
+            if v.len() == 1 && self.ast.span(v[0]).is_none() {
+                if let Some(sp) = self.ast.span(stmt) {
+                    self.ast.set_span(v[0], sp.start_line, sp.end_line, sp.end_col);
+                }
+            }
             new.append(&mut v);
         }
         // 终止语句后的不可达删除
@@ -458,11 +466,14 @@ impl<'a> Pass<'a> {
                 let _ = (target_raw, is_async);
                 vec![id]
             }
-            NodeData::FunctionDef { .. } => {
+            NodeData::FunctionDef { params_raw, .. } => {
                 let body = self.ast.children(id)[0];
                 let saved = self.dead_scope.take();
-                self.dead_scope = Some(analyze_function(self.ast, body));
+                self.dead_scope = Some(analyze_function(self.ast, body, &params_raw));
                 self.simplify_block(body, true);
+                if self.enabled("py_local_propagation") {
+                    self.propagate_local_literal(body);
+                }
                 self.dead_scope = saved;
                 vec![id]
             }
@@ -922,6 +933,164 @@ impl<'a> Pass<'a> {
         new.remove(i + 1);
         self.hit("py_trailing_assign_return");
         true
+    }
+
+    /// 局部常量传播：函数体首条（docstring/pass 之后）`y = <标量字面量>`
+    /// 且 y 在函数内只被这一处绑定、不是形参/global/nonlocal/`del` 目标时，
+    /// 把函数内所有 y 的读取替换成该字面量。
+    ///
+    /// 顺序安全：赋值是首条可执行语句，任何读取都发生在其后；嵌套闭包
+    /// 只可能在其后被定义/调用（定义在前的闭包读 y 在原文就是编译期
+    /// 错误或 UnboundLocalError——bindings/counts 会让名字出现在前置
+    /// raw/def 形参里时整条规则跳过）。裸表达式语句不替换（避免把
+    /// `y` 变成作用域首条字符串而生成新 docstring）。
+    fn propagate_local_literal(&mut self, body: PyId) {
+        if self.dead_scope.as_ref().is_some_and(|ds| ds.introspection) {
+            return;
+        }
+        let ch = self.ast.children(body).to_vec();
+        let mut idx = 0;
+        while idx < ch.len()
+            && (matches!(self.ast.data(ch[idx]), NodeData::Pass)
+                || is_doc_expr(self.ast, ch[idx]))
+        {
+            idx += 1;
+        }
+        let Some(&first) = ch.get(idx) else {
+            return;
+        };
+        let NodeData::Assign { targets: 1 } = self.ast.data(first) else {
+            return;
+        };
+        let ach = self.ast.children(first).to_vec();
+        let name = match self.ast.data(ach[0]) {
+            NodeData::Name(n) => n.clone(),
+            _ => return,
+        };
+        let lit = match self.ast.data(ach[1]) {
+            NodeData::Literal(l) => l.clone(),
+            _ => return,
+        };
+        if lit.kind == LitKind::Bool && self.bool_shadowed {
+            return;
+        }
+        let Some(ds) = self.dead_scope.as_ref() else {
+            return;
+        };
+        if ds.params.contains(&name)
+            || ds.forbidden.contains(&name)
+            || ds.bindings.get(&name).copied().unwrap_or(0) != 1
+        {
+            return;
+        }
+        if self.subst_name_reads(body, &name, &lit) > 0 {
+            self.hit("py_local_propagation");
+        }
+    }
+
+    /// 把 `name` 的读取位替换为字面量，返回替换次数。赋值目标、形参、
+    /// 模式绑定位不动；裸表达式语句不替换。
+    fn subst_name_reads(&mut self, id: PyId, name: &str, lit: &Literal) -> usize {
+        match self.ast.data(id).clone() {
+            NodeData::Name(n) => {
+                if n == name {
+                    *self.ast.data_mut(id) = NodeData::Literal(lit.clone());
+                    self.ast.set_children(id, vec![]);
+                    1
+                } else {
+                    0
+                }
+            }
+            NodeData::Literal(_) | NodeData::Raw(_) => 0,
+            NodeData::Assign { targets } => {
+                let ch = self.ast.children(id).to_vec();
+                let mut n = 0;
+                for &t in &ch[..targets] {
+                    n += self.subst_target_reads(t, name, lit);
+                }
+                if let Some(&v) = ch.get(targets) {
+                    n += self.subst_name_reads(v, name, lit);
+                }
+                n
+            }
+            NodeData::AnnAssign { .. } => {
+                let ch = self.ast.children(id).to_vec();
+                let mut n = 0;
+                if let Some(&t) = ch.first() {
+                    n += self.subst_target_reads(t, name, lit);
+                }
+                if let Some(&v) = ch.get(1) {
+                    n += self.subst_name_reads(v, name, lit);
+                }
+                n
+            }
+            NodeData::AugAssign { .. } => {
+                let ch = self.ast.children(id).to_vec();
+                let mut n = 0;
+                if let Some(&t) = ch.first() {
+                    n += self.subst_target_reads(t, name, lit);
+                }
+                if let Some(&v) = ch.get(1) {
+                    n += self.subst_name_reads(v, name, lit);
+                }
+                n
+            }
+            NodeData::ExprStmt => {
+                // 裸表达式语句：若唯一孩子就是目标名字且字面量是字符串，
+                // 替换会把它变成作用域首条字符串（新 docstring）→ 不换；
+                // 其余表达式语句（调用等）正常递归。
+                let Some(&c) = self.ast.children(id).first() else {
+                    return 0;
+                };
+                if lit.kind == LitKind::Str
+                    && matches!(self.ast.data(c), NodeData::Name(n) if n == name)
+                {
+                    return 0;
+                }
+                self.subst_name_reads(c, name, lit)
+            }
+            NodeData::Delete => 0,
+            NodeData::Global(_) | NodeData::Nonlocal(_) => 0,
+            _ => {
+                let ch = self.ast.children(id).to_vec();
+                let mut n = 0;
+                for c in ch {
+                    n += self.subst_name_reads(c, name, lit);
+                }
+                n
+            }
+        }
+    }
+
+    /// 目标位：裸 Name 是绑定（不动）；属性/下标目标里的基址与索引是
+    /// 读取（递归替换）；解包目标逐项递归。
+    fn subst_target_reads(&mut self, id: PyId, name: &str, lit: &Literal) -> usize {
+        match self.ast.data(id).clone() {
+            NodeData::Name(_) => 0,
+            NodeData::Tuple | NodeData::List | NodeData::Starred | NodeData::Paren => {
+                let ch = self.ast.children(id).to_vec();
+                let mut n = 0;
+                for c in ch {
+                    n += self.subst_target_reads(c, name, lit);
+                }
+                n
+            }
+            NodeData::Attribute { .. } => {
+                let Some(&b) = self.ast.children(id).first() else {
+                    return 0;
+                };
+                self.subst_name_reads(b, name, lit)
+            }
+            NodeData::Subscript => {
+                let ch = self.ast.children(id).to_vec();
+                let mut n = 0;
+                for c in ch {
+                    n += self.subst_name_reads(c, name, lit);
+                }
+                n
+            }
+            _ => self.subst_name_reads(id, name, lit),
+        }
     }
 
     /// `if c: x = a else: x = b` → `x = a if c else b`；
@@ -1575,10 +1744,21 @@ struct DeadScope {
     /// 名字出现次数（Name 节点 + raw 片段里的标识符词）。尾赋值返回要求
     /// 目标名字只有 return 这一处读取（计数只用于保守判定：只会偏大）。
     counts: BTreeMap<String, usize>,
+    /// 绑定次数（赋值/for/with/except/参数/import/嵌套 def 名）。局部
+    /// 常量传播要求目标只绑定一次。
+    bindings: BTreeMap<String, usize>,
+    /// 当前函数形参（参数在函数入口已绑定，不能当作可传播的局部常量）。
+    params: BTreeSet<String>,
 }
 
-fn analyze_function(ast: &PyAst, body: PyId) -> DeadScope {
+fn analyze_function(ast: &PyAst, body: PyId, params_raw: &str) -> DeadScope {
     let mut ds = DeadScope::default();
+    let mut params = BTreeSet::new();
+    add_words(params_raw, &mut params);
+    for p in &params {
+        *ds.bindings.entry(p.clone()).or_insert(0) += 1;
+    }
+    ds.params = params;
     collect_reads(ast, body, &mut ds);
     ds
 }
@@ -1606,6 +1786,40 @@ fn add_words_counted(raw: &str, ds: &mut DeadScope) {
     for w in words {
         *ds.counts.entry(w.clone()).or_insert(0) += 1;
         ds.reads.insert(w);
+    }
+}
+
+/// raw 片段里的标识符计入 bindings（绑定次数）。
+fn add_words_binding(raw: &str, ds: &mut DeadScope) {
+    let mut words = BTreeSet::new();
+    add_words(raw, &mut words);
+    for w in words {
+        *ds.bindings.entry(w).or_insert(0) += 1;
+    }
+}
+
+/// 赋值目标的绑定形态（Name 计数；解包递归；属性/下标只算读取）。
+fn collect_target_bindings(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
+    match ast.data(id) {
+        NodeData::Name(n) => {
+            *ds.bindings.entry(n.clone()).or_insert(0) += 1;
+        }
+        NodeData::Tuple | NodeData::List | NodeData::Starred | NodeData::Paren => {
+            for &c in ast.children(id) {
+                collect_target_bindings(ast, c, ds);
+            }
+        }
+        NodeData::Attribute { .. } => {
+            if let Some(&b) = ast.children(id).first() {
+                collect_reads(ast, b, ds);
+            }
+        }
+        NodeData::Subscript => {
+            for &c in ast.children(id) {
+                collect_reads(ast, c, ds);
+            }
+        }
+        _ => collect_reads(ast, id, ds),
     }
 }
 
@@ -1645,6 +1859,7 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
             let ch = ast.children(id);
             for &t in &ch[..*targets] {
                 collect_target_reads(ast, t, ds);
+                collect_target_bindings(ast, t, ds);
             }
             if let Some(&v) = ch.get(*targets) {
                 collect_reads(ast, v, ds);
@@ -1656,6 +1871,7 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
             let ch = ast.children(id);
             if let Some(&t) = ch.first() {
                 collect_target_reads(ast, t, ds);
+                collect_target_bindings(ast, t, ds);
             }
             if let Some(&v) = ch.get(1) {
                 collect_reads(ast, v, ds);
@@ -1663,6 +1879,9 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
             return;
         }
         NodeData::AugAssign { .. } => {
+            if let Some(&t) = ast.children(id).first() {
+                collect_target_bindings(ast, t, ds);
+            }
             for &c in ast.children(id) {
                 collect_reads(ast, c, ds);
             }
@@ -1670,6 +1889,7 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
         }
         NodeData::For { target_raw, .. } | NodeData::CompFor { target_raw, .. } => {
             add_words_counted(target_raw, ds);
+            add_words_binding(target_raw, ds);
             for &c in ast.children(id) {
                 collect_reads(ast, c, ds);
             }
@@ -1677,6 +1897,7 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
         }
         NodeData::With { items_raw, .. } => {
             add_words_counted(items_raw, ds);
+            add_words_binding(items_raw, ds);
             for &c in ast.children(id) {
                 collect_reads(ast, c, ds);
             }
@@ -1684,12 +1905,14 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
         }
         NodeData::ExceptHandler { clause_raw } => {
             add_words_counted(clause_raw, ds);
+            add_words_binding(clause_raw, ds);
             for &c in ast.children(id) {
                 collect_reads(ast, c, ds);
             }
             return;
         }
         NodeData::FunctionDef {
+            name,
             params_raw,
             ret_raw,
             deco_raw,
@@ -1701,18 +1924,24 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
             add_words_counted(ret_raw, ds);
             add_words_counted(deco_raw, ds);
             add_words_counted(generics_raw, ds);
+            // 嵌套函数的局部绑定不得与外层同名常量混淆：名字/形参
+            // 计入 bindings（只影响保守判定）。
+            *ds.bindings.entry(name.clone()).or_insert(0) += 1;
+            add_words_binding(params_raw, ds);
             if let Some(&b) = ast.children(id).first() {
                 collect_reads(ast, b, ds);
             }
             return;
         }
         NodeData::ClassDef {
+            name,
             header_raw,
             deco_raw,
             ..
         } => {
             add_words_counted(header_raw, ds);
             add_words_counted(deco_raw, ds);
+            *ds.bindings.entry(name.clone()).or_insert(0) += 1;
             if let Some(&b) = ast.children(id).first() {
                 collect_reads(ast, b, ds);
             }
@@ -1720,6 +1949,7 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
         }
         NodeData::Lambda { params_raw } => {
             add_words_counted(params_raw, ds);
+            add_words_binding(params_raw, ds);
             if let Some(&b) = ast.children(id).first() {
                 collect_reads(ast, b, ds);
             }
@@ -1727,6 +1957,7 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
         }
         NodeData::Case { pattern_raw, .. } => {
             add_words_counted(pattern_raw, ds);
+            add_words_binding(pattern_raw, ds);
             for &c in ast.children(id) {
                 collect_reads(ast, c, ds);
             }
@@ -1737,14 +1968,46 @@ fn collect_reads(ast: &PyAst, id: PyId, ds: &mut DeadScope) {
             add_words(raw, &mut ds.forbidden);
             return;
         }
-        NodeData::RawStmt(raw) => {
-            add_words_counted(raw, ds);
-            if raw.trim_start().starts_with("exec") {
-                ds.introspection = true;
+        NodeData::Delete => {
+            // `del y`：后续读取变成 NameError——名字进 forbidden；
+            // 下标/属性目标的基址是读取。
+            for &t in ast.children(id) {
+                // `del y` 是 y 的一次使用（删除绑定）——计入 reads，
+                // 同时进 forbidden（传播/尾返回不能改写被删除的名字）。
+                collect_reads(ast, t, ds);
+                collect_target_names(ast, t, &mut ds.forbidden);
             }
             return;
         }
-        NodeData::Import(_) | NodeData::FromImport(_) => return,
+        NodeData::NamedExpr { name } => {
+            // 海象绑定：`(y := v)` 是 y 的绑定，不是读取。
+            *ds.bindings.entry(name.clone()).or_insert(0) += 1;
+            if let Some(&v) = ast.children(id).first() {
+                collect_reads(ast, v, ds);
+            }
+            return;
+        }
+        NodeData::RawStmt(raw) => {
+            add_words_counted(raw, ds);
+            let t = raw.trim_start();
+            if t.starts_with("exec") {
+                ds.introspection = true;
+            }
+            // `del y` 会让后续读取变成 NameError；传播/尾返回都不能碰。
+            if t.starts_with("del") {
+                add_words(raw, &mut ds.forbidden);
+            }
+            // 版本相关语句里的绑定：PEP 695 `type X = …`、PEP 810
+            // `lazy import/from …`（未建模，整条 raw 保真）。
+            if t.starts_with("type ") || t.starts_with("lazy import") || t.starts_with("lazy from") {
+                add_words_binding(raw, ds);
+            }
+            return;
+        }
+        NodeData::Import(raw) | NodeData::FromImport(raw) => {
+            add_words_binding(raw, ds);
+            return;
+        }
         NodeData::Call { .. } => {
             if let Some(&f) = ast.children(id).first() {
                 if let NodeData::Name(n) = ast.data(f) {

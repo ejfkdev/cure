@@ -89,7 +89,7 @@ fn t262_no_panics_and_parse_rate() {
 fn t262_zero_progress_fuse() {
     // 保险丝单元验证：无效转义形态只跳字节，绝不无限累积
     let src = "var x = a._\\uZZZZ;";
-    let (toks, errs) = cure_ts_parser::Lexer::new(src).tokenize();
+    let (toks, errs, _comments) = cure_ts_parser::Lexer::new(src).tokenize();
     assert!(!toks.is_empty());
     assert!(toks.len() < 20, "token 数 {}——零进展累积回来了！", toks.len());
     assert!(errs.iter().any(|e| e.message.contains("zero-progress")));

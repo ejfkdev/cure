@@ -26,7 +26,7 @@ type R<T> = Result<T, String>;
 pub fn parse(src: &str) -> ParseOutcome {
     // UTF-8 BOM 不是 Python 源代码的一部分（CPython 自行剥离）。
     let src = src.strip_prefix('\u{feff}').unwrap_or(src);
-    let (toks, lex_errs) = tokenize(src);
+    let (toks, lex_errs, comments) = tokenize(src);
     let bool_names = bool_literals_are_shadowed(&toks);
     let mut p = Parser {
         src,
@@ -38,6 +38,7 @@ pub fn parse(src: &str) -> ParseOutcome {
         depth: 0,
         no_cond_lambda: false,
         bool_names,
+        in_async: false,
     };
     for e in lex_errs {
         p.errors.push(ParseError {
@@ -47,11 +48,18 @@ pub fn parse(src: &str) -> ParseOutcome {
         });
     }
     let mut items = Vec::new();
-    // 保留 shebang / PEP 263 编码声明：Python 2 源码没有它就无法按
-    // UTF-8 解码非 ASCII 内容，改成别的编码也可能改变语义。
+    // 保留文件头注释块（shebang、PEP 263 编码声明、license header、
+    // 文件级 `# type: ignore` / `# mypy:` 等）。Python 2 源码没有编码
+    // 声明就无法按原编码解码；类型检查指令丢失会改变检查结果。
+    let mut comments = comments;
     if let Some(header) = leading_header(src) {
+        // 文件头已整体作为 RawStmt 输出：其中的注释不能再进语句级注释
+        // 游标（否则会重复/变成空行）。
+        let header_lines = header.matches('\n').count() as u32 + 1;
+        comments.retain(|c| c.line > header_lines);
         items.push(p.ast.raw_stmt(&header));
     }
+    p.ast.set_comments(comments);
     while !p.at_eof() {
         let before = p.pos;
         if p.eat_kind(TokKind::Newline)
@@ -88,6 +96,9 @@ struct Parser<'a> {
     /// Python 2 允许 `True = 0`/`False = 1`；一旦出现绑定，模块内所有
     /// True/False 都按普通名字处理，避免把被遮蔽的条件折成常量。
     bool_names: bool,
+    /// 当前位于 `async def` 函数体内：只有这里 `await` 才是运算符；
+    /// 3.5/3.6 的普通代码里 `await` 是普通标识符（`await(1)` 是调用）。
+    in_async: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -178,11 +189,49 @@ impl<'a> Parser<'a> {
 
     fn parse_stmt_into(&mut self, out: &mut Vec<PyId>) {
         let start = self.pos;
+        let start_line = self.tk().line;
+        let n0 = out.len();
         if let Err(msg) = self.parse_stmt(out) {
             self.err_here(&msg);
             let raw = self.capture_raw_from(start);
             out.push(raw);
         }
+        // 语句行区间（注释附着）：起点是语句首 token 行（装饰器从 `@`
+        // 算起），终点是本次消费的最后一个非 trivia token 的结束位置。
+        let (end_line, end_col) = self.last_code_end(start);
+        for &s in &out[n0..] {
+            self.ast.set_span(s, start_line, end_line, end_col);
+            // 原文保真语句的 raw 文本已包含区间内注释，去掉游标副本。
+            if matches!(self.ast.data(s), NodeData::RawStmt(_)) {
+                self.ast.drop_comments_between(start_line, end_line);
+            }
+            // 装饰器/形参表/with 项等 raw 字段也已包含注释：按文本匹配去重，
+            // 避免打印 raw 后再从游标输出一次（会重复且破坏幂等）。
+            if let Some(blob) = raw_field_blob(self.ast.data(s)) {
+                self.ast.drop_comments_if(|c| {
+                    c.line >= start_line && c.line <= end_line && blob.contains(&c.text)
+                });
+            }
+        }
+    }
+
+    /// 本次语句解析消费的最后一个码 token 的结束位置（1-based 下一列）。
+    fn last_code_end(&self, from: usize) -> (u32, u32) {
+        for t in self.toks[from..self.pos].iter().rev() {
+            if matches!(
+                t.kind,
+                TokKind::Newline | TokKind::Indent | TokKind::Dedent | TokKind::Eof
+            ) {
+                continue;
+            }
+            let end = t.end as usize;
+            let before = &self.src[..end];
+            let line = before.bytes().filter(|b| *b == b'\n').count() as u32 + 1;
+            let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let col = before[line_start..].chars().count() as u32 + 1;
+            return (line, col);
+        }
+        (self.tk().line, self.tk().col)
     }
 
     fn parse_stmt(&mut self, out: &mut Vec<PyId>) -> R<()> {
@@ -666,7 +715,10 @@ impl<'a> Parser<'a> {
             ret_raw = self.slice_tokens(s, self.pos).trim().to_string();
         }
         self.expect_op(":")?;
+        let saved_async = self.in_async;
+        self.in_async = is_async;
         let body = self.parse_block()?;
+        self.in_async = saved_async;
         Ok(self.ast.function(
             &name,
             &params_raw,
@@ -1178,11 +1230,22 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_await_primary(&mut self) -> R<PyId> {
-        if self.eat_kw("await") {
+        // Python 3.5/3.6（以及更早）里 `await` 只在 `async def` 内是
+        // 关键字，普通代码里只是标识符：`await = 1`、`f(await=1)`、
+        // `x = await`、`await(1)`（调用）、`await[0]`（下标）都合法。
+        // 版本无关解析以「是否位于 async 函数体」为准；3.7+ 在
+        // 非 async 代码里写 await 本来就是语法错误，按标识符接收无害。
+        if self.at_kw("await") && !self.await_is_ident() {
+            self.advance();
             let e = self.parse_await_primary()?;
             return Ok(self.ast.push(NodeData::Await, vec![e]));
         }
         self.parse_primary()
+    }
+
+    /// `await` 是否按标识符处理：只在 `async def` 体内是运算符。
+    fn await_is_ident(&self) -> bool {
+        !self.in_async
     }
 
     fn parse_primary(&mut self) -> R<PyId> {
@@ -2082,41 +2145,61 @@ fn bool_literals_are_shadowed(toks: &[Token]) -> bool {
     false
 }
 
-/// 模块开头的 shebang 与编码声明（最多前两行）。
-fn leading_header(src: &str) -> Option<String> {
-    let lines: Vec<&str> = src.lines().take(2).collect();
-    let mut keep = 0usize;
-    if let Some(first) = lines.first() {
-        let t = first.trim_start_matches([' ', '\t', '\x0c']);
-        if t.starts_with("#!") {
-            keep = 1;
-            if lines.get(1).is_some_and(|l| is_coding_line(l)) {
-                keep = 2;
-            }
-        } else if is_coding_line(first) {
-            keep = 1;
-        } else if (t.is_empty() || t.starts_with('#'))
-            && lines.get(1).is_some_and(|l| is_coding_line(l))
-        {
-            // PEP 263 允许第一行为空行或注释、第二行写编码声明。
-            keep = 2;
+/// 语句节点里会原样打印的 raw 字段拼接（用于注释去重）。
+fn raw_field_blob(d: &NodeData) -> Option<String> {
+    match d {
+        NodeData::FunctionDef {
+            params_raw,
+            ret_raw,
+            deco_raw,
+            generics_raw,
+            ..
+        } => Some(format!("{params_raw}{ret_raw}{deco_raw}{generics_raw}")),
+        NodeData::ClassDef {
+            header_raw,
+            deco_raw,
+            ..
+        } => Some(format!("{header_raw}{deco_raw}")),
+        NodeData::For { target_raw, .. } | NodeData::CompFor { target_raw, .. } => {
+            Some(target_raw.clone())
         }
+        NodeData::With { items_raw, .. } => Some(items_raw.clone()),
+        NodeData::ExceptHandler { clause_raw } => Some(clause_raw.clone()),
+        NodeData::Case { pattern_raw, .. } => Some(pattern_raw.clone()),
+        NodeData::AnnAssign { annotation_raw } => Some(annotation_raw.clone()),
+        NodeData::Import(raw) | NodeData::FromImport(raw) => Some(raw.clone()),
+        NodeData::RawStmt(raw) => Some(raw.clone()),
+        _ => None,
     }
-    if keep == 0 {
-        return None;
-    }
-    Some(
-        lines[..keep]
-            .iter()
-            .map(|l| l.trim_end())
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
 }
 
-fn is_coding_line(line: &str) -> bool {
-    let t = line.trim_start_matches([' ', '\t', '\x0c']);
-    t.starts_with('#') && (t.contains("coding:") || t.contains("coding="))
+/// 模块开头的注释块（首条语句之前的所有注释行与空行）。
+///
+/// 之前只保留 shebang 与 PEP 263 编码声明；现在保留整个块，附带保住
+/// license header、文件级 `# type: ignore` / `# mypy: …` / `# pyright: …`
+/// （Python 2 的编码声明依然在首两行，行为不变）。只裁尾部空行
+///（保留前导空行以维持「第 2 行编码声明」），行尾空白裁掉，二次打印
+/// 幂等。
+fn leading_header(src: &str) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for line in src.lines() {
+        let t = line.trim_start_matches([' ', '\t', '\x0c']);
+        if t.is_empty() || t.starts_with('#') {
+            out.push(line.trim_end());
+        } else {
+            break;
+        }
+    }
+    // 保留前导空行：PEP 263 编码声明允许位于第 2 行（第 1 行空行），
+    // 删掉空行虽然仍合法，但会改变文件头字节；只裁尾部空行。
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join("\n"))
+    }
 }
 
 fn number_literal(raw: &str) -> Literal {

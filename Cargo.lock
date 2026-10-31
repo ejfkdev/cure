@@ -63,7 +63,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "cure-cli"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "assert_cmd",
  "cure-dart-ast",
@@ -90,18 +90,18 @@ dependencies = [
 
 [[package]]
 name = "cure-dart-ast"
-version = "0.3.1"
+version = "0.4.0"
 
 [[package]]
 name = "cure-dart-parser"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-dart-ast",
 ]
 
 [[package]]
 name = "cure-dart-print"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-dart-ast",
  "cure-dart-parser",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "cure-dart-simplify"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-dart-ast",
  "cure-dart-parser",
@@ -119,11 +119,11 @@ dependencies = [
 
 [[package]]
 name = "cure-engine"
-version = "0.3.1"
+version = "0.4.0"
 
 [[package]]
 name = "cure-java-ast"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-engine",
  "cure-tree",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "cure-java-parser"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-engine",
  "cure-java-ast",
@@ -140,14 +140,14 @@ dependencies = [
 
 [[package]]
 name = "cure-java-print"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-java-ast",
 ]
 
 [[package]]
 name = "cure-java-simplify"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-engine",
  "cure-java-ast",
@@ -157,25 +157,25 @@ dependencies = [
 
 [[package]]
 name = "cure-python-ast"
-version = "0.3.1"
+version = "0.4.0"
 
 [[package]]
 name = "cure-python-parser"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-python-ast",
 ]
 
 [[package]]
 name = "cure-python-print"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-python-ast",
 ]
 
 [[package]]
 name = "cure-python-simplify"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-engine",
  "cure-python-ast",
@@ -185,14 +185,14 @@ dependencies = [
 
 [[package]]
 name = "cure-tree"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-engine",
 ]
 
 [[package]]
 name = "cure-ts-ast"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-engine",
  "cure-tree",
@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "cure-ts-parser"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-engine",
  "cure-ts-ast",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "cure-ts-print"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-engine",
  "cure-ts-ast",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "cure-ts-simplify"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cure-engine",
  "cure-ts-ast",

@@ -117,6 +117,10 @@ pub const INDENT: &str = "    ";
 /// 整个编译单元 → 格式化源码。
 pub fn print_unit(ast: &JavaAst, unit: &CompilationUnit) -> String {
     let mut out = String::new();
+    if !unit.header_comments.is_empty() {
+        out.push_str(&unit.header_comments);
+        out.push_str("\n\n");
+    }
     if let Some(pkg) = &unit.package {
         if !unit.package_annotations.is_empty() {
             out.push_str(&unit.package_annotations);

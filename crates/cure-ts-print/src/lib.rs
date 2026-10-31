@@ -23,8 +23,36 @@ pub fn print_module(ast: &TsAst, unit: &ModuleUnit) -> String {
         p.out.push_str(&unit.shebang);
         p.out.push('\n');
     }
-    for item in &unit.items {
+    for l in &unit.leading_comments {
+        p.out.push_str(l);
+        p.out.push('\n');
+    }
+    for (i, item) in unit.items.iter().enumerate() {
+        let dirs: Vec<String> = unit
+            .item_directives
+            .get(i)
+            .cloned()
+            .unwrap_or_default();
+        if !dirs.is_empty() {
+            if let Some(Some((a, b))) = unit.item_source_spans.get(i) {
+                for d in &dirs {
+                    p.out.push_str(d);
+                    p.out.push('\n');
+                }
+                p.print_verbatim_span((*a as usize, *b as usize));
+                p.out.push('\n');
+                continue;
+            }
+            for d in &dirs {
+                p.out.push_str(d);
+                p.out.push('\n');
+            }
+        }
         p.print_top_item(item);
+        p.out.push('\n');
+    }
+    for d in &unit.tail_directives {
+        p.out.push_str(d);
         p.out.push('\n');
     }
     if !p.out.ends_with('\n') {
@@ -120,6 +148,38 @@ impl<'a> Printer<'a> {
     fn ind(&mut self) {
         for _ in 0..self.indent {
             self.out.push_str("    ");
+        }
+    }
+
+    /// 按源码区间逐行原样输出（带指令的语句/条目）：保留原有行结构，
+    /// 保证 `@ts-ignore` 抑制的行不变；去掉源首行缩进后按当前缩进重排。
+    fn print_verbatim_span(&mut self, span: (usize, usize)) {
+        let Some(src) = self.ast.source() else {
+            return;
+        };
+        if span.1 <= span.0 || span.1 > src.len() {
+            return;
+        }
+        let text = &src[span.0..span.1];
+        let line_start = src[..span.0].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let orig = &src[line_start..span.0];
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                self.out.push('\n');
+            }
+            let line = if i == 0 {
+                line
+            } else {
+                line.strip_prefix(orig).unwrap_or(line)
+            };
+            let line = line.trim_end_matches('\r');
+            if !line.is_empty() {
+                // 第一行：调用方已通过 nl_indent 输出行首缩进；后续行补缩进。
+                if i > 0 {
+                    self.ind();
+                }
+                self.out.push_str(line);
+            }
         }
     }
 
@@ -220,7 +280,27 @@ impl<'a> Printer<'a> {
             return;
         }
         self.indent += 1;
-        for m in &c.members {
+        for (i, m) in c.members.iter().enumerate() {
+            let dirs = c
+                .member_directives
+                .get(i)
+                .cloned()
+                .unwrap_or_default();
+            if !dirs.is_empty() {
+                if let Some(Some(span)) = c.member_spans.get(i) {
+                    for d in &dirs {
+                        self.nl_indent();
+                        self.out.push_str(d);
+                    }
+                    self.nl_indent();
+                    self.print_verbatim_span((span.0 as usize, span.1 as usize));
+                    continue;
+                }
+                for d in &dirs {
+                    self.nl_indent();
+                    self.out.push_str(d);
+                }
+            }
             self.print_class_member(m);
         }
         self.indent -= 1;
@@ -670,6 +750,9 @@ impl<'a> Printer<'a> {
             }
             self.indent += 1;
             for &st in self.ast.children(c).iter().skip(*labels as usize) {
+                if self.print_directive_lead(st) {
+                    continue;
+                }
                 self.nl_indent();
                 self.print_stmt_at(st);
             }
@@ -690,6 +773,9 @@ impl<'a> Printer<'a> {
         }
         self.indent += 1;
         for &s in &stmts {
+            if self.print_directive_lead(s) {
+                continue;
+            }
             self.nl_indent();
             self.print_stmt_at(s);
         }
@@ -699,12 +785,51 @@ impl<'a> Printer<'a> {
     }
 
     /// 语句位（if/while/for 体）：块 → 块形态；单语句 → 单行（同缩进）。
+    /// 带行级指令的单语句体提升为块，让指令独占一行且不吞掉语句。
     fn print_stmt_or_inline(&mut self, s: TsId) {
         if self.ast.kind(s) == NodeKind::Block {
             self.print_block_like(s);
             return;
         }
-        self.print_stmt_at(s);
+        if self.ast.stmt_directives(s).is_empty() {
+            self.print_stmt_at(s);
+            return;
+        }
+        while self.out.ends_with(' ') {
+            self.out.pop();
+        }
+        self.out.push_str(" {");
+        self.indent += 1;
+        let handled = self.print_directive_lead(s);
+        if !handled {
+            self.nl_indent();
+            self.print_stmt_at(s);
+        }
+        self.indent -= 1;
+        self.nl_indent();
+        self.out.push('}');
+    }
+
+    /// 打印语句前的指令行；若该语句有原文区间则整段原文输出并返回 true。
+    fn print_directive_lead(&mut self, s: TsId) -> bool {
+        let dirs: Vec<String> = self.ast.stmt_directives(s).to_vec();
+        if dirs.is_empty() {
+            return false;
+        }
+        if let Some(span) = self.ast.stmt_source_span(s) {
+            for d in &dirs {
+                self.nl_indent();
+                self.out.push_str(d);
+            }
+            self.nl_indent();
+            self.print_verbatim_span(span);
+            return true;
+        }
+        for d in &dirs {
+            self.nl_indent();
+            self.out.push_str(d);
+        }
+        false
     }
 
     // ---- 表达式 ----
@@ -1479,6 +1604,36 @@ mod tests {
         let out = roundtrip("class A {\n  constructor() {}\n}\nclass B {\n  x = 1;\n}\n");
         assert!(out.contains("class A {\n    constructor() {}\n}\n"), "{out}");
         assert!(out.contains("class B {\n    x = 1;\n}\n"), "{out}");
+    }
+
+    #[test]
+    fn line_directives_freeze_statement_source() {
+        let src = "// @ts-ignore\nconst a: number = \"x\";\nfunction f() {\n  // @ts-expect-error\n  const b: string = 1;\n  /*#__PURE__*/ foo();\n  const c = 1; // ordinary\n  return b;\n}\n";
+        let out = roundtrip(src);
+        // 文件首条 @ts-ignore 附到首条语句，语句按原文单行输出
+        assert!(out.starts_with("// @ts-ignore\nconst a: number = \"x\";"), "{out}");
+        assert!(out.contains("// @ts-expect-error\n    const b: string = 1;"), "{out}");
+        assert!(out.contains("/*#__PURE__*/\n    foo();"), "{out}");
+        // 普通叙述性注释仍不保留
+        assert!(!out.contains("ordinary"), "{out}");
+
+        // 类成员指令同样按原文行结构输出（保持 @ts-ignore 抑制的行）
+        let cls = "class C {\n  // @ts-ignore\n  m(a: number): string { return a; }\n}\n";
+        let out = roundtrip(cls);
+        assert!(out.contains("// @ts-ignore\n    m(a: number): string { return a; }"), "{out}");
+        assert_eq!(out, roundtrip(&out));
+    }
+
+    #[test]
+    fn leading_comments_and_directives_are_preserved() {
+        let out = roundtrip(
+            "#!/usr/bin/env node\n// @ts-nocheck\n/// <reference path=\"a.d.ts\" />\n/* @flow */\n// license\nconst x = 1;\n",
+        );
+        assert!(out.starts_with("#!/usr/bin/env node\n// @ts-nocheck\n"), "{out}");
+        assert!(out.contains("/// <reference path=\"a.d.ts\" />"), "{out}");
+        assert!(out.contains("/* @flow */"), "{out}");
+        assert!(out.contains("// license"), "{out}");
+        assert_eq!(out, roundtrip(&out));
     }
 
     #[test]

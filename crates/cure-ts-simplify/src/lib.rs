@@ -1506,6 +1506,122 @@ impl Rule<TsAst> for TsInlineFunc {
     }
 }
 
+/// **零参 IIFE 内联**：`(() => expr)()` / `(() => { return expr; })()` →
+/// `expr`；普通函数表达式只在体表达式不依赖函数语境时内联。
+///
+/// 安全性：零参数、无类型参数、函数体只有单个返回表达式（无声明/指令），
+/// 因此调用只做一次求值。箭头函数的 `this`/`arguments`/`super`/
+/// `new.target` 都是词法的，内联到原位置后指向同一外层；普通函数的这些
+/// 语境不同，出现即跳过。含 `eval` 时跳过（内联会改变 var 泄漏作用域）。
+pub struct TsIifeInline;
+
+impl Rule<TsAst> for TsIifeInline {
+    fn name(&self) -> &'static str {
+        "ts_iife_inline"
+    }
+    fn structural(&self) -> bool {
+        true
+    }
+    fn kinds(&self) -> &'static [NodeKind] {
+        &[NodeKind::Call]
+    }
+    fn check(&self, ctx: RewriteCtx<'_, TsAst>, id: TsId) -> Option<Edit<TsAst>> {
+        let RewriteCtx { lang, .. } = ctx;
+        if lang.kind(id) != NodeKind::Call {
+            return None;
+        }
+        if matches!(lang.data(id), NodeData::Call { optional: true }) {
+            return None;
+        }
+        let ch = lang.children(id).to_vec();
+        if ch.len() != 1 {
+            return None;
+        }
+        let mut callee = ch[0];
+        while let NodeData::Paren = lang.data(callee) {
+            callee = *lang.children(callee).first()?;
+        }
+        let (arrow, body) = match lang.data(callee) {
+            NodeData::Lambda {
+                params_raw,
+                name,
+                generics_raw,
+                arrow,
+                is_async,
+                is_generator,
+                ..
+            } => {
+                if *is_async
+                    || *is_generator
+                    || !params_raw.trim().is_empty()
+                    || !generics_raw.trim().is_empty()
+                    || !name.is_empty()
+                {
+                    return None;
+                }
+                (*arrow, *lang.children(callee).first()?)
+            }
+            _ => return None,
+        };
+        let expr = if matches!(lang.data(body), NodeData::Block) {
+            let stmts = lang.children(body);
+            if stmts.len() != 1 {
+                return None;
+            }
+            let ret = stmts[0];
+            if !matches!(lang.data(ret), NodeData::Return) {
+                return None;
+            }
+            let rc = lang.children(ret);
+            if rc.len() != 1 {
+                return None;
+            }
+            rc[0]
+        } else if arrow {
+            body
+        } else {
+            return None;
+        };
+        if contains_eval(lang, expr) {
+            return None;
+        }
+        if !arrow && uses_function_context(lang, expr) {
+            return None;
+        }
+        Some(Edit::Replace { target: id, with: expr })
+    }
+}
+
+/// 直接 `eval` 调用（内联会改变 eval 声明变量的作用域）。
+fn contains_eval(lang: &TsAst, id: TsId) -> bool {
+    if let NodeData::Call { .. } = lang.data(id) {
+        if let Some(&callee) = lang.children(id).first() {
+            if let NodeData::VarRef { name } = lang.data(callee) {
+                if lang.sn(*name) == "eval" {
+                    return true;
+                }
+            }
+        }
+    }
+    lang.children(id).iter().any(|&c| contains_eval(lang, c))
+}
+
+/// 普通函数体内的 `this`/`arguments`/`super`/`new.target`（含嵌套箭头 —
+/// 保守：嵌套普通函数里的这些本可安全，但一起拒绝）。
+fn uses_function_context(lang: &TsAst, id: TsId) -> bool {
+    match lang.data(id) {
+        NodeData::This => return true,
+        NodeData::VarRef { name } if lang.sn(*name) == "arguments" => return true,
+        NodeData::Raw { text }
+            if text.starts_with("super") || text.trim() == "new.target" =>
+        {
+            return true;
+        }
+        _ => {}
+    }
+    lang.children(id).iter().any(|&c| uses_function_context(lang, c))
+}
+
 /// 表达式的参数替换克隆（VarRef 命中参数 → 实参节点；否则按结构克隆）。
 fn subst_expr(
     lang: &mut TsAst,
@@ -1531,6 +1647,7 @@ pub fn default_ts_rules() -> Vec<Box<dyn Rule<TsAst>>> {
     rules.push(Box::new(TsTruthyFold));
     rules.push(Box::new(TsMemberUnquote));
     rules.push(Box::new(TsInlineFunc));
+    rules.push(Box::new(TsIifeInline));
     rules.push(Box::new(crate::rules::TsAssignToCompound));
     // 移植规则包（字面量求值 / try 清理 / else 展平 / 尾赋值返回 /
     // 纯调用删除）

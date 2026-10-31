@@ -186,6 +186,23 @@ String tir(int c) {
   } finally {
   }
 }
+
+int lp1(int x) { final v = 5; return v + x; }
+String lp2() { final a = 'x'; final b = a + a; return b; }
+bool lp3(bool c) { final t = true; return t ? c : !t; }
+int lp4(int n) {
+  final step = 2;
+  var sum = 0;
+  for (var i = 0; i < n; i++) { sum += step * i; }
+  return sum;
+}
+int lp5(int x) { final y = 3; final f = () => y; return f() + x; }
+int lp6(int x) { final v = 4; return v.toString().length + x; }
+String lp7(int x) { final v = 'v'; return 'v=$v:$x'; }
+int lp8(int x) { final v = 1; int g(int v) => v + 1; return g(x) + v; }
+String locals() {
+  return '${lp1(1)},${lp2()},${lp3(true) ? 1 : 0}${lp3(false) ? 1 : 0},${lp4(4)},${lp5(2)},${lp6(3)},${lp7(4)},${lp8(5)}';
+}
 """
 
 MODERN = r"""
@@ -279,6 +296,7 @@ void main() {
   trailing_void();
   print(tir(7));
   print(calls(8));
+  print(locals());
 """)
     if modern:
         body.append("""

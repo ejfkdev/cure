@@ -4,6 +4,8 @@
 //! 永不中止。缩进用「空格 + tab×8」宽度比较（CPython TabError 不在
 //! 本工具职责内）。
 
+use cure_python_ast::Comment;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TokKind {
     Name,
@@ -42,7 +44,7 @@ const OPS: &[&str] = &[
     ",", ";", ".", "+", "-", "*", "/", "%", "@", "&", "|", "^", "~", "<", ">", "=", "`",
 ];
 
-pub fn tokenize(src: &str) -> (Vec<Token>, Vec<LexError>) {
+pub fn tokenize(src: &str) -> (Vec<Token>, Vec<LexError>, Vec<Comment>) {
     Lexer::new(src).run()
 }
 
@@ -54,6 +56,7 @@ struct Lexer<'a> {
     col: u32,
     toks: Vec<Token>,
     errors: Vec<LexError>,
+    comments: Vec<Comment>,
     indents: Vec<usize>,
     at_line_start: bool,
     line_has_code: bool,
@@ -72,6 +75,7 @@ impl<'a> Lexer<'a> {
             col: 1,
             toks: Vec::new(),
             errors: Vec::new(),
+            comments: Vec::new(),
             indents: vec![0],
             at_line_start: true,
             line_has_code: false,
@@ -120,7 +124,7 @@ impl<'a> Lexer<'a> {
         });
     }
 
-    fn run(mut self) -> (Vec<Token>, Vec<LexError>) {
+    fn run(mut self) -> (Vec<Token>, Vec<LexError>, Vec<Comment>) {
         let mut nl_before = false;
         loop {
             if self.at_line_start && self.paren_depth == 0 {
@@ -176,12 +180,15 @@ impl<'a> Lexer<'a> {
                 continue;
             }
             if c == '#' {
+                let (line, col) = (self.line, self.col);
+                let start = self.pos;
                 while let Some(c) = self.peek() {
                     if c == '\n' || c == '\r' {
                         break;
                     }
                     self.bump();
                 }
+                self.record_comment(start, line, col);
                 continue;
             }
             if c.is_whitespace() {
@@ -302,10 +309,30 @@ impl<'a> Lexer<'a> {
             self.col,
             false,
         );
-        (self.toks, self.errors)
+        (self.toks, self.errors, self.comments)
     }
 
     /// 处理行首缩进；返回 false 表示本行是空行/纯注释（已消费）。
+    /// 注释是否独占本行（前面只有空白）。
+    fn comment_is_own_line(&self, start: usize) -> bool {
+        let line_start = self.src[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        self.src[line_start..start].trim().is_empty()
+    }
+
+    fn record_comment(&mut self, start: usize, line: u32, col: u32) {
+        let own_line = self.comment_is_own_line(start);
+        let mut end = self.pos;
+        while end > start && matches!(self.bytes.get(end - 1), Some(b'\n' | b'\r')) {
+            end -= 1;
+        }
+        self.comments.push(Comment {
+            line,
+            col,
+            text: self.src[start..end].to_string(),
+            own_line,
+        });
+    }
+
     fn consume_indentation(&mut self) -> bool {
         let start = self.pos;
         let mut width = 0usize;
@@ -332,6 +359,7 @@ impl<'a> Lexer<'a> {
             || self.peek() == Some('\r')
             || self.peek() == Some('#')
         {
+            let comment_at = (self.peek() == Some('#')).then(|| (self.pos, self.line, self.col));
             while let Some(c) = self.peek() {
                 if c == '\n' {
                     self.bump();
@@ -345,6 +373,9 @@ impl<'a> Lexer<'a> {
                     break;
                 }
                 self.bump();
+            }
+            if let Some((start, line, col)) = comment_at {
+                self.record_comment(start, line, col);
             }
             return false;
         }

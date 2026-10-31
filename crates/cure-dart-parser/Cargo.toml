@@ -11,4 +11,4 @@ keywords = ["dart", "parser", "lexer", "deobfuscator"]
 categories = ["development-tools", "parser-implementations"]
 
 [dependencies]
-cure-dart-ast = { path = "../cure-dart-ast", version = "0.3.1" }
+cure-dart-ast = { path = "../cure-dart-ast", version = "0.4.0" }

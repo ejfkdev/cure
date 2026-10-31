@@ -51,7 +51,7 @@ Highlights:
   parameters; PEP 701 f-strings, t-strings, `match`, walrus, `except*`, PEP
   695, `lazy import`), Python-semantics constant folding that preserves
   Python 2 int/long types and `True`/`False` rebinding, and generator/scope
-  guards. A 27-rule pack includes literal string/builtin/subscript folding,
+  guards. A 28-rule pack includes literal string/builtin/subscript folding,
   if/else-to-conditional (including adjacent `return` branches), nested-if
   merging, else-after-terminal and empty-branch removal, not/is/in
   rewriting, redundant-paren removal, function-scope dead-assignment

@@ -36,6 +36,8 @@ pub enum TokKind {
     Eof,
 }
 
+use cure_ts_ast::Comment;
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct Token {
     pub kind: TokKind,
@@ -118,6 +120,9 @@ pub struct Lexer<'a> {
     /// Annex B HTML 闭合注释 `-->` 只在此位置生效。
     at_line_start: bool,
     errors: Vec<LexError>,
+    comments: Vec<Comment>,
+    /// 源码里没有任何行级指令标记时不必收集注释（大语料零开销）。
+    collect_comments: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -139,13 +144,26 @@ impl<'a> Lexer<'a> {
             last_brace_regex: false,
             at_line_start: true,
             errors: Vec::new(),
+            comments: Vec::new(),
+            collect_comments: [
+                "@ts-ignore",
+                "@ts-expect-error",
+                "__PURE__",
+                "__pure__",
+                "eslint-disable-next-line",
+                "prettier-ignore",
+                "istanbul ignore next",
+                "@vite-ignore",
+            ]
+            .iter()
+            .any(|k| src.contains(k)),
         }
     }
 
     /// 全量词法（容错）。**零进展防御**：非 Eof token 必须消费 ≥1 字节
     /// ——违反即跳过该字节并记错（异常转义/未来词法 bug 的保险丝；
     /// test262 曾因空 ident 零消费进入无限 token 累积 → 系统级 OOM）。
-    pub fn tokenize(mut self) -> (Vec<Token>, Vec<LexError>) {
+    pub fn tokenize(mut self) -> (Vec<Token>, Vec<LexError>, Vec<Comment>) {
         let mut toks = Vec::new();
         loop {
             let before = self.pos;
@@ -166,7 +184,7 @@ impl<'a> Lexer<'a> {
                 self.pos += utf8_len(self.peek()).max(1);
             }
         }
-        (toks, self.errors)
+        (toks, self.errors, self.comments)
     }
 
     fn err(&mut self, msg: &str) {
@@ -200,6 +218,25 @@ impl<'a> Lexer<'a> {
     }
 
     /// 跳过空白与注释；返回是否遇到换行。
+    /// 记录一条注释（行号/字节区间/是否独占行）。
+    fn record_comment(&mut self, start: usize, end: usize, line: usize, line_start: usize) {
+        if !self.collect_comments {
+            return;
+        }
+        // 块注释可能跨行：line_start 必须取注释起点所在行，不能用扫描后的值。
+        let ls = line_start.min(start);
+        let own_line = self.src[ls..start]
+            .iter()
+            .all(|b| matches!(*b, b' ' | b'\t' | 0x0b | 0x0c));
+        self.comments.push(Comment {
+            line: line as u32,
+            start: start as u32,
+            end: end as u32,
+            own_line,
+            text: String::from_utf8_lossy(&self.src[start..end]).to_string(),
+        });
+    }
+
     fn skip_trivia(&mut self) -> bool {
         let mut newline = false;
         loop {
@@ -251,23 +288,38 @@ impl<'a> Lexer<'a> {
                     self.line_start = self.pos;
                 }
                 b'/' if self.peek2() == b'/' => {
+                    let start = self.pos;
+                    let line = self.line;
+                    let line_start = self.line_start;
                     while !self.at_end() && self.peek() != b'\n' {
                         self.pos += 1;
                     }
+                    self.record_comment(start, self.pos, line, line_start);
                 }
                 // Annex B HTML 注释：`<!--`（任意位置）与行首 `-->`
                 b'<' if self.src[self.pos..].starts_with(b"<!--") => {
+                    let start = self.pos;
+                    let line = self.line;
+                    let line_start = self.line_start;
                     while !self.at_end() && self.peek() != b'\n' {
                         self.pos += 1;
                     }
+                    self.record_comment(start, self.pos, line, line_start);
                 }
                 b'-' if self.at_line_start && self.src[self.pos..].starts_with(b"-->") =>
                 {
+                    let start = self.pos;
+                    let line = self.line;
+                    let line_start = self.line_start;
                     while !self.at_end() && self.peek() != b'\n' {
                         self.pos += 1;
                     }
+                    self.record_comment(start, self.pos, line, line_start);
                 }
                 b'/' if self.peek2() == b'*' => {
+                    let start = self.pos;
+                    let line = self.line;
+                    let line_start = self.line_start;
                     self.pos += 2;
                     while !self.at_end() {
                         if self.peek() == b'*' && self.peek2() == b'/' {
@@ -290,6 +342,7 @@ impl<'a> Lexer<'a> {
                         }
                         self.bump();
                     }
+                    self.record_comment(start, self.pos, line, line_start);
                 }
                 _ => return newline,
             }
@@ -914,7 +967,7 @@ mod tests {
     use super::*;
 
     fn kinds(src: &str) -> Vec<(TokKind, String)> {
-        let (toks, errs) = Lexer::new(src).tokenize();
+        let (toks, errs, _comments) = Lexer::new(src).tokenize();
         assert!(errs.is_empty(), "{errs:?}");
         toks.into_iter()
             .filter(|t| t.kind != TokKind::Eof)
@@ -974,7 +1027,7 @@ mod tests {
 
     #[test]
     fn newline_flag() {
-        let (toks, _) = Lexer::new("a\nb").tokenize();
+        let (toks, _, _) = Lexer::new("a\nb").tokenize();
         let b = toks.iter().find(|t| t.text == "b").unwrap();
         assert!(b.newline_before);
         let a = toks.iter().find(|t| t.text == "a").unwrap();

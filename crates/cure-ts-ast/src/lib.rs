@@ -358,6 +358,10 @@ pub struct ClassDecl {
     pub kind_kw: String,
     pub name: String,
     pub members: Vec<ClassMember>,
+    /// 与 `members` 对齐的行级指令（`// @ts-ignore` 等），打印在成员前。
+    pub member_directives: Vec<Vec<String>>,
+    /// 与 `members` 对齐的源码字节区间（带指令时按原文输出）。
+    pub member_spans: Vec<Option<(u32, u32)>>,
     /// 完整 class 源码区间（`class` 起，至 `}`）。
     pub raw_span: Option<(u32, u32)>,
 }
@@ -376,10 +380,32 @@ pub enum ClassMember {
     Raw(String),
 }
 
+/// 词法阶段收集的注释（语句级指令附着用）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Comment {
+    pub line: u32,
+    /// 源码字节区间（含注释定界符）。
+    pub start: u32,
+    pub end: u32,
+    pub own_line: bool,
+    pub text: String,
+}
+
 /// 模块单元。
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct ModuleUnit {
     pub shebang: String,
+    /// 文件头注释块（首条语句之前的所有注释与空行，原样逐行保存）。
+    /// 打印器原样输出：`// @ts-nocheck`、`/// <reference …>`、
+    /// `/* @flow */`、license header 与首条语句上方的行级指令都因此
+    /// 不丢失，类型检查/编译行为不变。
+    pub leading_comments: Vec<String>,
+    /// 与 `items` 逐项对齐的语句级指令注释（`// @ts-ignore` 等）。
+    pub item_directives: Vec<Vec<String>>,
+    /// 与 `items` 对齐的源码字节区间（带指令时按原文输出）。
+    pub item_source_spans: Vec<Option<(u32, u32)>>,
+    /// 文件末尾没有后续语句可附着的指令。
+    pub tail_directives: Vec<String>,
     pub items: Vec<TopItem>,
 }
 
@@ -455,6 +481,12 @@ pub struct TsAst {
     source: Option<Arc<str>>,
     /// 函数/对象字面量节点 → 源码字节区间（preserve_function_source）。
     source_spans: HashMap<TsId, (u32, u32)>,
+    /// 语句级指令注释：`// @ts-ignore` / `@ts-expect-error` /
+    /// `/*#__PURE__*/` / `eslint-disable-next-line` 等。普通叙述性注释仍
+    /// 不保留（Python 后端是语句级全注释保留）。
+    stmt_directives: HashMap<TsId, Vec<String>>,
+    /// 语句源码字节区间（带指令时按原文整段输出，保持行结构）。
+    stmt_source_spans: HashMap<TsId, (u32, u32)>,
     /// 打印时函数/class/对象字面量原文输出。
     preserve_source: bool,
     /// 区域事件索引（B3 惰性重建）。
@@ -549,6 +581,28 @@ impl TsAst {
     }
 
     /// 记录函数/对象字面量节点的源码区间。
+    pub fn set_stmt_directives(&mut self, id: TsId, dirs: Vec<String>) {
+        if !dirs.is_empty() {
+            self.stmt_directives.insert(id, dirs);
+        }
+    }
+
+    pub fn stmt_directives(&self, id: TsId) -> &[String] {
+        self.stmt_directives.get(&id).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    pub fn set_stmt_source_span(&mut self, id: TsId, start: usize, end: usize) {
+        if end > start {
+            self.stmt_source_spans.insert(id, (start as u32, end as u32));
+        }
+    }
+
+    pub fn stmt_source_span(&self, id: TsId) -> Option<(usize, usize)> {
+        self.stmt_source_spans
+            .get(&id)
+            .map(|&(a, b)| (a as usize, b as usize))
+    }
+
     pub fn set_source_span(&mut self, id: TsId, start: usize, end: usize) {
         if end > start {
             self.source_spans.insert(id, (start as u32, end as u32));
@@ -2190,6 +2244,9 @@ impl Lang for TsAst {
             // TS 类型实参：类型层可见（丢弃会改变推断），整块不参与
             // 表达式化简（基址仍作为普通子节点被分析）。
             NodeData::TypeArgs { .. } => true,
+            // 带行级指令注释（@ts-ignore/@ts-expect-error/@__PURE__ 等）的
+            // 语句冻结：改写或删除会让指令失去附着对象。
+            _ if !self.stmt_directives.is_empty() && self.stmt_directives.contains_key(&id) => true,
             // 解构模式：绑定名在原文里（事件盲区）——含模式的名字必须
             // 以不透明拒绝传播/删除
             NodeData::Destruct { .. } | NodeData::DestructStmt { .. } => true,

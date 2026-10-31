@@ -3,6 +3,66 @@
 本项目所有显著变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-10-31
+
+### 修复（版本兼容性）
+
+- **Java 25 紧凑源文件**（JEP 512）：省略外层 `class`、顶层直接写字段/
+  方法/实例 `main` 的源文件曾被报 `expected type declaration` 并把整段
+  按 raw 保真（`--strict` 会失败）。现在识别隐式类成员形态，0 诊断、
+  幂等，内容仍逐字节保留；JDK 25 编译验证通过。JDK 27 预览的基元模式
+  （`case int i`）与未命名变量也验证可解析/保真。
+- **Python 3.5/3.6 `await` 软关键字**：`await = 1`、`def f(await=2)`、
+  `f(await=4)` 曾按现代 `await` 运算符解析报错。解析器现在按后随 token
+  消歧（赋值/分隔/属性位按标识符，其余保持现代 async 语义），3.5/3.6
+  旧代码与 3.7+ 代码都能解析。
+- **版本矩阵核对**（临时语料，不作为常驻测试）：Python 2.0–3.15
+  （py2 print/exec/raise/反引号/`<>`/long/元组形参 → t-string/PEP 695/
+  696/701/758/810）、Java 8–27（records/patterns/sealed/text blocks/
+  module import/compact source/primitive patterns 预览）、ES5–ES2026
+  （async generators/class fields/static blocks/import attributes/using/
+  iterator helpers）、TS 1.x–5.x（decorators/const type params/type
+  arguments/satisfies/using）、Dart 1.24–3.13（旧 typedef/final 形参 →
+  records/patterns/extension types/primary constructors/dot shorthands）
+  均 0 诊断、二次运行 0 漂移；有可用 SDK 的组合（Node/tsc、javac、
+  Dart 1.24.3/2.19.6/3.13、Python 3.15）编译或诊断集合与原文件一致。
+- **注释保真（大幅补全）**：
+  - **Python**：语句级注释全部保留——独立行注释、行尾注释（含
+    `# type: ignore`、`# noqa`、`# fmt: off`）、文件头 license/编码块；
+    打印器按源码行把独立注释放到下一条语句前、行尾注释接在语句末尾。
+    简化删除语句时其注释会顺延到下一条语句/文件末尾（不丢失）。
+  - **TypeScript/JavaScript**：保留文件头块与行级指令（`// @ts-ignore`、
+    `@ts-expect-error`、`/*#__PURE__*/`、`eslint-disable-next-line`、
+    `prettier-ignore`、`istanbul ignore next`、`@vite-ignore`）；带指令的
+    语句按源码原文行结构整段输出（不再展开成多行），因此 `@ts-ignore`
+    抑制的仍是原来那一行（曾把单行 `class Bad { x: number = "y"; }`
+    展开后导致 tsc 多报一条）。带指令语句同时被标记为不透明，规则不会
+    改写/删除它。普通叙述性注释在 TS/JS 代码中间仍不保留。
+  - **Java**：文件头注释块（license、`//noinspection` 等）原样输出在
+    package/import 之前；代码中间的行级注释仍不保留。
+  - Dart 仍是唯一逐 token 全注释保真后端；TS 的
+    `--preserve-function-source` 可保留函数/类/对象字面量内部注释。
+
+### 增强（简化规则）
+
+- **Python 27 → 28**：新增 `py_local_propagation`——函数首条
+  `y = <标量字面量>` 且 y 只绑定一次、不是形参/`global`/`nonlocal`/
+  `del`/海象目标、嵌套作用域不重绑定、函数无 locals/eval 反射时，把
+  字面量内联到所有读取位（裸字符串表达式语句除外，避免生成新
+  docstring）；`del y` 同时计为读取与禁用标记，防止把赋值删成
+  UnboundLocalError。
+- **Dart 24 → 25**：新增 `dart_local_propagation`——单 token 的
+  `final/var/const y = <标量字面量>` 在块内所有出现都是明确的表达式
+  操作数时内联并删除声明；声明/参数表/catch/模式/`for` 头/多声明器/
+  字符串插值/成员访问/可空后缀位都会让规则整体跳过（token 模型无法
+  改写插值或区分遮蔽绑定）。Dart 1/2/3 运行时差分（含局部变量、
+  `this`/闭包/循环用例）0 失配。
+- **TS/JS 新增 `ts_iife_inline`**：零参、无类型参数、单表达式或单
+  `return` 体的 IIFE（`(() => expr)()`、`(function(){ return expr; })()`）
+  内联为表达式；普通函数若体表达式依赖 `this`/`arguments`/`super`/
+  `new.target` 则保留，含 `eval` 或异步/生成器/有参形态保留。node
+  运行时差分（class 方法 this、arguments、eval、strict this）0 失配。
+
 ## [0.3.1] - 2026-10-27
 
 ### 修复
@@ -878,7 +938,8 @@ var b=2;`——`b` 变成非导出（模块语义改变）。
 - 跨平台批量 I/O：Linux `io_uring` feature（read syscall 6,977 → 10，
   syscall 时长 −53%）；macOS/Windows 线程池；默认构建零运行时依赖
 
-[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ejfkdev/cure/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/ejfkdev/cure/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ejfkdev/cure/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ejfkdev/cure/releases/tag/v0.2.0

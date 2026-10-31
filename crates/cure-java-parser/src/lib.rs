@@ -402,7 +402,39 @@ impl<'src> Parser<'src> {
         }
     }
 
-    /// 值类（JDK 28 预览 JEP draft：`value class` / 内部亦可能 `value` + 其他
+    /// 文件头注释块：首条声明之前的连续 `//`/`/* … */` 注释（原样）。
+fn leading_comments(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut i = 0usize;
+    let mut out: Vec<String> = Vec::new();
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'/' {
+            let start = i;
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            out.push(src[start..i].trim_end().to_string());
+        } else if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < b.len() {
+                i += 2;
+            }
+            out.push(src[start..i].to_string());
+        } else {
+            break;
+        }
+    }
+    out.join("\n")
+}
+
+/// 值类（JDK 28 预览 JEP draft：`value class` / 内部亦可能 `value` + 其他
     /// 声明）。两 token 前瞻判定——不进 is_modifier_kw（value 是常见标识符，
     /// 会误吃变量名/字段名）
     fn at_value_decl(&self) -> bool {
@@ -411,6 +443,36 @@ impl<'src> Parser<'src> {
 
     fn at_kw(&self, s: &str) -> bool {
         matches!(self.tok().tok, Tok::Ident(i) if i == s)
+    }
+
+    /// Java 25 紧凑源文件（JEP 512 隐式类）：编译单元允许直接出现成员
+    ///（方法/字段/初始化块），没有外层 `class … { }`。识别成员起始形态
+    ///（`Type name`、`Type<…>`、`Type[]`、`pkg.Type`、`{`），按原文保真
+    /// 且不报语法错误（内容不变，只是不参与类型级改写）。
+    fn at_implicit_member(&self) -> bool {
+        if self.at_punct("{") {
+            return true;
+        }
+        if !matches!(self.tok().tok, Tok::Ident(_)) {
+            return false;
+        }
+        match &self.peek(1).tok {
+            Tok::Ident(n) => {
+                let name: &str = n;
+                !matches!(
+                    name,
+                    "class"
+                        | "interface"
+                        | "enum"
+                        | "record"
+                        | "extends"
+                        | "implements"
+                        | "permits"
+                )
+            }
+            Tok::Punct(p) => matches!(*p, "<" | "[" | "."),
+            _ => false,
+        }
     }
     /// `@interface` 注解类型声明（`@` 是独立 punct，词法层不成单 token）。
     fn at_annotation_decl(&self) -> bool {
@@ -831,6 +893,7 @@ impl<'src> Parser<'src> {
 
     fn compilation_unit(&mut self) -> CompilationUnit {
         let mut unit = CompilationUnit::default();
+        unit.header_comments = Self::leading_comments(self.src);
         let mut guard = 0usize;
         loop {
             guard += 1;
@@ -952,8 +1015,11 @@ impl<'src> Parser<'src> {
             // 顶层无法识别 → 原文保真（**含已消费的修饰符**——mods 文本
             // 前置拼回：R15 三角化根因 6：Java 25 隐式类顶层 `protected
             // void finalize()` 曾从 mods 后取 raw 静默吞 protected——
-            // 可见性降低无法覆盖 Object.finalize）
-            self.err_at("expected type declaration");
+            // 可见性降低无法覆盖 Object.finalize）。
+            // Java 25 紧凑源文件的顶层成员是合法语法（隐式类），不报错。
+            if !self.at_implicit_member() {
+                self.err_at("expected type declaration");
+            }
             let pos_before = self.pos;
             let text = self.sync_member();
             let text = if !mods.trim().is_empty() {

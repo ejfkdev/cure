@@ -50,10 +50,20 @@ pub fn print_module(ast: &PyAst, module: PyId) -> String {
         ast,
         out: String::new(),
         indent: 0,
+        ci: 0,
     };
-    for &stmt in ast.children(module) {
+    let stmts = ast.children(module).to_vec();
+    for (i, &stmt) in stmts.iter().enumerate() {
+        p.flush_leading(stmt);
         p.print_stmt(stmt);
+        let next_same_line = stmts.get(i + 1).is_some_and(|&n| {
+            p.ast.span(stmt).zip(p.ast.span(n)).is_some_and(|(a, b)| {
+                a.end_line == b.start_line
+            })
+        });
+        p.attach_trailing(stmt, next_same_line);
     }
+    p.flush_rest();
     let mut s = p.out;
     while s.ends_with('\n') {
         s.pop();
@@ -62,10 +72,20 @@ pub fn print_module(ast: &PyAst, module: PyId) -> String {
     s
 }
 
+fn is_compound(d: &cure_python_ast::NodeData) -> bool {
+    use cure_python_ast::NodeData::*;
+    matches!(
+        d,
+        If | While | For { .. } | Try { .. } | With { .. } | Match | FunctionDef { .. } | ClassDef { .. }
+    )
+}
+
 struct Printer<'a> {
     ast: &'a PyAst,
     out: String,
     indent: usize,
+    /// 注释游标（按源码行顺序消费）。
+    ci: usize,
 }
 
 impl<'a> Printer<'a> {
@@ -87,16 +107,82 @@ impl<'a> Printer<'a> {
     }
 
     fn print_block(&mut self, block: PyId) {
-        let ch = self.ast.children(block);
+        let ch = self.ast.children(block).to_vec();
         self.indent += 1;
         if ch.is_empty() {
             self.blank_block();
         } else {
-            for &s in ch {
+            for (i, &s) in ch.iter().enumerate() {
+                self.flush_leading(s);
                 self.print_stmt(s);
+                let next_same_line = ch.get(i + 1).is_some_and(|&n| {
+                    self.ast.span(s).zip(self.ast.span(n)).is_some_and(|(a, b)| {
+                        a.end_line == b.start_line
+                    })
+                });
+                self.attach_trailing(s, next_same_line);
             }
         }
         self.indent -= 1;
+    }
+
+    fn next_comment(&self) -> Option<&cure_python_ast::Comment> {
+        self.ast.comments().get(self.ci)
+    }
+
+    /// 把源码中位于该语句之前（按行）的独立注释打印在语句前。
+    fn flush_leading(&mut self, stmt: PyId) {
+        let Some(span) = self.ast.span(stmt) else {
+            return;
+        };
+        while let Some(c) = self.next_comment() {
+            if c.line >= span.start_line {
+                break;
+            }
+            let text = c.text.clone();
+            self.ind();
+            self.out.push_str(&text);
+            self.out.push('\n');
+            self.ci += 1;
+        }
+    }
+
+    /// 行尾注释：接在简单语句最后一行末尾（`stmt  # …`）。
+    fn attach_trailing(&mut self, stmt: PyId, next_same_line: bool) {
+        if next_same_line || is_compound(self.ast.data(stmt)) {
+            return;
+        }
+        let Some(span) = self.ast.span(stmt) else {
+            return;
+        };
+        let Some(c) = self.next_comment() else {
+            return;
+        };
+        if c.own_line || c.line != span.end_line || c.col < span.end_col {
+            return;
+        }
+        let text = c.text.clone();
+        self.ci += 1;
+        if self.out.ends_with('\n') {
+            self.out.pop();
+        }
+        while self.out.ends_with(' ') {
+            self.out.pop();
+        }
+        self.out.push_str("  ");
+        self.out.push_str(&text);
+        self.out.push('\n');
+    }
+
+    /// 文件末尾剩余的注释（含被简化删掉的语句上的注释）。
+    fn flush_rest(&mut self) {
+        while let Some(c) = self.next_comment() {
+            let text = c.text.clone();
+            self.ind();
+            self.out.push_str(&text);
+            self.out.push('\n');
+            self.ci += 1;
+        }
     }
 
     fn print_stmt(&mut self, id: PyId) {

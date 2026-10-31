@@ -455,11 +455,36 @@ pub struct Node {
     pub children: Vec<PyId>,
 }
 
+/// 词法阶段保留的注释（语句级附着用）。
+///
+/// `own_line`：注释前本行只有空白（独立注释行）；否则是行尾注释。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Comment {
+    pub line: u32,
+    /// 1-based 列号（`#` 所在列）。
+    pub col: u32,
+    pub text: String,
+    pub own_line: bool,
+}
+
+/// 语句源码行区间。`end_col` 是最后一条码 token 之后的下一个 1-based
+/// 列号，用于判断行尾注释是否确实排在语句之后。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StmtSpan {
+    pub start_line: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct PyAst {
     nodes: Vec<Node>,
     /// 解析时记录的源行号（诊断/调试；不影响语义）。
     lines: HashMap<PyId, u32>,
+    /// 语句级注释（按源码顺序）与语句行区间：打印器按行把独立注释放在
+    /// 下一条语句前、把行尾注释接在语句末尾。
+    comments: Vec<Comment>,
+    spans: HashMap<PyId, StmtSpan>,
     /// 模块里 True/False 被当作可重绑定的名字（Python 2 的赋值/exec
     /// 等）；此时简化器不得再生成 True/False 字面量。
     bool_shadowed: bool,
@@ -476,6 +501,8 @@ impl PyAst {
         Self {
             nodes: Vec::new(),
             lines: HashMap::new(),
+            comments: Vec::new(),
+            spans: HashMap::new(),
             bool_shadowed: false,
         }
     }
@@ -493,6 +520,39 @@ impl PyAst {
 
     pub fn set_line(&mut self, id: PyId, line: u32) {
         self.lines.insert(id, line);
+    }
+
+    pub fn set_comments(&mut self, comments: Vec<Comment>) {
+        self.comments = comments;
+    }
+
+    pub fn comments(&self) -> &[Comment] {
+        &self.comments
+    }
+
+    /// 丢弃落在 [lo, hi] 行的注释（原文保真语句已包含其文本，避免重复）。
+    pub fn drop_comments_between(&mut self, lo: u32, hi: u32) {
+        self.comments.retain(|c| c.line < lo || c.line > hi);
+    }
+
+    /// 按谓词丢弃注释（raw 字段已包含的注释避免重复输出）。
+    pub fn drop_comments_if(&mut self, f: impl Fn(&Comment) -> bool) {
+        self.comments.retain(|c| !f(c));
+    }
+
+    pub fn set_span(&mut self, id: PyId, start_line: u32, end_line: u32, end_col: u32) {
+        self.spans.insert(
+            id,
+            StmtSpan {
+                start_line,
+                end_line,
+                end_col,
+            },
+        );
+    }
+
+    pub fn span(&self, id: PyId) -> Option<StmtSpan> {
+        self.spans.get(&id).copied()
     }
 
     pub fn set_bool_literals_shadowed(&mut self, v: bool) {

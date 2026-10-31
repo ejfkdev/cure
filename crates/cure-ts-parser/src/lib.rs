@@ -15,6 +15,7 @@ mod lexer;
 
 use cure_engine::kind::{BinOp, UnOp};
 use cure_ts_ast::{
+    Comment,
     ClassDecl, ClassMember, JsLit, ModuleUnit, NodeData, NumVal, ParseError, TopItem,
     TsAst, TsId, VarKind,
 };
@@ -164,14 +165,21 @@ fn parse_inner(
     } else {
         src
     };
-    let (toks, lex_errs) = Lexer::new(body).tokenize();
+    let (toks, lex_errs, mut comments) = Lexer::new(body).tokenize();
     let module_goal = module_goal.unwrap_or_else(|| detect_module_goal(&toks));
+    // 文件头注释块单独逐行输出；其中的注释不能再进语句级指令游标。
+    let leading = leading_comments(body);
+    if !leading.is_empty() {
+        let header_lines = leading.len() as u32;
+        comments.retain(|c| c.line > header_lines);
+    }
+    let track_directives = !comments.is_empty();
     let mut p = Parser {
         src: body,
         toks,
         pos: 0,
         ast: TsAst::new(),
-        unit: ModuleUnit { shebang, items: Vec::new() },
+        unit: ModuleUnit { shebang, leading_comments: leading, item_directives: Vec::new(), item_source_spans: Vec::new(), tail_directives: Vec::new(), items: Vec::new() },
         errors: Vec::new(),
         async_ctx: module_goal,
         depth: 0,
@@ -179,8 +187,12 @@ fn parse_inner(
         capture_source,
         ts_syntax,
         jsx,
+        comments,
+        comment_i: 0,
     };
-    if capture_source {
+    // 只有含行级指令的源码才需要保留原文/记录语句区间（供逐行保真
+    // 输出）；普通文件不承担这份内存与每个语句的 span 开销。
+    if track_directives || capture_source {
         p.ast.set_source(body);
     }
     for e in lex_errs {
@@ -210,6 +222,101 @@ fn parse_inner(
     }
 }
 
+/// 顶层条目里会原样打印的 raw 文本（注释去重）。
+fn top_item_raw_blob(item: &TopItem) -> Option<String> {
+    match item {
+        TopItem::Import(raw) | TopItem::ExportRaw(raw) | TopItem::Raw(raw) => Some(raw.clone()),
+        TopItem::Func { sig_raw, prefix, .. } => Some(format!("{prefix}{sig_raw}")),
+        TopItem::Class(c) => Some(format!("{}{}", c.prefix, c.head_raw)),
+        _ => None,
+    }
+}
+
+/// 类成员里会原样打印的 raw 文本（注释去重）。
+fn class_member_raw_blob(m: &ClassMember) -> Option<&str> {
+    match m {
+        ClassMember::Method { sig_raw, .. } => Some(sig_raw),
+        ClassMember::Field { sig_raw, .. } => Some(sig_raw),
+        ClassMember::Raw(raw) => Some(raw),
+        ClassMember::StaticBlock { .. } => None,
+    }
+}
+
+/// 语句级指令注释白名单：这些注释影响类型检查、lint 或打包器的
+/// tree-shaking/副作用判定，必须随语句保留。普通叙述性注释不在此列。
+fn is_directive_comment(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "@ts-ignore",
+        "@ts-expect-error",
+        "#__pure__",
+        "@__pure__",
+        "eslint-disable-next-line",
+        "eslint-disable-line",
+        "prettier-ignore",
+        "istanbul ignore next",
+        "@vite-ignore",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+}
+
+/// 收集文件头注释块：从文件开头到首条语句之前的所有注释行与空行。
+///
+/// 保留整个块（而不只是 `@ts-nocheck` 等指令）可以同时保住 license
+/// header、`/// <reference …>`、`@jsx` pragma 与紧贴首条语句的
+/// `// @ts-ignore`；行尾空格裁掉、首尾空行裁掉，保证二次打印幂等。
+/// 支持单行 `//`、单行 `/* … */` 与多行块注释；遇到第一条非注释行停止。
+fn leading_comments(src: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_block = false;
+    for line in src.lines() {
+        let t = line.trim_start();
+        if in_block {
+            out.push(line.trim_end().to_string());
+            if t.contains("*/") {
+                in_block = false;
+            }
+            continue;
+        }
+        if t.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        if is_directive_comment(t) {
+            // 行级指令（@ts-ignore/@__PURE__ 等）必须附着到下一条语句，
+            // 不能并入文件头块——否则首条语句不会按原文行结构输出。
+            break;
+        }
+        if t.starts_with("//") {
+            out.push(line.trim_end().to_string());
+            continue;
+        }
+        if t.starts_with("/*") {
+            // 单行块注释后面若还有代码（`/*#__PURE__*/ foo();`），这一行
+            // 不是文件头注释：留给语句级指令附着，否则会重复打印整行。
+            if let Some(end) = t.find("*/") {
+                if !t[end + 2..].trim().is_empty() {
+                    break;
+                }
+                out.push(line.trim_end().to_string());
+            } else {
+                out.push(line.trim_end().to_string());
+                in_block = true;
+            }
+            continue;
+        }
+        break;
+    }
+    while out.first().is_some_and(|l| l.is_empty()) {
+        out.remove(0);
+    }
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    out
+}
+
 struct Parser<'a> {
     src: &'a str,
     toks: Vec<Token>,
@@ -231,6 +338,9 @@ struct Parser<'a> {
     ts_syntax: bool,
     /// 表达式起始 `<` 按 JSX 捕获（否则按 TS 尖括号断言）。
     jsx: bool,
+    /// 词法收集的注释与游标（语句级指令附着）。
+    comments: Vec<Comment>,
+    comment_i: usize,
 }
 
 /// 递归上限。正常源码远低于此；超出者整文件 Raw 保真。
@@ -408,12 +518,51 @@ impl<'a> Parser<'a> {
     // ---- 模块层 ----
 
     fn parse_module(&mut self) {
+        let mut carry: Vec<String> = Vec::new();
         while !self.at_eof() {
             let before = self.pos;
+            let mut dirs = std::mem::take(&mut carry);
+            dirs.extend(self.take_directives(self.pos));
+            let items_before = self.unit.items.len();
+            let start_off = self.toks.get(self.pos).map(|t| t.start as usize).unwrap_or(0);
             self.parse_top_item();
+            let items_after = self.unit.items.len();
+            let end_off = if self.pos > 0 {
+                self.toks[self.pos - 1].end as usize
+            } else {
+                start_off
+            };
+            if items_after == items_before {
+                // 纯注释/无法成条目的区域：指令留给下一条目。
+                carry = dirs;
+            } else {
+                for k in items_before..items_after {
+                    self.unit.item_directives.push(if k == items_before {
+                        dirs.clone()
+                    } else {
+                        Vec::new()
+                    });
+                    self.unit.item_source_spans.push(
+                        (end_off > start_off).then_some((start_off as u32, end_off as u32)),
+                    );
+                    // raw 条目（interface/declare/namespace/import 等）已把
+                    // 区间内注释原样打印；去掉游标副本避免重复。
+                    if let Some(blob) = top_item_raw_blob(&self.unit.items[k]) {
+                        self.comments.retain(|c| {
+                            !((c.start as usize) >= start_off
+                                && (c.end as usize) <= end_off
+                                && blob.contains(&c.text))
+                        });
+                    }
+                }
+            }
             if self.pos == before {
                 self.advance();
             }
+        }
+        let tail = self.take_directives(usize::MAX);
+        if !tail.is_empty() {
+            self.unit.tail_directives = tail;
         }
     }
 
@@ -875,10 +1024,34 @@ impl<'a> Parser<'a> {
         }
         self.advance();
         let mut members = Vec::new();
+        let mut member_directives: Vec<Vec<String>> = Vec::new();
+        let mut member_spans: Vec<Option<(u32, u32)>> = Vec::new();
         while !self.at_eof() && !self.is_punct("}") {
             let before = self.pos;
+            let member_start = self.pos;
+            let dirs = self.take_directives(self.pos);
             if let Some(m) = self.parse_class_member() {
                 members.push(m);
+                member_directives.push(dirs);
+                let start = self.toks.get(member_start).map(|t| t.start).unwrap_or(0);
+                let end = if self.pos > member_start {
+                    self.toks[self.pos - 1].end
+                } else {
+                    start
+                };
+                if let Some(blob) = class_member_raw_blob(&members[members.len() - 1]) {
+                    self.comments.retain(|c| {
+                        !((c.start as usize) >= start as usize
+                            && (c.end as usize) <= end as usize
+                            && blob.contains(&c.text))
+                    });
+                }
+                let sp = if self.ast.source().is_some() && end > start {
+                    Some((start, end))
+                } else {
+                    None
+                };
+                member_spans.push(sp);
             }
             if self.pos == before {
                 self.advance();
@@ -888,7 +1061,7 @@ impl<'a> Parser<'a> {
             self.advance();
         }
         let raw_span = self.span_u32(class_start);
-        Some(ClassDecl { prefix, head_raw: head, kind_kw, name, members, raw_span })
+        Some(ClassDecl { prefix, head_raw: head, kind_kw, name, members, member_directives, member_spans, raw_span })
     }
 
     fn parse_class_member(&mut self) -> Option<ClassMember> {
@@ -1183,7 +1356,9 @@ impl<'a> Parser<'a> {
             // 多声明符 `let a, b;` 的 Group 在此展开为独立语句：Group 的
             // kind 是 Block，引擎语句表规则（dead_decl 等）只扫描组内
             // 兄弟，组外引用不可见 → 曾把声明当死代码删除。
-            if matches!(self.ast.data(s), NodeData::Group) {
+            if matches!(self.ast.data(s), NodeData::Group)
+                && self.ast.stmt_directives(s).is_empty()
+            {
                 stmts.extend(self.ast.children(s).iter().copied());
             } else {
                 stmts.push(s);
@@ -1212,16 +1387,48 @@ impl<'a> Parser<'a> {
         self.err_here("expected ;");
     }
 
+    /// 取走位于 `tok` 之前的语句级指令注释（普通注释直接丢弃）。
+    fn take_directives(&mut self, tok: usize) -> Vec<String> {
+        let off = self.toks.get(tok).map(|t| t.start as usize).unwrap_or(usize::MAX);
+        let mut out = Vec::new();
+        while self.comment_i < self.comments.len()
+            && (self.comments[self.comment_i].start as usize) < off
+        {
+            let c = self.comments[self.comment_i].clone();
+            self.comment_i += 1;
+            if is_directive_comment(&c.text) {
+                out.push(c.text);
+            }
+        }
+        out
+    }
+
     fn parse_stmt(&mut self) -> TsId {
-        if self.depth >= MAX_NEST {
+        let dirs = self.take_directives(self.pos);
+        let start_tok = self.pos;
+        let out = if self.depth >= MAX_NEST {
             self.too_deep = true;
             let s = self.pos;
             self.skip_balanced_to_stmt_boundary();
-            return self.ast.raw(&self.raw_between(s, self.pos));
+            self.ast.raw(&self.raw_between(s, self.pos))
+        } else {
+            self.depth += 1;
+            let out = self.parse_stmt_inner();
+            self.depth -= 1;
+            out
+        };
+        if !dirs.is_empty() {
+            self.ast.set_stmt_directives(out, dirs);
         }
-        self.depth += 1;
-        let out = self.parse_stmt_inner();
-        self.depth -= 1;
+        if self.ast.source().is_some() {
+            let start = self.toks.get(start_tok).map(|t| t.start as usize).unwrap_or(0);
+            let end = if self.pos > start_tok {
+                self.toks[self.pos - 1].end as usize
+            } else {
+                start
+            };
+            self.ast.set_stmt_source_span(out, start, end);
+        }
         out
     }
 

@@ -49,6 +49,7 @@ pub fn default_rules() -> &'static [&'static str] {
         "dart_nested_if",
         "dart_empty_then",
         "dart_assign_compound",
+        "dart_local_propagation",
         "dart_unreachable",
         "dart_trailing_continue",
         "dart_trailing_return",
@@ -114,6 +115,9 @@ pub fn simplify_module(ast: &mut DartAst, cfg: &Config) -> Report {
         }
         if enabled(cfg, "dart_assign_compound") {
             changed |= assign_compound(ast, &mut report);
+        }
+        if enabled(cfg, "dart_local_propagation") {
+            changed |= local_propagation(ast, &mut report);
         }
         if enabled(cfg, "dart_unreachable") {
             changed |= unreachable(ast, &mut report);
@@ -2473,6 +2477,369 @@ fn assign_compound(ast: &mut DartAst, report: &mut Report) -> bool {
         }
     }
     apply_edits(ast, edits, "dart_assign_compound", report)
+}
+
+/// 局部字面量传播：`final y = <标量字面量>;`（var/const 同）在同一个
+/// 块内只被安全读取位置使用时，把所有读取替换成字面量并删除声明。
+///
+/// 只接受单 token 字面量（数字/无插值字符串/true/false/null）；读取位
+/// 必须是明确的表达式操作数（前/后 token 白名单），任何可能的绑定
+/// （声明、for 目标、参数表、catch 参数、模式声明、多声明器）都会让
+/// 整条规则跳过。字符串插值里出现同名标识符也跳过（token 模型无法
+/// 改写插值内部）。
+fn local_propagation(ast: &mut DartAst, report: &mut Report) -> bool {
+    let mut edits: Vec<Edit> = Vec::new();
+    for decl_start in 0..ast.tokens.len() {
+        if ast.tokens[decl_start].kind != TokKind::Ident
+            || !matches!(ast.text(decl_start), "final" | "var" | "const")
+            || !direct_stmt_start(ast, decl_start)
+        {
+            continue;
+        }
+        let Some(name_i) = ast.next_sig(decl_start) else {
+            continue;
+        };
+        if ast.tokens[name_i].kind != TokKind::Ident || ast.text(name_i) == "_" {
+            continue;
+        }
+        let Some(eq_i) = ast.next_sig(name_i) else {
+            continue;
+        };
+        if ast.text(eq_i) != "=" {
+            continue;
+        }
+        let Some(lit_i) = ast.next_sig(eq_i) else {
+            continue;
+        };
+        let Some(semi) = ast.next_sig(lit_i) else {
+            continue;
+        };
+        if ast.text(semi) != ";" {
+            continue;
+        }
+        let lit = &ast.tokens[lit_i];
+        let lit_kind = match lit.kind {
+            TokKind::Number => TokKind::Number,
+            TokKind::Str if !lit.text.contains('$') => TokKind::Str,
+            TokKind::Ident if matches!(lit.text.as_ref(), "true" | "false" | "null") => {
+                TokKind::Ident
+            }
+            _ => continue,
+        };
+        if ast.has_comment_between(decl_start, semi) {
+            continue;
+        }
+        let name = ast.text(name_i).to_string();
+        let Some((open, close)) = enclosing_block(ast, decl_start) else {
+            continue;
+        };
+        if !in_function_body(ast, decl_start)
+            || has_ambiguous_declaration(ast, open, close, &name)
+            || name_in_parameter_list(ast, open, close, &name)
+            || name_in_for_header(ast, open, close, &name)
+            || name_in_interpolated_string(ast, open, close, &name)
+        {
+            continue;
+        }
+        let mut repl: Vec<usize> = Vec::new();
+        let mut bad = false;
+        for i in open + 1..close {
+            if ast.tokens[i].kind != TokKind::Ident || ast.text(i) != name {
+                continue;
+            }
+            if i == name_i {
+                continue;
+            }
+            if !safe_read_position(ast, i) {
+                bad = true;
+                break;
+            }
+            repl.push(i);
+        }
+        if bad || repl.is_empty() {
+            continue;
+        }
+        let (line, col) = (ast.tokens[decl_start].line, ast.tokens[decl_start].col);
+        for i in repl {
+            let nb = ast.tokens[i].newlines_before;
+            edits.push(Edit {
+                start: i,
+                end: i + 1,
+                tokens: vec![Token::new(lit_kind, lit.text.to_string(), line, col, nb)],
+            });
+        }
+        edits.push(Edit {
+            start: decl_start,
+            end: semi + 1,
+            tokens: Vec::new(),
+        });
+    }
+    apply_edits(ast, edits, "dart_local_propagation", report)
+}
+
+/// 最近的块花括号（声明所在作用域）。
+fn enclosing_block(ast: &DartAst, i: usize) -> Option<(usize, usize)> {
+    let mut j = i;
+    while j > 0 {
+        j -= 1;
+        if ast.text(j) == "{" && ast.brace_kind(j) == Some(BraceKind::Block) {
+            if let Some(close) = ast.matching(j) {
+                if close > i {
+                    return Some((j, close));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 声明外层存在函数/闭包体（局部变量；类字段/顶层变量不传播）。
+fn in_function_body(ast: &DartAst, i: usize) -> bool {
+    let mut j = i;
+    while j > 0 {
+        j -= 1;
+        if ast.text(j) == "{" && ast.brace_kind(j) == Some(BraceKind::Block) {
+            if let Some(close) = ast.matching(j) {
+                if close > i && is_function_body(ast, j) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 同一作用域内有多声明器（`final a = 1, b = 2;` / `int a = 1, b = 2;`）
+/// 或模式声明（`final (a, b) = …`）时整条规则跳过：token 层无法可靠
+/// 区分声明名与初始化表达式里的读取。语句内深度 0 的逗号只可能出现在
+/// 多声明器里（Dart 没有逗号表达式）。
+fn has_ambiguous_declaration(ast: &DartAst, open: usize, close: usize, name: &str) -> bool {
+    let Some(stmts) = split_block(ast, open, close) else {
+        return true;
+    };
+    for st in stmts {
+        let (mut paren, mut bracket, mut brace) = (0i32, 0i32, 0i32);
+        for i in st.start..st.end {
+            match ast.text(i) {
+                "(" => paren += 1,
+                ")" => paren -= 1,
+                "[" => bracket += 1,
+                "]" => bracket -= 1,
+                "{" => brace += 1,
+                "}" => brace -= 1,
+                "," if paren == 0 && bracket == 0 && brace == 0 => {
+                    // 只有该声明涉及目标名字时才影响传播。
+                    if ast.tokens[st.start..st.end]
+                        .iter()
+                        .any(|t| t.kind == TokKind::Ident && t.text.as_ref() == name)
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut i = open + 1;
+    while i < close {
+        if ast.tokens[i].kind == TokKind::Ident
+            && matches!(ast.text(i), "var" | "final" | "const" | "late")
+        {
+            if let Some(n) = ast.next_sig(i) {
+                if ast.text(n) == "(" {
+                    if let Some(cp) = ast.matching(n) {
+                        if ast.tokens[n + 1..cp]
+                            .iter()
+                            .any(|t| t.kind == TokKind::Ident && t.text.as_ref() == name)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `for (…)` 头部出现同名（循环变量或条件里的读取）：token 层不区分
+/// 绑定/读取，整条规则跳过。
+fn name_in_for_header(ast: &DartAst, open: usize, close: usize, name: &str) -> bool {
+    let mut i = open + 1;
+    while i < close {
+        if ast.text(i) == "for" {
+            if let Some(p) = ast.next_sig(i) {
+                if ast.text(p) == "(" {
+                    if let Some(cp) = ast.matching(p) {
+                        if cp < close
+                            && ast.tokens[p + 1..cp]
+                                .iter()
+                                .any(|t| t.kind == TokKind::Ident && t.text.as_ref() == name)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// 函数/闭包/catch 参数表里出现同名 → 可能是遮蔽绑定，整条规则跳过。
+fn name_in_parameter_list(ast: &DartAst, open: usize, close: usize, name: &str) -> bool {
+    let mut i = open + 1;
+    while i < close {
+        if ast.text(i) == "(" {
+            if let Some(cp) = ast.matching(i) {
+                if cp < close {
+                    if let Some(next) = ast.next_sig(cp) {
+                        let nt = ast.text(next);
+                        let is_param = matches!(nt, "{" | "=>" | "async" | "sync")
+                            && !matches!(
+                                ast.prev_sig(i).map(|p| ast.text(p)).unwrap_or(""),
+                                "if" | "for" | "while" | "switch"
+                            );
+                        if is_param
+                            && ast.tokens[i + 1..cp]
+                                .iter()
+                                .any(|t| t.kind == TokKind::Ident && t.text.as_ref() == name)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// 字符串插值里出现同名标识符（`'$y'` / `'${f(y)}'`）：token 模型无法
+/// 改写插值内部，整条规则跳过。
+fn name_in_interpolated_string(ast: &DartAst, open: usize, close: usize, name: &str) -> bool {
+    for t in &ast.tokens[open + 1..close] {
+        if t.kind != TokKind::Str || !t.text.contains('$') {
+            continue;
+        }
+        if contains_word(&t.text, name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// ASCII 标识符边界上的单词出现（`$y` 命中，`$yy`/`yes` 不命中）。
+fn contains_word(text: &str, word: &str) -> bool {
+    let bytes = text.as_bytes();
+    let w = word.as_bytes();
+    if w.is_empty() || w.len() > bytes.len() {
+        return false;
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i + w.len() <= bytes.len() {
+        if &bytes[i..i + w.len()] == w {
+            let before_ok = i == 0 || !is_ident(bytes[i - 1]);
+            let after_ok = i + w.len() == bytes.len() || !is_ident(bytes[i + w.len()]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// 读取位白名单：前后 token 必须是明确的表达式操作数边界。声明/模式/
+/// 参数/命名参数/标签/类型位/成员名/调用/下标/可空后缀都不在名单内。
+fn safe_read_position(ast: &DartAst, i: usize) -> bool {
+    let Some(p) = ast.prev_sig(i) else {
+        return false;
+    };
+    let Some(n) = ast.next_sig(i) else {
+        return false;
+    };
+    let prev_ok = matches!(
+        ast.text(p),
+        "(" | ","
+            | "="
+            | "+="
+            | "-="
+            | "*="
+            | "/="
+            | "%="
+            | "~/="
+            | "&="
+            | "|="
+            | "^="
+            | "<<="
+            | ">>="
+            | ">>>="
+            | "??="
+            | "return"
+            | "yield"
+            | "throw"
+            | "await"
+            | "=>"
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "~/"
+            | "&&"
+            | "||"
+            | "??"
+            | "=="
+            | "!="
+            | "<="
+            | ">="
+            | "&"
+            | "|"
+            | "^"
+            | "<<"
+            | ">>"
+            | ">>>"
+            | "!"
+            | "~"
+            | "["
+            | "..."
+            | "...?"
+    );
+    let next_ok = matches!(
+        ast.text(n),
+        ";" | ","
+            | ")"
+            | "]"
+            | "}"
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "~/"
+            | "&&"
+            | "||"
+            | "??"
+            | "=="
+            | "!="
+            | "<="
+            | ">="
+            | "&"
+            | "|"
+            | "^"
+            | "<<"
+            | ">>"
+            | ">>>"
+            | "?"
+            | "is"
+            | "as"
+    );
+    prev_ok && next_ok
 }
 
 fn try_catch_body(ast: &DartAst, start: usize) -> Option<(usize, usize)> {

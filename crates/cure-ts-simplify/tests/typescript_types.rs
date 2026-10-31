@@ -164,3 +164,51 @@ fn js_mode_keeps_comparison_chains() {
     assert!(!printed.contains("a(c)"), "{printed}");
     assert!(printed.contains('<') && printed.contains('>'), "{printed}");
 }
+
+#[test]
+fn iife_inline_only_when_scope_neutral() {
+    let src = r#"
+const a = (() => 42)();
+const b = (() => { return 7; })();
+const c = (() => "x" + "y")();
+const d = (function () { return 1; })();
+function f(x: number) {
+  const e = (() => x + 1)();
+  return e;
+}
+class K {
+  y = 1;
+  m() { return (() => this.y)(); }
+}
+function h() { return (function () { return this; })(); }
+function i() { return (function () { return arguments[0]; })(); }
+const j = (() => { const z = 1; return z; })();
+const l = (async () => 1)();
+const m = (x: number) => x;
+const n = ((x: number) => x)(1);
+"#;
+    let out = cure_ts(src);
+    // 零参、单表达式 / 单 return 的 IIFE 内联
+    assert!(out.contains("const a = 42"), "{out}");
+    assert!(out.contains("const b = 7"), "{out}");
+    assert!(out.contains("const c = 'xy'"), "{out}");
+    assert!(out.contains("const d = 1"), "{out}");
+    assert!(out.contains("return x + 1"), "{out}");
+    // 箭头词法 this 保留内联；普通函数的 this/arguments 不内联
+    assert!(out.contains("m() {\n        return this.y;"), "{out}");
+    assert!(out.contains("(function () {\n        return this;"), "{out}");
+    assert!(out.contains("return arguments[0];"), "{out}");
+    // 有局部声明 / async / 有参：保持
+    assert!(out.contains("const z = 1;"), "{out}");
+    assert!(out.contains("(async () => 1)()"), "{out}");
+    assert!(out.contains("((x: number) => x)(1)"), "{out}");
+    let twice = cure_ts(&out);
+    assert_eq!(out, twice, "not idempotent:\n{out}");
+
+    // 模块里出现直接 eval：引擎的 eval 污染区冻结模块级改写（保守），
+    // IIFE 保留；函数内部的非污染子树仍可简化。
+    let eval_src = "const k = (() => eval(\"1\"))();\nfunction g() { return (() => 2)(); }\n";
+    let out = cure_ts(eval_src);
+    assert!(out.contains("eval('1')"), "{out}");
+    assert!(out.contains("return 2"), "{out}");
+}

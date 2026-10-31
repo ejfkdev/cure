@@ -1191,3 +1191,29 @@ console.log(out.join(','));
 "#,
     );
 }
+
+#[test]
+fn diff_iife_inline_scope_and_this() {
+    differential(
+        "iife_inline_scope",
+        r#""use strict";
+class K {
+  constructor() { this.y = 3; }
+  m() { return (() => this.y)(); }
+  n() { return (function () { return this; }).call(this) === this; }
+  o() { return (function () { return arguments.length; })(1, 2); }
+  p() { return (() => arguments.length)(1); }
+}
+const k = new K();
+const f = () => "arrow";
+const g = function () { return this === undefined; };
+const r1 = (() => 42)();
+const r2 = (() => { return 21; })() * 2;
+const r3 = (() => ({ a: 1 }))();
+const r4 = (function () { return 5; })();
+const r5 = (() => eval("1 + 1"))();
+const r6 = (() => "x" + "y")();
+console.log(k.m(), k.n(), k.o(), k.p(), r1 + r2 + r3.a + r4 + r5 + r6, f(), g.call(undefined));
+"#,
+    );
+}
