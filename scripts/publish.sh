@@ -73,7 +73,18 @@ for c in "${CRATES[@]}"; do
   fi
   echo "==> cargo publish $DRY -p $c"
   attempt=1
-  until cargo publish $DRY -p "$c"; do
+  while :; do
+    if out=$(cargo publish $DRY -p "$c" 2>&1); then
+      printf '%s\n' "$out"
+      break
+    fi
+    # 上面的 API 探测会因索引传播延迟短暂 404；真正的权威答复是
+    # cargo 的 "already exists/uploaded"——视为幂等成功，别重试到失败。
+    if printf '%s' "$out" | grep -qE "already (exists|uploaded)"; then
+      echo "==> $c@$VER 已存在于 crates.io —— 跳过"
+      break
+    fi
+    printf '%s\n' "$out" >&2
     if [[ "$DRY" == "--dry-run" || $attempt -ge 5 ]]; then
       echo "错误: 发布 $c 失败" >&2
       exit 1
