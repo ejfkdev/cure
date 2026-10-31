@@ -11,9 +11,9 @@ keywords = ["python", "simplifier", "deobfuscator"]
 categories = ["development-tools"]
 
 [dependencies]
-cure-engine = { path = "../cure-engine", version = "0.4.1" }
-cure-python-ast = { path = "../cure-python-ast", version = "0.4.1" }
+cure-engine = { path = "../cure-engine", version = "0.4.2" }
+cure-python-ast = { path = "../cure-python-ast", version = "0.4.2" }
 
 [dev-dependencies]
-cure-python-parser = { path = "../cure-python-parser", version = "0.4.1" }
-cure-python-print = { path = "../cure-python-print", version = "0.4.1" }
+cure-python-parser = { path = "../cure-python-parser", version = "0.4.2" }
+cure-python-print = { path = "../cure-python-print", version = "0.4.2" }

@@ -3,7 +3,7 @@
 本项目所有显著变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.4.2] - 2026-11-01
 
 ### 修复
 
@@ -24,6 +24,14 @@
   解包/元组目标）全部加入 `forbidden`；`del obj.attr` / `del box[k]`
   只删内容、基址仍绑定，不受影响。补 `py_del_unbinds_and_forbids_propagation`
   差分回归测试（原版 vs 简化版 stdout/退出码）。
+
+### 验证
+
+- 新回归测试在 0.4.1 上失败（`unbound gone` → `5 None`）、修复后通过；
+  `cargo test --workspace` 在 Linux / macOS / Windows / io_uring 四种 CI
+  环境全绿，MSRV 1.74 检查通过。
+- 该 bug 是在把 0.4.1 接入 pycdc 的 `--cure` 时发现的：754 条行为用例里
+  有 1 条（`del` 在 try/except 中）从 100% 掉到 98.1%。
 
 ## [0.4.1] - 2026-10-31
 
@@ -980,7 +988,8 @@ var b=2;`——`b` 变成非导出（模块语义改变）。
 - 跨平台批量 I/O：Linux `io_uring` feature（read syscall 6,977 → 10，
   syscall 时长 −53%）；macOS/Windows 线程池；默认构建零运行时依赖
 
-[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/ejfkdev/cure/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/ejfkdev/cure/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ejfkdev/cure/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/ejfkdev/cure/compare/v0.3.0...v0.3.1
