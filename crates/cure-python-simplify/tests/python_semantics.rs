@@ -176,6 +176,42 @@ for v in ([1,2], {"a":5,"b":6}, 2, 9):
 }
 
 #[test]
+fn py_del_unbinds_and_forbids_propagation() {
+    differential(
+        "del_scope",
+        r#"def del_then_read():
+    v = 5
+    del v
+    try:
+        return v
+    except UnboundLocalError:
+        return 'unbound'
+
+def del_then_bare_read():
+    v = 1
+    del v
+    try:
+        v
+    except UnboundLocalError:
+        return 'gone'
+
+def del_then_rebind():
+    v = 1
+    del v
+    v = 2
+    return v
+
+def del_item():
+    box = {'k': 1}
+    del box['k']
+    return box
+
+print(del_then_read(), del_then_bare_read(), del_then_rebind(), del_item())
+"#,
+    );
+}
+
+#[test]
 fn py_comprehensions_and_walrus() {
     differential(
         "comp",
