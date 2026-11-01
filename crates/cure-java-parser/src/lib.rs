@@ -130,6 +130,52 @@ fn build_decoded(src: &str, b: &[u8], first: usize) -> String {
     out
 }
 
+/// 把字符串/字符字面量内的裸控制字符还原为 `\uXXXX`。
+///
+/// `parse()` 按 JLS 3.3 在词法前解码 `\uXXXX`；按原文切片保存的区域
+///（注解参数、枚举常量等）因此可能携带裸控制字符（`"a\u0010b"` 变成
+/// 真实 0x10）。打印前转义回去，保持源码字节与可读性。引号外不动。
+fn escape_controls_in_literals(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quote: Option<char> = None;
+    let mut esc = false;
+    for c in text.chars() {
+        if let Some(q) = quote {
+            if esc {
+                out.push(c);
+                esc = false;
+                continue;
+            }
+            match c {
+                '\\' => {
+                    out.push(c);
+                    esc = true;
+                }
+                c if c == q => {
+                    out.push(c);
+                    quote = None;
+                }
+                // 换行/回车不可能是合法字面量内容（JLS 预处理后已变行
+                // 终止符）——保留原结构，避免破坏注解的多行排版
+                '\n' | '\r' => out.push(c),
+                c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                    out.push_str(&format!("\\u{:04X}", c as u32));
+                }
+                c => out.push(c),
+            }
+        } else {
+            match c {
+                '"' | '\'' => {
+                    quote = Some(c);
+                    out.push(c);
+                }
+                _ => out.push(c),
+            }
+        }
+    }
+    out
+}
+
 /// 解析 Java 源码（容错，永不失败）。
 pub fn parse(src: &str) -> ParseOutcome {
     // JLS 3.3：\uXXXX 预解码（词法之前）——token 偏移与 text_of 均基于
@@ -291,7 +337,9 @@ impl<'src> Parser<'src> {
             if self.at_punct("(") {
                 self.skip_balanced("(", ")");
             }
-            text.push_str(self.text_of(s_, self.cur_start()).trim());
+            text.push_str(&escape_controls_in_literals(
+                self.text_of(s_, self.cur_start()).trim(),
+            ));
             text.push(' ');
         }
         let _ = start;
@@ -1096,7 +1144,7 @@ fn leading_comments(src: &str) -> String {
             }
             break;
         }
-        self.text_of(start, last_end)
+        escape_controls_in_literals(&self.text_of(start, last_end))
     }
 
     // ---- 类型声明 ----
@@ -1146,12 +1194,16 @@ fn leading_comments(src: &str) -> String {
         // 泛型参数原文
         let mut ty_params = String::new();
         if self.at_punct("<") {
-            ty_params = self.skip_balanced("<", ">").unwrap_or_default();
+            ty_params = escape_controls_in_literals(
+                &self.skip_balanced("<", ">").unwrap_or_default(),
+            );
         }
-        // record 头
+        // record 头（可带参数注解与默认值字符串）
         let mut header = String::new();
         if kind == TypeKind::Record && self.at_punct("(") {
-            header = self.skip_balanced("(", ")").unwrap_or_default();
+            header = escape_controls_in_literals(
+                &self.skip_balanced("(", ")").unwrap_or_default(),
+            );
         }
         let mut extends = Vec::new();
         let mut implements = Vec::new();
@@ -1223,10 +1275,9 @@ fn leading_comments(src: &str) -> String {
                 if self.at_punct("{") {
                     self.skip_balanced_braces();
                 }
-                let text = self
-                    .text_of(cstart, self.t[self.pos.saturating_sub(1)].end)
-                    .trim()
-                    .to_string();
+                let text = escape_controls_in_literals(
+                    self.text_of(cstart, self.t[self.pos.saturating_sub(1)].end).trim(),
+                );
                 enum_constants.push(text);
                 if !self.eat(",") {
                     break;

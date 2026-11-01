@@ -288,6 +288,11 @@ impl Rule<JavaAst> for BoxUnboxChain {
         &[NodeKind::Call]
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        // 语句位标志先取（借用 ctx.lang 后不能再访问 ctx 的其他字段）
+        let at_stmt_pos = ctx
+            .parent(id)
+            .map(|p| ctx.lang.kind(p) == NodeKind::ExprStmt)
+            .unwrap_or(false);
         let lang = ctx.lang;
         // 外层：inner.xxxValue()
         if lang.kind(id) != NodeKind::Call {
@@ -370,6 +375,19 @@ impl Rule<JavaAst> for BoxUnboxChain {
         if !ok {
             return None;
         }
+        // 语句位：替换结果必须是合法表达式语句（JLS 14.8：赋值/自增
+        // 自减/调用/new）。`Integer.valueOf((int) d).intValue();` 曾折成
+        // `(int) d;` 不可编译——弃置结果时保留原调用链。
+        if at_stmt_pos {
+            let stmt_expr = match lang.kind(arg) {
+                NodeKind::Call | NodeKind::New | NodeKind::Assign => true,
+                NodeKind::Unary => lang.un_op(arg).is_some_and(|op| op.is_incdec()),
+                _ => false,
+            };
+            if !stmt_expr {
+                return None;
+            }
+        }
         Some(Edit::Replace {
             target: id,
             with: arg,
@@ -387,6 +405,56 @@ impl Rule<JavaAst> for BoxUnboxChain {
 // 安全性：与 for-each 的脱糖完全同构（iterator() 各求值一次、hasNext/next 同序）。
 // 守卫：`it` 在 body 其余部分不再被引用。
 // ---------------------------------------------------------------------------
+
+/// 可 for-each 的静态类型白名单（数组/未知类型另行放行）。
+fn iterable_type_ok(ast: &JavaAst, iterable: JavaId) -> bool {
+    let Some(ty) = ast.var_type(iterable) else {
+        return true;
+    };
+    match ty {
+        JType::Array(_) | JType::Var => true,
+        JType::Ref(n) => {
+            let base = n.split('<').next().unwrap_or(n);
+            let base = base.rsplit('.').next().unwrap_or(base);
+            matches!(
+                base,
+                "Iterable"
+                    | "Collection"
+                    | "List"
+                    | "Set"
+                    | "Queue"
+                    | "Deque"
+                    | "SortedSet"
+                    | "NavigableSet"
+                    | "BlockingQueue"
+                    | "BlockingDeque"
+                    | "TransferQueue"
+                    | "ArrayList"
+                    | "LinkedList"
+                    | "Vector"
+                    | "Stack"
+                    | "HashSet"
+                    | "LinkedHashSet"
+                    | "TreeSet"
+                    | "EnumSet"
+                    | "ArrayDeque"
+                    | "PriorityQueue"
+                    | "CopyOnWriteArrayList"
+                    | "CopyOnWriteArraySet"
+                    | "ConcurrentLinkedQueue"
+                    | "ConcurrentLinkedDeque"
+                    | "LinkedBlockingQueue"
+                    | "LinkedBlockingDeque"
+                    | "ArrayBlockingQueue"
+                    | "SynchronousQueue"
+                    | "PriorityBlockingQueue"
+                    | "DelayQueue"
+                    | "ConcurrentSkipListSet"
+            ) || base.ends_with("Iterable")
+        }
+        _ => false,
+    }
+}
 
 pub struct IteratorToForEach;
 
@@ -434,6 +502,12 @@ impl Rule<JavaAst> for IteratorToForEach {
         let iterable = lang.children(icallee)[0];
         // iterable 不得引用 it（自引用）
         if subtree_has_var(&*lang, iterable, &it_name) {
+            return None;
+        }
+        // for-each 只接受数组与 Iterable：有 `iterator()` 但未实现
+        // Iterable 的类（JDK GeneralSubtrees）无法 for-each。声明类型
+        // 可解析时按白名单放行；未知类型保持原行为（反编译自由名）。
+        if !iterable_type_ok(lang, iterable) {
             return None;
         }
 
@@ -511,6 +585,21 @@ fn unwrap_paren_cast(lang: &JavaAst, mut n: JavaId) -> JavaId {
 }
 
 /// 从任意泛型 Ref（ArrayList<String> / List<T>）提取元素类型；裸类型 None。
+/// 泛型实参原文（允许嵌套，如 `Map.Entry<String,String>`）；仅用于
+/// 与目标声明类型的全串相等比较。
+fn type_inner_raw(ty: &JType) -> Option<&str> {
+    let JType::Ref(n) = ty else {
+        return None;
+    };
+    let lt = n.find('<')?;
+    let gt = n.rfind('>')?;
+    if gt <= lt {
+        None
+    } else {
+        Some(n[lt + 1..gt].trim())
+    }
+}
+
 fn generic_elem_ty(ty: &JType) -> Option<JType> {
     let name = match ty {
         JType::Ref(n) => n.as_str(),
@@ -2018,13 +2107,48 @@ impl Rule<JavaAst> for WhileIteratorToForEach {
                 NodeData::VarDecl { ty, .. } => generic_elem_ty(ty),
                 _ => None,
             };
-            let elem = match it_decl_elem {
+            let mut elem = match it_decl_elem {
                 Some(t) => t,
                 None => match lang.var_type(iterable) {
                     Some(t) => generic_elem_ty(t).unwrap_or(JType::Ref("Object".into())),
                     None => JType::Ref("Object".into()),
                 },
             };
+            // 内联形态 `target = it.next();`：循环变量类型必须能赋回
+            // target。generic_elem_ty 对嵌套泛型（Iterator<Map.Entry<…>>）
+            // 返回 None → Object，而 target 声明为 Map.Entry<…> 时
+            // `for (Object e : …) target = e;` 不可编译。迭代器实参全串
+            // 与 target 声明类型一致时用 target 类型；Object 兜底与已知
+            // 目标类型不兼容则放弃还原。
+            {
+                let wp = parent_of_recv(lang, body, wrapped);
+                if matches!(lang.data(wp), NodeData::Assign { op: None }) {
+                    let ach = lang.children(wp).to_vec();
+                    if ach.len() == 2 && ach[1] == wrapped {
+                        if let Some(t) = lang.var_type(ach[0]).cloned() {
+                            let t_name = match &t {
+                                JType::Ref(n) => n.as_str(),
+                                _ => "",
+                            };
+                            let elem_object =
+                                matches!(&elem, JType::Ref(n) if n == "Object");
+                            if elem_object && t_name != "Object" && !t_name.is_empty() {
+                                let decl_ty = match lang.data(decl) {
+                                    NodeData::VarDecl { ty, .. } => ty,
+                                    _ => return None,
+                                };
+                                if type_inner_raw(decl_ty) == Some(t_name) {
+                                    elem = t;
+                                } else {
+                                    return None;
+                                }
+                            } else if !elem_object && elem != t {
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
             let elem = if for_each_elem_ok(&elem) {
                 elem
             } else {
@@ -4013,6 +4137,22 @@ pub fn collect_unit_consts(ast: &mut JavaAst, unit: &CompilationUnit) {
                 }
             }
             match ast.data(n) {
+                // lambda 形参 / for-each 变量 / catch 参数 / 模式绑定名
+                // 同样遮蔽同名字段（此前只收集方法形参与局部声明，
+                // `s -> !s.startsWith()` + 字段 `s` 被误替换成字段值）。
+                // lambda params_raw 含类型名/注解——抽取全部标识符，
+                // 过度遮蔽只损失优化、不漏判。
+                NodeData::Lambda { params_raw } => {
+                    for nm in identifier_words(params_raw) {
+                        shadowed.insert(nm);
+                    }
+                }
+                NodeData::ForEach { name, .. } | NodeData::Catch { name, .. } => {
+                    shadowed.insert(name.clone());
+                }
+                NodeData::InstanceOf { bind: Some(b), .. } => {
+                    shadowed.insert(b.clone());
+                }
                 NodeData::Assign { .. } => {
                     let t = ast.children(n)[0];
                     if ast.kind(t) == NodeKind::Member {
@@ -4233,6 +4373,23 @@ fn is_const_init(ast: &JavaAst, init: JavaId) -> bool {
         }
         _ => false,
     }
+}
+
+/// 从原始片段提取标识符词（Java 字母/数字/_/$）。
+fn identifier_words(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in s.chars() {
+        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// 递归收集类型体内（含嵌套类型）：方法/构造器体、初始化块、字段初始化
@@ -4905,9 +5062,21 @@ impl Rule<JavaAst> for TrailingElseFlatten {
         // 构新 If 节点（[cond, then]）——cond 是表达式不能裸插语句列表
         let new_if = lang.clone_node(id, vec![ch[0], then]);
         let mut insert: Vec<JavaId> = vec![new_if];
-        // else 体语句追加（Block 展平或单语句直接加）
+        // else 体语句追加（Block 展平或单语句直接加）。含局部声明的
+        // else 块不能拆散：声明提升到外层会让后续同名局部无法再声明
+        //（Java 禁止嵌套块重复声明外层局部——JDK Plotter 的
+        // `else { Sequence seq = …; }` 展平后与后续 for 内 seq 冲突）。
+        // 保留为一个裸块语句，作用域不变。
         if lang.kind(els) == NodeKind::Block {
-            insert.extend(lang.children(els).to_vec());
+            let ech = lang.children(els).to_vec();
+            let has_decl = ech.iter().any(|&s| {
+                matches!(lang.kind(s), NodeKind::VarDecl | NodeKind::Raw)
+            });
+            if has_decl {
+                insert.push(els);
+            } else {
+                insert.extend(ech);
+            }
         } else {
             insert.push(els);
         }
@@ -5078,6 +5247,19 @@ impl Rule<JavaAst> for ConstFieldPropagate {
         true
     }
     fn check(&self, ctx: RewriteCtx<'_, JavaAst>, id: JavaId) -> Option<Edit<JavaAst>> {
+        // case 标签里的裸名可能解析到枚举常量而非同名字段
+        //（FutureTask：`private static final int CANCELLED = 4` 与
+        // `switch (state()) { case CANCELLED: }` 的枚举常量同名——
+        // 替换成 `case 4:` 对枚举 switch 不可编译）。case 内一律不传播。
+        {
+            let mut cur = id;
+            while let Some(p) = ctx.parent(cur) {
+                if ctx.lang.kind(p) == NodeKind::Case {
+                    return None;
+                }
+                cur = p;
+            }
+        }
         let parent = ctx.parent(id);
         let _grandparent = parent.and_then(|p| ctx.parent(p));
         let lang = ctx.lang;
@@ -5297,8 +5479,36 @@ impl Rule<JavaAst> for ConstMethodInline {
         if args.len() != params.len() || params.is_empty() {
             return None;
         }
+        // 形参在方法体内被 ++/-- 或赋值目标消费时拒绝内联：实参只允许
+        // 字面量，代进写位置会产出 `3++` / `1 = x` 之类非法 Java
+        //（`test(3)` + `return !((a++) != a)` 复现）
+        for p in &params {
+            if param_written_in_body(lang, body_expr, p) {
+                return None;
+            }
+        }
         for &a in &args {
             lang.literal(a)?;
+        }
+        // this/super 绑定守卫：内联把方法体复制到调用点，`this` 的指向
+        // 随词法位置改变（JDK JavadocFormatter：外部类的
+        // `this.escapeSequencesSupported` 被内联进内部类后指向内部类 →
+        // 找不到符号）。无类上下文信息时一律拒绝。
+        if cure_engine::analysis::subtree_contains(lang, body_expr, |n| {
+            matches!(lang.data(n), NodeData::This | NodeData::Super)
+        }) {
+            return None;
+        }
+        // null 实参代入需要引用类型的头部位置（成员接收者/数组基座/
+        // instanceof 被测式/synchronized 锁/for-each 可迭代位）会产出
+        // `null.getHandle()` 一类不可编译代码（JDK HeapGXLWriter 的
+        // getID(null) 内联复现）。
+        for (p, &a) in params.iter().zip(args.iter()) {
+            if matches!(lang.literal(a), Some(LitRef::Null))
+                && param_in_reference_head(lang, body_expr, p)
+            {
+                return None;
+            }
         }
         let map: std::collections::HashMap<String, JavaId> = params
             .iter()
@@ -5322,6 +5532,52 @@ impl Rule<JavaAst> for ConstMethodInline {
             with,
         })
     }
+}
+
+/// 形参是否在方法体内出现在写位置（赋值目标子树或 ++/-- 操作数子树）。
+fn param_written_in_body(ast: &JavaAst, node: JavaId, name: &str) -> bool {
+    match ast.data(node) {
+        NodeData::Assign { .. } => {
+            if let Some(&t) = ast.children(node).first() {
+                if subtree_has_var(ast, t, name) {
+                    return true;
+                }
+            }
+        }
+        NodeData::Unary { op } if op.is_incdec() => {
+            if let Some(&t) = ast.children(node).first() {
+                if subtree_has_var(ast, t, name) {
+                    return true;
+                }
+            }
+        }
+        _ => {}
+    }
+    ast.children(node)
+        .iter()
+        .any(|&c| param_written_in_body(ast, c, name))
+}
+
+/// 形参是否出现在需要引用类型的“头部”位置（成员/下标基座、instanceof
+/// 被测式、synchronized 锁、for-each 可迭代位）。
+fn param_in_reference_head(ast: &JavaAst, node: JavaId, name: &str) -> bool {
+    match ast.data(node) {
+        NodeData::Member { .. }
+        | NodeData::Index
+        | NodeData::Synchronized
+        | NodeData::ForEach { .. }
+        | NodeData::InstanceOf { .. } => {
+            if let Some(&first) = ast.children(node).first() {
+                if subtree_has_var(ast, first, name) {
+                    return true;
+                }
+            }
+        }
+        _ => {}
+    }
+    ast.children(node)
+        .iter()
+        .any(|&c| param_in_reference_head(ast, c, name))
 }
 
 /// 深拷贝 + VarRef 参数替换。
@@ -7205,6 +7461,10 @@ fn simplify_member(ast: &mut JavaAst, m: &mut Member, cfg: &Config, total: &mut 
         _ => Vec::new(),
     };
     ast.set_param_scope(&params);
+    let prev_ret = ast.current_return_ty.take();
+    if let Member::Method { ret, .. } = m {
+        ast.current_return_ty = Some(ret.clone());
+    }
     match m {
         Member::Method { body: Some(b), .. }
         | Member::Constructor { body: Some(b), .. } => {
@@ -7246,6 +7506,7 @@ fn simplify_member(ast: &mut JavaAst, m: &mut Member, cfg: &Config, total: &mut 
         Member::Raw(_) => {}
         _ => {}
     }
+    ast.current_return_ty = prev_ret;
 }
 
 fn merge_report(total: &mut Report, r: Report) {

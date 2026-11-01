@@ -3,6 +3,70 @@
 本项目所有显著变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.4.3] - 2026-11-01
+
+### 修复（Java 后端）
+
+用户报告的 6 个缺陷 + 用 JDK 27 全源码编译校验又发现的 7 个：
+
+- **分支位 `if (false)`**：删除后父 If 只剩条件孩子，打印机 `ch[1]`
+  越界 panic，目录模式整轮中止。`const_condition` 在非 Block 父节点
+  改用空块占位，`if_tail` 增加缺体防御；`if (a) if (false) …` 现在
+  输出 `if (a) {}`（条件有副作用时保留求值）。
+- **`const_method_inline` 写位置守卫**：形参出现在 `++/--` 操作数或
+  赋值目标子树时拒绝内联，`test(3)` 不再变成 `3++`。
+- **`null` 不传播进 `synchronized` 锁位**：原守卫按「Synchronized 只有
+  一个孩子」判断，实际 AST 是 `[lock, block]`，守卫从未生效；改为
+  锁位子树直接拒绝。
+- **`const_field_propagate` 绑定守卫**：lambda 形参、for-each 变量、
+  catch 参数、`instanceof` 模式绑定都会遮蔽同名字段；switch 的
+  `case` 标签可能指向枚举常量而非同名字段——两类位置都不再替换。
+- **`box_unbox_chain` 语句位**：`Integer.valueOf((int) d).intValue();`
+  结果弃置时不再折成 `(int) d;`（非语句表达式），保留原调用链。
+- **注解参数 `\uXXXX`**：JLS 词法前解码使按原文切片保存的注解文本
+  携带裸控制字符；打印前在字符串/字符字面量内还原为 `\uXXXX`。
+- **for 头部自赋值**：`for (i = i; …)` 删除 init 槽的 ExprStmt 会移位
+  成 `for (cond; step; )`（JDK SerialVer 复现）；`self_assign` 只删除
+  真正处于 Block/Case 语句列表的语句。
+- **泛型数组初始化**：`A<T>[] xs = new A[]{…}` 不再折叠成 `{…}`
+  （generic array creation 非法）。
+- **int 最小字面量**：常量折叠产生 `0x80000000`（i32::MIN）时不再打印
+  非法十进制 `2147483648`。
+- **赋值目标基座传播**：`Object[] result = a; result[i] = e;` 不再内联成
+  `a[i] = e;`（`a` 可能是更窄的 `T[]`，写转换不成立；JDK LinkedList/
+  HashMap `toArray` 复现）。
+- **泛型调用接收位传播**：声明带显式类型实参且值是方法调用时不再内联
+  进接收位（丢失赋值目标对调用链类型推断的锚定；JDK MethodHandles
+  `Stream<Class<?>> cstream` 复现）。
+- **iterator → for-each**：仅对数组与 Iterable 白名单类型转换；有
+  `iterator()` 但未实现 Iterable 的类（JDK `GeneralSubtrees`）保留
+  原循环。`while (it.hasNext())` 内联形态的元素类型与赋值目标声明类型
+  对齐（嵌套泛型 `Map.Entry<…>` 不再退化成 Object）。
+- **else 展平作用域**：含局部声明的 else 块保留为裸块语句，不把声明
+  提升到外层（否则与后续同名局部冲突——JDK Plotter 复现）。
+- **try-with-resources 资源槽**：不把非 effectively-final 变量传播进
+  `try (x; …)`（JDK LinkableRuntimeImage 复现）。
+- **if→三元类型上下文**：diamond 构造不搬进三元分支；窄基本类型
+  （short/byte/char）返回/赋值只在两支都已是窄类型时合并（常量表达式
+  收窄在非常量三元上失效——JDK NodeImpl 等复现）。
+- **泛型 cast 传播**：参数化/数组声明类型的非字面量值不再内联进 cast
+  操作数（`List<?>` → `List<Object>` 会让 unchecked cast 变成
+  inconvertible——JDK RecordedStackTrace 复现）。
+- **内联绑定**：方法体含 `this`/`super` 时不再内联到其他词法位置；
+  `null` 实参不代入成员接收者/数组基座/instanceof/synchronized/
+  for-each 头部（JDK JavadocFormatter、HeapGXLWriter 复现）。
+- **常量真分支不可达传播**：`if (true) throw …;` 折叠后若外层块链还有
+  尾随语句，拒绝折叠（JDK ExpressionParser 的 `break` 不可达复现）。
+
+### 验证
+
+- 22 个最小用例（6 报告 + 16 编译校验发现的变体）配 javac 门禁；
+  workspace 641 项测试（debug + release）通过。
+- JDK 27 源码 15,310 文件：0 解析错误、0 panic、79,696 次编辑；全部
+  JDK 模块净化输出 `javac --patch-module` 的错误数与原始源码**逐模块
+  相同**（`java.base`/`jdk.compiler`/`java.net.http` 等 0 错误；
+  `java.desktop` 等仅剩缺 `--add-exports` 的环境错误）。
+
 ## [0.4.2] - 2026-11-01
 
 ### 修复
@@ -988,7 +1052,8 @@ var b=2;`——`b` 变成非导出（模块语义改变）。
 - 跨平台批量 I/O：Linux `io_uring` feature（read syscall 6,977 → 10，
   syscall 时长 −53%）；macOS/Windows 线程池；默认构建零运行时依赖
 
-[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/ejfkdev/cure/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/ejfkdev/cure/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/ejfkdev/cure/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/ejfkdev/cure/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ejfkdev/cure/compare/v0.3.1...v0.4.0

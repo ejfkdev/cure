@@ -333,6 +333,9 @@ pub struct JavaAst {
     /// 用：前缀字段写被 rest 再赋值时，仅 final 才放弃（非 final 的
     /// 材料化写是死写，语义恒等、可编译）。
     pub final_fields: HashSet<String>,
+    /// 当前正在简化的方法返回类型（simplify_member 设置）——窄类型
+    /// return 的常量收窄守卫用（if→三元合并前检查）。None = 非方法体。
+    pub current_return_ty: Option<JType>,
     /// 可内联的单 return 方法：名字 → (参数名表, 返回表达式节点, 声明
     /// 该方法的类的简单名)。owner 供 const_method_inline 的归属守卫：
     /// 限定调用的接收者类名必须与之一致——名字匹配不判归属会把 JDK 的
@@ -1069,6 +1072,19 @@ fn cmp_i64(op: BinOp, x: i64, y: i64) -> Option<bool> {
     })
 }
 
+/// 表达式静态类型是否已是窄基本类型（short/byte/char）。
+fn narrow_typed_expr(ast: &JavaAst, id: JavaId) -> bool {
+    match ast.data(id) {
+        NodeData::VarRef { .. } => matches!(
+            ast.var_type(id),
+            Some(JType::Short | JType::Byte | JType::Char)
+        ),
+        NodeData::Cast { ty } => matches!(ty, JType::Short | JType::Byte | JType::Char),
+        NodeData::Literal(Lit::Char(_)) => true,
+        _ => false,
+    }
+}
+
 impl Lang for JavaAst {
     type Id = JavaId;
     type NameKey = u32;
@@ -1558,6 +1574,66 @@ impl Lang for JavaAst {
         )
     }
 
+    fn ternary_merge_ok(&self, target: Option<JavaId>, branches: &[JavaId]) -> bool {
+        // diamond 构造依赖赋值/返回目标推断；放进三元分支后推断退化
+        //（`return c ? new ArrayList<>(0) : (List<X>) list;` → 推断成
+        // ArrayList<Object>，JDK RecordedStackTrace 复现）。
+        if branches.iter().any(|&b| {
+            matches!(
+                self.data(b),
+                NodeData::New {
+                    ty: JType::Ref(n),
+                    ..
+                } if n.ends_with("<>")
+            )
+        }) {
+            return false;
+        }
+        let dest = match target {
+            Some(t) => self.var_type(t).cloned(),
+            None => self.current_return_ty.clone(),
+        };
+        let narrow = matches!(dest, Some(JType::Short | JType::Byte | JType::Char));
+        if !narrow {
+            return true;
+        }
+        // 窄类型返回/赋值：原 if 的两支各是常量表达式（int 常量可收窄），
+        // 合并成非常量三元后收窄失效。仅当两支都已是窄类型形态时放行。
+        branches.iter().all(|&b| narrow_typed_expr(self, b))
+    }
+
+    fn ternary_arg_unsound(&self, decl: JavaId, _value: JavaId) -> bool {
+        // 声明类型带类型实参/通配符：实参位的目标类型参与泛型方法推断，
+        // 多态条件表达式脱离该锚点会推断失败（JDK management 复现）。
+        matches!(
+            self.data(decl),
+            NodeData::VarDecl {
+                ty: JType::Ref(n),
+                ..
+            } if n.contains('<')
+        )
+    }
+
+    fn propagation_cast_unsound(&self, decl: JavaId, value: JavaId) -> bool {
+        if self.receiver_boxing_unsound(decl, value) {
+            return true;
+        }
+        // 声明类型是参数化/数组引用且值不是字面量：值的静态类型不可由
+        // 形状判定，内联进 cast 可能把合法 cast 变成 inconvertible
+        //（`List<?> list = Arrays.asList(a); (List<X>) list` 合法，
+        // 换成 List<Object> 后非法——JDK RecordedStackTrace 复现）。
+        let declared = match self.data(decl) {
+            NodeData::VarDecl { ty, .. } => ty,
+            _ => return false,
+        };
+        let generic_or_array = match declared {
+            JType::Ref(n) => n.contains('<'),
+            JType::Array(_) => true,
+            _ => false,
+        };
+        generic_or_array && !matches!(self.data(value), NodeData::Literal(_))
+    }
+
     fn receiver_propagation_unsound(
         &self,
         decl: JavaId,
@@ -1586,6 +1662,21 @@ impl Lang for JavaAst {
             //     `A a0 = new CloneableProblem(0); a0.clone()` 内联后
             //     A.clone() 的 CloneNotSupportedException 不再可抛，catch 失据）。
             if self.receiver_new_type_unsound(decl, value) {
+                return true;
+            }
+            // 声明类型带**显式类型实参**且值是方法调用：内联进接收位会
+            // 丢掉赋值目标对调用链泛型推断的锚定（JDK MethodHandles：
+            // `Stream<Class<?>> cstream = fini.stream()…map(…);`
+            // `cstream.findFirst().orElse(void.class)` 内联后 orElse
+            // 的 Class<Void> 与推断出的 CAP#1 不兼容）。保守拒绝。
+            if matches!(
+                self.data(decl),
+                NodeData::VarDecl {
+                    ty: JType::Ref(n),
+                    ..
+                } if n.contains('<')
+            ) && matches!(self.data(value), NodeData::Call)
+            {
                 return true;
             }
             // 声明类型为 **已知泛型的 raw 引用**（无类型实参——擦除成员解析）：

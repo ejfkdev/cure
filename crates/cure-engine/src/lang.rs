@@ -52,6 +52,27 @@ pub trait Lang {
 
     fn build_return(&mut self, value: Option<Self::Id>) -> Self::Id;
     fn build_block(&mut self, stmts: Vec<Self::Id>) -> Self::Id;
+
+    /// if→三元合并前的类型上下文校验。窄基本类型（Java short/byte/char）
+    /// 的 return/赋值允许**常量表达式**收窄；`if` 的两支各自是常量表达式，
+    /// 合并成非常量三元后收窄失效（`return cond ? A|B : C|D;` 对 short
+    /// 返回不可编译）。默认放行；Java 侧按返回类型/目标类型裁决。
+    fn ternary_merge_ok(&self, _target: Option<Self::Id>, _branches: &[Self::Id]) -> bool {
+        true
+    }
+
+    /// 局部传播把值内联进 cast 操作数时的语言类型守卫（Java 装箱：
+    /// `Boolean b = call(); (T) b` → `(T) call()` 把基本 boolean 塞进
+    /// 类型变量 cast，非法）。默认放行。
+    fn propagation_cast_unsound(&self, _decl: Self::Id, _value: Self::Id) -> bool {
+        false
+    }
+
+    /// 三元值内联进 Call/New 实参位是否可能丢失泛型推断（声明为参数化
+    /// 引用类型时目标类型是推断锚点）。默认 false。
+    fn ternary_arg_unsound(&self, _decl: Self::Id, _value: Self::Id) -> bool {
+        false
+    }
     fn build_unary(&mut self, op: UnOp, operand: Self::Id) -> Self::Id;
     fn build_bool(&mut self, v: bool) -> Self::Id;
     /// 构造整数/long 字面量（常量折叠产物）。`long` 为 true 时带 L 语义。

@@ -231,7 +231,13 @@ fn decl_init_expr(ast: &JavaAst, ty: &JType, init: JavaId) -> JavaId {
                     t = inner;
                     n += 1;
                 }
-                if n == *dims && !matches!(t, JType::Var) {
+                // 泛型元素（`StatementAnalyzer<JCTree,JCTree>[]`）不能
+                // 用裸 `{…}` 初始化：那是 generic array creation（JLS
+                // 15.10.1），原 `new StatementAnalyzer[]{…}` 是合法的
+                // raw 数组创建。保留 new 形态。
+                let generic_elem =
+                    matches!(t, JType::Ref(name) if name.contains('<'));
+                if n == *dims && !matches!(t, JType::Var) && !generic_elem {
                     return only;
                 }
             }
@@ -904,6 +910,12 @@ impl<'a> Printer<'a> {
         self.out.push_str("if (");
         self.expr(ch[0], prec::ASSIGN);
         self.out.push_str(") ");
+        // 防御：破损/畸形 AST 可能只剩条件孩子（规则层已保证不再产生
+        // 单孩子 If，但容错输入仍可能走到这里——曾 ch[1] 越界 panic）
+        if ch.len() < 2 {
+            self.out.push_str("{}");
+            return;
+        }
         self.body_stmt(ch[1]);
         if let Some(&els) = ch.get(2) {
             self.out.push_str(" else ");
@@ -1389,6 +1401,14 @@ fn lit_str(l: &Lit) -> String {
     match l {
         Lit::Bool(true) => "true".into(),
         Lit::Bool(false) => "false".into(),
+        // 0x80000000 的 int 值 = i32::MIN，但十进制 2147483648 不是合法
+        // int 字面量（JLS 3.10.1 只允许它出现在一元减操作数位）。常量
+        // 折叠（如 `0x7FFFFFFF + 1`）会产出该值——按十六进制打印，
+        // 保持 int 域与可编译性。
+        Lit::Int(v) if *v == 1i64 << 31 => "0x80000000".into(),
+        Lit::Int(v) if *v > i32::MAX as i64 && *v <= u32::MAX as i64 => {
+            format!("0x{v:X}")
+        }
         Lit::Int(v) => format!("{v}"),
         Lit::Long(v) => format!("{v}L"),
         Lit::Float(v) => format!("{}f", ensure_frac(*v)),

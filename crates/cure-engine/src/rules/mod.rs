@@ -116,6 +116,31 @@ impl<L: Lang> Rule<L> for ConstCondition {
                     vec![then]
                 };
                 let terminates = insert.iter().any(|&s| self_is_terminal(lang, s));
+                // 终结式折叠后，外层 Block 链也会变成不可正常完成——若任一
+                // 祖先语句列表还有后续兄弟，就产出不可达语句（JDK jdi：
+                // `{if (true) throw …;} break;` 折叠后 break 不可达）。
+                // 直接父 Block 的尾随兄弟由下面 remove 一并删除；从它开始
+                // 逐层 Block 上溯检查。
+                if terminates {
+                    let mut p = walk.parent(id);
+                    let mut i = walk.index(id);
+                    if let (Some(pp), Some(_)) = (p, i) {
+                        if lang.kind(pp) == NodeKind::Block {
+                            p = walk.parent(pp);
+                            i = walk.index(pp);
+                        }
+                    }
+                    while let (Some(pp), Some(ii)) = (p, i) {
+                        if ii + 1 < lang.children(pp).len() {
+                            return None;
+                        }
+                        if lang.kind(pp) != NodeKind::Block {
+                            break;
+                        }
+                        p = walk.parent(pp);
+                        i = walk.index(pp);
+                    }
+                }
                 if let (Some(parent), Some(index)) = (walk.parent(id), walk.index(id)) {
                     if lang.kind(parent) == NodeKind::Block {
                         let siblings = lang.children(parent).to_vec();
@@ -206,7 +231,20 @@ impl<L: Lang> Rule<L> for ConstCondition {
                         target: id,
                         with: e,
                     }),
-                    None => Some(Edit::Delete { node: id }),
+                    None => {
+                        // 非 Block 父节点（if 分支位/循环体等）：直接删除会
+                        // 让父语句缺体（Java `if (a) if (false) s;` 曾产出
+                        // 单孩子 If，打印机 ch[1] panic）。用空块占位保持
+                        // 语句形态；根/块内的 If 删除不影响父结构。
+                        if walk.parent(id).is_some() {
+                            Some(Edit::Replace {
+                                target: id,
+                                with: lang.build_block(Vec::new()),
+                            })
+                        } else {
+                            Some(Edit::Delete { node: id })
+                        }
+                    }
                 }
             }
             _ => None,
@@ -557,7 +595,18 @@ impl<L: Lang> Rule<L> for SelfAssign {
         // Assign 本身（Block 孩子删除安全）。
         let (parent, _) = walk.parents.get(&id)?;
         match lang.kind(*parent) {
-            NodeKind::ExprStmt => Some(Edit::Delete { node: *parent }),
+            NodeKind::ExprStmt => {
+                // ExprStmt 必须真正处于语句列表（Block/Case）：for 头部的
+                // init 槽也可能包着 ExprStmt，删掉会移位成
+                // `for (cond; step; )`（JDK SerialVer `for (i = i; …)`
+                // 复现）。槽位计数（inits/has_cond/steps）规则侧无法
+                // 更新——拒绝。
+                let (gp, _) = walk.parents.get(parent)?;
+                match lang.kind(*gp) {
+                    NodeKind::Block | NodeKind::Case => Some(Edit::Delete { node: *parent }),
+                    _ => None,
+                }
+            }
             NodeKind::Block => Some(Edit::Delete { node: id }),
             _ => None,
         }
@@ -1089,6 +1138,43 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         }
         let use_id = wa.uses[0];
 
+        // try-with-resources 资源变量必须 effectively final，且资源槽只
+        // 接受变量/字段访问。把外层非 final 变量代进资源槽
+        //（`final InputStream in = filesIn; try (in; …)`）会产出
+        // “resource variable is not final” 不可编译。直接父为 Try 的
+        // 使用即资源槽——保守拒绝。
+        {
+            let mut cur = use_id;
+            loop {
+                let Some(&(p, _)) = walk.parents.get(&cur) else {
+                    break;
+                };
+                match lang.kind(p) {
+                    NodeKind::Try => return None,
+                    // 语句/表达式作用域边界：块内的使用不是资源槽
+                    NodeKind::Block
+                    | NodeKind::Case
+                    | NodeKind::Lambda
+                    | NodeKind::Catch => break,
+                    _ => cur = p,
+                }
+            }
+        }
+        // 三元值不内联进 Call/New 实参位：泛型方法的类型推断依赖实参
+        // 上下文，多态条件表达式的目标类型会丢失（JDK
+        // getNotificationBroadcaster(name, instance, removeAll ? A : B)
+        // 复现）。Paren 链不改变这一点。
+        if lang.kind(value) == NodeKind::Ternary && lang.ternary_arg_unsound(id, value) {
+            let mut cur = use_id;
+            while let Some(&(p, _)) = walk.parents.get(&cur) {
+                match lang.kind(p) {
+                    NodeKind::Paren => cur = p,
+                    NodeKind::Call | NodeKind::New => return None,
+                    _ => break,
+                }
+            }
+        }
+
         // 纯自赋值（x = x）形态拒绝传播：让 self_assign 先删。传播会把
         // RHS 换成声明值制造悬挂写 `i = 1`——store_kill 删声明后
         // dead_store 因锚点缺失无法清理（golden self_assign_removed
@@ -1157,10 +1243,9 @@ impl<L: Lang> Rule<L> for LocalPropagation {
                             return None;
                         }
                     }
-                    // synchronized (null…) 锁位（唯一孩子）
+                    // synchronized (null…) 锁位（children: [lock, block]）
                     NodeKind::Synchronized => {
-                        let ch = lang.children(p);
-                        if ch.len() == 1 && ch[0] == cur {
+                        if at_head {
                             return None;
                         }
                     }
@@ -1181,14 +1266,37 @@ impl<L: Lang> Rule<L> for LocalPropagation {
         {
             return None;
         }
+        // VarRef 值不得内联进赋值目标子树：目标基座的静态类型决定写入
+        // 转换（`Object[] result = a; result[i] = e;` 内联成
+        // `a[i] = e;` 时 a 是 T[]，E 不可写——JDK LinkedList/HashMap
+        // toArray 系列）。字面量已在上面按位置拒绝；VarRef 可能带更宽类型。
+        if lang.kind(value) == NodeKind::VarRef {
+            let mut cur = use_id;
+            let mut in_target = false;
+            while let Some(&(p, idx)) = walk.parents.get(&cur) {
+                if lang.kind(p) == NodeKind::Assign && idx == 0 {
+                    in_target = true;
+                    break;
+                }
+                cur = p;
+            }
+            if in_target {
+                return None;
+            }
+        }
         // VarRef 值不得内联进 cast/instanceof 类型判定位（声明类型即合法
         // 性依据——同 null 实参位的族）；声明类型未解析或与目标类型
         // 同名时恒可编译（var_cast_position_ok 钩子裁决）
-        if lang.kind(value) == NodeKind::VarRef
-            && typed_position(&*lang, walk, use_id)
-                .is_some_and(|t| !lang.var_cast_position_ok(value, t))
-        {
-            return None;
+        if let Some(t) = typed_position(&*lang, walk, use_id) {
+            if lang.kind(value) == NodeKind::VarRef {
+                if !lang.var_cast_position_ok(value, t) {
+                    return None;
+                }
+            } else if lang.propagation_cast_unsound(id, value) {
+                // Java：装箱声明 + 基本类型表达式值，内联进 cast 丢装箱
+                //（`Boolean b = call(); (T) b` → `(T) call()` 非法）
+                return None;
+            }
         }
         // value 读到的名字键（写冲突兴趣集；reads 含 name 自身——一票否决）
         let mut watch_keys: Vec<L::NameKey> = Vec::new();
@@ -2638,6 +2746,9 @@ impl<L: Lang> Rule<L> for IfToTernary {
             let b = single_ret(ch[2])?;
             let with = match (a, b) {
                 (Some(va), Some(vb)) => {
+                    if !lang.ternary_merge_ok(None, &[va, vb]) {
+                        return None;
+                    }
                     let t = lang.build_ternary(c, va, vb);
                     lang.build_return(Some(t))
                 }
@@ -2671,6 +2782,9 @@ impl<L: Lang> Rule<L> for IfToTernary {
         let b = lang.children(tail).first().copied();
         let with = match (a, b) {
             (Some(va), Some(vb)) => {
+                if !lang.ternary_merge_ok(None, &[va, vb]) {
+                    return None;
+                }
                 let t = lang.build_ternary(c, va, vb);
                 lang.build_return(Some(t))
             }
@@ -2743,6 +2857,9 @@ impl<L: Lang> Rule<L> for IfAssignTernary {
         let (t1, va) = single_assign(ch[1])?;
         let (t2, vb) = single_assign(ch[2])?;
         if !lang.same_binding(t1, t2) || lang.var_name(t1).is_none() {
+            return None;
+        }
+        if !lang.ternary_merge_ok(Some(t1), &[va, vb]) {
             return None;
         }
         let t = lang.build_ternary(c, va, vb);
