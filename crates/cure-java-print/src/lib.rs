@@ -1409,6 +1409,11 @@ fn lit_str(l: &Lit) -> String {
         Lit::Int(v) if *v > i32::MAX as i64 && *v <= u32::MAX as i64 => {
             format!("0x{v:X}")
         }
+        // 常量折叠可能把 long 运算的结果封成 Int 节点（见 regressions_043
+        // 的 xor 链）；超出 int/u32 的十进制值只能作为 long 字面量编译。
+        Lit::Int(v) if *v > u32::MAX as i64 || *v < i32::MIN as i64 => {
+            format!("{v}L")
+        }
         Lit::Int(v) => format!("{v}"),
         Lit::Long(v) => format!("{v}L"),
         Lit::Float(v) => format!("{}f", ensure_frac(*v)),
